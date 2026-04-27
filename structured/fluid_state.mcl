@@ -1,0 +1,35 @@
+! ════════════════════════════════════════════════════════════════
+! LAYER 3: FLUID — Particle dynamics (GPU-exclusive)
+! ════════════════════════════════════════════════════════════════
+!
+! The fluid is the particle state — positions, velocities, omega, flags.
+! GPU owns exclusively. Each particle is a signed accumulator.
+! Positive = source/gain. Negative = drain/loss. Zero = off/skip.
+!
+! The CPU never sees individual particles — only waveguide summaries.
+
+! ── Fluid state (SoA) ────────────────────────────────────
+STATIC REAL :: POS_X(MAXPART), POS_Y(MAXPART), POS_Z(MAXPART)
+STATIC REAL :: VEL_X(MAXPART), VEL_Y(MAXPART), VEL_Z(MAXPART)
+STATIC REAL :: OMEGA_NAT(MAXPART)
+STATIC INTEGER :: FLAGS(MAXPART)
+
+! ── Metadata (CPU-side only, not on GPU) ──────────────────
+STATIC REAL :: PUMP_SCALE(MAXPART), PUMP_RESID(MAXPART), PUMP_HIST(MAXPART)
+STATIC INTEGER :: PUMP_STATE(MAXPART)
+STATIC INTEGER :: TOPO_STATE(MAXPART)
+
+! ── Population state ──────────────────────────────────────
+STATIC INTEGER :: NPART = 0
+STATIC INTEGER :: CAPACITY = 0
+STATIC INTEGER :: RNG_STATE = 42
+
+! ── Oracle spawn control (written by NET codegen) ─────────
+STATIC INTEGER :: NET_SPAWN_ACTIVE = 0
+STATIC INTEGER :: NET_SPAWN_COUNT = 0
+STATIC INTEGER :: NET_SPAWN_PAUSE = 0
+STATIC INTEGER :: NET_CENSUS_OVERRIDE = 0
+
+! ════════════════════════════════════════════════════════════════
+! PRNG (deterministic, reproducible)
+! ════════════════════════════════════════════════════════════════

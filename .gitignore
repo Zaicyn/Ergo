@@ -1,0 +1,21 @@
+# Whitelist mode: ignore everything, then allow specific dirs
+*
+!.gitignore
+!structured/
+!structured/**
+!galaxy_structured.mcl
+!mcl/
+!mcl/**
+!Spec/
+!Spec/**
+!README.md
+!NEXT_SESSION.md
+
+# Always ignore build artifacts
+__pycache__/
+*.pyc
+*.spvasm
+*.spv
+*.o
+*.so
+

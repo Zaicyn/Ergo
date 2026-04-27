@@ -1,0 +1,492 @@
+! ════════════════════════════════════════════════════════════════
+! LAYER 3: FLUID SUBROUTINES
+! ════════════════════════════════════════════════════════════════
+!
+! Everything is a signed accumulator. Decay always runs.
+! Accumulation is the variable. Zero input = pure decay.
+! One path through the kernel. Mode modulates amplitude, not flow.
+
+! ════════════════════════════════════════════════════════════════
+! PRNG (deterministic, reproducible)
+! ════════════════════════════════════════════════════════════════
+
+REAL FUNCTION RNGF()
+  RNG_STATE := IAND(RNG_STATE * 1103515245 + 12345, 2147483647)
+  RNGF := REAL(IAND(ISHFT(RNG_STATE, -16), 32767)) / 32767.0
+  RETURN RNGF
+END
+
+INTEGER FUNCTION BITCOUNT(N)
+  INTEGER :: N, CNT, B
+  CNT := 0
+  DO B = 0, 7
+    IF IAND(N, ISHFT(1, B)) ≠ 0 THEN
+      CNT := CNT + 1
+    ENDIF
+  ENDDO
+  BITCOUNT := CNT
+  RETURN BITCOUNT
+END
+
+! ════════════════════════════════════════════════════════════════
+! INIT (CPU-only, runs once)
+! ════════════════════════════════════════════════════════════════
+
+SUBROUTINE SIM_INIT(N, CAP, SEED)
+  INTEGER :: N, CAP, SEED
+  INTEGER :: I, GEN, PH
+  REAL :: X, Y, Z, R, S
+  REAL :: THETA_I, R_XZ, V_CIRC, R_CLAMP
+
+  NPART := N
+  IF CAP < N THEN
+    CAPACITY := N
+  ELSE
+    CAPACITY := CAP
+  ENDIF
+  RNG_STATE := SEED
+
+  DO I = 1, CAPACITY
+    POS_X(I) := 0.0
+    POS_Y(I) := 0.0
+    POS_Z(I) := 0.0
+    VEL_X(I) := 0.0
+    VEL_Y(I) := 0.0
+    VEL_Z(I) := 0.0
+    PUMP_SCALE(I) := 0.0
+    PUMP_RESID(I) := 0.0
+    PUMP_HIST(I) := 0.0
+    PUMP_STATE(I) := 0
+    OMEGA_NAT(I) := 0.0
+    FLAGS(I) := 0
+    TOPO_STATE(I) := 0
+  ENDDO
+
+  DO I = 1, N
+    X := (RNGF() * 2.0 - 1.0) * DISK_OUTER_R
+    Y := (RNGF() * 2.0 - 1.0) * DISK_OUTER_R * 0.3
+    Z := (RNGF() * 2.0 - 1.0) * DISK_OUTER_R
+
+    R := SQRT(X * X + Y * Y + Z * Z)
+    IF R < 1.0 THEN
+      S := 1.0 / R
+      X := X * S
+      Y := Y * S
+      Z := Z * S
+    ENDIF
+
+    POS_X(I) := X
+    POS_Y(I) := Y
+    POS_Z(I) := Z
+
+    THETA_I := ATAN2(Z, X) + SEAM_STEP
+    IF THETA_I ≥ TWO_PI THEN
+      THETA_I := THETA_I - TWO_PI
+    ENDIF
+    IF THETA_I < 0.0 THEN
+      THETA_I := THETA_I + TWO_PI
+    ENDIF
+
+    PH := IAND(INT(THETA_I * REAL(PHASE_MASK) / TWO_PI), PHASE_MASK)
+    GEN := IAND(ISHFT(PH, -10), GEN_MASK) + 1
+
+    R_XZ := SQRT(X * X + Z * Z)
+    V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
+    VEL_X(I) := TANGENT(1, GEN) * V_CIRC
+    VEL_Y(I) := TANGENT(2, GEN) * V_CIRC
+    VEL_Z(I) := TANGENT(3, GEN) * V_CIRC
+
+    R_CLAMP := MAX(R_XZ, 1.0)
+    OMEGA_NAT(I) := 0.1 * (50.0 / R_CLAMP) ** 1.5
+
+    PUMP_SCALE(I) := 1.0
+    FLAGS(I) := IOR(IOR(PFLAG_ACTIVE, ISHFT(IAND(GEN - 1, GEN_MASK), &
+      GEN_SHIFT)), ISHFT(PH, PHASE_SHIFT))
+  ENDDO
+
+  RETURN
+END
+
+! ════════════════════════════════════════════════════════════════
+! SEED SHELL (CPU-only, runs once)
+! ════════════════════════════════════════════════════════════════
+
+SUBROUTINE SIM_SEED_SHELL()
+  INTEGER :: I, N_SHELL, GEN, PH
+  REAL :: PX, PY, PZ, SHELL_R, THETA_I, R_XZ, V_CIRC
+
+  SHELL_R := 50.0
+  IF NPART < 12 THEN
+    N_SHELL := NPART
+  ELSE
+    N_SHELL := 12
+  ENDIF
+
+  DO I = 1, N_SHELL
+    PX := CUBOCT(1, I) * SHELL_R
+    PY := CUBOCT(2, I) * SHELL_R
+    PZ := CUBOCT(3, I) * SHELL_R
+    POS_X(I) := PX
+    POS_Y(I) := PY
+    POS_Z(I) := PZ
+
+    THETA_I := REAL(I - 1) * (TWO_PI / 12.0)
+    PH := IAND(INT(THETA_I * REAL(PHASE_MASK) / TWO_PI), PHASE_MASK)
+    GEN := IAND(ISHFT(PH, -10), GEN_MASK) + 1
+
+    R_XZ := SQRT(PX * PX + PZ * PZ)
+    V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
+    VEL_X(I) := TANGENT(1, GEN) * V_CIRC
+    VEL_Y(I) := TANGENT(2, GEN) * V_CIRC
+    VEL_Z(I) := TANGENT(3, GEN) * V_CIRC
+
+    OMEGA_NAT(I) := 0.1
+    FLAGS(I) := IOR(IOR(PFLAG_ACTIVE, ISHFT(IAND(GEN - 1, GEN_MASK), &
+      GEN_SHIFT)), ISHFT(PH, PHASE_SHIFT))
+    PUMP_SCALE(I) := 1.0
+  ENDDO
+
+  RETURN
+END
+
+! ════════════════════════════════════════════════════════════════
+! PHYSICS — One path. Decay always. Accumulation varies.
+! ════════════════════════════════════════════════════════════════
+!
+! Every particle follows the same chain:
+!   1. Gravity pulls (always negative, the universal downhill)
+!   2. Omega decays (always, the arrow of time)
+!   3. Field coupling accumulates (amplitude modulated by mode)
+!   4. Velocity accumulates from forces
+!   5. Position accumulates from velocity
+!   6. Thresholds observed (nova, crystal — state transitions)
+!
+! Mode doesn't branch the path. Mode modulates the amplitude.
+! COAST: field coupling = 0 (zero × anything = zero, natural skip)
+! ACTIVE: field coupling = 1 (full accumulation)
+! FLOW: field coupling = 1 + weak channel
+!
+! Zero density = zero force from field. Zero omega = crystal.
+! The zero IS the null. No special cases.
+
+SUBROUTINE SIM_PHYSICS_STEP(DT)
+  REAL :: DT
+  INTEGER :: I, GEN, FMODE, CI, CJ, CK
+  REAL :: PX, PY, PZ, VX, VY, VZ
+  REAL :: R3D_SQ, R3D, INV_R3D, R_SAFE, INV_R
+  REAL :: RX, RY, RZ, GRAVITY
+  REAL :: AX, AY, AZ
+  REAL :: V_SQ, OMEGA
+  REAL :: ENV, RHO, MET_GATE, COUPLING
+  REAL :: DECAY, SPD_SQ
+  REAL :: TANG_X, TANG_Y, TANG_Z, Z_C, FLOW_WG
+  REAL :: CP_X, CP_Y, CP_Z, DX_N, DY_N, DZ_N, D_NODE_SQ
+  REAL :: INV_RXZ, PGX, PGZ
+  REAL :: F_DOT_R, FPX, FPY, FPZ, VIV_MOD
+  REAL :: TX, TY, TZ, BASE_RATE, STEER_R
+  REAL :: INV_SPD_B, INV_T_MAG, TNX, TNY, TNZ
+  REAL :: V_DOT_T, INV_SPD_A, RESCALE
+  REAL :: STRONG
+  REAL :: DRIVE, TARGET, INSTABILITY
+  REAL :: WEAK_DOT_R, WEAK_STR
+  REAL :: GDX, GDY, GDZ, GD_R, GTX, GTY, GTZ
+
+  DO I = 1, NPART
+    ! ── Skip crystallized (off) and ejected (gone) ────────
+    ! These are the TRUE nulls — particles that have left the chain.
+    ! Crystal = ground state, no energy, no movement, part of lattice.
+    ! Ejected = escaped, no longer relevant.
+    IF IAND(FLAGS(I), IOR(PFLAG_CRYSTAL, PFLAG_EJECTED)) ≠ 0 THEN
+      CYCLE
+    ENDIF
+
+    ! ── Load state ────────────────────────────────────────
+    PX := POS_X(I)
+    PY := POS_Y(I)
+    PZ := POS_Z(I)
+    VX := VEL_X(I)
+    VY := VEL_Y(I)
+    VZ := VEL_Z(I)
+    OMEGA := OMEGA_NAT(I)
+
+    ! ── GEN + mode ────────────────────────────────────────
+    GEN := IAND(ISHFT(FLAGS(I), -GEN_SHIFT), GEN_MASK) + 1
+    FMODE := FLOW_MODE(GEN)
+
+    ! ── 1. GRAVITY (always — the universal downhill) ──────
+    R3D_SQ := PX * PX + PY * PY + PZ * PZ
+    INV_R3D := 1.0 / SQRT(R3D_SQ + 1.0E-8)
+    R3D := R3D_SQ * INV_R3D
+    R_SAFE := MAX(R3D, 1.0)
+    INV_R := MIN(INV_R3D, 1.0)
+
+    RX := PX * INV_R
+    RY := PY * INV_R
+    RZ := PZ * INV_R
+    GRAVITY := BH_MASS * INV_R * INV_R
+
+    AX := -RX * GRAVITY
+    AY := -RY * GRAVITY
+    AZ := -RZ * GRAVITY
+
+    ! ── 2. OMEGA DECAY (always — the arrow of time) ───────
+    ! Everything loses energy unless something feeds it.
+    DECAY := 1.0 - OMEGA_DECAY * DT
+    DECAY := DECAY * DECAY * DECAY * DECAY
+    OMEGA := OMEGA * DECAY
+
+    ! ── 3. MODE COUPLING (amplitude, not branch) ─────────
+    ! COAST=0: coupling is zero. ACTIVE=1,FLOW=2: coupling is 1.
+    ! The zero makes all field terms vanish naturally.
+    IF FMODE = 0 THEN
+      COUPLING := 0.0
+    ELSE
+      COUPLING := 1.0
+    ENDIF
+
+    ! ── 4. WAVEGUIDE READ (always — zero density = zero force)
+    CI := CLAMP(INT(PX / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    CJ := CLAMP(INT(PY / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    CK := CLAMP(INT(PZ / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    RHO := REAL(GRID_DENSITY(CI, CJ, CK)) * COUPLING
+
+    ! ── 5. ENVELOPE (distance to coherence node) ─────────
+    CP_X := CURVE_PT(1, GEN) * R_SAFE
+    CP_Y := CURVE_PT(2, GEN) * R_SAFE
+    CP_Z := CURVE_PT(3, GEN) * R_SAFE
+    DX_N := PX - CP_X
+    DY_N := PY - CP_Y
+    DZ_N := PZ - CP_Z
+    D_NODE_SQ := DX_N * DX_N + DY_N * DY_N + DZ_N * DZ_N
+    ENV := 1.0 / SQRT(1.0 + D_NODE_SQ * INV_R_SCALE_SQ) * COUPLING
+
+    ! ── 6. METABOLIC GATE ────────────────────────────────
+    MET_GATE := GRID_MET_GATE(CI, CJ, CK) * COUPLING
+
+    ! ── 7. LUT GEOMETRY ──────────────────────────────────
+    TANG_X := TANGENT(1, GEN)
+    TANG_Y := TANGENT(2, GEN)
+    TANG_Z := TANGENT(3, GEN)
+    Z_C := Z_COUPLING(GEN)
+    FLOW_WG := FLOW_W(GEN)
+
+    ! ── 8. PROGRADE TANGENT ──────────────────────────────
+    INV_RXZ := 1.0 / SQRT(PX * PX + PZ * PZ + 1.0E-8)
+    PGX := -PZ * INV_RXZ
+    PGZ :=  PX * INV_RXZ
+
+    ! ── 9. VIVIANI MODULATION ────────────────────────────
+    F_DOT_R := TANG_X * RX + TANG_Y * RY + TANG_Z * RZ
+    FPX := TANG_X - F_DOT_R * RX
+    FPY := TANG_Y - F_DOT_R * RY
+    FPZ := TANG_Z - F_DOT_R * RZ
+    VIV_MOD := FPX * PGX + FPZ * PGZ
+
+    TX := PGX * ABS(VIV_MOD) + FPX * 0.1
+    TY := FPY * 0.1
+    TZ := PGZ * ABS(VIV_MOD) + FPZ * 0.1
+
+    ! ── 10. EM STEERING (speed-preserving, amplitude-modulated)
+    ! COAST: COUPLING=0 → STEER_R=0 → no steering. Natural skip.
+    IF FMODE = 2 THEN
+      BASE_RATE := 0.02
+    ELSE
+      BASE_RATE := 0.002
+    ENDIF
+    STEER_R := BASE_RATE * ENV
+
+    SPD_SQ := VX * VX + VY * VY + VZ * VZ
+    INV_SPD_B := 1.0 / SQRT(SPD_SQ + 1.0E-8)
+
+    INV_T_MAG := 1.0 / SQRT(TX * TX + TY * TY + TZ * TZ + 1.0E-8)
+    TNX := TX * INV_T_MAG
+    TNY := TY * INV_T_MAG
+    TNZ := TZ * INV_T_MAG
+
+    V_DOT_T := VX * TNX + VY * TNY + VZ * TNZ
+    VX := VX - (VX - V_DOT_T * TNX) * STEER_R
+    VY := VY - (VY - V_DOT_T * TNY) * STEER_R
+    VZ := VZ - (VZ - V_DOT_T * TNZ) * STEER_R
+
+    INV_SPD_A := 1.0 / SQRT(VX * VX + VY * VY + VZ * VZ + 1.0E-8)
+    RESCALE := INV_SPD_A / INV_SPD_B
+    VX := VX * RESCALE
+    VY := VY * RESCALE
+    VZ := VZ * RESCALE
+
+    ! ── 11. STRONG CHANNEL (z-coupling, always signed) ───
+    STRONG := Z_C * GRAVITY * 0.1 * COUPLING
+    AX := AX + RX * STRONG
+    AY := AY + RY * STRONG
+    AZ := AZ + RZ * STRONG
+
+    ! ── 12. WEAK CHANNEL (flow escape, FLOW mode only) ───
+    ! FLOW_WG is signed from LUT. Non-FLOW modes: COUPLING gates it.
+    ! But FLOW_WG is only nonzero for FLOW segments in the LUT.
+    ! We still gate on FMODE=2 to avoid the CURVE_PT lookups.
+    IF FMODE = 2 THEN
+      WEAK_DOT_R := CURVE_PT(1, GEN) * RX + &
+        CURVE_PT(2, GEN) * RY + CURVE_PT(3, GEN) * RZ
+      WEAK_STR := ABS(FLOW_WG) * GRAVITY * 0.05
+      AX := AX + (CURVE_PT(1, GEN) - WEAK_DOT_R * RX) * WEAK_STR
+      AY := AY + (CURVE_PT(2, GEN) - WEAK_DOT_R * RY) * WEAK_STR
+      AZ := AZ + (CURVE_PT(3, GEN) - WEAK_DOT_R * RZ) * WEAK_STR
+    ENDIF
+
+    ! ── 13. DENSITY SIPHON (waveguide → fluid) ───────────
+    ! RHO already multiplied by COUPLING. Zero RHO = zero force.
+    GDX := GRID_GRAD_X(CI, CJ, CK)
+    GDY := GRID_GRAD_Y(CI, CJ, CK)
+    GDZ := GRID_GRAD_Z(CI, CJ, CK)
+    GD_R := GDX * RX + GDY * RY + GDZ * RZ
+    GTX := GDX - GD_R * RX
+    GTY := GDY - GD_R * RY
+    GTZ := GDZ - GD_R * RZ
+    AX := AX + GTX * RHO * ENV * DENSITY_FORCE_SCALE
+    AY := AY + GTY * RHO * ENV * DENSITY_FORCE_SCALE
+    AZ := AZ + GTZ * RHO * ENV * DENSITY_FORCE_SCALE
+
+    ! ── 14. VELOCITY ACCUMULATION ────────────────────────
+    VX := VX + AX * DT
+    VY := VY + AY * DT
+    VZ := VZ + AZ * DT
+
+    V_SQ := VX * VX + VY * VY + VZ * VZ
+    IF V_SQ ≥ 1.0E24 THEN
+      CYCLE
+    ENDIF
+
+    ! ── 15. OMEGA ACCUMULATION (driven by field coupling) ─
+    ! DRIVE is zero when RHO is zero (COAST or empty cell).
+    ! Zero drive = omega continues to decay toward zero.
+    DRIVE := RHO * ENV * MET_GATE
+    TARGET := OMEGA_BASE * COUPLING + DRIVE * OMEGA_GAIN
+    OMEGA := OMEGA + (TARGET - OMEGA) * OMEGA_RESPONSE * DT
+    INSTABILITY := MAX(OMEGA - 0.4, 0.0)
+    OMEGA := OMEGA + INSTABILITY * INSTABILITY * 0.5 * DT
+    IF OMEGA > OMEGA_MAX THEN
+      OMEGA := OMEGA_MAX
+    ENDIF
+    IF OMEGA < 0.0 THEN
+      OMEGA := 0.0
+    ENDIF
+
+    ! ── 16. POSITION ACCUMULATION ────────────────────────
+    POS_X(I) := PX + VX * DT
+    POS_Y(I) := PY + VY * DT
+    POS_Z(I) := PZ + VZ * DT
+    VEL_X(I) := VX
+    VEL_Y(I) := VY
+    VEL_Z(I) := VZ
+    OMEGA_NAT(I) := OMEGA
+
+    ! ── 17. THRESHOLD OBSERVATIONS ───────────────────────
+    ! These are not computations. They are observations of
+    ! where the accumulators ended up this frame.
+
+    ! Nova: omega exceeded threshold AND density supports it
+    IF OMEGA > OMEGA_NOVA_THRESH .AND. RHO > RHO_NOVA_THRESH THEN
+      FLAGS(I) := IOR(FLAGS(I), PFLAG_NOVA)
+      FLAGS(I) := IAND(FLAGS(I), NOT(PFLAG_ACTIVE))
+      ! Blast: one-time velocity impulse along tangent
+      VEL_X(I) := VX + TANGENT(1, GEN) * BLAST_MULT
+      VEL_Y(I) := VY + TANGENT(2, GEN) * BLAST_MULT
+      VEL_Z(I) := VZ + TANGENT(3, GEN) * BLAST_MULT
+    ENDIF
+
+    ! Crystal: omega decayed below threshold AND velocity near zero
+    ! This is the ground state — the particle reached the bottom
+    ! of the decay chain. It becomes part of the lattice.
+    SPD_SQ := VX * VX + VY * VY + VZ * VZ
+    IF OMEGA < OMEGA_CRYSTAL_THRESH .AND. SPD_SQ < 0.01 THEN
+      FLAGS(I) := IOR(FLAGS(I), PFLAG_CRYSTAL)
+    ENDIF
+  ENDDO
+
+  RETURN
+END
+
+! ════════════════════════════════════════════════════════════════
+! SPAWN — New particles from existing (CPU-side, every 100 frames)
+! ════════════════════════════════════════════════════════════════
+
+SUBROUTINE SIM_SPAWN(CAP, NSPAWN)
+  INTEGER :: CAP, NSPAWN
+  INTEGER :: EFF_CAP, BIAS_EQ, WORKING, REDLINE, BUDGET
+  INTEGER :: I, SLOT, OLD_N, GEN
+  INTEGER :: PH_CHILD
+  REAL :: T, PX, PY, PZ, R_XZ, V_CIRC
+
+  EFF_CAP := CAP
+  IF EFF_CAP > CAPACITY THEN
+    EFF_CAP := CAPACITY
+  ENDIF
+
+  NSPAWN := 0
+  IF NPART ≥ EFF_CAP THEN
+    RETURN
+  ENDIF
+
+  BIAS_EQ := INT(REAL(EFF_CAP) * 0.75)
+  WORKING := INT(REAL(EFF_CAP) * 0.844)
+  REDLINE := INT(REAL(EFF_CAP) * 0.969)
+
+  IF NPART ≥ REDLINE THEN
+    RETURN
+  ENDIF
+
+  IF NPART < BIAS_EQ THEN
+    BUDGET := NPART
+  ELSEIF NPART < WORKING THEN
+    T := REAL(NPART - BIAS_EQ) / REAL(WORKING - BIAS_EQ)
+    BUDGET := INT(REAL(NPART) * (1.0 - T * 0.8))
+  ELSE
+    BUDGET := NPART / 100
+    IF BUDGET < 1 THEN
+      BUDGET := 1
+    ENDIF
+  ENDIF
+
+  OLD_N := NPART
+
+  DO I = 1, NPART
+    IF NSPAWN ≥ BUDGET THEN
+      CYCLE
+    ENDIF
+    IF IAND(FLAGS(I), PFLAG_ACTIVE) = 0 THEN
+      CYCLE
+    ENDIF
+
+    SLOT := OLD_N + NSPAWN + 1
+    IF SLOT > EFF_CAP THEN
+      CYCLE
+    ENDIF
+
+    PH_CHILD := IAND(IAND(ISHFT(FLAGS(I), -PHASE_SHIFT), &
+      PHASE_MASK) + SEAM_STEP_PH, PHASE_MASK)
+    GEN := IAND(ISHFT(PH_CHILD, -10), GEN_MASK) + 1
+
+    PX := POS_X(I) + (RNGF() - 0.5) * 2.0
+    PY := POS_Y(I) + (RNGF() - 0.5) * 0.5
+    PZ := POS_Z(I) + (RNGF() - 0.5) * 2.0
+
+    R_XZ := SQRT(PX * PX + PZ * PZ)
+    V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
+
+    POS_X(SLOT) := PX
+    POS_Y(SLOT) := PY
+    POS_Z(SLOT) := PZ
+    VEL_X(SLOT) := TANGENT(1, GEN) * V_CIRC
+    VEL_Y(SLOT) := TANGENT(2, GEN) * V_CIRC
+    VEL_Z(SLOT) := TANGENT(3, GEN) * V_CIRC
+    OMEGA_NAT(SLOT) := 0.1 * (50.0 / MAX(R_XZ, 1.0)) ** 1.5
+    FLAGS(SLOT) := IOR(IOR(PFLAG_ACTIVE, ISHFT(IAND(GEN - 1, &
+      GEN_MASK), GEN_SHIFT)), ISHFT(PH_CHILD, PHASE_SHIFT))
+    PUMP_SCALE(SLOT) := 1.0
+
+    NSPAWN := NSPAWN + 1
+  ENDDO
+
+  NPART := NPART + NSPAWN
+  RETURN
+END

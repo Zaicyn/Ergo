@@ -1,0 +1,138 @@
+! ── DOWNLOAD_WAVEGUIDE: GPU → CPU readback ────────────────
+! The ONLY place GPU sends data to CPU. 128KB per grid array.
+! Called at census intervals only (every 50-2000 frames).
+! Must be called AFTER frame_end + frame_wait (GPU idle).
+!
+! This is a no-op subroutine that the codegen recognizes as
+! a signal to insert grid array downloads. The subroutine body
+! copies from the GPU arrays to their CPU-side counterparts.
+! On CPU-only mode, this is a no-op (arrays are already in sync).
+
+SUBROUTINE DOWNLOAD_WAVEGUIDE()
+  ! Forces GPU → CPU sync of waveguide grid arrays.
+  ! Total: ~768KB (6 arrays × 32³ × 4 bytes).
+  ! Touch each grid array to trigger codegen download.
+  REAL :: DW
+  DW := REAL(GRID_DENSITY(1, 1, 1))
+  DW := GRID_GRAD_X(1, 1, 1)
+  DW := GRID_GRAD_Y(1, 1, 1)
+  DW := GRID_GRAD_Z(1, 1, 1)
+  DW := GRID_MET_GATE(1, 1, 1)
+  DW := REAL(BIN_PRESENCE(1, 1, 1))
+  RETURN
+END
+
+SUBROUTINE CLEAR_GRID()
+  CALL ZERO(GRID_DENSITY)
+  CALL ZERO(GRID_GRAD_X)
+  CALL ZERO(GRID_GRAD_Y)
+  CALL ZERO(GRID_GRAD_Z)
+  CALL ZERO(GRID_MET_GATE)
+  CALL ZERO(BIN_PRESENCE)
+  RETURN
+END
+
+! ── SCATTER: fluid → waveguide ────────────────────────────
+! Each particle deposits its presence into the field.
+! Phase advance + GEN packing + density + bin presence.
+! Zero-flagged particles (ejected/crystal): SKIP.
+!
+! This is the generational handoff — the particle declares
+! its lifecycle state into the field.
+
+SUBROUTINE SCATTER_GRID()
+  INTEGER :: I, CI, CJ, CK, GEN, BIN, PH
+
+  DO I = 1, NPART
+    ! Zero check: ejected/crystal = off, skip entirely
+    IF IAND(FLAGS(I), IOR(PFLAG_EJECTED, PFLAG_CRYSTAL)) ≠ 0 THEN
+      CYCLE
+    ENDIF
+    IF IAND(FLAGS(I), IOR(PFLAG_ACTIVE, PFLAG_NOVA)) = 0 THEN
+      CYCLE
+    ENDIF
+
+    ! Phase accumulator: advance, wrap (all integer)
+    PH := IAND(ISHFT(FLAGS(I), -PHASE_SHIFT), PHASE_MASK)
+    PH := IAND(PH + INT(OMEGA_NAT(I) * PHASE_INC_SCALE), PHASE_MASK)
+
+    ! GEN from top 5 bits of 15-bit phase
+    GEN := IAND(ISHFT(PH, -10), GEN_MASK)
+
+    ! Write back FLAGS: low byte (status) + GEN + PHASE
+    FLAGS(I) := IOR(IOR(IAND(FLAGS(I), 255), ISHFT(GEN, GEN_SHIFT)), ISHFT(PH, PHASE_SHIFT))
+
+    ! Density: +1 into cell (positive accumulator)
+    CI := CLAMP(INT(POS_X(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    CJ := CLAMP(INT(POS_Y(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    CK := CLAMP(INT(POS_Z(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    GRID_DENSITY(CI, CJ, CK) := GRID_DENSITY(CI, CJ, CK) + 1
+
+    ! Generation bin presence
+    BIN := IAND(GEN, 7) + 1
+    BIN_PRESENCE(CI, CJ, CK) := IOR(BIN_PRESENCE(CI, CJ, CK), ISHFT(1, BIN - 1))
+  ENDDO
+  RETURN
+END
+
+! ── STENCIL: waveguide → waveguide ───────────────────────
+! Computes gradients from density, metabolic gate from presence.
+! Blends oracle consensus into local field before differentiation.
+! Cells with zero density: gradients are zero. Natural skip.
+
+SUBROUTINE STENCIL_GRID()
+  INTEGER :: I, J, K, IM, IP, JM, JP, KM, KP
+  INTEGER :: BP
+  REAL :: COV
+
+  DO K = 1, GRID_SIZE
+    KM := MOD(K - 2 + GRID_SIZE, GRID_SIZE) + 1
+    KP := MOD(K, GRID_SIZE) + 1
+    DO J = 1, GRID_SIZE
+      JM := MOD(J - 2 + GRID_SIZE, GRID_SIZE) + 1
+      JP := MOD(J, GRID_SIZE) + 1
+      DO I = 1, GRID_SIZE
+        IM := MOD(I - 2 + GRID_SIZE, GRID_SIZE) + 1
+        IP := MOD(I, GRID_SIZE) + 1
+
+        ! Oracle blend: local + alpha * (global - local)
+        GRID_DENSITY(I, J, K) := INT(REAL(GRID_DENSITY(I, J, K)) + FIELD_BLEND * (GRID_DENSITY_GLOBAL(I, J, K) - REAL(GRID_DENSITY(I, J, K))))
+
+        ! Gradients (cast INTEGER → REAL for arithmetic)
+        GRID_GRAD_X(I, J, K) := REAL(GRID_DENSITY(IP, J, K) - GRID_DENSITY(IM, J, K)) * 0.5
+        GRID_GRAD_Y(I, J, K) := REAL(GRID_DENSITY(I, JP, K) - GRID_DENSITY(I, JM, K)) * 0.5
+        GRID_GRAD_Z(I, J, K) := REAL(GRID_DENSITY(I, J, KP) - GRID_DENSITY(I, J, KM)) * 0.5
+
+        ! Metabolic gate: popcount → coverage → gate
+        BP := BIN_PRESENCE(I, J, K)
+        COV := 0.0
+        IF IAND(BP, 1) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 2) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 4) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 8) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 16) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 32) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 64) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 128) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        GRID_MET_GATE(I, J, K) := 0.2 + 1.3 * COV / 8.0
+      ENDDO
+    ENDDO
+  ENDDO
+  RETURN
+END

@@ -1,0 +1,40 @@
+! ════════════════════════════════════════════════════════════════
+! CENSUS — CPU observation (minimal: population + frame only)
+! ════════════════════════════════════════════════════════════════
+!
+! For now, census reports NPART and FRAME only.
+! Grid-level statistics (density distribution, gradient magnitude)
+! will be added when proper census-time grid downloads are implemented.
+!
+! NPART is a CPU scalar — no GPU download needed.
+! Census persistent state is declared in waveguide_state.mcl.
+
+SUBROUTINE SIM_CENSUS_ADAPTIVE(COUNT, FRAME, NEXT_INTERVAL)
+  INTEGER :: COUNT, FRAME, NEXT_INTERVAL
+  INTEGER :: INTERVAL
+
+  PRINT FRAME
+  PRINT COUNT
+
+  ! Adaptive interval: simple population-based for now
+  INTERVAL := CENSUS_INTERVAL_DEFAULT
+  IF COUNT > 50000 THEN
+    INTERVAL := CENSUS_INTERVAL_MIN
+  ELSEIF COUNT > 10000 THEN
+    INTERVAL := CENSUS_INTERVAL_DEFAULT / 2
+  ELSEIF COUNT < 100 THEN
+    INTERVAL := CENSUS_INTERVAL_MAX
+  ENDIF
+
+  IF INTERVAL < CENSUS_INTERVAL_MIN THEN
+    INTERVAL := CENSUS_INTERVAL_MIN
+  ENDIF
+  IF INTERVAL > CENSUS_INTERVAL_MAX THEN
+    INTERVAL := CENSUS_INTERVAL_MAX
+  ENDIF
+
+  CENSUS_PREV_FRAME := FRAME
+  CENSUS_INITIALIZED := 1
+  NEXT_INTERVAL := INTERVAL
+  RETURN
+END

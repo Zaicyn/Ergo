@@ -1,0 +1,38 @@
+! ════════════════════════════════════════════════════════════════
+! LAYER 2: WAVEGUIDE — Field structure (density + gradients)
+! ════════════════════════════════════════════════════════════════
+!
+! The waveguide is the structure that guides the fluid.
+! Updated every frame by scatter (fluid → field) and stencil (field → field).
+! Corrected at census intervals by oracle blend (external → field).
+!
+! The CPU oracle sees ONLY this layer — the 128KB density grid.
+! The GPU fluid reads this layer but never owns it.
+
+! ── Waveguide state ───────────────────────────────────────
+STATIC INTEGER :: GRID_DENSITY(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+STATIC REAL :: GRID_GRAD_X(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+STATIC REAL :: GRID_GRAD_Y(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+STATIC REAL :: GRID_GRAD_Z(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+STATIC REAL :: GRID_MET_GATE(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+STATIC INTEGER :: BIN_PRESENCE(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+
+! ── Oracle consensus (external correction) ────────────────
+STATIC REAL :: GRID_DENSITY_GLOBAL(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+
+! ── Census persistent state (CPU-side sampling history) ───
+STATIC REAL :: CENSUS_PREV_OMEGA_MAX = 0.0
+STATIC REAL :: CENSUS_PREV_OMEGA_MEAN = 0.0
+STATIC INTEGER :: CENSUS_PREV_CRYSTAL = 0
+STATIC INTEGER :: CENSUS_PREV_NOVA = 0
+STATIC REAL :: CENSUS_PREV_SPREAD = 0.0
+STATIC INTEGER :: CENSUS_PREV_FRAME = 0
+STATIC INTEGER :: CENSUS_INITIALIZED = 0
+
+! ════════════════════════════════════════════════════════════════
+! WAVEGUIDE SUBROUTINES
+! ════════════════════════════════════════════════════════════════
+
+! ── CLEAR: zero accumulators ──────────────────────────────
+! Zeros density, gradients, presence, met_gate for fresh scatter pass.
+! On GPU this becomes vkCmdFillBuffer (no CPU memset).

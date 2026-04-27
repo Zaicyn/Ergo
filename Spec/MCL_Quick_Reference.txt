@@ -1,0 +1,142 @@
+================================================================================
+MCL (MATHEMATICAL COMPUTE LANGUAGE) — DESIGN COMPLETE & LOCKED
+================================================================================
+
+STATUS: Ready for implementation. No design decisions remain.
+
+================================================================================
+THE LANGUAGE (16 OPERATORS)
+================================================================================
+
+ARITHMETIC:     ** * / + - (5 operators)
+RELATIONAL:     < > = ≠ ≤ ≥ (6 operators)
+LOGICAL:        .AND. .OR. .NOT. (3 operators)
+ASSIGNMENT:     := (1 operator)
+UNARY:          + - (prefix, right-assoc, shared symbols with binary)
+
+TOTAL: 16 distinct operators. No ambiguity.
+
+================================================================================
+MEMORY MODEL
+================================================================================
+
+RULE: No hidden allocation. Ever.
+
+Static arrays:      REAL :: A(10, 20)         ! Compile-time constant size
+Allocatable arrays: REAL, ALLOCATABLE :: A(:,:)
+                    ALLOCATE(A(m, n))        ! Explicit allocation (statement)
+                    DEALLOCATE(A)            ! Optional cleanup
+
+Intrinsics:         All array-returning functions require caller-allocated output
+                    No MATMUL(A, B) auto-allocating a result
+                    Caller must: REAL :: C(m, p); C := MATMUL(A, B)
+
+Assignment:         Never resizes arrays. Shape mismatch is a compile-time error.
+
+================================================================================
+INTRINSIC FUNCTIONS (40+ Total)
+================================================================================
+
+Scalar math:        SIN, COS, TAN, EXP, LOG, SQRT, ABS, MOD, MAX, MIN
+Vector reduction:   SUM, PRODUCT, DOT_PRODUCT, NORM2, MAXVAL, MINVAL
+Array operations:   MATMUL, TRANSPOSE, RESHAPE (all caller-allocated output)
+String functions:   LEN, INDEX, CONCAT (fixed-length, no dynamic allocation)
+Array inspection:   SIZE, SHAPE, RANK
+
+EVERY intrinsic has explicit memory contract. No exceptions.
+
+================================================================================
+TYPE SYSTEM
+================================================================================
+
+Base types:    INTEGER, REAL, COMPLEX, LOGICAL, CHARACTER (fixed-length)
+
+Coercion:      INTEGER + REAL → REAL (implicit promotion)
+               COMPLEX + anything → COMPLEX
+               INTEGER ** negative_int → COMPILE-TIME ERROR (use REAL)
+
+No implicit allocation on type mismatch. Shape errors are rejected at compile time.
+
+================================================================================
+PARSER BEHAVIOR
+================================================================================
+
+Line continuation:      & at end of line joins with next line.
+                        DATA A / 1, 2, &
+                                 3, 4 /
+                        Pre-processed before tokenization.
+
+Comparison chaining:    1 < x ≤ 10   desugars to   (1 < x) .AND. (x ≤ 10)
+                        Happens at parse time, not runtime.
+
+Assignment-as-statement: y := x := 5  is ILLEGAL.
+                         Assignment produces no value.
+                         ALLOCATE(C(m, p)) is a statement, not an expression.
+
+Unary minus precedence:  -5 ** 2 = -(5 ** 2) = -25   (not 25)
+                         ** binds tighter than unary minus.
+                         Parentheses: (-5) ** 2 = 25
+
+================================================================================
+BOOTSTRAP STRATEGY
+================================================================================
+
+Phase 0 (Weeks 1-2):  Write MCL compiler in Python
+                      - Lexer (Day 1-2)
+                      - Parser (Day 2-3)
+                      - Type checker (Week 2)
+                      - C codegen (Week 2-3)
+                      - Test on real kernels
+
+Phase 1 (Weeks 3-4):  Rewrite compiler in MCL itself (self-hosting)
+                      This validates the entire language design.
+
+Why? Because a compiler written in MCL is the ultimate test.
+
+================================================================================
+FILES GENERATED
+================================================================================
+
+Language_Design_Spec_v1_UPDATED.md       Full specification (types, memory, examples)
+MCL_EBNF_Grammar.md                      Formal grammar (parser-ready)
+MCL_Intrinsic_Signatures_Complete.md     Every built-in function with memory contract
+MCL_Memory_Model_Decision.md             Rationale for F77+Allocatable
+MCL_Bootstrap_Strategy.md                Week-by-week implementation plan
+MCL_Design_COMPLETE.md                   This locked design summary
+MCL_Quick_Reference.txt                  One-page cheat sheet (this file)
+
+================================================================================
+PHILOSOPHY
+================================================================================
+
+Get the core so tight that micro-optimizations aren't needed.
+Discipline over convenience.
+Determinism over surprise.
+Auditable over "helpful."
+
+MCL is not:
+- General-purpose (no file I/O, strings as secondary)
+- Modern convenience (no GC, no auto-reallocation)
+- Research language (no novel type systems)
+
+MCL is:
+- F77-inspired (simple, deterministic)
+- GPU-ready (explicit memory, no hidden allocation)
+- Math-first (operators are mathematical)
+- Strict (static types, shape checking, allocation explicit)
+
+Result: A language for physics simulation, GPU kernels, and HPC where:
+  - Every allocation is visible
+  - Every shape check is deterministic
+  - Every operation is auditable
+  - Performance is predictable
+
+================================================================================
+NEXT ACTION
+================================================================================
+
+Start the lexer.
+
+You've got everything you need. Build it.
+
+================================================================================

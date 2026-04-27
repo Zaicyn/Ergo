@@ -1,0 +1,215 @@
+! ════════════════════════════════════════════════════════════════
+! LAYER 1: CONSTANTS — The reference lattice
+! ════════════════════════════════════════════════════════════════
+!
+! Computed once. Never changes during simulation.
+! CPU sets at init. GPU reads as push constants or small buffers.
+! This IS the structure. The waveguides and fluid flow through it.
+!
+! Every value here is either positive (a coupling strength),
+! negative (a decay/threshold), or zero (that channel is OFF).
+! Zero constants produce zero contributions downstream — natural skip.
+
+! ── Simulation sizing ──────────────────────────────────────
+PARAMETER INTEGER :: MAXPART = 3000000
+PARAMETER INTEGER :: DEFAULT_N = 12
+PARAMETER INTEGER :: DEFAULT_FRAMES = 5000
+
+! ── Central mass + geometry ────────────────────────────────
+PARAMETER REAL :: BH_MASS = 100.0
+PARAMETER REAL :: ISCO_R = 1.0
+PARAMETER REAL :: DISK_OUTER_R = 1200.0
+PARAMETER REAL :: TWO_PI = 6.28318530717958648
+PARAMETER REAL :: SEAM_STEP = 0.19634954084936208
+PARAMETER REAL :: DEFAULT_DT = 0.01666666666666667
+
+! ── Viviani field parameters ──────────────────────────────
+PARAMETER REAL :: R_SCALE = 25.0
+PARAMETER REAL :: INV_R_SCALE_SQ = 0.0016
+PARAMETER REAL :: SCALE_RATIO = 1.6875
+PARAMETER REAL :: STEER_RATE = 0.03
+PARAMETER REAL :: DENSITY_FORCE_SCALE = 0.01
+
+! ── Metabolic thresholds (positive = gain, negative = decay)
+PARAMETER REAL :: OMEGA_BASE = 0.08
+PARAMETER REAL :: OMEGA_GAIN = 2.0
+PARAMETER REAL :: OMEGA_RESPONSE = 0.5
+PARAMETER REAL :: OMEGA_DECAY = 0.15
+PARAMETER REAL :: OMEGA_MAX = 2.0
+PARAMETER REAL :: OMEGA_NOVA_THRESH = 0.65
+PARAMETER REAL :: OMEGA_CRYSTAL_THRESH = 0.008
+PARAMETER REAL :: RHO_NOVA_THRESH = 0.2
+PARAMETER REAL :: BLAST_MULT = 2.5
+
+! ── Grid constants ─────────────────────────────────────────
+PARAMETER INTEGER :: GRID_SIZE = 32
+PARAMETER INTEGER :: GRID_HALF = 16
+PARAMETER REAL :: CELL_SIZE = 75.0
+
+! ── Waveguide blending (0 = autonomous, 1 = full consensus)
+PARAMETER REAL :: FIELD_BLEND = 0.15
+
+! ── Status flags (bitmask) ────────────────────────────────
+! Each flag is a boolean accumulator: on or off.
+PARAMETER INTEGER :: PFLAG_ACTIVE  = 1
+PARAMETER INTEGER :: PFLAG_EJECTED = 2
+PARAMETER INTEGER :: PFLAG_VENT    = 4
+PARAMETER INTEGER :: PFLAG_CRYSTAL = 8
+PARAMETER INTEGER :: PFLAG_NOVA    = 16
+
+! ── Phase encoding in FLAGS ───────────────────────────────
+! GEN (ring segment 0-31) in bits 8-12
+! PHASE (15-bit, 0-32767 ≈ 0-2pi) in bits 16-30
+PARAMETER INTEGER :: GEN_SHIFT = 8
+PARAMETER INTEGER :: GEN_MASK  = 31
+PARAMETER INTEGER :: PHASE_SHIFT = 16
+PARAMETER INTEGER :: PHASE_MASK  = 32767
+PARAMETER REAL :: PHASE_INC_SCALE = 86.89
+PARAMETER INTEGER :: SEAM_STEP_PH = 1024
+
+! ── Census interval bounds ────────────────────────────────
+PARAMETER INTEGER :: CENSUS_INTERVAL_MIN = 50
+PARAMETER INTEGER :: CENSUS_INTERVAL_MAX = 2000
+PARAMETER INTEGER :: CENSUS_INTERVAL_DEFAULT = 500
+
+! ════════════════════════════════════════════════════════════════
+! LOOKUP TABLES — Signed structure of the metabolic ring
+! ════════════════════════════════════════════════════════════════
+!
+! Each LUT value is a signed accumulator weight:
+!   positive = this segment contributes positively
+!   negative = this segment contributes negatively
+!   zero     = this segment is OFF for this channel
+
+! ── Lifecycle mode per ring segment ───────────────────────
+! 0=COAST (gravity only, decaying), 1=ACTIVE (full coupling),
+! 2=FLOW (full + escape channel)
+! 10 COAST (31%), 14 ACTIVE (44%), 8 FLOW (25%)
+STATIC INTEGER :: FLOW_MODE(32)
+DATA FLOW_MODE / 0, 1, 1, 1, 2, 0, 0, 2, 1, 2, &
+                 0, 0, 2, 1, 1, 1, 0, 1, 1, 1, &
+                 2, 0, 0, 2, 1, 2, 0, 0, 2, 1, 1, 1 /
+
+! ── Viviani curve tangent vectors (3 × 32) ────────────────
+! Signed: direction of flow at each ring position.
+! Zero Y component at poles = no vertical flow there.
+STATIC REAL :: TANGENT(3, 32)
+DATA TANGENT / &
+  -1.000000,  0.000000, -0.000000, &
+  -0.138370, -0.331496, -0.933255, &
+   0.120303, -0.344944, -0.930882, &
+   0.408600, -0.332813, -0.849871, &
+   0.857493, -0.171499, -0.485071, &
+   0.941049,  0.250189,  0.227669, &
+   0.666393,  0.564428,  0.487177, &
+   0.386358,  0.836993,  0.387517, &
+   0.000000,  1.000000,  0.000000, &
+  -0.386358,  0.836993, -0.387517, &
+  -0.666393,  0.564428, -0.487177, &
+  -0.941049,  0.250189, -0.227669, &
+  -0.857493, -0.171499,  0.485071, &
+  -0.408600, -0.332813,  0.849871, &
+  -0.120303, -0.344944,  0.930882, &
+   0.138370, -0.331496,  0.933255, &
+   1.000000, -0.000000,  0.000000, &
+   0.138370,  0.331496, -0.933255, &
+  -0.120303,  0.344944, -0.930882, &
+  -0.408600,  0.332813, -0.849871, &
+  -0.857493,  0.171499, -0.485071, &
+  -0.941049, -0.250189,  0.227669, &
+  -0.666393, -0.564428,  0.487177, &
+  -0.386358, -0.836993,  0.387517, &
+  -0.000000, -1.000000,  0.000000, &
+   0.386358, -0.836993, -0.387517, &
+   0.666393, -0.564428, -0.487177, &
+   0.941049, -0.250189, -0.227669, &
+   0.857493,  0.171499,  0.485071, &
+   0.408600,  0.332813,  0.849871, &
+   0.120303,  0.344944,  0.930882, &
+  -0.138370,  0.331496,  0.933255 /
+
+! ── Cuboctahedral seed shell (3 × 12) ────────────────────
+! 12 vertices of the cuboctahedron at unit radius.
+! The initial structure — 12 directions that tile 3-space
+! with maximal symmetry. The +1 seam step breaks it.
+STATIC REAL :: CUBOCT(3, 12)
+DATA CUBOCT / &
+   0.7071,  0.7071,  0.0, &
+   0.7071, -0.7071,  0.0, &
+  -0.7071,  0.7071,  0.0, &
+  -0.7071, -0.7071,  0.0, &
+   0.7071,  0.0,     0.7071, &
+   0.7071,  0.0,    -0.7071, &
+  -0.7071,  0.0,     0.7071, &
+  -0.7071,  0.0,    -0.7071, &
+   0.0,     0.7071,  0.7071, &
+   0.0,     0.7071, -0.7071, &
+   0.0,    -0.7071,  0.7071, &
+   0.0,    -0.7071, -0.7071 /
+
+! ── Z-coupling: cos(θ)·cos(3θ) — strong channel ──────────
+! Signed: positive = outward push, negative = inward pull.
+! Zero at nodes = no radial force at those ring positions.
+STATIC REAL :: Z_COUPLING(32)
+DATA Z_COUPLING / &
+   1.000000,  0.815493,  0.353553, -0.162212, &
+  -0.500000, -0.544895, -0.353553, -0.108386, &
+  -0.000000, -0.108386, -0.353553, -0.544895, &
+  -0.500000, -0.162212,  0.353553,  0.815493, &
+   1.000000,  0.815493,  0.353553, -0.162212, &
+  -0.500000, -0.544895, -0.353553, -0.108386, &
+  -0.000000, -0.108386, -0.353553, -0.544895, &
+  -0.500000, -0.162212,  0.353553,  0.815493 /
+
+! ── Flow weights: ⅓ sin(5θ) — weak channel gate ──────────
+! Signed: positive = escape window open, negative = closed.
+! Zero at nodes = no weak channel contribution.
+! 5θ coprime to 3θ — escape windows never align with trefoil.
+STATIC REAL :: FLOW_W(32)
+DATA FLOW_W / &
+   0.000000,  0.263371,  0.231222,  0.227317, &
+   0.340459,  0.163085, -0.216041, -0.319410, &
+  -0.259259, -0.319410, -0.216041,  0.163086, &
+   0.340459,  0.227318,  0.231222,  0.263371, &
+  -0.000000, -0.263371, -0.231222, -0.227317, &
+  -0.340459, -0.163085,  0.216041,  0.319410, &
+   0.259259,  0.319410,  0.216041, -0.163086, &
+  -0.340459, -0.227317, -0.231222, -0.263371 /
+
+! ── Curve control points (3 × 32) — coherence nodes ──────
+! Envelope = 1/sqrt(1 + dist² · INV_R_SCALE_SQ)
+! Signed XYZ positions on the unit sphere.
+STATIC REAL :: CURVE_PT(3, 32)
+DATA CURVE_PT / &
+   0.000000, -0.447214,  0.894427, &
+  -0.083063, -0.567568,  0.819126, &
+  -0.096980, -0.896348,  0.432615, &
+   0.068948, -0.982752, -0.171595, &
+   0.288675, -0.866025, -0.408248, &
+   0.528346, -0.752980, -0.392265, &
+   0.772875, -0.585344, -0.245021, &
+   0.944624, -0.319859, -0.073314, &
+   1.000000, -0.000000, -0.000000, &
+   0.944624,  0.319859, -0.073314, &
+   0.772875,  0.585344, -0.245021, &
+   0.528346,  0.752980, -0.392265, &
+   0.288675,  0.866025, -0.408248, &
+   0.068948,  0.982752, -0.171595, &
+  -0.096980,  0.896348,  0.432615, &
+  -0.083063,  0.567568,  0.819126, &
+  -0.000000,  0.447214,  0.894427, &
+   0.083063,  0.567568,  0.819126, &
+   0.096980,  0.896348,  0.432615, &
+  -0.068948,  0.982752, -0.171595, &
+  -0.288675,  0.866025, -0.408248, &
+  -0.528346,  0.752980, -0.392265, &
+  -0.772875,  0.585344, -0.245021, &
+  -0.944624,  0.319859, -0.073314, &
+  -1.000000,  0.000000, -0.000000, &
+  -0.944624, -0.319859, -0.073314, &
+  -0.772875, -0.585344, -0.245021, &
+  -0.528346, -0.752980, -0.392265, &
+  -0.288675, -0.866025, -0.408248, &
+  -0.068948, -0.982752, -0.171595, &
+   0.096980, -0.896348,  0.432615, &
+   0.083063, -0.567568,  0.819126 /

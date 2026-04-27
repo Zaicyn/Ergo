@@ -1,0 +1,86 @@
+! ════════════════════════════════════════════════════════════════
+! MAIN — Pipeline orchestration
+! ════════════════════════════════════════════════════════════════
+!
+! CPU is instruction (DNA). GPU is execution (RNA).
+!
+! CPU tick (census interval):
+!   - Receive density grid from GPU (128KB — the only readback)
+!   - Observe: compute stats from density grid
+!   - Decide: adjust census interval, send to oracle
+!   - Instruct: upload waveguide corrections (blend field, spawn params)
+!
+! GPU tick (every frame):
+!   - CLEAR → SCATTER → STENCIL → PHYSICS → SPAWN
+!   - All on GPU. No downloads. No CPU involvement.
+!   - Density grid is the feedback signal — available for CPU at census.
+!
+! The interface between CPU and GPU is the waveguide.
+! CPU sends: GRID_DENSITY_GLOBAL (oracle consensus), FIELD_BLEND, spawn params
+! GPU sends: GRID_DENSITY (128KB density grid), population count
+!
+! Zero particle downloads. Ever.
+
+IMPLICIT NONE
+
+INTEGER :: FRAME, SPAWNED, SAMPLE
+INTEGER :: CENSUS_INTERVAL, NEXT_CENSUS
+
+CENSUS_INTERVAL := CENSUS_INTERVAL_DEFAULT
+NEXT_CENSUS := CENSUS_INTERVAL
+
+! ── CPU INIT: set constants, seed initial fluid state ─────
+! This is the only time CPU touches particles directly.
+! After this, particles are GPU-exclusive.
+CALL SIM_INIT(DEFAULT_N, MAXPART, 42)
+CALL SIM_SEED_SHELL()
+
+PRINT NPART
+
+! ── FRAME LOOP: GPU executes, CPU observes at intervals ───
+DO FRAME = 1, DEFAULT_FRAMES
+
+  ! ── GPU EXECUTION (every frame) ─────────────────────────
+  ! Forward pipeline: waveguide rebuild → fluid update → spawn
+  ! All GPU. No CPU. No downloads.
+  CALL CLEAR_GRID()
+  CALL SCATTER_GRID()
+  CALL STENCIL_GRID()
+  CALL SIM_PHYSICS_STEP(DEFAULT_DT)
+
+  ! Spawn: GPU-side, budget-driven, autonomous
+  IF FRAME > 1 .AND. MOD(FRAME, 100) = 0 THEN
+    IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_SPAWN_PAUSE ≠ 0 THEN
+      ! Oracle says physics demands a pause — skip
+    ELSE
+      CALL SIM_SPAWN(MAXPART, SPAWNED)
+    ENDIF
+    ! Oracle injection: additive batch
+    IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_SPAWN_COUNT > 0 THEN
+      CALL SIM_SPAWN(NPART + NET_SPAWN_COUNT, SPAWNED)
+      NET_SPAWN_COUNT := 0
+    ENDIF
+  ENDIF
+
+  ! ── CPU OBSERVATION (census intervals only) ─────────────
+  ! After frame_end + frame_wait, GPU is idle. Safe to download.
+  ! Download the waveguide (128KB grid arrays), NOT particles (96MB).
+  ! Census reads the fresh density, computes stats, sends to oracle.
+  IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_CENSUS_OVERRIDE > 0 THEN
+    CENSUS_INTERVAL := NET_CENSUS_OVERRIDE
+  ENDIF
+  IF FRAME ≥ NEXT_CENSUS THEN
+    ! Census reads NPART (CPU scalar, no GPU download).
+    ! Grid-level stats will be added with proper census-time downloads.
+    CALL SIM_CENSUS_ADAPTIVE(NPART, FRAME, CENSUS_INTERVAL)
+    NEXT_CENSUS := FRAME + CENSUS_INTERVAL
+  ENDIF
+
+  IF FRAME > 1 .AND. MOD(FRAME, 1000) = 0 THEN
+    PRINT FRAME
+    PRINT NPART
+  ENDIF
+
+ENDDO
+
+PRINT NPART

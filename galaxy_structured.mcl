@@ -1,0 +1,1044 @@
+! ════════════════════════════════════════════════════════════════
+! LAYER 1: CONSTANTS — The reference lattice
+! ════════════════════════════════════════════════════════════════
+!
+! Computed once. Never changes during simulation.
+! CPU sets at init. GPU reads as push constants or small buffers.
+! This IS the structure. The waveguides and fluid flow through it.
+!
+! Every value here is either positive (a coupling strength),
+! negative (a decay/threshold), or zero (that channel is OFF).
+! Zero constants produce zero contributions downstream — natural skip.
+
+! ── Simulation sizing ──────────────────────────────────────
+PARAMETER INTEGER :: MAXPART = 3000000
+PARAMETER INTEGER :: DEFAULT_N = 12
+PARAMETER INTEGER :: DEFAULT_FRAMES = 5000
+
+! ── Central mass + geometry ────────────────────────────────
+PARAMETER REAL :: BH_MASS = 100.0
+PARAMETER REAL :: ISCO_R = 1.0
+PARAMETER REAL :: DISK_OUTER_R = 1200.0
+PARAMETER REAL :: TWO_PI = 6.28318530717958648
+PARAMETER REAL :: SEAM_STEP = 0.19634954084936208
+PARAMETER REAL :: DEFAULT_DT = 0.01666666666666667
+
+! ── Viviani field parameters ──────────────────────────────
+PARAMETER REAL :: R_SCALE = 25.0
+PARAMETER REAL :: INV_R_SCALE_SQ = 0.0016
+PARAMETER REAL :: SCALE_RATIO = 1.6875
+PARAMETER REAL :: STEER_RATE = 0.03
+PARAMETER REAL :: DENSITY_FORCE_SCALE = 0.01
+
+! ── Metabolic thresholds (positive = gain, negative = decay)
+PARAMETER REAL :: OMEGA_BASE = 0.08
+PARAMETER REAL :: OMEGA_GAIN = 2.0
+PARAMETER REAL :: OMEGA_RESPONSE = 0.5
+PARAMETER REAL :: OMEGA_DECAY = 0.15
+PARAMETER REAL :: OMEGA_MAX = 2.0
+PARAMETER REAL :: OMEGA_NOVA_THRESH = 0.65
+PARAMETER REAL :: OMEGA_CRYSTAL_THRESH = 0.008
+PARAMETER REAL :: RHO_NOVA_THRESH = 0.2
+PARAMETER REAL :: BLAST_MULT = 2.5
+
+! ── Grid constants ─────────────────────────────────────────
+PARAMETER INTEGER :: GRID_SIZE = 32
+PARAMETER INTEGER :: GRID_HALF = 16
+PARAMETER REAL :: CELL_SIZE = 75.0
+
+! ── Waveguide blending (0 = autonomous, 1 = full consensus)
+PARAMETER REAL :: FIELD_BLEND = 0.15
+
+! ── Status flags (bitmask) ────────────────────────────────
+! Each flag is a boolean accumulator: on or off.
+PARAMETER INTEGER :: PFLAG_ACTIVE  = 1
+PARAMETER INTEGER :: PFLAG_EJECTED = 2
+PARAMETER INTEGER :: PFLAG_VENT    = 4
+PARAMETER INTEGER :: PFLAG_CRYSTAL = 8
+PARAMETER INTEGER :: PFLAG_NOVA    = 16
+
+! ── Phase encoding in FLAGS ───────────────────────────────
+! GEN (ring segment 0-31) in bits 8-12
+! PHASE (15-bit, 0-32767 ≈ 0-2pi) in bits 16-30
+PARAMETER INTEGER :: GEN_SHIFT = 8
+PARAMETER INTEGER :: GEN_MASK  = 31
+PARAMETER INTEGER :: PHASE_SHIFT = 16
+PARAMETER INTEGER :: PHASE_MASK  = 32767
+PARAMETER REAL :: PHASE_INC_SCALE = 86.89
+PARAMETER INTEGER :: SEAM_STEP_PH = 1024
+
+! ── Census interval bounds ────────────────────────────────
+PARAMETER INTEGER :: CENSUS_INTERVAL_MIN = 50
+PARAMETER INTEGER :: CENSUS_INTERVAL_MAX = 2000
+PARAMETER INTEGER :: CENSUS_INTERVAL_DEFAULT = 500
+
+! ════════════════════════════════════════════════════════════════
+! LOOKUP TABLES — Signed structure of the metabolic ring
+! ════════════════════════════════════════════════════════════════
+!
+! Each LUT value is a signed accumulator weight:
+!   positive = this segment contributes positively
+!   negative = this segment contributes negatively
+!   zero     = this segment is OFF for this channel
+
+! ── Lifecycle mode per ring segment ───────────────────────
+! 0=COAST (gravity only, decaying), 1=ACTIVE (full coupling),
+! 2=FLOW (full + escape channel)
+! 10 COAST (31%), 14 ACTIVE (44%), 8 FLOW (25%)
+STATIC INTEGER :: FLOW_MODE(32)
+DATA FLOW_MODE / 0, 1, 1, 1, 2, 0, 0, 2, 1, 2, &
+                 0, 0, 2, 1, 1, 1, 0, 1, 1, 1, &
+                 2, 0, 0, 2, 1, 2, 0, 0, 2, 1, 1, 1 /
+
+! ── Viviani curve tangent vectors (3 × 32) ────────────────
+! Signed: direction of flow at each ring position.
+! Zero Y component at poles = no vertical flow there.
+STATIC REAL :: TANGENT(3, 32)
+DATA TANGENT / &
+  -1.000000,  0.000000, -0.000000, &
+  -0.138370, -0.331496, -0.933255, &
+   0.120303, -0.344944, -0.930882, &
+   0.408600, -0.332813, -0.849871, &
+   0.857493, -0.171499, -0.485071, &
+   0.941049,  0.250189,  0.227669, &
+   0.666393,  0.564428,  0.487177, &
+   0.386358,  0.836993,  0.387517, &
+   0.000000,  1.000000,  0.000000, &
+  -0.386358,  0.836993, -0.387517, &
+  -0.666393,  0.564428, -0.487177, &
+  -0.941049,  0.250189, -0.227669, &
+  -0.857493, -0.171499,  0.485071, &
+  -0.408600, -0.332813,  0.849871, &
+  -0.120303, -0.344944,  0.930882, &
+   0.138370, -0.331496,  0.933255, &
+   1.000000, -0.000000,  0.000000, &
+   0.138370,  0.331496, -0.933255, &
+  -0.120303,  0.344944, -0.930882, &
+  -0.408600,  0.332813, -0.849871, &
+  -0.857493,  0.171499, -0.485071, &
+  -0.941049, -0.250189,  0.227669, &
+  -0.666393, -0.564428,  0.487177, &
+  -0.386358, -0.836993,  0.387517, &
+  -0.000000, -1.000000,  0.000000, &
+   0.386358, -0.836993, -0.387517, &
+   0.666393, -0.564428, -0.487177, &
+   0.941049, -0.250189, -0.227669, &
+   0.857493,  0.171499,  0.485071, &
+   0.408600,  0.332813,  0.849871, &
+   0.120303,  0.344944,  0.930882, &
+  -0.138370,  0.331496,  0.933255 /
+
+! ── Cuboctahedral seed shell (3 × 12) ────────────────────
+! 12 vertices of the cuboctahedron at unit radius.
+! The initial structure — 12 directions that tile 3-space
+! with maximal symmetry. The +1 seam step breaks it.
+STATIC REAL :: CUBOCT(3, 12)
+DATA CUBOCT / &
+   0.7071,  0.7071,  0.0, &
+   0.7071, -0.7071,  0.0, &
+  -0.7071,  0.7071,  0.0, &
+  -0.7071, -0.7071,  0.0, &
+   0.7071,  0.0,     0.7071, &
+   0.7071,  0.0,    -0.7071, &
+  -0.7071,  0.0,     0.7071, &
+  -0.7071,  0.0,    -0.7071, &
+   0.0,     0.7071,  0.7071, &
+   0.0,     0.7071, -0.7071, &
+   0.0,    -0.7071,  0.7071, &
+   0.0,    -0.7071, -0.7071 /
+
+! ── Z-coupling: cos(θ)·cos(3θ) — strong channel ──────────
+! Signed: positive = outward push, negative = inward pull.
+! Zero at nodes = no radial force at those ring positions.
+STATIC REAL :: Z_COUPLING(32)
+DATA Z_COUPLING / &
+   1.000000,  0.815493,  0.353553, -0.162212, &
+  -0.500000, -0.544895, -0.353553, -0.108386, &
+  -0.000000, -0.108386, -0.353553, -0.544895, &
+  -0.500000, -0.162212,  0.353553,  0.815493, &
+   1.000000,  0.815493,  0.353553, -0.162212, &
+  -0.500000, -0.544895, -0.353553, -0.108386, &
+  -0.000000, -0.108386, -0.353553, -0.544895, &
+  -0.500000, -0.162212,  0.353553,  0.815493 /
+
+! ── Flow weights: ⅓ sin(5θ) — weak channel gate ──────────
+! Signed: positive = escape window open, negative = closed.
+! Zero at nodes = no weak channel contribution.
+! 5θ coprime to 3θ — escape windows never align with trefoil.
+STATIC REAL :: FLOW_W(32)
+DATA FLOW_W / &
+   0.000000,  0.263371,  0.231222,  0.227317, &
+   0.340459,  0.163085, -0.216041, -0.319410, &
+  -0.259259, -0.319410, -0.216041,  0.163086, &
+   0.340459,  0.227318,  0.231222,  0.263371, &
+  -0.000000, -0.263371, -0.231222, -0.227317, &
+  -0.340459, -0.163085,  0.216041,  0.319410, &
+   0.259259,  0.319410,  0.216041, -0.163086, &
+  -0.340459, -0.227317, -0.231222, -0.263371 /
+
+! ── Curve control points (3 × 32) — coherence nodes ──────
+! Envelope = 1/sqrt(1 + dist² · INV_R_SCALE_SQ)
+! Signed XYZ positions on the unit sphere.
+STATIC REAL :: CURVE_PT(3, 32)
+DATA CURVE_PT / &
+   0.000000, -0.447214,  0.894427, &
+  -0.083063, -0.567568,  0.819126, &
+  -0.096980, -0.896348,  0.432615, &
+   0.068948, -0.982752, -0.171595, &
+   0.288675, -0.866025, -0.408248, &
+   0.528346, -0.752980, -0.392265, &
+   0.772875, -0.585344, -0.245021, &
+   0.944624, -0.319859, -0.073314, &
+   1.000000, -0.000000, -0.000000, &
+   0.944624,  0.319859, -0.073314, &
+   0.772875,  0.585344, -0.245021, &
+   0.528346,  0.752980, -0.392265, &
+   0.288675,  0.866025, -0.408248, &
+   0.068948,  0.982752, -0.171595, &
+  -0.096980,  0.896348,  0.432615, &
+  -0.083063,  0.567568,  0.819126, &
+  -0.000000,  0.447214,  0.894427, &
+   0.083063,  0.567568,  0.819126, &
+   0.096980,  0.896348,  0.432615, &
+  -0.068948,  0.982752, -0.171595, &
+  -0.288675,  0.866025, -0.408248, &
+  -0.528346,  0.752980, -0.392265, &
+  -0.772875,  0.585344, -0.245021, &
+  -0.944624,  0.319859, -0.073314, &
+  -1.000000,  0.000000, -0.000000, &
+  -0.944624, -0.319859, -0.073314, &
+  -0.772875, -0.585344, -0.245021, &
+  -0.528346, -0.752980, -0.392265, &
+  -0.288675, -0.866025, -0.408248, &
+  -0.068948, -0.982752, -0.171595, &
+   0.096980, -0.896348,  0.432615, &
+   0.083063, -0.567568,  0.819126 /
+! ════════════════════════════════════════════════════════════════
+! LAYER 3: FLUID — Particle dynamics (GPU-exclusive)
+! ════════════════════════════════════════════════════════════════
+!
+! The fluid is the particle state — positions, velocities, omega, flags.
+! GPU owns exclusively. Each particle is a signed accumulator.
+! Positive = source/gain. Negative = drain/loss. Zero = off/skip.
+!
+! The CPU never sees individual particles — only waveguide summaries.
+
+! ── Fluid state (SoA) ────────────────────────────────────
+STATIC REAL :: POS_X(MAXPART), POS_Y(MAXPART), POS_Z(MAXPART)
+STATIC REAL :: VEL_X(MAXPART), VEL_Y(MAXPART), VEL_Z(MAXPART)
+STATIC REAL :: OMEGA_NAT(MAXPART)
+STATIC INTEGER :: FLAGS(MAXPART)
+
+! ── Metadata (CPU-side only, not on GPU) ──────────────────
+STATIC REAL :: PUMP_SCALE(MAXPART), PUMP_RESID(MAXPART), PUMP_HIST(MAXPART)
+STATIC INTEGER :: PUMP_STATE(MAXPART)
+STATIC INTEGER :: TOPO_STATE(MAXPART)
+
+! ── Population state ──────────────────────────────────────
+STATIC INTEGER :: NPART = 0
+STATIC INTEGER :: CAPACITY = 0
+STATIC INTEGER :: RNG_STATE = 42
+
+! ── Oracle spawn control (written by NET codegen) ─────────
+STATIC INTEGER :: NET_SPAWN_ACTIVE = 0
+STATIC INTEGER :: NET_SPAWN_COUNT = 0
+STATIC INTEGER :: NET_SPAWN_PAUSE = 0
+STATIC INTEGER :: NET_CENSUS_OVERRIDE = 0
+
+! ════════════════════════════════════════════════════════════════
+! PRNG (deterministic, reproducible)
+! ════════════════════════════════════════════════════════════════
+! ════════════════════════════════════════════════════════════════
+! LAYER 2: WAVEGUIDE — Field structure (density + gradients)
+! ════════════════════════════════════════════════════════════════
+!
+! The waveguide is the structure that guides the fluid.
+! Updated every frame by scatter (fluid → field) and stencil (field → field).
+! Corrected at census intervals by oracle blend (external → field).
+!
+! The CPU oracle sees ONLY this layer — the 128KB density grid.
+! The GPU fluid reads this layer but never owns it.
+
+! ── Waveguide state ───────────────────────────────────────
+STATIC INTEGER :: GRID_DENSITY(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+STATIC REAL :: GRID_GRAD_X(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+STATIC REAL :: GRID_GRAD_Y(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+STATIC REAL :: GRID_GRAD_Z(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+STATIC REAL :: GRID_MET_GATE(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+STATIC INTEGER :: BIN_PRESENCE(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+
+! ── Oracle consensus (external correction) ────────────────
+STATIC REAL :: GRID_DENSITY_GLOBAL(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+
+! ── Census persistent state (CPU-side sampling history) ───
+STATIC REAL :: CENSUS_PREV_OMEGA_MAX = 0.0
+STATIC REAL :: CENSUS_PREV_OMEGA_MEAN = 0.0
+STATIC INTEGER :: CENSUS_PREV_CRYSTAL = 0
+STATIC INTEGER :: CENSUS_PREV_NOVA = 0
+STATIC REAL :: CENSUS_PREV_SPREAD = 0.0
+STATIC INTEGER :: CENSUS_PREV_FRAME = 0
+STATIC INTEGER :: CENSUS_INITIALIZED = 0
+
+! ════════════════════════════════════════════════════════════════
+! WAVEGUIDE SUBROUTINES
+! ════════════════════════════════════════════════════════════════
+
+! ── CLEAR: zero accumulators ──────────────────────────────
+! Zeros density, gradients, presence, met_gate for fresh scatter pass.
+! On GPU this becomes vkCmdFillBuffer (no CPU memset).
+! ════════════════════════════════════════════════════════════════
+! LAYER 3: FLUID SUBROUTINES
+! ════════════════════════════════════════════════════════════════
+!
+! Everything is a signed accumulator. Decay always runs.
+! Accumulation is the variable. Zero input = pure decay.
+! One path through the kernel. Mode modulates amplitude, not flow.
+
+! ════════════════════════════════════════════════════════════════
+! PRNG (deterministic, reproducible)
+! ════════════════════════════════════════════════════════════════
+
+REAL FUNCTION RNGF()
+  RNG_STATE := IAND(RNG_STATE * 1103515245 + 12345, 2147483647)
+  RNGF := REAL(IAND(ISHFT(RNG_STATE, -16), 32767)) / 32767.0
+  RETURN RNGF
+END
+
+INTEGER FUNCTION BITCOUNT(N)
+  INTEGER :: N, CNT, B
+  CNT := 0
+  DO B = 0, 7
+    IF IAND(N, ISHFT(1, B)) ≠ 0 THEN
+      CNT := CNT + 1
+    ENDIF
+  ENDDO
+  BITCOUNT := CNT
+  RETURN BITCOUNT
+END
+
+! ════════════════════════════════════════════════════════════════
+! INIT (CPU-only, runs once)
+! ════════════════════════════════════════════════════════════════
+
+SUBROUTINE SIM_INIT(N, CAP, SEED)
+  INTEGER :: N, CAP, SEED
+  INTEGER :: I, GEN, PH
+  REAL :: X, Y, Z, R, S
+  REAL :: THETA_I, R_XZ, V_CIRC, R_CLAMP
+
+  NPART := N
+  IF CAP < N THEN
+    CAPACITY := N
+  ELSE
+    CAPACITY := CAP
+  ENDIF
+  RNG_STATE := SEED
+
+  DO I = 1, CAPACITY
+    POS_X(I) := 0.0
+    POS_Y(I) := 0.0
+    POS_Z(I) := 0.0
+    VEL_X(I) := 0.0
+    VEL_Y(I) := 0.0
+    VEL_Z(I) := 0.0
+    PUMP_SCALE(I) := 0.0
+    PUMP_RESID(I) := 0.0
+    PUMP_HIST(I) := 0.0
+    PUMP_STATE(I) := 0
+    OMEGA_NAT(I) := 0.0
+    FLAGS(I) := 0
+    TOPO_STATE(I) := 0
+  ENDDO
+
+  DO I = 1, N
+    X := (RNGF() * 2.0 - 1.0) * DISK_OUTER_R
+    Y := (RNGF() * 2.0 - 1.0) * DISK_OUTER_R * 0.3
+    Z := (RNGF() * 2.0 - 1.0) * DISK_OUTER_R
+
+    R := SQRT(X * X + Y * Y + Z * Z)
+    IF R < 1.0 THEN
+      S := 1.0 / R
+      X := X * S
+      Y := Y * S
+      Z := Z * S
+    ENDIF
+
+    POS_X(I) := X
+    POS_Y(I) := Y
+    POS_Z(I) := Z
+
+    THETA_I := ATAN2(Z, X) + SEAM_STEP
+    IF THETA_I ≥ TWO_PI THEN
+      THETA_I := THETA_I - TWO_PI
+    ENDIF
+    IF THETA_I < 0.0 THEN
+      THETA_I := THETA_I + TWO_PI
+    ENDIF
+
+    PH := IAND(INT(THETA_I * REAL(PHASE_MASK) / TWO_PI), PHASE_MASK)
+    GEN := IAND(ISHFT(PH, -10), GEN_MASK) + 1
+
+    R_XZ := SQRT(X * X + Z * Z)
+    V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
+    VEL_X(I) := TANGENT(1, GEN) * V_CIRC
+    VEL_Y(I) := TANGENT(2, GEN) * V_CIRC
+    VEL_Z(I) := TANGENT(3, GEN) * V_CIRC
+
+    R_CLAMP := MAX(R_XZ, 1.0)
+    OMEGA_NAT(I) := 0.1 * (50.0 / R_CLAMP) ** 1.5
+
+    PUMP_SCALE(I) := 1.0
+    FLAGS(I) := IOR(IOR(PFLAG_ACTIVE, ISHFT(IAND(GEN - 1, GEN_MASK), &
+      GEN_SHIFT)), ISHFT(PH, PHASE_SHIFT))
+  ENDDO
+
+  RETURN
+END
+
+! ════════════════════════════════════════════════════════════════
+! SEED SHELL (CPU-only, runs once)
+! ════════════════════════════════════════════════════════════════
+
+SUBROUTINE SIM_SEED_SHELL()
+  INTEGER :: I, N_SHELL, GEN, PH
+  REAL :: PX, PY, PZ, SHELL_R, THETA_I, R_XZ, V_CIRC
+
+  SHELL_R := 50.0
+  IF NPART < 12 THEN
+    N_SHELL := NPART
+  ELSE
+    N_SHELL := 12
+  ENDIF
+
+  DO I = 1, N_SHELL
+    PX := CUBOCT(1, I) * SHELL_R
+    PY := CUBOCT(2, I) * SHELL_R
+    PZ := CUBOCT(3, I) * SHELL_R
+    POS_X(I) := PX
+    POS_Y(I) := PY
+    POS_Z(I) := PZ
+
+    THETA_I := REAL(I - 1) * (TWO_PI / 12.0)
+    PH := IAND(INT(THETA_I * REAL(PHASE_MASK) / TWO_PI), PHASE_MASK)
+    GEN := IAND(ISHFT(PH, -10), GEN_MASK) + 1
+
+    R_XZ := SQRT(PX * PX + PZ * PZ)
+    V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
+    VEL_X(I) := TANGENT(1, GEN) * V_CIRC
+    VEL_Y(I) := TANGENT(2, GEN) * V_CIRC
+    VEL_Z(I) := TANGENT(3, GEN) * V_CIRC
+
+    OMEGA_NAT(I) := 0.1
+    FLAGS(I) := IOR(IOR(PFLAG_ACTIVE, ISHFT(IAND(GEN - 1, GEN_MASK), &
+      GEN_SHIFT)), ISHFT(PH, PHASE_SHIFT))
+    PUMP_SCALE(I) := 1.0
+  ENDDO
+
+  RETURN
+END
+
+! ════════════════════════════════════════════════════════════════
+! PHYSICS — One path. Decay always. Accumulation varies.
+! ════════════════════════════════════════════════════════════════
+!
+! Every particle follows the same chain:
+!   1. Gravity pulls (always negative, the universal downhill)
+!   2. Omega decays (always, the arrow of time)
+!   3. Field coupling accumulates (amplitude modulated by mode)
+!   4. Velocity accumulates from forces
+!   5. Position accumulates from velocity
+!   6. Thresholds observed (nova, crystal — state transitions)
+!
+! Mode doesn't branch the path. Mode modulates the amplitude.
+! COAST: field coupling = 0 (zero × anything = zero, natural skip)
+! ACTIVE: field coupling = 1 (full accumulation)
+! FLOW: field coupling = 1 + weak channel
+!
+! Zero density = zero force from field. Zero omega = crystal.
+! The zero IS the null. No special cases.
+
+SUBROUTINE SIM_PHYSICS_STEP(DT)
+  REAL :: DT
+  INTEGER :: I, GEN, FMODE, CI, CJ, CK
+  REAL :: PX, PY, PZ, VX, VY, VZ
+  REAL :: R3D_SQ, R3D, INV_R3D, R_SAFE, INV_R
+  REAL :: RX, RY, RZ, GRAVITY
+  REAL :: AX, AY, AZ
+  REAL :: V_SQ, OMEGA
+  REAL :: ENV, RHO, MET_GATE, COUPLING
+  REAL :: DECAY, SPD_SQ
+  REAL :: TANG_X, TANG_Y, TANG_Z, Z_C, FLOW_WG
+  REAL :: CP_X, CP_Y, CP_Z, DX_N, DY_N, DZ_N, D_NODE_SQ
+  REAL :: INV_RXZ, PGX, PGZ
+  REAL :: F_DOT_R, FPX, FPY, FPZ, VIV_MOD
+  REAL :: TX, TY, TZ, BASE_RATE, STEER_R
+  REAL :: INV_SPD_B, INV_T_MAG, TNX, TNY, TNZ
+  REAL :: V_DOT_T, INV_SPD_A, RESCALE
+  REAL :: STRONG
+  REAL :: DRIVE, TARGET, INSTABILITY
+  REAL :: WEAK_DOT_R, WEAK_STR
+  REAL :: GDX, GDY, GDZ, GD_R, GTX, GTY, GTZ
+
+  DO I = 1, NPART
+    ! ── Skip crystallized (off) and ejected (gone) ────────
+    ! These are the TRUE nulls — particles that have left the chain.
+    ! Crystal = ground state, no energy, no movement, part of lattice.
+    ! Ejected = escaped, no longer relevant.
+    IF IAND(FLAGS(I), IOR(PFLAG_CRYSTAL, PFLAG_EJECTED)) ≠ 0 THEN
+      CYCLE
+    ENDIF
+
+    ! ── Load state ────────────────────────────────────────
+    PX := POS_X(I)
+    PY := POS_Y(I)
+    PZ := POS_Z(I)
+    VX := VEL_X(I)
+    VY := VEL_Y(I)
+    VZ := VEL_Z(I)
+    OMEGA := OMEGA_NAT(I)
+
+    ! ── GEN + mode ────────────────────────────────────────
+    GEN := IAND(ISHFT(FLAGS(I), -GEN_SHIFT), GEN_MASK) + 1
+    FMODE := FLOW_MODE(GEN)
+
+    ! ── 1. GRAVITY (always — the universal downhill) ──────
+    R3D_SQ := PX * PX + PY * PY + PZ * PZ
+    INV_R3D := 1.0 / SQRT(R3D_SQ + 1.0E-8)
+    R3D := R3D_SQ * INV_R3D
+    R_SAFE := MAX(R3D, 1.0)
+    INV_R := MIN(INV_R3D, 1.0)
+
+    RX := PX * INV_R
+    RY := PY * INV_R
+    RZ := PZ * INV_R
+    GRAVITY := BH_MASS * INV_R * INV_R
+
+    AX := -RX * GRAVITY
+    AY := -RY * GRAVITY
+    AZ := -RZ * GRAVITY
+
+    ! ── 2. OMEGA DECAY (always — the arrow of time) ───────
+    ! Everything loses energy unless something feeds it.
+    DECAY := 1.0 - OMEGA_DECAY * DT
+    DECAY := DECAY * DECAY * DECAY * DECAY
+    OMEGA := OMEGA * DECAY
+
+    ! ── 3. MODE COUPLING (amplitude, not branch) ─────────
+    ! COAST=0: coupling is zero. ACTIVE=1,FLOW=2: coupling is 1.
+    ! The zero makes all field terms vanish naturally.
+    IF FMODE = 0 THEN
+      COUPLING := 0.0
+    ELSE
+      COUPLING := 1.0
+    ENDIF
+
+    ! ── 4. WAVEGUIDE READ (always — zero density = zero force)
+    CI := CLAMP(INT(PX / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    CJ := CLAMP(INT(PY / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    CK := CLAMP(INT(PZ / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    RHO := REAL(GRID_DENSITY(CI, CJ, CK)) * COUPLING
+
+    ! ── 5. ENVELOPE (distance to coherence node) ─────────
+    CP_X := CURVE_PT(1, GEN) * R_SAFE
+    CP_Y := CURVE_PT(2, GEN) * R_SAFE
+    CP_Z := CURVE_PT(3, GEN) * R_SAFE
+    DX_N := PX - CP_X
+    DY_N := PY - CP_Y
+    DZ_N := PZ - CP_Z
+    D_NODE_SQ := DX_N * DX_N + DY_N * DY_N + DZ_N * DZ_N
+    ENV := 1.0 / SQRT(1.0 + D_NODE_SQ * INV_R_SCALE_SQ) * COUPLING
+
+    ! ── 6. METABOLIC GATE ────────────────────────────────
+    MET_GATE := GRID_MET_GATE(CI, CJ, CK) * COUPLING
+
+    ! ── 7. LUT GEOMETRY ──────────────────────────────────
+    TANG_X := TANGENT(1, GEN)
+    TANG_Y := TANGENT(2, GEN)
+    TANG_Z := TANGENT(3, GEN)
+    Z_C := Z_COUPLING(GEN)
+    FLOW_WG := FLOW_W(GEN)
+
+    ! ── 8. PROGRADE TANGENT ──────────────────────────────
+    INV_RXZ := 1.0 / SQRT(PX * PX + PZ * PZ + 1.0E-8)
+    PGX := -PZ * INV_RXZ
+    PGZ :=  PX * INV_RXZ
+
+    ! ── 9. VIVIANI MODULATION ────────────────────────────
+    F_DOT_R := TANG_X * RX + TANG_Y * RY + TANG_Z * RZ
+    FPX := TANG_X - F_DOT_R * RX
+    FPY := TANG_Y - F_DOT_R * RY
+    FPZ := TANG_Z - F_DOT_R * RZ
+    VIV_MOD := FPX * PGX + FPZ * PGZ
+
+    TX := PGX * ABS(VIV_MOD) + FPX * 0.1
+    TY := FPY * 0.1
+    TZ := PGZ * ABS(VIV_MOD) + FPZ * 0.1
+
+    ! ── 10. EM STEERING (speed-preserving, amplitude-modulated)
+    ! COAST: COUPLING=0 → STEER_R=0 → no steering. Natural skip.
+    IF FMODE = 2 THEN
+      BASE_RATE := 0.02
+    ELSE
+      BASE_RATE := 0.002
+    ENDIF
+    STEER_R := BASE_RATE * ENV
+
+    SPD_SQ := VX * VX + VY * VY + VZ * VZ
+    INV_SPD_B := 1.0 / SQRT(SPD_SQ + 1.0E-8)
+
+    INV_T_MAG := 1.0 / SQRT(TX * TX + TY * TY + TZ * TZ + 1.0E-8)
+    TNX := TX * INV_T_MAG
+    TNY := TY * INV_T_MAG
+    TNZ := TZ * INV_T_MAG
+
+    V_DOT_T := VX * TNX + VY * TNY + VZ * TNZ
+    VX := VX - (VX - V_DOT_T * TNX) * STEER_R
+    VY := VY - (VY - V_DOT_T * TNY) * STEER_R
+    VZ := VZ - (VZ - V_DOT_T * TNZ) * STEER_R
+
+    INV_SPD_A := 1.0 / SQRT(VX * VX + VY * VY + VZ * VZ + 1.0E-8)
+    RESCALE := INV_SPD_A / INV_SPD_B
+    VX := VX * RESCALE
+    VY := VY * RESCALE
+    VZ := VZ * RESCALE
+
+    ! ── 11. STRONG CHANNEL (z-coupling, always signed) ───
+    STRONG := Z_C * GRAVITY * 0.1 * COUPLING
+    AX := AX + RX * STRONG
+    AY := AY + RY * STRONG
+    AZ := AZ + RZ * STRONG
+
+    ! ── 12. WEAK CHANNEL (flow escape, FLOW mode only) ───
+    ! FLOW_WG is signed from LUT. Non-FLOW modes: COUPLING gates it.
+    ! But FLOW_WG is only nonzero for FLOW segments in the LUT.
+    ! We still gate on FMODE=2 to avoid the CURVE_PT lookups.
+    IF FMODE = 2 THEN
+      WEAK_DOT_R := CURVE_PT(1, GEN) * RX + &
+        CURVE_PT(2, GEN) * RY + CURVE_PT(3, GEN) * RZ
+      WEAK_STR := ABS(FLOW_WG) * GRAVITY * 0.05
+      AX := AX + (CURVE_PT(1, GEN) - WEAK_DOT_R * RX) * WEAK_STR
+      AY := AY + (CURVE_PT(2, GEN) - WEAK_DOT_R * RY) * WEAK_STR
+      AZ := AZ + (CURVE_PT(3, GEN) - WEAK_DOT_R * RZ) * WEAK_STR
+    ENDIF
+
+    ! ── 13. DENSITY SIPHON (waveguide → fluid) ───────────
+    ! RHO already multiplied by COUPLING. Zero RHO = zero force.
+    GDX := GRID_GRAD_X(CI, CJ, CK)
+    GDY := GRID_GRAD_Y(CI, CJ, CK)
+    GDZ := GRID_GRAD_Z(CI, CJ, CK)
+    GD_R := GDX * RX + GDY * RY + GDZ * RZ
+    GTX := GDX - GD_R * RX
+    GTY := GDY - GD_R * RY
+    GTZ := GDZ - GD_R * RZ
+    AX := AX + GTX * RHO * ENV * DENSITY_FORCE_SCALE
+    AY := AY + GTY * RHO * ENV * DENSITY_FORCE_SCALE
+    AZ := AZ + GTZ * RHO * ENV * DENSITY_FORCE_SCALE
+
+    ! ── 14. VELOCITY ACCUMULATION ────────────────────────
+    VX := VX + AX * DT
+    VY := VY + AY * DT
+    VZ := VZ + AZ * DT
+
+    V_SQ := VX * VX + VY * VY + VZ * VZ
+    IF V_SQ ≥ 1.0E24 THEN
+      CYCLE
+    ENDIF
+
+    ! ── 15. OMEGA ACCUMULATION (driven by field coupling) ─
+    ! DRIVE is zero when RHO is zero (COAST or empty cell).
+    ! Zero drive = omega continues to decay toward zero.
+    DRIVE := RHO * ENV * MET_GATE
+    TARGET := OMEGA_BASE * COUPLING + DRIVE * OMEGA_GAIN
+    OMEGA := OMEGA + (TARGET - OMEGA) * OMEGA_RESPONSE * DT
+    INSTABILITY := MAX(OMEGA - 0.4, 0.0)
+    OMEGA := OMEGA + INSTABILITY * INSTABILITY * 0.5 * DT
+    IF OMEGA > OMEGA_MAX THEN
+      OMEGA := OMEGA_MAX
+    ENDIF
+    IF OMEGA < 0.0 THEN
+      OMEGA := 0.0
+    ENDIF
+
+    ! ── 16. POSITION ACCUMULATION ────────────────────────
+    POS_X(I) := PX + VX * DT
+    POS_Y(I) := PY + VY * DT
+    POS_Z(I) := PZ + VZ * DT
+    VEL_X(I) := VX
+    VEL_Y(I) := VY
+    VEL_Z(I) := VZ
+    OMEGA_NAT(I) := OMEGA
+
+    ! ── 17. THRESHOLD OBSERVATIONS ───────────────────────
+    ! These are not computations. They are observations of
+    ! where the accumulators ended up this frame.
+
+    ! Nova: omega exceeded threshold AND density supports it
+    IF OMEGA > OMEGA_NOVA_THRESH .AND. RHO > RHO_NOVA_THRESH THEN
+      FLAGS(I) := IOR(FLAGS(I), PFLAG_NOVA)
+      FLAGS(I) := IAND(FLAGS(I), NOT(PFLAG_ACTIVE))
+      ! Blast: one-time velocity impulse along tangent
+      VEL_X(I) := VX + TANGENT(1, GEN) * BLAST_MULT
+      VEL_Y(I) := VY + TANGENT(2, GEN) * BLAST_MULT
+      VEL_Z(I) := VZ + TANGENT(3, GEN) * BLAST_MULT
+    ENDIF
+
+    ! Crystal: omega decayed below threshold AND velocity near zero
+    ! This is the ground state — the particle reached the bottom
+    ! of the decay chain. It becomes part of the lattice.
+    SPD_SQ := VX * VX + VY * VY + VZ * VZ
+    IF OMEGA < OMEGA_CRYSTAL_THRESH .AND. SPD_SQ < 0.01 THEN
+      FLAGS(I) := IOR(FLAGS(I), PFLAG_CRYSTAL)
+    ENDIF
+  ENDDO
+
+  RETURN
+END
+
+! ════════════════════════════════════════════════════════════════
+! SPAWN — New particles from existing (CPU-side, every 100 frames)
+! ════════════════════════════════════════════════════════════════
+
+SUBROUTINE SIM_SPAWN(CAP, NSPAWN)
+  INTEGER :: CAP, NSPAWN
+  INTEGER :: EFF_CAP, BIAS_EQ, WORKING, REDLINE, BUDGET
+  INTEGER :: I, SLOT, OLD_N, GEN
+  INTEGER :: PH_CHILD
+  REAL :: T, PX, PY, PZ, R_XZ, V_CIRC
+
+  EFF_CAP := CAP
+  IF EFF_CAP > CAPACITY THEN
+    EFF_CAP := CAPACITY
+  ENDIF
+
+  NSPAWN := 0
+  IF NPART ≥ EFF_CAP THEN
+    RETURN
+  ENDIF
+
+  BIAS_EQ := INT(REAL(EFF_CAP) * 0.75)
+  WORKING := INT(REAL(EFF_CAP) * 0.844)
+  REDLINE := INT(REAL(EFF_CAP) * 0.969)
+
+  IF NPART ≥ REDLINE THEN
+    RETURN
+  ENDIF
+
+  IF NPART < BIAS_EQ THEN
+    BUDGET := NPART
+  ELSEIF NPART < WORKING THEN
+    T := REAL(NPART - BIAS_EQ) / REAL(WORKING - BIAS_EQ)
+    BUDGET := INT(REAL(NPART) * (1.0 - T * 0.8))
+  ELSE
+    BUDGET := NPART / 100
+    IF BUDGET < 1 THEN
+      BUDGET := 1
+    ENDIF
+  ENDIF
+
+  OLD_N := NPART
+
+  DO I = 1, NPART
+    IF NSPAWN ≥ BUDGET THEN
+      CYCLE
+    ENDIF
+    IF IAND(FLAGS(I), PFLAG_ACTIVE) = 0 THEN
+      CYCLE
+    ENDIF
+
+    SLOT := OLD_N + NSPAWN + 1
+    IF SLOT > EFF_CAP THEN
+      CYCLE
+    ENDIF
+
+    PH_CHILD := IAND(IAND(ISHFT(FLAGS(I), -PHASE_SHIFT), &
+      PHASE_MASK) + SEAM_STEP_PH, PHASE_MASK)
+    GEN := IAND(ISHFT(PH_CHILD, -10), GEN_MASK) + 1
+
+    PX := POS_X(I) + (RNGF() - 0.5) * 2.0
+    PY := POS_Y(I) + (RNGF() - 0.5) * 0.5
+    PZ := POS_Z(I) + (RNGF() - 0.5) * 2.0
+
+    R_XZ := SQRT(PX * PX + PZ * PZ)
+    V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
+
+    POS_X(SLOT) := PX
+    POS_Y(SLOT) := PY
+    POS_Z(SLOT) := PZ
+    VEL_X(SLOT) := TANGENT(1, GEN) * V_CIRC
+    VEL_Y(SLOT) := TANGENT(2, GEN) * V_CIRC
+    VEL_Z(SLOT) := TANGENT(3, GEN) * V_CIRC
+    OMEGA_NAT(SLOT) := 0.1 * (50.0 / MAX(R_XZ, 1.0)) ** 1.5
+    FLAGS(SLOT) := IOR(IOR(PFLAG_ACTIVE, ISHFT(IAND(GEN - 1, &
+      GEN_MASK), GEN_SHIFT)), ISHFT(PH_CHILD, PHASE_SHIFT))
+    PUMP_SCALE(SLOT) := 1.0
+
+    NSPAWN := NSPAWN + 1
+  ENDDO
+
+  NPART := NPART + NSPAWN
+  RETURN
+END
+! ── DOWNLOAD_WAVEGUIDE: GPU → CPU readback ────────────────
+! The ONLY place GPU sends data to CPU. 128KB per grid array.
+! Called at census intervals only (every 50-2000 frames).
+! Must be called AFTER frame_end + frame_wait (GPU idle).
+!
+! This is a no-op subroutine that the codegen recognizes as
+! a signal to insert grid array downloads. The subroutine body
+! copies from the GPU arrays to their CPU-side counterparts.
+! On CPU-only mode, this is a no-op (arrays are already in sync).
+
+SUBROUTINE DOWNLOAD_WAVEGUIDE()
+  ! Forces GPU → CPU sync of waveguide grid arrays.
+  ! Total: ~768KB (6 arrays × 32³ × 4 bytes).
+  ! Touch each grid array to trigger codegen download.
+  REAL :: DW
+  DW := REAL(GRID_DENSITY(1, 1, 1))
+  DW := GRID_GRAD_X(1, 1, 1)
+  DW := GRID_GRAD_Y(1, 1, 1)
+  DW := GRID_GRAD_Z(1, 1, 1)
+  DW := GRID_MET_GATE(1, 1, 1)
+  DW := REAL(BIN_PRESENCE(1, 1, 1))
+  RETURN
+END
+
+SUBROUTINE CLEAR_GRID()
+  CALL ZERO(GRID_DENSITY)
+  CALL ZERO(GRID_GRAD_X)
+  CALL ZERO(GRID_GRAD_Y)
+  CALL ZERO(GRID_GRAD_Z)
+  CALL ZERO(GRID_MET_GATE)
+  CALL ZERO(BIN_PRESENCE)
+  RETURN
+END
+
+! ── SCATTER: fluid → waveguide ────────────────────────────
+! Each particle deposits its presence into the field.
+! Phase advance + GEN packing + density + bin presence.
+! Zero-flagged particles (ejected/crystal): SKIP.
+!
+! This is the generational handoff — the particle declares
+! its lifecycle state into the field.
+
+SUBROUTINE SCATTER_GRID()
+  INTEGER :: I, CI, CJ, CK, GEN, BIN, PH
+
+  DO I = 1, NPART
+    ! Zero check: ejected/crystal = off, skip entirely
+    IF IAND(FLAGS(I), IOR(PFLAG_EJECTED, PFLAG_CRYSTAL)) ≠ 0 THEN
+      CYCLE
+    ENDIF
+    IF IAND(FLAGS(I), IOR(PFLAG_ACTIVE, PFLAG_NOVA)) = 0 THEN
+      CYCLE
+    ENDIF
+
+    ! Phase accumulator: advance, wrap (all integer)
+    PH := IAND(ISHFT(FLAGS(I), -PHASE_SHIFT), PHASE_MASK)
+    PH := IAND(PH + INT(OMEGA_NAT(I) * PHASE_INC_SCALE), PHASE_MASK)
+
+    ! GEN from top 5 bits of 15-bit phase
+    GEN := IAND(ISHFT(PH, -10), GEN_MASK)
+
+    ! Write back FLAGS: low byte (status) + GEN + PHASE
+    FLAGS(I) := IOR(IOR(IAND(FLAGS(I), 255), ISHFT(GEN, GEN_SHIFT)), ISHFT(PH, PHASE_SHIFT))
+
+    ! Density: +1 into cell (positive accumulator)
+    CI := CLAMP(INT(POS_X(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    CJ := CLAMP(INT(POS_Y(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    CK := CLAMP(INT(POS_Z(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    GRID_DENSITY(CI, CJ, CK) := GRID_DENSITY(CI, CJ, CK) + 1
+
+    ! Generation bin presence
+    BIN := IAND(GEN, 7) + 1
+    BIN_PRESENCE(CI, CJ, CK) := IOR(BIN_PRESENCE(CI, CJ, CK), ISHFT(1, BIN - 1))
+  ENDDO
+  RETURN
+END
+
+! ── STENCIL: waveguide → waveguide ───────────────────────
+! Computes gradients from density, metabolic gate from presence.
+! Blends oracle consensus into local field before differentiation.
+! Cells with zero density: gradients are zero. Natural skip.
+
+SUBROUTINE STENCIL_GRID()
+  INTEGER :: I, J, K, IM, IP, JM, JP, KM, KP
+  INTEGER :: BP
+  REAL :: COV
+
+  DO K = 1, GRID_SIZE
+    KM := MOD(K - 2 + GRID_SIZE, GRID_SIZE) + 1
+    KP := MOD(K, GRID_SIZE) + 1
+    DO J = 1, GRID_SIZE
+      JM := MOD(J - 2 + GRID_SIZE, GRID_SIZE) + 1
+      JP := MOD(J, GRID_SIZE) + 1
+      DO I = 1, GRID_SIZE
+        IM := MOD(I - 2 + GRID_SIZE, GRID_SIZE) + 1
+        IP := MOD(I, GRID_SIZE) + 1
+
+        ! Oracle blend: local + alpha * (global - local)
+        GRID_DENSITY(I, J, K) := INT(REAL(GRID_DENSITY(I, J, K)) + FIELD_BLEND * (GRID_DENSITY_GLOBAL(I, J, K) - REAL(GRID_DENSITY(I, J, K))))
+
+        ! Gradients (cast INTEGER → REAL for arithmetic)
+        GRID_GRAD_X(I, J, K) := REAL(GRID_DENSITY(IP, J, K) - GRID_DENSITY(IM, J, K)) * 0.5
+        GRID_GRAD_Y(I, J, K) := REAL(GRID_DENSITY(I, JP, K) - GRID_DENSITY(I, JM, K)) * 0.5
+        GRID_GRAD_Z(I, J, K) := REAL(GRID_DENSITY(I, J, KP) - GRID_DENSITY(I, J, KM)) * 0.5
+
+        ! Metabolic gate: popcount → coverage → gate
+        BP := BIN_PRESENCE(I, J, K)
+        COV := 0.0
+        IF IAND(BP, 1) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 2) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 4) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 8) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 16) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 32) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 64) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        IF IAND(BP, 128) ≠ 0 THEN
+          COV := COV + 1.0
+        ENDIF
+        GRID_MET_GATE(I, J, K) := 0.2 + 1.3 * COV / 8.0
+      ENDDO
+    ENDDO
+  ENDDO
+  RETURN
+END
+! ════════════════════════════════════════════════════════════════
+! CENSUS — CPU observation (minimal: population + frame only)
+! ════════════════════════════════════════════════════════════════
+!
+! For now, census reports NPART and FRAME only.
+! Grid-level statistics (density distribution, gradient magnitude)
+! will be added when proper census-time grid downloads are implemented.
+!
+! NPART is a CPU scalar — no GPU download needed.
+! Census persistent state is declared in waveguide_state.mcl.
+
+SUBROUTINE SIM_CENSUS_ADAPTIVE(COUNT, FRAME, NEXT_INTERVAL)
+  INTEGER :: COUNT, FRAME, NEXT_INTERVAL
+  INTEGER :: INTERVAL
+
+  PRINT FRAME
+  PRINT COUNT
+
+  ! Adaptive interval: simple population-based for now
+  INTERVAL := CENSUS_INTERVAL_DEFAULT
+  IF COUNT > 50000 THEN
+    INTERVAL := CENSUS_INTERVAL_MIN
+  ELSEIF COUNT > 10000 THEN
+    INTERVAL := CENSUS_INTERVAL_DEFAULT / 2
+  ELSEIF COUNT < 100 THEN
+    INTERVAL := CENSUS_INTERVAL_MAX
+  ENDIF
+
+  IF INTERVAL < CENSUS_INTERVAL_MIN THEN
+    INTERVAL := CENSUS_INTERVAL_MIN
+  ENDIF
+  IF INTERVAL > CENSUS_INTERVAL_MAX THEN
+    INTERVAL := CENSUS_INTERVAL_MAX
+  ENDIF
+
+  CENSUS_PREV_FRAME := FRAME
+  CENSUS_INITIALIZED := 1
+  NEXT_INTERVAL := INTERVAL
+  RETURN
+END
+! ════════════════════════════════════════════════════════════════
+! MAIN — Pipeline orchestration
+! ════════════════════════════════════════════════════════════════
+!
+! CPU is instruction (DNA). GPU is execution (RNA).
+!
+! CPU tick (census interval):
+!   - Receive density grid from GPU (128KB — the only readback)
+!   - Observe: compute stats from density grid
+!   - Decide: adjust census interval, send to oracle
+!   - Instruct: upload waveguide corrections (blend field, spawn params)
+!
+! GPU tick (every frame):
+!   - CLEAR → SCATTER → STENCIL → PHYSICS → SPAWN
+!   - All on GPU. No downloads. No CPU involvement.
+!   - Density grid is the feedback signal — available for CPU at census.
+!
+! The interface between CPU and GPU is the waveguide.
+! CPU sends: GRID_DENSITY_GLOBAL (oracle consensus), FIELD_BLEND, spawn params
+! GPU sends: GRID_DENSITY (128KB density grid), population count
+!
+! Zero particle downloads. Ever.
+
+IMPLICIT NONE
+
+INTEGER :: FRAME, SPAWNED, SAMPLE
+INTEGER :: CENSUS_INTERVAL, NEXT_CENSUS
+
+CENSUS_INTERVAL := CENSUS_INTERVAL_DEFAULT
+NEXT_CENSUS := CENSUS_INTERVAL
+
+! ── CPU INIT: set constants, seed initial fluid state ─────
+! This is the only time CPU touches particles directly.
+! After this, particles are GPU-exclusive.
+CALL SIM_INIT(DEFAULT_N, MAXPART, 42)
+CALL SIM_SEED_SHELL()
+
+PRINT NPART
+
+! ── FRAME LOOP: GPU executes, CPU observes at intervals ───
+DO FRAME = 1, DEFAULT_FRAMES
+
+  ! ── GPU EXECUTION (every frame) ─────────────────────────
+  ! Forward pipeline: waveguide rebuild → fluid update → spawn
+  ! All GPU. No CPU. No downloads.
+  CALL CLEAR_GRID()
+  CALL SCATTER_GRID()
+  CALL STENCIL_GRID()
+  CALL SIM_PHYSICS_STEP(DEFAULT_DT)
+
+  ! Spawn: GPU-side, budget-driven, autonomous
+  IF FRAME > 1 .AND. MOD(FRAME, 100) = 0 THEN
+    IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_SPAWN_PAUSE ≠ 0 THEN
+      ! Oracle says physics demands a pause — skip
+    ELSE
+      CALL SIM_SPAWN(MAXPART, SPAWNED)
+    ENDIF
+    ! Oracle injection: additive batch
+    IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_SPAWN_COUNT > 0 THEN
+      CALL SIM_SPAWN(NPART + NET_SPAWN_COUNT, SPAWNED)
+      NET_SPAWN_COUNT := 0
+    ENDIF
+  ENDIF
+
+  ! ── CPU OBSERVATION (census intervals only) ─────────────
+  ! After frame_end + frame_wait, GPU is idle. Safe to download.
+  ! Download the waveguide (128KB grid arrays), NOT particles (96MB).
+  ! Census reads the fresh density, computes stats, sends to oracle.
+  IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_CENSUS_OVERRIDE > 0 THEN
+    CENSUS_INTERVAL := NET_CENSUS_OVERRIDE
+  ENDIF
+  IF FRAME ≥ NEXT_CENSUS THEN
+    ! Census reads NPART (CPU scalar, no GPU download).
+    ! Grid-level stats will be added with proper census-time downloads.
+    CALL SIM_CENSUS_ADAPTIVE(NPART, FRAME, CENSUS_INTERVAL)
+    NEXT_CENSUS := FRAME + CENSUS_INTERVAL
+  ENDIF
+
+  IF FRAME > 1 .AND. MOD(FRAME, 1000) = 0 THEN
+    PRINT FRAME
+    PRINT NPART
+  ENDIF
+
+ENDDO
+
+PRINT NPART
