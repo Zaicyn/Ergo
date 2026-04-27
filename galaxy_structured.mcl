@@ -903,24 +903,18 @@ END
 ! MAIN — Pipeline orchestration
 ! ════════════════════════════════════════════════════════════════
 !
-! CPU is instruction (DNA). GPU is execution (RNA).
+! Two waves, one cycle:
 !
-! CPU tick (census interval):
-!   - Receive density grid from GPU (128KB — the only readback)
-!   - Observe: compute stats from density grid
-!   - Decide: adjust census interval, send to oracle
-!   - Instruct: upload waveguide corrections (blend field, spawn params)
+! Wave 1 — Instruction (Oracle → CPU → GPU):
+!   Oracle sends consensus field → CPU sets waveguide corrections →
+!   GPU reads them at next frame start.
 !
-! GPU tick (every frame):
-!   - CLEAR → SCATTER → STENCIL → PHYSICS → SPAWN
-!   - All on GPU. No downloads. No CPU involvement.
-!   - Density grid is the feedback signal — available for CPU at census.
+! Wave 2 — Observation (GPU → CPU → Oracle):
+!   GPU accumulates density → CPU lazy-grabs grid at census →
+!   CPU sends density + stats to oracle → Oracle sums, trust-weights,
+!   broadcasts consensus back.
 !
-! The interface between CPU and GPU is the waveguide.
-! CPU sends: GRID_DENSITY_GLOBAL (oracle consensus), FIELD_BLEND, spawn params
-! GPU sends: GRID_DENSITY (128KB density grid), population count
-!
-! Zero particle downloads. Ever.
+! Zero particle downloads. Ever. The waveguide is the interface.
 
 IMPLICIT NONE
 
@@ -931,12 +925,18 @@ CENSUS_INTERVAL := CENSUS_INTERVAL_DEFAULT
 NEXT_CENSUS := CENSUS_INTERVAL
 
 ! ── CPU INIT: set constants, seed initial fluid state ─────
-! This is the only time CPU touches particles directly.
-! After this, particles are GPU-exclusive.
 CALL SIM_INIT(DEFAULT_N, MAXPART, 42)
 CALL SIM_SEED_SHELL()
 
 PRINT NPART
+
+! ── VERIFY: oracle probe + NET for field exchange ─────────
+! This line activates the two-wave cycle:
+!   - Sends 12 probe particles to oracle every 100 frames (Wave 2)
+!   - Receives spawn commands from oracle (Wave 1)
+!   - NET enables density grid send/recv at census intervals
+VERIFY POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT &
+  ORACLE 12 EVERY 100 TOL 1.0E-4 NET "127.0.0.1:4250"
 
 ! ── FRAME LOOP: GPU executes, CPU observes at intervals ───
 DO FRAME = 1, DEFAULT_FRAMES
@@ -964,14 +964,12 @@ DO FRAME = 1, DEFAULT_FRAMES
   ENDIF
 
   ! ── CPU OBSERVATION (lazy readback at census intervals) ──
-  ! CPU grabs the density grid when it's ready. GPU doesn't wait.
-  ! The grid is always fresh from the last scatter — whatever
-  ! frame that was. The CPU observes, computes stats, reports.
+  ! Wave 2: CPU grabs density grid, computes stats, sends to oracle.
+  ! GPU doesn't wait. CPU gets to it when it gets to it.
   IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_CENSUS_OVERRIDE > 0 THEN
     CENSUS_INTERVAL := NET_CENSUS_OVERRIDE
   ENDIF
   IF FRAME ≥ NEXT_CENSUS THEN
-    ! Lazy grab: download density grid (128KB) + NPART from GPU
     CALL DOWNLOAD_WAVEGUIDE()
     CALL SIM_CENSUS_ADAPTIVE(NPART, FRAME, CENSUS_INTERVAL)
     NEXT_CENSUS := FRAME + CENSUS_INTERVAL
