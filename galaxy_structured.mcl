@@ -239,16 +239,19 @@ STATIC INTEGER :: NPART = 0
 STATIC INTEGER :: CAPACITY = 0
 STATIC INTEGER :: RNG_STATE = 42
 
-! ── Spawn control (GPU-side) ──────────────────────────────
-PARAMETER INTEGER :: SPAWN_INTERVAL = 100
-STATIC INTEGER :: SPAWN_TICK = 0
-! SPAWN_COUNTER as 1-element array so the compiler treats
-! increments as scatter writes (→ atomic on GPU)
+! ── Spawn control (GPU-side, continuous) ──────────────────
+! SPAWN_RATE: probability of spawning per active particle per frame.
+! CPU sets the target rate. GPU applies it continuously.
+! At rate 0.01, each particle has 1% chance per frame → ~1 spawn
+! per 100 frames per particle. Smooth, no bursts.
+! SPAWN_COUNTER: atomic slot allocator for new particles.
+PARAMETER REAL :: SPAWN_RATE_DEFAULT = 0.01
+STATIC REAL :: SPAWN_RATE = 0.01
 STATIC INTEGER :: SPAWN_COUNTER(1)
 
-! ── Oracle spawn control (written by NET codegen) ─────────
+! ── Oracle control (CPU instructions, applied as amplitudes) ──
 STATIC INTEGER :: NET_SPAWN_ACTIVE = 0
-STATIC INTEGER :: NET_SPAWN_COUNT = 0
+STATIC REAL :: NET_SPAWN_RATE = 0.0
 STATIC INTEGER :: NET_SPAWN_PAUSE = 0
 STATIC INTEGER :: NET_CENSUS_OVERRIDE = 0
 
@@ -680,11 +683,14 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
       FLAGS(I) := IOR(FLAGS(I), PFLAG_CRYSTAL)
     ENDIF
 
-    ! ── 18. SPAWN (every SPAWN_INTERVAL frames) ─────────
-    ! Each active particle can produce one child.
-    ! Child slot from atomic counter. Deterministic offset from parent state.
-    ! No sequential RNG — child position derived from parent index + position.
-    IF SPAWN_TICK ≠ 0 .AND. IAND(FLAGS(I), PFLAG_ACTIVE) ≠ 0 THEN
+    ! ── 18. SPAWN (continuous, rate-based) ──────────────
+    ! SPAWN_RATE is a probability per particle per frame.
+    ! Deterministic: hash of (index × phase) changes each frame
+    ! because phase advances. At rate=0.01, ~1% of active particles
+    ! spawn per frame. Smooth growth, no bursts. Zero = natural skip.
+    HASH := REAL(IAND((I * 1103515245 + GEN * 2654435) + 12345, &
+      65535)) / 65536.0
+    IF HASH < SPAWN_RATE .AND. IAND(FLAGS(I), PFLAG_ACTIVE) ≠ 0 THEN
       IF SPAWN_COUNTER(1) < CAPACITY THEN
         SLOT := SPAWN_COUNTER(1) + 1
         SPAWN_COUNTER(1) := SPAWN_COUNTER(1) + 1
@@ -929,6 +935,9 @@ CALL SIM_SEED_SHELL()
 
 PRINT NPART
 
+! GPU spawn counter starts at NPART — set once, GPU manages from here
+SPAWN_COUNTER(1) := NPART
+
 ! ── VERIFY: oracle probe + NET for field exchange ─────────
 ! This line activates the two-wave cycle:
 !   - Sends 12 probe particles to oracle every 100 frames (Wave 2)
@@ -943,7 +952,8 @@ DO FRAME = 1, DEFAULT_FRAMES
   ! ── GPU EXECUTION (every frame) ─────────────────────────
   ! Forward pipeline: waveguide rebuild → fluid update (+ spawn)
   ! All GPU. No CPU. No downloads.
-
+  ! SPAWN_RATE is continuous — GPU applies it every frame as probability.
+  ! SPAWN_COUNTER is GPU-managed via atomic increment.
   CALL CLEAR_GRID()
   CALL SCATTER_GRID()
   CALL STENCIL_GRID()

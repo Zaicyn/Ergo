@@ -29,6 +29,9 @@ CALL SIM_SEED_SHELL()
 
 PRINT NPART
 
+! GPU spawn counter starts at NPART — set once, GPU manages from here
+SPAWN_COUNTER(1) := NPART
+
 ! ── VERIFY: oracle probe + NET for field exchange ─────────
 ! This line activates the two-wave cycle:
 !   - Sends 12 probe particles to oracle every 100 frames (Wave 2)
@@ -43,7 +46,8 @@ DO FRAME = 1, DEFAULT_FRAMES
   ! ── GPU EXECUTION (every frame) ─────────────────────────
   ! Forward pipeline: waveguide rebuild → fluid update (+ spawn)
   ! All GPU. No CPU. No downloads.
-
+  ! SPAWN_RATE is continuous — GPU applies it every frame as probability.
+  ! SPAWN_COUNTER is GPU-managed via atomic increment.
   CALL CLEAR_GRID()
   CALL SCATTER_GRID()
   CALL STENCIL_GRID()

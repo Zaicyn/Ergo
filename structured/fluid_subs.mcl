@@ -385,11 +385,14 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
       FLAGS(I) := IOR(FLAGS(I), PFLAG_CRYSTAL)
     ENDIF
 
-    ! ── 18. SPAWN (every SPAWN_INTERVAL frames) ─────────
-    ! Each active particle can produce one child.
-    ! Child slot from atomic counter. Deterministic offset from parent state.
-    ! No sequential RNG — child position derived from parent index + position.
-    IF SPAWN_TICK ≠ 0 .AND. IAND(FLAGS(I), PFLAG_ACTIVE) ≠ 0 THEN
+    ! ── 18. SPAWN (continuous, rate-based) ──────────────
+    ! SPAWN_RATE is a probability per particle per frame.
+    ! Deterministic: hash of (index × phase) changes each frame
+    ! because phase advances. At rate=0.01, ~1% of active particles
+    ! spawn per frame. Smooth growth, no bursts. Zero = natural skip.
+    HASH := REAL(IAND((I * 1103515245 + GEN * 2654435) + 12345, &
+      65535)) / 65536.0
+    IF HASH < SPAWN_RATE .AND. IAND(FLAGS(I), PFLAG_ACTIVE) ≠ 0 THEN
       IF SPAWN_COUNTER(1) < CAPACITY THEN
         SLOT := SPAWN_COUNTER(1) + 1
         SPAWN_COUNTER(1) := SPAWN_COUNTER(1) + 1

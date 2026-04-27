@@ -24,16 +24,19 @@ STATIC INTEGER :: NPART = 0
 STATIC INTEGER :: CAPACITY = 0
 STATIC INTEGER :: RNG_STATE = 42
 
-! ── Spawn control (GPU-side) ──────────────────────────────
-PARAMETER INTEGER :: SPAWN_INTERVAL = 100
-STATIC INTEGER :: SPAWN_TICK = 0
-! SPAWN_COUNTER as 1-element array so the compiler treats
-! increments as scatter writes (→ atomic on GPU)
+! ── Spawn control (GPU-side, continuous) ──────────────────
+! SPAWN_RATE: probability of spawning per active particle per frame.
+! CPU sets the target rate. GPU applies it continuously.
+! At rate 0.01, each particle has 1% chance per frame → ~1 spawn
+! per 100 frames per particle. Smooth, no bursts.
+! SPAWN_COUNTER: atomic slot allocator for new particles.
+PARAMETER REAL :: SPAWN_RATE_DEFAULT = 0.01
+STATIC REAL :: SPAWN_RATE = 0.01
 STATIC INTEGER :: SPAWN_COUNTER(1)
 
-! ── Oracle spawn control (written by NET codegen) ─────────
+! ── Oracle control (CPU instructions, applied as amplitudes) ──
 STATIC INTEGER :: NET_SPAWN_ACTIVE = 0
-STATIC INTEGER :: NET_SPAWN_COUNT = 0
+STATIC REAL :: NET_SPAWN_RATE = 0.0
 STATIC INTEGER :: NET_SPAWN_PAUSE = 0
 STATIC INTEGER :: NET_CENSUS_OVERRIDE = 0
 
