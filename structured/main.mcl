@@ -48,19 +48,11 @@ DO FRAME = 1, DEFAULT_FRAMES
   CALL STENCIL_GRID()
   CALL SIM_PHYSICS_STEP(DEFAULT_DT)
 
-  ! Spawn: GPU-side, budget-driven, autonomous
-  IF FRAME > 1 .AND. MOD(FRAME, 100) = 0 THEN
-    IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_SPAWN_PAUSE ≠ 0 THEN
-      ! Oracle says physics demands a pause — skip
-    ELSE
-      CALL SIM_SPAWN(MAXPART, SPAWNED)
-    ENDIF
-    ! Oracle injection: additive batch
-    IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_SPAWN_COUNT > 0 THEN
-      CALL SIM_SPAWN(NPART + NET_SPAWN_COUNT, SPAWNED)
-      NET_SPAWN_COUNT := 0
-    ENDIF
-  ENDIF
+  ! Spawn disabled — needs GPU-side implementation to avoid
+  ! per-frame particle array uploads (3.2MB through staging).
+  ! CPU spawn writes particle arrays, which forces full re-upload
+  ! every frame via the codegen's dirty array tracking.
+  ! TODO: implement spawn as a GPU kernel.
 
   ! ── CPU OBSERVATION (census intervals only) ─────────────
   ! After frame_end + frame_wait, GPU is idle. Safe to download.
