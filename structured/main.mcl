@@ -41,18 +41,26 @@ PRINT NPART
 DO FRAME = 1, DEFAULT_FRAMES
 
   ! ── GPU EXECUTION (every frame) ─────────────────────────
-  ! Forward pipeline: waveguide rebuild → fluid update → spawn
+  ! Forward pipeline: waveguide rebuild → fluid update (+ spawn)
   ! All GPU. No CPU. No downloads.
+
+  ! Set spawn tick: 1 on spawn frames, 0 otherwise
+  IF FRAME > 1 .AND. MOD(FRAME, SPAWN_INTERVAL) = 0 THEN
+    SPAWN_TICK := 1
+    SPAWN_COUNTER(1) := NPART
+  ELSE
+    SPAWN_TICK := 0
+  ENDIF
+
   CALL CLEAR_GRID()
   CALL SCATTER_GRID()
   CALL STENCIL_GRID()
   CALL SIM_PHYSICS_STEP(DEFAULT_DT)
 
-  ! Spawn disabled — needs GPU-side implementation to avoid
-  ! per-frame particle array uploads (3.2MB through staging).
-  ! CPU spawn writes particle arrays, which forces full re-upload
-  ! every frame via the codegen's dirty array tracking.
-  ! TODO: implement spawn as a GPU kernel.
+  ! After physics+spawn, update NPART from spawn counter
+  IF SPAWN_TICK ≠ 0 THEN
+    NPART := SPAWN_COUNTER(1)
+  ENDIF
 
   ! ── CPU OBSERVATION (census intervals only) ─────────────
   ! After frame_end + frame_wait, GPU is idle. Safe to download.

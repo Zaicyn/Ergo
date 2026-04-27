@@ -239,6 +239,13 @@ STATIC INTEGER :: NPART = 0
 STATIC INTEGER :: CAPACITY = 0
 STATIC INTEGER :: RNG_STATE = 42
 
+! ── Spawn control (GPU-side) ──────────────────────────────
+PARAMETER INTEGER :: SPAWN_INTERVAL = 100
+STATIC INTEGER :: SPAWN_TICK = 0
+! SPAWN_COUNTER as 1-element array so the compiler treats
+! increments as scatter writes (→ atomic on GPU)
+STATIC INTEGER :: SPAWN_COUNTER(1)
+
 ! ── Oracle spawn control (written by NET codegen) ─────────
 STATIC INTEGER :: NET_SPAWN_ACTIVE = 0
 STATIC INTEGER :: NET_SPAWN_COUNT = 0
@@ -438,24 +445,18 @@ SUBROUTINE SIM_SEED_SHELL()
 END
 
 ! ════════════════════════════════════════════════════════════════
-! PHYSICS — One path. Decay always. Accumulation varies.
+! PHYSICS + SPAWN — One path. Decay always. Spawn is accumulation.
 ! ════════════════════════════════════════════════════════════════
 !
-! Every particle follows the same chain:
-!   1. Gravity pulls (always negative, the universal downhill)
-!   2. Omega decays (always, the arrow of time)
-!   3. Field coupling accumulates (amplitude modulated by mode)
-!   4. Velocity accumulates from forces
-!   5. Position accumulates from velocity
-!   6. Thresholds observed (nova, crystal — state transitions)
+! Spawn is integrated into the physics pass. Each active particle
+! can produce one child per spawn interval. The child slot comes
+! from an atomic counter (SPAWN_COUNTER(1)). The child's position
+! offset is derived from the parent's state (deterministic hash,
+! no sequential RNG needed).
 !
-! Mode doesn't branch the path. Mode modulates the amplitude.
-! COAST: field coupling = 0 (zero × anything = zero, natural skip)
-! ACTIVE: field coupling = 1 (full accumulation)
-! FLOW: field coupling = 1 + weak channel
-!
-! Zero density = zero force from field. Zero omega = crystal.
-! The zero IS the null. No special cases.
+! SPAWN_COUNTER(1) is reset to NPART at the start of each spawn frame.
+! Each spawning particle does: SLOT = atomicAdd(SPAWN_COUNTER(1), 1).
+! After the physics pass, NPART = SPAWN_COUNTER(1).
 
 SUBROUTINE SIM_PHYSICS_STEP(DT)
   REAL :: DT
@@ -478,12 +479,12 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
   REAL :: DRIVE, TARGET, INSTABILITY
   REAL :: WEAK_DOT_R, WEAK_STR
   REAL :: GDX, GDY, GDZ, GD_R, GTX, GTY, GTZ
+  ! Spawn vars
+  INTEGER :: SLOT, PH_CHILD, GEN_CHILD
+  REAL :: HASH, SPX, SPY, SPZ, SR_XZ, SV_CIRC
 
   DO I = 1, NPART
     ! ── Skip crystallized (off) and ejected (gone) ────────
-    ! These are the TRUE nulls — particles that have left the chain.
-    ! Crystal = ground state, no energy, no movement, part of lattice.
-    ! Ejected = escaped, no longer relevant.
     IF IAND(FLAGS(I), IOR(PFLAG_CRYSTAL, PFLAG_EJECTED)) ≠ 0 THEN
       CYCLE
     ENDIF
@@ -517,28 +518,25 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
     AY := -RY * GRAVITY
     AZ := -RZ * GRAVITY
 
-    ! ── 2. OMEGA DECAY (always — the arrow of time) ───────
-    ! Everything loses energy unless something feeds it.
+    ! ── 2. OMEGA DECAY (always) ───────────────────────────
     DECAY := 1.0 - OMEGA_DECAY * DT
     DECAY := DECAY * DECAY * DECAY * DECAY
     OMEGA := OMEGA * DECAY
 
-    ! ── 3. MODE COUPLING (amplitude, not branch) ─────────
-    ! COAST=0: coupling is zero. ACTIVE=1,FLOW=2: coupling is 1.
-    ! The zero makes all field terms vanish naturally.
+    ! ── 3. MODE COUPLING ─────────────────────────────────
     IF FMODE = 0 THEN
       COUPLING := 0.0
     ELSE
       COUPLING := 1.0
     ENDIF
 
-    ! ── 4. WAVEGUIDE READ (always — zero density = zero force)
+    ! ── 4. WAVEGUIDE READ ────────────────────────────────
     CI := CLAMP(INT(PX / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
     CJ := CLAMP(INT(PY / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
     CK := CLAMP(INT(PZ / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
     RHO := REAL(GRID_DENSITY(CI, CJ, CK)) * COUPLING
 
-    ! ── 5. ENVELOPE (distance to coherence node) ─────────
+    ! ── 5. ENVELOPE ──────────────────────────────────────
     CP_X := CURVE_PT(1, GEN) * R_SAFE
     CP_Y := CURVE_PT(2, GEN) * R_SAFE
     CP_Z := CURVE_PT(3, GEN) * R_SAFE
@@ -574,8 +572,7 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
     TY := FPY * 0.1
     TZ := PGZ * ABS(VIV_MOD) + FPZ * 0.1
 
-    ! ── 10. EM STEERING (speed-preserving, amplitude-modulated)
-    ! COAST: COUPLING=0 → STEER_R=0 → no steering. Natural skip.
+    ! ── 10. EM STEERING ──────────────────────────────────
     IF FMODE = 2 THEN
       BASE_RATE := 0.02
     ELSE
@@ -602,16 +599,13 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
     VY := VY * RESCALE
     VZ := VZ * RESCALE
 
-    ! ── 11. STRONG CHANNEL (z-coupling, always signed) ───
+    ! ── 11. STRONG CHANNEL ───────────────────────────────
     STRONG := Z_C * GRAVITY * 0.1 * COUPLING
     AX := AX + RX * STRONG
     AY := AY + RY * STRONG
     AZ := AZ + RZ * STRONG
 
-    ! ── 12. WEAK CHANNEL (flow escape, FLOW mode only) ───
-    ! FLOW_WG is signed from LUT. Non-FLOW modes: COUPLING gates it.
-    ! But FLOW_WG is only nonzero for FLOW segments in the LUT.
-    ! We still gate on FMODE=2 to avoid the CURVE_PT lookups.
+    ! ── 12. WEAK CHANNEL ─────────────────────────────────
     IF FMODE = 2 THEN
       WEAK_DOT_R := CURVE_PT(1, GEN) * RX + &
         CURVE_PT(2, GEN) * RY + CURVE_PT(3, GEN) * RZ
@@ -621,8 +615,7 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
       AZ := AZ + (CURVE_PT(3, GEN) - WEAK_DOT_R * RZ) * WEAK_STR
     ENDIF
 
-    ! ── 13. DENSITY SIPHON (waveguide → fluid) ───────────
-    ! RHO already multiplied by COUPLING. Zero RHO = zero force.
+    ! ── 13. DENSITY SIPHON ───────────────────────────────
     GDX := GRID_GRAD_X(CI, CJ, CK)
     GDY := GRID_GRAD_Y(CI, CJ, CK)
     GDZ := GRID_GRAD_Z(CI, CJ, CK)
@@ -644,9 +637,7 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
       CYCLE
     ENDIF
 
-    ! ── 15. OMEGA ACCUMULATION (driven by field coupling) ─
-    ! DRIVE is zero when RHO is zero (COAST or empty cell).
-    ! Zero drive = omega continues to decay toward zero.
+    ! ── 15. OMEGA ACCUMULATION ───────────────────────────
     DRIVE := RHO * ENV * MET_GATE
     TARGET := OMEGA_BASE * COUPLING + DRIVE * OMEGA_GAIN
     OMEGA := OMEGA + (TARGET - OMEGA) * OMEGA_RESPONSE * DT
@@ -669,113 +660,65 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
     OMEGA_NAT(I) := OMEGA
 
     ! ── 17. THRESHOLD OBSERVATIONS ───────────────────────
-    ! These are not computations. They are observations of
-    ! where the accumulators ended up this frame.
 
-    ! Nova: omega exceeded threshold AND density supports it
+    ! Nova
     IF OMEGA > OMEGA_NOVA_THRESH .AND. RHO > RHO_NOVA_THRESH THEN
       FLAGS(I) := IOR(FLAGS(I), PFLAG_NOVA)
       FLAGS(I) := IAND(FLAGS(I), NOT(PFLAG_ACTIVE))
-      ! Blast: one-time velocity impulse along tangent
       VEL_X(I) := VX + TANGENT(1, GEN) * BLAST_MULT
       VEL_Y(I) := VY + TANGENT(2, GEN) * BLAST_MULT
       VEL_Z(I) := VZ + TANGENT(3, GEN) * BLAST_MULT
     ENDIF
 
-    ! Crystal: omega decayed below threshold AND velocity near zero
-    ! This is the ground state — the particle reached the bottom
-    ! of the decay chain. It becomes part of the lattice.
+    ! Crystal
     SPD_SQ := VX * VX + VY * VY + VZ * VZ
     IF OMEGA < OMEGA_CRYSTAL_THRESH .AND. SPD_SQ < 0.01 THEN
       FLAGS(I) := IOR(FLAGS(I), PFLAG_CRYSTAL)
     ENDIF
+
+    ! ── 18. SPAWN (every SPAWN_INTERVAL frames) ─────────
+    ! Each active particle can produce one child.
+    ! Child slot from atomic counter. Deterministic offset from parent state.
+    ! No sequential RNG — child position derived from parent index + position.
+    IF SPAWN_TICK ≠ 0 .AND. IAND(FLAGS(I), PFLAG_ACTIVE) ≠ 0 THEN
+      IF SPAWN_COUNTER(1) < CAPACITY THEN
+        SLOT := SPAWN_COUNTER(1) + 1
+        SPAWN_COUNTER(1) := SPAWN_COUNTER(1) + 1
+
+        ! Child phase = parent + seam step
+        PH_CHILD := IAND(IAND(ISHFT(FLAGS(I), -PHASE_SHIFT), &
+          PHASE_MASK) + SEAM_STEP_PH, PHASE_MASK)
+        GEN_CHILD := IAND(ISHFT(PH_CHILD, -10), GEN_MASK) + 1
+
+        ! Deterministic offset from parent index (replaces RNG)
+        ! Hash: scramble index with large prime (fits signed int32)
+        HASH := REAL(IAND(I * 1103515245 + 12345, 65535)) / 65536.0
+        SPX := PX + (HASH - 0.5) * 2.0
+        SPY := PY + (HASH * 0.7 - 0.35) * 0.5
+        SPZ := PZ + (HASH * 1.3 - 0.65) * 2.0
+
+        SR_XZ := SQRT(SPX * SPX + SPZ * SPZ)
+        SV_CIRC := SQRT(BH_MASS / MAX(SR_XZ, 1.0))
+
+        POS_X(SLOT) := SPX
+        POS_Y(SLOT) := SPY
+        POS_Z(SLOT) := SPZ
+        VEL_X(SLOT) := TANGENT(1, GEN_CHILD) * SV_CIRC
+        VEL_Y(SLOT) := TANGENT(2, GEN_CHILD) * SV_CIRC
+        VEL_Z(SLOT) := TANGENT(3, GEN_CHILD) * SV_CIRC
+        OMEGA_NAT(SLOT) := 0.1 * (50.0 / MAX(SR_XZ, 1.0)) ** 1.5
+        FLAGS(SLOT) := IOR(IOR(PFLAG_ACTIVE, &
+          ISHFT(IAND(GEN_CHILD - 1, GEN_MASK), GEN_SHIFT)), &
+          ISHFT(PH_CHILD, PHASE_SHIFT))
+      ENDIF
+    ENDIF
   ENDDO
 
-  RETURN
-END
-
-! ════════════════════════════════════════════════════════════════
-! SPAWN — New particles from existing (CPU-side, every 100 frames)
-! ════════════════════════════════════════════════════════════════
-
-SUBROUTINE SIM_SPAWN(CAP, NSPAWN)
-  INTEGER :: CAP, NSPAWN
-  INTEGER :: EFF_CAP, BIAS_EQ, WORKING, REDLINE, BUDGET
-  INTEGER :: I, SLOT, OLD_N, GEN
-  INTEGER :: PH_CHILD
-  REAL :: T, PX, PY, PZ, R_XZ, V_CIRC
-
-  EFF_CAP := CAP
-  IF EFF_CAP > CAPACITY THEN
-    EFF_CAP := CAPACITY
+  ! Update NPART from spawn counter
+  IF SPAWN_TICK ≠ 0 THEN
+    NPART := SPAWN_COUNTER(1)
   ENDIF
 
-  NSPAWN := 0
-  IF NPART ≥ EFF_CAP THEN
-    RETURN
-  ENDIF
-
-  BIAS_EQ := INT(REAL(EFF_CAP) * 0.75)
-  WORKING := INT(REAL(EFF_CAP) * 0.844)
-  REDLINE := INT(REAL(EFF_CAP) * 0.969)
-
-  IF NPART ≥ REDLINE THEN
-    RETURN
-  ENDIF
-
-  IF NPART < BIAS_EQ THEN
-    BUDGET := NPART
-  ELSEIF NPART < WORKING THEN
-    T := REAL(NPART - BIAS_EQ) / REAL(WORKING - BIAS_EQ)
-    BUDGET := INT(REAL(NPART) * (1.0 - T * 0.8))
-  ELSE
-    BUDGET := NPART / 100
-    IF BUDGET < 1 THEN
-      BUDGET := 1
-    ENDIF
-  ENDIF
-
-  OLD_N := NPART
-
-  DO I = 1, NPART
-    IF NSPAWN ≥ BUDGET THEN
-      CYCLE
-    ENDIF
-    IF IAND(FLAGS(I), PFLAG_ACTIVE) = 0 THEN
-      CYCLE
-    ENDIF
-
-    SLOT := OLD_N + NSPAWN + 1
-    IF SLOT > EFF_CAP THEN
-      CYCLE
-    ENDIF
-
-    PH_CHILD := IAND(IAND(ISHFT(FLAGS(I), -PHASE_SHIFT), &
-      PHASE_MASK) + SEAM_STEP_PH, PHASE_MASK)
-    GEN := IAND(ISHFT(PH_CHILD, -10), GEN_MASK) + 1
-
-    PX := POS_X(I) + (RNGF() - 0.5) * 2.0
-    PY := POS_Y(I) + (RNGF() - 0.5) * 0.5
-    PZ := POS_Z(I) + (RNGF() - 0.5) * 2.0
-
-    R_XZ := SQRT(PX * PX + PZ * PZ)
-    V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
-
-    POS_X(SLOT) := PX
-    POS_Y(SLOT) := PY
-    POS_Z(SLOT) := PZ
-    VEL_X(SLOT) := TANGENT(1, GEN) * V_CIRC
-    VEL_Y(SLOT) := TANGENT(2, GEN) * V_CIRC
-    VEL_Z(SLOT) := TANGENT(3, GEN) * V_CIRC
-    OMEGA_NAT(SLOT) := 0.1 * (50.0 / MAX(R_XZ, 1.0)) ** 1.5
-    FLAGS(SLOT) := IOR(IOR(PFLAG_ACTIVE, ISHFT(IAND(GEN - 1, &
-      GEN_MASK), GEN_SHIFT)), ISHFT(PH_CHILD, PHASE_SHIFT))
-    PUMP_SCALE(SLOT) := 1.0
-
-    NSPAWN := NSPAWN + 1
-  ENDDO
-
-  NPART := NPART + NSPAWN
   RETURN
 END
 ! ── DOWNLOAD_WAVEGUIDE: GPU → CPU readback ────────────────
@@ -999,18 +942,26 @@ PRINT NPART
 DO FRAME = 1, DEFAULT_FRAMES
 
   ! ── GPU EXECUTION (every frame) ─────────────────────────
-  ! Forward pipeline: waveguide rebuild → fluid update → spawn
+  ! Forward pipeline: waveguide rebuild → fluid update (+ spawn)
   ! All GPU. No CPU. No downloads.
+
+  ! Set spawn tick: 1 on spawn frames, 0 otherwise
+  IF FRAME > 1 .AND. MOD(FRAME, SPAWN_INTERVAL) = 0 THEN
+    SPAWN_TICK := 1
+    SPAWN_COUNTER(1) := NPART
+  ELSE
+    SPAWN_TICK := 0
+  ENDIF
+
   CALL CLEAR_GRID()
   CALL SCATTER_GRID()
   CALL STENCIL_GRID()
   CALL SIM_PHYSICS_STEP(DEFAULT_DT)
 
-  ! Spawn disabled — needs GPU-side implementation to avoid
-  ! per-frame particle array uploads (3.2MB through staging).
-  ! CPU spawn writes particle arrays, which forces full re-upload
-  ! every frame via the codegen's dirty array tracking.
-  ! TODO: implement spawn as a GPU kernel.
+  ! After physics+spawn, update NPART from spawn counter
+  IF SPAWN_TICK ≠ 0 THEN
+    NPART := SPAWN_COUNTER(1)
+  ENDIF
 
   ! ── CPU OBSERVATION (census intervals only) ─────────────
   ! After frame_end + frame_wait, GPU is idle. Safe to download.

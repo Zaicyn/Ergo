@@ -24,6 +24,13 @@ STATIC INTEGER :: NPART = 0
 STATIC INTEGER :: CAPACITY = 0
 STATIC INTEGER :: RNG_STATE = 42
 
+! ── Spawn control (GPU-side) ──────────────────────────────
+PARAMETER INTEGER :: SPAWN_INTERVAL = 100
+STATIC INTEGER :: SPAWN_TICK = 0
+! SPAWN_COUNTER as 1-element array so the compiler treats
+! increments as scatter writes (→ atomic on GPU)
+STATIC INTEGER :: SPAWN_COUNTER(1)
+
 ! ── Oracle spawn control (written by NET codegen) ─────────
 STATIC INTEGER :: NET_SPAWN_ACTIVE = 0
 STATIC INTEGER :: NET_SPAWN_COUNT = 0
