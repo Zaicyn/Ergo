@@ -62,16 +62,16 @@ DO FRAME = 1, DEFAULT_FRAMES
     NPART := SPAWN_COUNTER(1)
   ENDIF
 
-  ! ── CPU OBSERVATION (census intervals only) ─────────────
-  ! After frame_end + frame_wait, GPU is idle. Safe to download.
-  ! Download the waveguide (128KB grid arrays), NOT particles (96MB).
-  ! Census reads the fresh density, computes stats, sends to oracle.
+  ! ── CPU OBSERVATION (lazy readback at census intervals) ──
+  ! CPU grabs the density grid when it's ready. GPU doesn't wait.
+  ! The grid is always fresh from the last scatter — whatever
+  ! frame that was. The CPU observes, computes stats, reports.
   IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_CENSUS_OVERRIDE > 0 THEN
     CENSUS_INTERVAL := NET_CENSUS_OVERRIDE
   ENDIF
   IF FRAME ≥ NEXT_CENSUS THEN
-    ! Census reads NPART (CPU scalar, no GPU download).
-    ! Grid-level stats will be added with proper census-time downloads.
+    ! Lazy grab: download density grid (128KB) + NPART from GPU
+    CALL DOWNLOAD_WAVEGUIDE()
     CALL SIM_CENSUS_ADAPTIVE(NPART, FRAME, CENSUS_INTERVAL)
     NEXT_CENSUS := FRAME + CENSUS_INTERVAL
   ENDIF
