@@ -1928,12 +1928,9 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
                             float point_size, float val_min, float val_max,
                             float world_scale) {
     if (g.headless) return;
-    fprintf(stderr, "[render] enter n=%d offset=%zu\n", n_points, g.render_offset);
 
     /* Wait for previous frame */
-    fprintf(stderr, "[render] waiting render_fence...\n");
     VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence, VK_TRUE, UINT64_MAX));
-    fprintf(stderr, "[render] fence OK, acquiring image...\n");
     VK_CHECK(vkResetFences(g.device, 1, &g.render_fence));
 
     /* Acquire swapchain image */
@@ -1997,6 +1994,18 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
     VK_CHECK(vkResetCommandBuffer(g.render_cmd_buf, 0));
     VK_CHECK(vkBeginCommandBuffer(g.render_cmd_buf, &begin_info));
+
+    /* Barrier: compute shader writes → vertex shader reads */
+    {
+        VkMemoryBarrier mb = {0};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g.render_cmd_buf,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+            0, 1, &mb, 0, NULL, 0, NULL);
+    }
 
     VkClearValue clears[2];
     clears[0].color = (VkClearColorValue){{0.02f, 0.02f, 0.04f, 1.0f}};

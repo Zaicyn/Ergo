@@ -343,8 +343,12 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
     ENDIF
 
     ! ── 15. OMEGA ACCUMULATION ───────────────────────────
+    ! OMEGA_BASE is always present — the background metabolic rate.
+    ! DRIVE (field coupling) is zero for COAST (RHO already zero).
+    ! The base prevents total omega collapse — particles maintain
+    ! enough energy to orbit. Without it, everything crystallizes.
     DRIVE := RHO * ENV * MET_GATE
-    TARGET := OMEGA_BASE * COUPLING + DRIVE * OMEGA_GAIN
+    TARGET := OMEGA_BASE + DRIVE * OMEGA_GAIN
     OMEGA := OMEGA + (TARGET - OMEGA) * OMEGA_RESPONSE * DT
     INSTABILITY := MAX(OMEGA - 0.4, 0.0)
     OMEGA := OMEGA + INSTABILITY * INSTABILITY * 0.5 * DT
@@ -418,11 +422,6 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
       ENDIF
     ENDIF
   ENDDO
-
-  ! Update NPART from spawn counter
-  IF SPAWN_TICK ≠ 0 THEN
-    NPART := SPAWN_COUNTER(1)
-  ENDIF
 
   RETURN
 END

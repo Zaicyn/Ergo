@@ -833,17 +833,24 @@ class IRCodeGen:
                     self._array_shapes["POS_X"][0])
                 color_arr = particle["color"]
 
-                # Add render arrays to upload set (may already be there)
+                # Add render arrays to upload set ONLY if CPU dirtied them.
+                # Arrays written by GPU kernels are already current on GPU —
+                # do NOT overwrite them with stale CPU data.
                 render_arrays = set(particle["render_arrays"])
-                # Only upload render arrays that the CPU actually dirtied
+                gpu_written: set[str] = set()
+                for bodyitem in node.body:
+                    if isinstance(bodyitem, IRLoop):
+                        k = self._kernel_by_line.get(bodyitem.line)
+                        if k:
+                            gpu_written |= k.arrays_written
                 if frame_dirty:
-                    render_need_upload = render_arrays & frame_dirty
+                    render_need_upload = render_arrays & frame_dirty - gpu_written
                 else:
-                    render_need_upload = render_arrays
+                    render_need_upload = set()  # GPU has current data, no upload
                 upload_set |= render_need_upload
 
                 # Single upload pass — skip arrays already on GPU
-                upload_needed = upload_set - self._gpu_current
+                upload_needed = upload_set - self._gpu_current - gpu_written
                 if upload_needed:
                     self._put("/* Sync CPU state to GPU (render + next frame) */")
                     for arr in sorted(upload_needed):
@@ -860,6 +867,11 @@ class IRCodeGen:
                 self._emit_minmax_scan(color_arr, count)
 
                 ws = particle["world_scale"]
+                # Ensure compute is submitted and complete before render reads
+                if self._batched_frame and not self._frame_ended_early:
+                    self._put("ergo_vk_frame_end();")
+                    self._put("ergo_vk_frame_wait();")
+                    self._frame_ended_early = True
                 if hasattr(self, '_pp_arrays') and self._pp_arrays:
                     self._put(f"ergo_vk_set_render_offset("
                               f"(size_t)_pp_wr_offset * sizeof(float));")

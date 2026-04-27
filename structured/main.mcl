@@ -44,23 +44,10 @@ DO FRAME = 1, DEFAULT_FRAMES
   ! Forward pipeline: waveguide rebuild → fluid update (+ spawn)
   ! All GPU. No CPU. No downloads.
 
-  ! Set spawn tick: 1 on spawn frames, 0 otherwise
-  IF FRAME > 1 .AND. MOD(FRAME, SPAWN_INTERVAL) = 0 THEN
-    SPAWN_TICK := 1
-    SPAWN_COUNTER(1) := NPART
-  ELSE
-    SPAWN_TICK := 0
-  ENDIF
-
   CALL CLEAR_GRID()
   CALL SCATTER_GRID()
   CALL STENCIL_GRID()
   CALL SIM_PHYSICS_STEP(DEFAULT_DT)
-
-  ! After physics+spawn, update NPART from spawn counter
-  IF SPAWN_TICK ≠ 0 THEN
-    NPART := SPAWN_COUNTER(1)
-  ENDIF
 
   ! ── CPU OBSERVATION (lazy readback at census intervals) ──
   ! Wave 2: CPU grabs density grid, computes stats, sends to oracle.
@@ -69,7 +56,9 @@ DO FRAME = 1, DEFAULT_FRAMES
     CENSUS_INTERVAL := NET_CENSUS_OVERRIDE
   ENDIF
   IF FRAME ≥ NEXT_CENSUS THEN
-    CALL DOWNLOAD_WAVEGUIDE()
+    ! Census reads NPART only — grid download causes per-frame
+    ! rubber-banding because codegen inserts unconditional downloads.
+    ! TODO: fix codegen to only download inside conditional blocks.
     CALL SIM_CENSUS_ADAPTIVE(NPART, FRAME, CENSUS_INTERVAL)
     NEXT_CENSUS := FRAME + CENSUS_INTERVAL
   ENDIF
