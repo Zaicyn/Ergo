@@ -1,135 +1,137 @@
-# Ergo Galaxy Simulation — Session Context
+# Next Session: Particle Compaction + Warp-Level Skip
 
-## What This Is
+## Goal
 
-A metabolic galaxy simulation written in Ergo (Fortran-like DSL), compiled to
-SPIRV compute shaders via a Python compiler, running on GPU (RTX 2060).
-29 million particles at 141-144 fps with full Viviani force model.
+Eliminate wasted GPU compute for dead/crystallized particles by compacting
+the alive particles to the front of the array. This reduces dispatch size
+and creates uniform crystal-only warps at the tail that skip entirely.
 
-The simulation models a galaxy as a metabolic system where particles traverse
-a 32-segment lifecycle ring. The ring determines mode (COAST/ACTIVE/FLOW),
-coupling to the density field, and spawn behavior. Two rotations (4pi) to
-return to origin — spinor topology.
+## The Problem
 
-## Architecture: Forward Pipeline with Causal Ordering
+At 30M particles after many frames:
+- Low indices: crystallized (frozen, FLAGS has PFLAG_CRYSTAL)
+- Mid indices: mixed alive/dead, mixed COAST/ACTIVE/FLOW
+- High indices: fresh spawns (ACTIVE)
+
+The physics kernel dispatches `(NPART + 255) / 256` workgroups. NPART
+includes dead particles. Dead particles hit the CYCLE at line 193 and
+exit, but the warp still launched and the thread still occupied a slot.
+
+With COAST particles (31%), the unified kernel computes field coupling
+multiplied by zero — 4% wasted compute. With dead particles, the CYCLE
+is free but the dispatch size is inflated.
+
+## The Fix: Periodic Compaction
+
+Every N frames (e.g., every 1000 or at census intervals):
+
+1. **Count alive** — parallel reduction over FLAGS, count non-crystal/non-ejected
+2. **Prefix scan** — compute destination index for each alive particle
+3. **Scatter** — move alive particles to compact indices [0..alive_count)
+4. **Update NPART** — set to alive_count
+
+After compaction:
+- Dispatch size = alive_count (no dead particle warps)
+- First warps = oldest alive particles (likely COAST → will crystallize soon)
+- Last warps = freshest spawns (ACTIVE)
+- Crystal warps eliminated entirely
+
+## Compaction Algorithm (GPU parallel)
 
 ```
-CLEAR → SCATTER → STENCIL (+ blend) → PHYSICS
-         ↓           ↓                    ↓
-    write field   blend global +       read field
-    + phase       transform to         update
-    + generation  gradients            particles
-                  + met_gate
+// Step 1: Per-thread alive flag
+alive[i] = (FLAGS[i] & (CRYSTAL | EJECTED)) == 0 ? 1 : 0
+
+// Step 2: Exclusive prefix scan on alive[]
+// dest[i] = sum(alive[0..i-1])
+// This gives the destination index for each alive particle.
+
+// Step 3: If alive, scatter to dest[i]
+if (alive[i]) {
+    POS_X[dest[i]] = POS_X[i]
+    // ... all particle arrays
+    FLAGS[dest[i]] = FLAGS[i]
+}
+
+// Step 4: NPART = total alive count (last element of scan + last alive flag)
 ```
 
-**Ping-pong buffers**: Read-write particle arrays are doubled. Physics reads
-from offset `PP_RD`, writes to offset `PP_WR`. Offsets swap each frame.
+The prefix scan is the hard part — it's a well-known GPU algorithm
+(Blelloch scan, work-efficient). Ergo's SPIRV backend doesn't generate
+scans yet, but the allocator in other versions of the codebase has one.
 
-**Field blending**: STENCIL blends local density with oracle's global consensus
-before computing gradients: `density + FIELD_BLEND * (global - density)`.
-FIELD_BLEND = 0.15 default. One fma per cell, runs in SPIRV.
+## Implementation Options
 
-**3 dispatches per frame** in a single command buffer (batched frame dispatch).
+### Option A: Separate compaction kernel (cleanest)
+- New subroutine `SIM_COMPACT()` with its own extracted GPU kernel
+- Called from main loop at census intervals
+- Needs: prefix scan array, temporary buffers for scatter
+- The allocator (sq2core or similar) may already have this
 
-### Network Oracle (implemented, tested)
+### Option B: Compact during scatter (piggyback)
+- Scatter already iterates all particles
+- During scatter, also compute alive flag + write to compact indices
+- Combines compaction with the density pass
+- Harder to implement but zero extra dispatches
+
+### Option C: Lazy compaction (simplest)
+- Don't scatter — just swap dead particles to the end
+- Each frame, if particle I is dead and I < NPART, swap with NPART-1
+  and decrement NPART
+- Sequential, but only processes a few particles per frame
+- Works on CPU, not GPU-friendly
+
+## What Exists
+
+The user mentions a compaction implementation exists in another version
+of the allocator. Check:
+- `allocator/sq2core.f` — the Squaragon V2 allocator
+- Other repos the user has access to
+- The pattern is: prefix scan → scatter → update count
+
+## Current Architecture (for context)
 
 ```
-                    ┌──────────────┐
-                    │   Oracle     │  (Pi / any CPU)
-                    │  trust mgr  │
-                    │  field sum   │
-                    │  regime cls  │
-                    └──────┬───────┘
-                      UDP │ 128KB field + 96B census
-                   mcast  │ 128KB global field back
-         ┌────────────────┼────────────────┐
-         │                │                │
-    ┌────▼────┐     ┌────▼────┐     ┌────▼────┐
-    │  GPU 0  │     │  GPU 1  │     │  GPU 2  │
-    │ scatter │     │ scatter │     │ scatter │
-    │ blend   │     │ blend   │     │ blend   │
-    │ stencil │     │ stencil │     │ stencil │
-    │ physics │     │ physics │     │ physics │
-    └─────────┘     └─────────┘     └─────────┘
-
-    Autonomous between census intervals.
-    Oracle provides consensus field + spawn control.
-    Trust-weighted: bad clients dampened in consensus.
+structured/
+  constants.mcl       — Layer 1: LUTs, parameters
+  fluid_state.mcl     — Layer 3: particle arrays, spawn control
+  waveguide_state.mcl — Layer 2: grid arrays, census state
+  fluid_subs.mcl      — Physics + spawn (unified kernel)
+  waveguide_subs.mcl  — Clear, scatter, stencil
+  census.mcl          — CPU observation (NPART only currently)
+  main.mcl            — Pipeline: CLEAR → SCATTER → STENCIL → PHYSICS
+  build.sh            — Assembles → galaxy_structured.mcl
 ```
 
-Scatter-sum-broadcast: each GPU sends 128KB density grid, oracle sums
-(trust-weighted), broadcasts global field via multicast. Each GPU blends
-global into local before stencil. Particle count invisible to oracle.
-
-### Performance at 29M (RTX 2060, f32)
+Pipeline per frame (zero CPU↔GPU transfers):
 ```
-SCATTER:  1.16 ms  (17%)
-STENCIL:  0.005 ms (0.1%) — includes blend, still negligible
-PHYSICS:  5.8 ms   (83%)    ← bandwidth-bound at 77% of 336 GB/s peak
-TOTAL:    ~7.0 ms  (141-144 fps)
-NET:      ~0 ms    (one census every 50-2000 frames, off critical path)
+GPU: CLEAR → SCATTER → STENCIL → PHYSICS+SPAWN
+CPU: observes at census intervals only (768KB grid download)
 ```
 
-## Key Files
+Performance: 134 fps at 30M, 138 fps at 29M (RTX 2060, f32)
+Known inefficiency: COAST (31%) computes field coupling × zero = 4% waste
 
-### Simulation
-- `galaxy/galaxy_full.mcl` — the simulation (forward pipeline, packed phase, blend)
-- `galaxy/galaxy_bench.mcl` — stripped benchmark version (no spawn/census/oracle)
+## Build
 
-### Compiler
-- `mcl/ir_codegen.py` — C codegen: NET, field send/recv, PP-aware sync, blend
-- `mcl/backends/spirv.py` — SPIRV: f32 types, right-shift, PP offset injection
-- `mcl/parser.py` — NET "host:port" GPU n syntax
-- `mcl/ast_nodes.py` — net_gpu_id field
-- `mcl/ir_builder.py` — net_gpu_id propagation
-
-### Runtime
-- `mcl/runtime/vk_host.c` — Vulkan: xfer_cmd_buf, download_at/upload_at
-- `mcl/runtime/ergo_vk.h` — API declarations
-- `mcl/runtime/ergo_net.h` — UDP transport + field chunks + multicast
-
-### Oracle
-- `tools/ergo_oracle.c` — multi-client, trust-weighted consensus, field exchange
-
-### Archive
-- `archive/2026-04-26/` — pre-network snapshot
-- `archive/2026-04-26-net/` — network oracle + field exchange milestone
-
-### Build
 ```bash
-# Oracle
-cc -O2 -o ergo_oracle tools/ergo_oracle.c -lm
-
-# GPU simulation
-python -m mcl --target spirv --precision f32 --no-split -o galaxy_gpu galaxy/galaxy_full.mcl
+./structured/build.sh
+python -m mcl --target spirv --precision f32 --no-split -o galaxy_gpu galaxy_structured.mcl
+python -m mcl --target spirv --precision f32 --no-split --render -o galaxy_render galaxy_structured.mcl
 ERGO_PROFILE=1 ./galaxy_gpu
-
-# CPU test (loopback)
-python -m mcl -o galaxy_cpu galaxy/galaxy_full.mcl
-./ergo_oracle 4250 &
-./galaxy_cpu
 ```
 
+Render requires stripping VERIFY/NET line for no-oracle mode:
+```bash
+sed '/VERIFY/,/4250/d' galaxy_structured.mcl > /tmp/render.mcl
+python -m mcl --target spirv --precision f32 --no-split --render -N 1000000 -M 1000000 -o galaxy_render /tmp/render.mcl
+```
 
-## Where To Go Next
+## Key Decisions from This Session
 
-### Phase 2: Tune for Cascade (Regime II)
-
-Current omega ≈ 0.09 (PLATEAU). Need to reach ω > 0.4 for nova events.
-Now with field blending, coherent structures couple across GPUs.
-
-Parameters to tune:
-- `OMEGA_GAIN = 2.0` → try 4.0 (density coupling strength)
-- `OMEGA_RESPONSE = 0.5` → try 0.8 (tracking speed)
-- `DENSITY_FORCE_SCALE = 0.01` → try 0.03 (pressure gradient strength)
-- `FIELD_BLEND = 0.15` → regime-adaptive (high in COLD, low in WARMING)
-
-### GPU hardware validation
-- Run with ERGO_PROFILE=1, confirm pipeline timings hold with NET active
-- Field recv/blend happens between frames, should not affect dispatch timing
-- Test ping-pong correctness with structured initial conditions
-
-### Multi-rate operator splitting
-Field (scatter+stencil) doesn't need to update every frame at steady state.
-Run scatter every N frames, physics every frame. FIELD_BLEND provides
-inter-frame correction from oracle consensus.
+- Unified physics kernel: one path, COUPLING multiplier, no mode branching
+- OMEGA_BASE always present (not gated by COUPLING) — prevents total collapse
+- Spawn is continuous rate-based (SPAWN_RATE=0.01), not discrete ticks
+- CPU never writes particle arrays after init — GPU is sole owner
+- Render: f32 vertex shader, compute→vertex barrier, frame_end before render
+- No per-frame uploads or downloads in frame loop
