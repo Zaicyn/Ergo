@@ -1505,7 +1505,11 @@ class IRCodeGen:
         sk = sp.scan_kernel_id
         sck = sp.scatter_kernel_id
 
-        self._put(f"/* ── SORT_BY_GEN: histogram → scan → scatter → swap ── */")
+        # Submit the frame's regular work first so the render pipeline
+        # doesn't stall behind the sort. ergo_vk_frame_drain submits
+        # without waiting and re-opens the command buffer.
+        self._put(f"/* ── SORT_BY_GEN: submit frame, then sort in fresh cmd buf ── */")
+        self._put(f"ergo_vk_frame_drain();")
         self._put(f"{{")
         self.indent += 1
 
@@ -1528,7 +1532,7 @@ class IRCodeGen:
         self._put(f"ergo_vk_frame_dispatch(pipe_{sk}, 1);")
         self._put(f"ergo_vk_frame_barrier();")
 
-        # Step 5: Dispatch scatter kernel
+        # Step 4: Dispatch scatter kernel
         self._put(f"/* SCATTER_GEN: scatter particles to sorted positions */")
         self._put(f"ergo_vk_bind_buffer(pipe_{sck}, 0, d_FLAGS);")
         self._put(f"ergo_vk_bind_buffer(pipe_{sck}, 1, d_sort_offsets);")
@@ -1545,10 +1549,14 @@ class IRCodeGen:
         self._put(f"  ergo_vk_push_constants(pipe_{sck}, &_pc, sizeof(_pc)); }}")
         self._put(f"ergo_vk_frame_dispatch(pipe_{sck}, (NPART + 255) / 256);")
 
-        # Step 6: Pointer swap — sorted buffers become the active buffers
+        # Pointer swap: CPU-side only. Queue ordering guarantees the
+        # scatter completes before any subsequent dispatches read the
+        # swapped buffers. Next frame's bind_buffer picks up new handles.
         self._put(f"/* Pointer swap: sorted → active */")
         for arr in arrays:
             self._put(f"{{ ErgoVkBuf _tmp = d_{arr}; d_{arr} = d_sort_{arr}; d_sort_{arr} = _tmp; }}")
+        # Force render descriptor set rebind — buffer handles changed
+        self._put(f"{{ extern int pts_ds_bound; pts_ds_bound = 0; }}")
 
         self.indent -= 1
         self._put(f"}}")

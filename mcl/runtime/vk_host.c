@@ -40,7 +40,7 @@
 
 #define ERGO_VK_MAX_BUFFERS   64
 #define ERGO_VK_MAX_PIPELINES 16
-#define ERGO_VK_MAX_BINDINGS  16
+#define ERGO_VK_MAX_BINDINGS  32
 #define ERGO_VK_MAX_SWAPCHAIN 4
 
 /* ── Internal state ──────────────────────────────────────── */
@@ -81,6 +81,8 @@ static struct {
     VkCommandBuffer          cmd_bufs[2];
     VkFence                  fences[2];
     int                      cmd_idx;       /* 0 or 1, flips each frame */
+    /* Dedicated sort command buffer (avoids resetting in-flight bufs) */
+    VkCommandBuffer          sort_cmd_buf;
     VkPhysicalDeviceMemoryProperties mem_props;
 
     /* Resources */
@@ -219,6 +221,7 @@ static void submit_and_wait(void) {
 /* Transfer submit — uses xfer_cmd_buf + xfer_fence.
  * Safe to call while cmd_buf is recording (mid-frame). */
 static int g_frame_waited = 0;  /* 1 = fence already waited since last frame_end */
+int pts_ds_bound = 0;           /* 1 = render descriptor set bound; reset on sort swap */
 
 static void xfer_submit_and_wait(void) {
     VkSubmitInfo si = {0};
@@ -576,6 +579,9 @@ int ergo_vk_init(int headless) {
     /* --- Transfer command buffer (for mid-frame downloads) --- */
     alloc_info.commandBufferCount = 1;
     VK_CHECK(vkAllocateCommandBuffers(g.device, &alloc_info, &g.xfer_cmd_buf));
+
+    /* --- Sort command buffer (separate from frame double-buffer) --- */
+    VK_CHECK(vkAllocateCommandBuffers(g.device, &alloc_info, &g.sort_cmd_buf));
 
     /* --- Fences (signaled so first frame_begin proceeds without wait) --- */
     VkFenceCreateInfo fence_ci = {0};
@@ -1210,6 +1216,27 @@ void ergo_vk_frame_wait(void) {
     }
     VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
     g_frame_waited = 1;
+}
+
+void ergo_vk_frame_drain(void) {
+    /* Submit current frame command buffer WITHOUT waiting, then switch
+     * to the dedicated sort command buffer for subsequent dispatches.
+     * GPU ordering is guaranteed within the same queue.
+     * frame_end will submit the sort cmd buf with the frame fence. */
+    if (!g.device) return;
+    VK_CHECK(vkEndCommandBuffer(g.cmd_buf));
+    VkSubmitInfo si = {0};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g.cmd_buf;
+    VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, VK_NULL_HANDLE));
+    /* Switch to sort command buffer — frame cmd buf stays pending */
+    g.cmd_buf = g.sort_cmd_buf;
+    VkCommandBufferBeginInfo begin = {0};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkResetCommandBuffer(g.cmd_buf, 0));
+    VK_CHECK(vkBeginCommandBuffer(g.cmd_buf, &begin));
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -1976,8 +2003,7 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
                                           &img_idx);
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
 
-    /* Bind 4 SoA buffers once — no pack, no copy, just reindex */
-    static int pts_ds_bound = 0;
+    /* Bind 4 SoA buffers — rebind after sort pointer swaps */
     if (!pts_ds_bound) {
         ErgoVkBuf bufs_arr[4] = { buf_x, buf_y, buf_z, buf_color };
         VkDescriptorBufferInfo buf_infos[4];

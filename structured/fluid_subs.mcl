@@ -355,11 +355,29 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
       OMEGA := 0.0
     ENDIF
 
-    ! ── 15.5. RING COUPLING — disabled until SORT_BY_GEN works
-    ! Without sort, shuffle exchanges with random warp neighbors,
-    ! not ring neighbors. This pumps OMEGA uniformly → yellow sponge.
-    ! Re-enable after sort atomic memory semantics are fixed.
-    ! (VUID-StandaloneSpirv-MemorySemantics-10871 in sort kernels)
+    ! ── 15.5. RING COUPLING (topological, not spatial) ────
+    ! Phase lock: restoring toward reference Viviani spacing.
+    ! PH_ERR is signed wrap-around: values > half-range are negative.
+    PH_NEXT := RING_NEXT(PH)
+    PH_DIFF := IAND(PH_NEXT - PH + PHASE_MASK + 1, PHASE_MASK)
+    PH_ERR := PH_DIFF - SEAM_STEP_PH
+    ! Signed wrap: if error > half phase range, subtract full range
+    IF PH_ERR > 16383 THEN
+      PH_ERR := PH_ERR - 32768
+    ENDIF
+    IF PH_ERR < -16383 THEN
+      PH_ERR := PH_ERR + 32768
+    ENDIF
+    ! Normalize to [-1, 1] and apply as gentle OMEGA correction
+    OMEGA := OMEGA - REAL(PH_ERR) * (1.0 / 16384.0) * K_PHASE_LOCK * DT
+
+    ! Re-clamp after phase lock
+    IF OMEGA > OMEGA_MAX THEN
+      OMEGA := OMEGA_MAX
+    ENDIF
+    IF OMEGA < 0.0 THEN
+      OMEGA := 0.0
+    ENDIF
 
     ! ── 16. POSITION ACCUMULATION ────────────────────────
     POS_X(I) := PX + VX * DT

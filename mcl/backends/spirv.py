@@ -201,7 +201,7 @@ class SPIRVBackend(KernelBackend):
      %c2     = OpConstant %i32 2
      %cu0    = OpConstant %u32 0
      %scope_dev = OpConstant %u32 1
-     %mem_none  = OpConstant %u32 0
+     %mem_sem   = OpConstant %u32 72
 
      %v_flags = OpVariable %p_sb_flags StorageBuffer
      %v_hist  = OpVariable %p_sb_hist StorageBuffer
@@ -234,7 +234,7 @@ class SPIRVBackend(KernelBackend):
          %gen = OpBitwiseAnd %i32 %shifted %gen_mask
                ; atomicAdd(histogram[gen], 1)
          %hist_p = OpAccessChain %p_sb_i32 %v_hist %c0 %gen
-         %_old = OpAtomicIAdd %i32 %hist_p %scope_dev %mem_none %c1
+         %_old = OpAtomicIAdd %i32 %hist_p %scope_dev %mem_sem %c1
                OpBranch %done
      %done   = OpLabel
                OpReturn
@@ -294,7 +294,7 @@ class SPIRVBackend(KernelBackend):
      %c16u   = OpConstant %u32 16
      %cu0    = OpConstant %u32 0
      %scope_wg = OpConstant %u32 2
-     %mem_wg = OpConstant %u32 256
+     %mem_wg = OpConstant %u32 264
 
      %v_hist = OpVariable %p_sb_hist StorageBuffer
      %v_off  = OpVariable %p_sb_off StorageBuffer
@@ -538,7 +538,7 @@ class SPIRVBackend(KernelBackend):
         lines.append(f"     %c2     = OpConstant %i32 2")
         lines.append(f"     %cu0    = OpConstant %u32 0")
         lines.append(f"     %scope_dev = OpConstant %u32 1")
-        lines.append(f"     %mem_none  = OpConstant %u32 0")
+        lines.append(f"     %mem_sem   = OpConstant %u32 72")
         lines.append(f"")
 
         # Variables
@@ -575,7 +575,7 @@ class SPIRVBackend(KernelBackend):
         lines.append(f"         %gen = OpBitwiseAnd %i32 %shifted %gen_mask")
         # atomicAdd(offsets[gen], 1) → dest index
         lines.append(f"         %off_p = OpAccessChain %p_sb_i32 %v_off %c0 %gen")
-        lines.append(f"         %dest = OpAtomicIAdd %i32 %off_p %scope_dev %mem_none %c1")
+        lines.append(f"         %dest = OpAtomicIAdd %i32 %off_p %scope_dev %mem_sem %c1")
         # Copy each array: dst[dest] = src[idx]
         for name in arrays:
             is_int = arr_types[name] == 'int'

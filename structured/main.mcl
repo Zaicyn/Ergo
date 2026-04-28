@@ -64,9 +64,14 @@ DO FRAME = 1, DEFAULT_FRAMES
     ! rubber-banding because codegen inserts unconditional downloads.
     ! TODO: fix codegen to only download inside conditional blocks.
     CALL SIM_CENSUS_ADAPTIVE(NPART, FRAME, CENSUS_INTERVAL)
-    ! Sort particles by GEN so warps align with ring topology
-    SORT_BY_GEN FLAGS, POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT
     NEXT_CENSUS := FRAME + CENSUS_INTERVAL
+  ENDIF
+
+  ! Sort by GEN every 5000 frames — GEN changes slowly (phase wraps
+  ! over ~1000 frames), so infrequent sort keeps warps aligned with
+  ! ring topology without per-census GPU stalls.
+  IF MOD(FRAME, 5000) = 0 THEN
+    SORT_BY_GEN FLAGS, POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT
   ENDIF
 
   IF FRAME > 1 .AND. MOD(FRAME, 1000) = 0 THEN

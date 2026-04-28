@@ -172,6 +172,11 @@ void ergo_vk_frame_end(void);
  * Safe to call multiple times — returns immediately if already waited. */
 void ergo_vk_frame_wait(void);
 
+/* Submit current command buffer, wait for ALL GPU work to finish, then
+ * re-open a fresh command buffer. Used before pointer swaps that change
+ * which VkBuffer is bound to a descriptor set. */
+void ergo_vk_frame_drain(void);
+
 /* Print GPU timestamp profile report (if ERGO_PROFILE env var is set). */
 void ergo_vk_profile_report(void);
 
