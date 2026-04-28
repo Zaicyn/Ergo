@@ -376,6 +376,11 @@ DO I = 1, N
 ENDDO
 ```
 
+MCL supports two loop forms: counted (`DO I = A, B`) and conditional
+(`DO WHILE condition`). Both support `CYCLE` (continue) and `EXIT` (break).
+DO WHILE conditions must be boolean — no truthy integers.
+Use `ELSEIF` (one word), not `ELSE IF`.
+
 This rule exists because array expressions create an impossible choice:
 1. **Fuse** the operations (no temporary) — changes semantics if arrays alias
 2. **Create temporaries** — violates the no-hidden-allocation rule

@@ -46,6 +46,51 @@ Array inspection:   SIZE, SHAPE, RANK
 EVERY intrinsic has explicit memory contract. No exceptions.
 
 ================================================================================
+CONTROL FLOW
+================================================================================
+
+Counted loop:       DO I = 1, N
+                      body
+                    ENDDO
+
+Conditional loop:   DO WHILE condition
+                      body
+                    ENDDO
+
+Branching:          IF condition THEN
+                      body
+                    ELSEIF condition THEN
+                      body
+                    ELSE
+                      body
+                    ENDIF
+
+Loop control:       CYCLE              ! skip to next iteration (continue)
+                    EXIT               ! break out of loop (break)
+
+Subroutines:        SUBROUTINE NAME(args)
+                      body
+                      RETURN
+                    END
+
+Functions:          REAL FUNCTION NAME(args)
+                      NAME := value
+                      RETURN NAME
+                    END
+
+Directives:         VERIFY array_list ORACLE n EVERY m TOL t NET "addr"
+                    SORT_BY_GEN array_list
+
+Ring intrinsics:    RING_PREV(x)       ! warp shuffle: value from GEN-1 neighbor
+                    RING_NEXT(x)       ! warp shuffle: value from GEN+1 neighbor
+                    RING_SHIFT(x, d)   ! warp shuffle: value from lane+d neighbor
+
+Loop family is complete. DO I=A,B for counted, DO WHILE for conditional.
+CYCLE and EXIT work in both loop types. No iterators, generators, or closures.
+
+NOTE: Use ELSEIF (one word), NOT "ELSE IF" (two words).
+
+================================================================================
 TYPE SYSTEM
 ================================================================================
 
