@@ -25,6 +25,41 @@ WARNING and PERF diagnostics may evolve between compiler versions.
 Separation matters — ERROR is provable, WARNING is heuristic, PERF is
 advisory. Users can suppress WARNING and PERF independently.
 
+## Extension Diagnostic Profiles
+
+The extension supports diagnostic modes to prevent visual overload.
+Users select a profile; only diagnostics in that profile are shown.
+
+| Profile       | Shows                              | Use case                    |
+|---------------|------------------------------------|-----------------------------|
+| **Clean**     | Errors only                        | "Just let me code"          |
+| **Performance** | Errors + GPU/PERF hints          | Optimizing hot paths        |
+| **Systems**   | Errors + memory/cache/bandwidth    | Capacity planning           |
+| **Proof**     | Errors + extraction reasoning      | Understanding why loops extract or don't |
+| **Pedantic**  | Everything                         | Full analysis, review mode  |
+
+Default: **Performance** (errors + GPU hints). Most useful for daily work.
+
+Profiles are an extension-side filter, not a compiler feature. The LSP
+server always emits all diagnostics; the extension client filters by
+the active profile. Switching profiles is instant (no recompilation).
+
+## Intrinsic Contracts
+
+Intrinsic documentation in hover is a semantic contract:
+
+| Property              | Example                       |
+|-----------------------|-------------------------------|
+| Pure                  | yes — no side effects         |
+| Deterministic         | yes — same input = same output|
+| Branchless lowering   | yes (CLAMP, MIN, MAX)         |
+| GPU-safe              | yes — no stack, no alloc      |
+| Vectorizable          | yes — no cross-lane deps      |
+| NaN-safe              | no under --fast-math          |
+
+If codegen changes the lowering (e.g., CLAMP emits branches), users
+would consider it a regression. These properties are contractual.
+
 ## Suppression Syntax
 
 ```
