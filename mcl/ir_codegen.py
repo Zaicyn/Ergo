@@ -50,11 +50,12 @@ C_MATH = {
 
 class IRCodeGen:
     def __init__(self, module: IRModule, gpu_plan: GPUPlan | None = None,
-                 backend=None, render: bool = False):
+                 backend=None, render: bool = False, jit_mode: bool = False):
         self.module = module
         self.gpu_plan = gpu_plan
         self.backend = backend
         self.render = render
+        self.jit_mode = jit_mode
         self._in_frame_loop = False
         self._batched_frame = False  # True inside batched frame dispatch loop
         self._frame_ended_early = False  # True when frame_end emitted before CPU suffix
@@ -194,6 +195,10 @@ class IRCodeGen:
         for fn in mod.functions:
             self._emit_function(fn)
             self._put_raw("")
+
+        # JIT mode: no main(), just export functions + statics
+        if self.jit_mode:
+            return "\n".join(self.lines) + "\n"
 
         # Emit main
         self._put("int main(int argc, char *argv[]) {")
