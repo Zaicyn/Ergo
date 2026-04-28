@@ -9,8 +9,8 @@
 ! On CPU-only mode, this is a no-op (arrays are already in sync).
 
 SUBROUTINE DOWNLOAD_WAVEGUIDE()
-  ! Forces GPU → CPU sync of waveguide grid arrays.
-  ! Total: ~768KB (6 arrays × 32³ × 4 bytes).
+  ! Forces GPU → CPU sync of waveguide + stone layer grids.
+  ! Total: ~1 MB (8 arrays × 32³ × 4 bytes).
   ! Touch each grid array to trigger codegen download.
   REAL :: DW
   DW := REAL(GRID_DENSITY(1, 1, 1))
@@ -19,6 +19,9 @@ SUBROUTINE DOWNLOAD_WAVEGUIDE()
   DW := GRID_GRAD_Z(1, 1, 1)
   DW := GRID_MET_GATE(1, 1, 1)
   DW := REAL(BIN_PRESENCE(1, 1, 1))
+  ! Stone layer: crystal count + material state
+  DW := REAL(GRID_CRYSTAL(1, 1, 1))
+  DW := REAL(GRID_MATERIAL(1, 1, 1))
   RETURN
 END
 
