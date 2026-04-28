@@ -1925,7 +1925,7 @@ void ergo_vk_render_frame(ErgoVkBuf buf, int width, int height,
     VK_CHECK(vkBeginCommandBuffer(g.render_cmd_buf, &begin_info));
 
     VkClearValue clears[2];
-    clears[0].color = (VkClearColorValue){{0.05f, 0.05f, 0.08f, 1.0f}};
+    clears[0].color = (VkClearColorValue){{0.0f, 0.0f, 0.0f, 1.0f}};
     clears[1].depthStencil = (VkClearDepthStencilValue){1.0f, 0};
 
     VkRenderPassBeginInfo rp_begin = {0};
@@ -2073,7 +2073,7 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     }
 
     VkClearValue clears[2];
-    clears[0].color = (VkClearColorValue){{0.02f, 0.02f, 0.04f, 1.0f}};
+    clears[0].color = (VkClearColorValue){{0.0f, 0.0f, 0.0f, 1.0f}};
     clears[1].depthStencil = (VkClearDepthStencilValue){1.0f, 0};
 
     VkRenderPassBeginInfo rp_begin = {0};

@@ -74,6 +74,13 @@ class DoLoop:
 
 
 @dataclass
+class DoWhileStmt:
+    condition: Any
+    body: list
+    line: int = 0
+
+
+@dataclass
 class PrintStmt:
     value: Any
     line: int = 0

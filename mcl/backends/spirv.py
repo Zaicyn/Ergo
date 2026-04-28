@@ -841,7 +841,7 @@ class _EmitContext:
                         self._needs_glsl_ext = True
                     if inst.op == Op.LOG10:
                         self._needs_glsl_ext = True
-                    if inst.op in (Op.RING_PREV, Op.RING_NEXT):
+                    if inst.op in (Op.RING_PREV, Op.RING_NEXT, Op.RING_SHIFT, Op.RING_BROADCAST):
                         self._needs_subgroup = True
                     if self._needs_glsl_ext and self._needs_subgroup:
                         return
@@ -1942,6 +1942,76 @@ class _EmitContext:
                 f"         {self._id(result)} = OpGroupNonUniformShuffle "
                 f"{self._id(result_type)} {self._id(scope)} "
                 f"{self._id(a)} {self._id(source_idx)}")
+            self._set_ssa_type(result, result_type)
+            if inst.result:
+                ssa_map[inst.result] = result
+            return False
+
+        # RING_SHIFT(val, delta) — subgroup shuffle with variable offset
+        # source = (lane + delta) & 31
+        if op == Op.RING_SHIFT:
+            a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
+            delta = self._resolve(inst.args[1], pc_member_ids, ssa_map)
+            is_fp = self._is_real_id(a)
+            result_type = self.id_real if is_fp else self.id_i32
+
+            lane = self._alloc()
+            self._function.append(
+                f"         {self._id(lane)} = OpLoad {self._id(self.id_u32)} "
+                f"{self._id(self.id_gl_subgroup_inv)}")
+            self._set_ssa_type(lane, self.id_u32)
+
+            # delta may be signed i32 — bitcast to u32 for add
+            delta_u = self._alloc()
+            self._function.append(
+                f"         {self._id(delta_u)} = OpBitcast {self._id(self.id_u32)} "
+                f"{self._id(delta)}")
+            self._set_ssa_type(delta_u, self.id_u32)
+
+            added = self._alloc()
+            self._function.append(
+                f"         {self._id(added)} = OpIAdd {self._id(self.id_u32)} "
+                f"{self._id(lane)} {self._id(delta_u)}")
+            self._set_ssa_type(added, self.id_u32)
+
+            const_31 = self._get_u32_const(31)
+            source_idx = self._alloc()
+            self._function.append(
+                f"         {self._id(source_idx)} = OpBitwiseAnd {self._id(self.id_u32)} "
+                f"{self._id(added)} {self._id(const_31)}")
+            self._set_ssa_type(source_idx, self.id_u32)
+
+            scope = self._get_u32_const(3)
+            result = self._alloc()
+            self._function.append(
+                f"         {self._id(result)} = OpGroupNonUniformShuffle "
+                f"{self._id(result_type)} {self._id(scope)} "
+                f"{self._id(a)} {self._id(source_idx)}")
+            self._set_ssa_type(result, result_type)
+            if inst.result:
+                ssa_map[inst.result] = result
+            return False
+
+        # RING_BROADCAST(val, source_lane) — broadcast one lane to all
+        if op == Op.RING_BROADCAST:
+            a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
+            src_lane = self._resolve(inst.args[1], pc_member_ids, ssa_map)
+            is_fp = self._is_real_id(a)
+            result_type = self.id_real if is_fp else self.id_i32
+
+            # source lane must be u32
+            src_u = self._alloc()
+            self._function.append(
+                f"         {self._id(src_u)} = OpBitcast {self._id(self.id_u32)} "
+                f"{self._id(src_lane)}")
+            self._set_ssa_type(src_u, self.id_u32)
+
+            scope = self._get_u32_const(3)
+            result = self._alloc()
+            self._function.append(
+                f"         {self._id(result)} = OpGroupNonUniformShuffle "
+                f"{self._id(result_type)} {self._id(scope)} "
+                f"{self._id(a)} {self._id(src_u)}")
             self._set_ssa_type(result, result_type)
             if inst.result:
                 ssa_map[inst.result] = result

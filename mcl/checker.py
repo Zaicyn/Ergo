@@ -294,6 +294,12 @@ class Checker:
             self._check_if(node)
         elif isinstance(node, ast.DoLoop):
             self._check_do(node)
+        elif isinstance(node, ast.DoWhileStmt):
+            self._infer_type(node.condition)
+            self._in_loop += 1
+            for s in node.body:
+                self._check_stmt(s)
+            self._in_loop -= 1
         elif isinstance(node, ast.SelectCaseStmt):
             self._check_select(node)
         elif isinstance(node, ast.PrintStmt):

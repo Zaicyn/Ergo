@@ -439,9 +439,24 @@ class Parser:
         self._eat_newline()
         return ast.SelectCaseStmt(expr, cases, line=line)
 
-    def _parse_do(self) -> ast.DoLoop:
+    def _parse_do(self):
         line = self._cur().line
         self._eat(TT.KW_DO)
+
+        # DO WHILE condition
+        if self._at(TT.KW_WHILE):
+            self._eat(TT.KW_WHILE)
+            condition = self._parse_expression()
+            self._eat_newline()
+            self._skip_newlines()
+            body = []
+            while not self._at(TT.KW_ENDDO, TT.EOF):
+                body.append(self._parse_statement())
+                self._skip_newlines()
+            self._eat(TT.KW_ENDDO)
+            self._eat_newline()
+            return ast.DoWhileStmt(condition, body, line=line)
+
         var = self._eat(TT.IDENT).value
         self._eat(TT.EQ)
         start = self._parse_expression()

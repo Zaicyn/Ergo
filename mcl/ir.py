@@ -182,6 +182,8 @@ class Op(Enum):
     # Warp ring shuffle (subgroup operations)
     RING_PREV = "ring_prev"   # value from lane-1 neighbor (wraps)
     RING_NEXT = "ring_next"   # value from lane+1 neighbor (wraps)
+    RING_SHIFT = "ring_shift"       # value from lane+delta neighbor (wraps)
+    RING_BROADCAST = "ring_broadcast"  # broadcast one lane's value to all
 
     # Array operations
     LOAD = "load"           # load from array: result = array[indices]
@@ -283,8 +285,17 @@ class IRSelect:
     line: int = 0
 
 
+@dataclass
+class IRWhileLoop:
+    """Structured DO WHILE loop — condition-controlled iteration."""
+    condition: Operand
+    cond_block: 'IRBlock'  # block that computes the condition
+    body: list  # list of IRBlock | IRIf | IRLoop | IRSelect | IRWhileLoop
+    line: int = 0
+
+
 # A structured IR item is one of these:
-IRItem = IRBlock | IRIf | IRLoop | IRSelect
+IRItem = IRBlock | IRIf | IRLoop | IRSelect | IRWhileLoop
 
 
 # ── Function ────────────────────────────────────────────────
@@ -376,6 +387,9 @@ def _dump_body(items: list, lines: list[str], indent: int):
         elif isinstance(item, IRLoop):
             lines.append(
                 f"{pad}DO {item.var} = {item.start}, {item.end}, {item.step}:")
+            _dump_body(item.body, lines, indent + 1)
+        elif isinstance(item, IRWhileLoop):
+            lines.append(f"{pad}DO WHILE {item.condition}:")
             _dump_body(item.body, lines, indent + 1)
         elif isinstance(item, IRSelect):
             lines.append(f"{pad}SELECT {item.expr}:")

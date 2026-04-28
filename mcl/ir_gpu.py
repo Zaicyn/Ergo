@@ -44,7 +44,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .ir import (
-    IRModule, IRVar, IRBlock, IRIf, IRLoop, IRSelect,
+    IRModule, IRVar, IRBlock, IRIf, IRLoop, IRSelect, IRWhileLoop,
     IRInst, IRConst, IRRef, IRType, StorageClass, Op, Operand,
 )
 from .ir_affine import (

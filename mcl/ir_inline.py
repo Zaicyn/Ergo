@@ -17,7 +17,7 @@ Architecture:
 from __future__ import annotations
 
 from .ir import (
-    IRModule, IRFunc, IRVar, IRBlock, IRIf, IRLoop, IRSelect,
+    IRModule, IRFunc, IRVar, IRBlock, IRIf, IRLoop, IRSelect, IRWhileLoop,
     IRInst, IRConst, IRRef, IRType, Op, StorageClass, Operand,
     IRItem,
 )
@@ -117,6 +117,13 @@ def inline_subroutines(module: IRModule) -> list[str]:
             new_then = _remap_body(item.then_body, prefix, local_names)
             new_else = _remap_body(item.else_body, prefix, local_names) if item.else_body else None
             return IRIf(condition=new_cond, then_body=new_then, else_body=new_else, line=item.line)
+
+        elif isinstance(item, IRWhileLoop):
+            new_cond = _remap_operand(item.condition, prefix, local_names)
+            new_cond_block = _remap_item(item.cond_block, prefix, local_names)
+            new_body = _remap_body(item.body, prefix, local_names)
+            return IRWhileLoop(condition=new_cond, cond_block=new_cond_block,
+                              body=new_body, line=item.line)
 
         elif isinstance(item, IRSelect):
             new_expr = _remap_operand(item.expr, prefix, local_names)
@@ -218,6 +225,11 @@ def inline_subroutines(module: IRModule) -> list[str]:
                 new_else = _process_body(item.else_body) if item.else_body else None
                 result.append(IRIf(condition=item.condition, then_body=new_then,
                                   else_body=new_else, line=item.line))
+            elif isinstance(item, IRWhileLoop):
+                new_body = _process_body(item.body)
+                result.append(IRWhileLoop(condition=item.condition,
+                                         cond_block=item.cond_block,
+                                         body=new_body, line=item.line))
             elif isinstance(item, IRSelect):
                 new_cases = []
                 for cv, cb in item.cases:

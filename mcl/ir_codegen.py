@@ -11,7 +11,7 @@ The existing AST codegen (codegen.py) is preserved as a reference and fallback.
 from __future__ import annotations
 
 from .ir import (
-    IRModule, IRFunc, IRVar, IRBlock, IRIf, IRLoop, IRSelect,
+    IRModule, IRFunc, IRVar, IRBlock, IRIf, IRLoop, IRSelect, IRWhileLoop,
     IRInst, IRConst, IRRef, IRType, StorageClass, Op, Operand,
 )
 from .ir_gpu import GPUPlan, KernelPlan
@@ -196,8 +196,11 @@ class IRCodeGen:
             self._put_raw("")
 
         # Emit main
-        self._put("int main(void) {")
+        self._put("int main(int argc, char *argv[]) {")
         self.indent += 1
+
+        # Runtime CLI parsing
+        self._emit_cli_parsing()
 
         # Declare main locals
         for v in mod.main_locals:
@@ -568,6 +571,23 @@ class IRCodeGen:
                               "__attribute__((weak));")
                     self._put("  if (&ergo_start_n && ergo_start_n > 0)")
                     self._put("    _SIM_INIT_N = ergo_start_n; }")
+                    # Runtime CLI: -N overrides starting particle count
+                    self._put("if (_cli_n > 0) {")
+                    self._put('    fprintf(stderr, "[CLI] -N %d: setting NPART\\n", _cli_n);')
+                    self._put("    _SIM_INIT_N = _cli_n;")
+                    self._put("}")
+                    # Runtime CLI: -M caps the CAP parameter so SIM_INIT
+                    # sets CAPACITY correctly downstream
+                    self._put("if (_cli_m > 0) {")
+                    self._put('    fprintf(stderr, "[CLI] -M %d: capping CAPACITY\\n", _cli_m);')
+                    self._put("    _SIM_INIT_CAP = _cli_m;")
+                    self._put("}")
+                    # Runtime CLI: --no-spawn disables spawning
+                    if "SPAWN_RATE" in self._var_types:
+                        self._put("if (_cli_no_spawn) {")
+                        self._put('    fprintf(stderr, "[CLI] --no-spawn: SPAWN_RATE = 0\\n");')
+                        self._put("    SPAWN_RATE = 0.0;")
+                        self._put("}")
                 # Track CPU-dirty arrays from ZERO/STORE ops in blocks
                 if gpu_array_set:
                     block_writes: set[str] = set()
@@ -644,6 +664,9 @@ class IRCodeGen:
                         cpu_dirty_arrays -= (suffix_writes & gpu_array_set)
             elif isinstance(item, IRSelect):
                 self._emit_select(item)
+
+            elif isinstance(item, IRWhileLoop):
+                self._emit_while_loop(item)
 
             # NET hook: detect end of inlined SIM_CENSUS_ADAPTIVE
             if (self._has_net and
@@ -784,7 +807,9 @@ class IRCodeGen:
                         sz = self._gpu_sizeof(arr)
                         self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
                                   f"{size_expr} * {sz});")
-            self._put(f"for (int {node.var} = {start}; {node.var} <= {end}; {node.var} += {step}) {{")
+            # Use runtime _max_frames if DEFAULT_FRAMES is the bound
+            _loop_end = "_max_frames" if end == "DEFAULT_FRAMES" and "DEFAULT_FRAMES" in self._var_types else end
+            self._put(f"for (int {node.var} = {start}; {node.var} <= {_loop_end}; {node.var} += {step}) {{")
             self.indent += 1
             if use_batched:
                 self._put("ergo_vk_frame_begin();")
@@ -1058,6 +1083,56 @@ class IRCodeGen:
             return "sizeof(int)"
         return f"sizeof({IRType.REAL.c_type})"
 
+    def _emit_while_loop(self, node: IRWhileLoop):
+        self._emit_line(node.line)
+
+        # Detect frame loop: DO WHILE containing GPU dispatches
+        is_frame_loop = False
+        if not self._in_frame_loop and self._items_contain_dispatch(node.body):
+            is_frame_loop = True
+
+        if is_frame_loop:
+            self._in_frame_loop = True
+            self._batched_frame = bool(self.gpu_plan)
+            # Sync CPU state to GPU before frame loop
+            gpu_arrays = self._gpu_arrays()
+            if gpu_arrays:
+                self._put("/* Sync CPU state to GPU before frame loop */")
+                for arr in gpu_arrays:
+                    shape = self._array_shapes.get(arr)
+                    if shape:
+                        size_expr = " * ".join(self._dim_expr(d) for d in shape)
+                        sz = self._gpu_sizeof(arr)
+                        self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
+                                  f"{size_expr} * {sz});")
+
+        # Emit condition block (computes the condition value)
+        self._emit_block(node.cond_block)
+        cond = self._operand(node.condition)
+        self._put(f"while ({cond}) {{")
+        self.indent += 1
+
+        if is_frame_loop and self._batched_frame:
+            self._put("ergo_vk_frame_begin();")
+
+        self._emit_body(node.body)
+
+        # Re-evaluate condition at end of loop body
+        self._emit_block(node.cond_block)
+
+        if is_frame_loop and self._batched_frame:
+            self._put("ergo_vk_frame_end();")
+            if self.render:
+                self._put("ergo_vk_frame_present();")
+                self._put("if (ergo_vk_should_close()) break;")
+
+        self.indent -= 1
+        self._put("}")
+
+        if is_frame_loop:
+            self._in_frame_loop = False
+            self._batched_frame = False
+
     def _loop_contains_dispatch(self, node: IRLoop) -> bool:
         """Check if a loop body contains any extracted GPU kernel dispatches (recursive)."""
         return self._items_contain_dispatch(node.body)
@@ -1068,6 +1143,9 @@ class IRCodeGen:
             if isinstance(item, IRLoop):
                 if item.line in self._kernel_by_line:
                     return True
+                if self._items_contain_dispatch(item.body):
+                    return True
+            elif isinstance(item, IRWhileLoop):
                 if self._items_contain_dispatch(item.body):
                     return True
             elif isinstance(item, IRIf):
@@ -1486,6 +1564,10 @@ class IRCodeGen:
                 r = self._find_verify_meta(item.body)
                 if r:
                     return r
+            elif isinstance(item, IRWhileLoop):
+                r = self._find_verify_meta(item.body)
+                if r:
+                    return r
         return None
 
     def _emit_sort_by_gen(self, inst: IRInst):
@@ -1887,7 +1969,9 @@ class IRCodeGen:
         for item in self.module.main_body:
             if isinstance(item, IRLoop):
                 if item.line not in self._kernel_by_line and self._items_contain_dispatch(item.body):
-                    # This is the frame loop — collect all kernel IDs inside it
+                    self._collect_kernel_ids(item.body, frame_ids)
+            elif isinstance(item, IRWhileLoop):
+                if self._items_contain_dispatch(item.body):
                     self._collect_kernel_ids(item.body, frame_ids)
         return frame_ids
 
@@ -1898,6 +1982,8 @@ class IRCodeGen:
                 k = self._kernel_by_line.get(item.line)
                 if k:
                     ids.add(k.kernel_id)
+                self._collect_kernel_ids(item.body, ids)
+            elif isinstance(item, IRWhileLoop):
                 self._collect_kernel_ids(item.body, ids)
             elif isinstance(item, IRIf):
                 self._collect_kernel_ids(item.then_body, ids)
@@ -2004,6 +2090,31 @@ class IRCodeGen:
 
             part_idx += 1
 
+    def _emit_cli_parsing(self):
+        """Emit runtime CLI argument parsing for -N, -M, --frames, --no-spawn."""
+        self._put("/* Runtime CLI overrides */")
+        self._put("int _cli_n = 0, _cli_m = 0, _cli_frames = 0, _cli_no_spawn = 0;")
+        self._put("for (int _i = 1; _i < argc; _i++) {")
+        self.indent += 1
+        self._put('if (strcmp(argv[_i], "-N") == 0 && _i + 1 < argc)')
+        self._put("    _cli_n = atoi(argv[++_i]);")
+        self._put('else if (strcmp(argv[_i], "-M") == 0 && _i + 1 < argc)')
+        self._put("    _cli_m = atoi(argv[++_i]);")
+        self._put('else if (strcmp(argv[_i], "--frames") == 0 && _i + 1 < argc)')
+        self._put("    _cli_frames = atoi(argv[++_i]);")
+        self._put('else if (strcmp(argv[_i], "--no-spawn") == 0)')
+        self._put("    _cli_no_spawn = 1;")
+        self.indent -= 1
+        self._put("}")
+        # Override DEFAULT_FRAMES via runtime variable
+        if "DEFAULT_FRAMES" in self._var_types:
+            self._put("int _max_frames = DEFAULT_FRAMES;")
+            self._put("if (_cli_frames > 0) {")
+            self._put('    fprintf(stderr, "[CLI] --frames %d\\n", _cli_frames);')
+            self._put("    _max_frames = _cli_frames;")
+            self._put("}")
+        self._put("")
+
     def _emit_vram_capacity(self):
         """Emit runtime MAXPART/CAPACITY computation from VRAM.
 
@@ -2070,6 +2181,7 @@ class IRCodeGen:
         self._put(f"  if (&ergo_max_cap && ergo_max_cap > 0 "
                   f"&& ergo_max_cap < CAPACITY)")
         self._put(f"    CAPACITY = ergo_max_cap; }}")
+        # Runtime CLI -M is applied after SIM_INIT (see _emit_body)
         self.indent -= 1
         self._put(f"}}")
 
@@ -2346,6 +2458,8 @@ class IRCodeGen:
                     self._collect_array_writes(item.else_body, writes)
             elif isinstance(item, IRLoop):
                 self._collect_array_writes(item.body, writes)
+            elif isinstance(item, IRWhileLoop):
+                self._collect_array_writes(item.body, writes)
 
     def _collect_array_reads(self, items: list, reads: set[str]):
         """Walk IR items and collect names of arrays read by LOAD ops."""
@@ -2386,6 +2500,9 @@ class IRCodeGen:
                 if item.else_body:
                     temps.update(self._collect_temps(item.else_body))
             elif isinstance(item, IRLoop):
+                temps.update(self._collect_temps(item.body))
+            elif isinstance(item, IRWhileLoop):
+                temps.update(self._collect_temps([item.cond_block]))
                 temps.update(self._collect_temps(item.body))
             elif isinstance(item, IRSelect):
                 for _, case_body in item.cases:

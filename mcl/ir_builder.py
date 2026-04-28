@@ -457,6 +457,26 @@ class IRBuilder:
             ))
             return IRRef(t, ret_type)
 
+        if upper == "RING_SHIFT":
+            a = self._lower_expr(node.args[0], block)
+            delta = self._lower_expr(node.args[1], block)
+            ret_type = self._operand_type(a)
+            t = self._fresh_temp()
+            block.insts.append(IRInst(
+                op=Op.RING_SHIFT, result=t, args=[a, delta], type=ret_type,
+            ))
+            return IRRef(t, ret_type)
+
+        if upper == "RING_BROADCAST":
+            a = self._lower_expr(node.args[0], block)
+            lane = self._lower_expr(node.args[1], block)
+            ret_type = self._operand_type(a)
+            t = self._fresh_temp()
+            block.insts.append(IRInst(
+                op=Op.RING_BROADCAST, result=t, args=[a, lane], type=ret_type,
+            ))
+            return IRRef(t, ret_type)
+
         # Type conversions
         if upper == "REAL":
             a = self._lower_expr(node.args[0], block)
@@ -584,6 +604,20 @@ class IRBuilder:
         if start_block.insts:
             return [start_block, loop]
         return [loop]
+
+    def _lower_while(self, node: ast.DoWhileStmt) -> list:
+        from .ir import IRWhileLoop
+        cond_block = IRBlock(self._fresh_block("while_cond"), line=node.line)
+        cond_op = self._lower_expr(node.condition, cond_block)
+
+        body_items = []
+        for s in node.body:
+            body_items.extend(self._lower_stmt(s))
+
+        return [IRWhileLoop(
+            condition=cond_op, cond_block=cond_block,
+            body=body_items, line=node.line,
+        )]
 
     def _lower_select(self, node: ast.SelectCaseStmt) -> list:
         expr_block = IRBlock(self._fresh_block("select_expr"), line=node.line)
@@ -726,6 +760,9 @@ class IRBuilder:
 
         if isinstance(node, ast.DoLoop):
             return self._lower_loop(node)
+
+        if isinstance(node, ast.DoWhileStmt):
+            return self._lower_while(node)
 
         if isinstance(node, ast.SelectCaseStmt):
             return self._lower_select(node)
