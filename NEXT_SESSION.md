@@ -1,110 +1,62 @@
-# Next Session: Sort-by-GEN + Ring Coupling Physics
+# Next Session: Tune Ring Coupling + Run at Scale
 
-## What's Done
+## What's Done (all complete)
 
-Steps 1-5 complete — RING_PREV / RING_NEXT intrinsics work end-to-end:
+### RING_PREV / RING_NEXT intrinsics (steps 1-5)
+- ir.py, ir_builder.py, spirv.py — full compiler pipeline
+- OpGroupNonUniformShuffle with wrapping modular index `(lane ± 1) & 31`
+- Validated on RTX 2060: lane 0 RING_PREV returns lane 31's value
 
-- **ir.py** — Op.RING_PREV, Op.RING_NEXT enum values
-- **ir_builder.py** — Intrinsic recognition, type-preserving (REAL→REAL, INTEGER→INTEGER)
-- **spirv.py** — OpGroupNonUniformShuffle with wrapping modular index `(lane ± 1) & 31`
-  - Capabilities: GroupNonUniform + GroupNonUniformShuffle
-  - Builtin: SubgroupLocalInvocationId
-  - Note: uses explicit index shuffle (NOT ShuffleUp/Down — those don't wrap per spec)
-- **spirv.py** — Bonus: f64 type no longer emitted in f32 mode (passes spirv-val)
-- **ir_codegen.py** — Bonus: VRAM capacity code only emitted when MAXPART exists
-- **tests/gpu_ring_shuffle.mcl** — Validated on RTX 2060: lane 0 RING_PREV returns lane 31's value (wraps correctly)
+### SORT_BY_GEN directive (steps 6-7)
+- New directive: `SORT_BY_GEN FLAGS, POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT`
+- 7 compiler files: tokens, AST, parser, checker, IR, IR builder, GPU extraction
+- 3 compiler-generated SPIRV kernels:
+  - kernel_5 (COUNT_GEN): atomicAdd histogram[GEN], 256 threads/wg
+  - kernel_6 (SCAN_GEN): Hillis-Steele exclusive prefix sum, 32 threads, 5 steps
+  - kernel_7 (SCATTER_GEN): scatter all 8 arrays, 18 bindings, 256 threads/wg
+- Pointer swap after scatter (d_X ↔ d_sort_X) — zero copy
+- Called at census intervals in main.mcl
+
+### Ring coupling physics (step 8)
+- Section 15.5 in fluid_subs.mcl (after OMEGA accumulation, before position writeback)
+- Metabolic exchange: RING_PREV/RING_NEXT on OMEGA, direction-gated by FLOW_W
+- Phase lock: RING_NEXT on PH, restoring toward SEAM_STEP_PH spacing
+- Re-clamp OMEGA to [0, OMEGA_MAX] after exchange
+- K_PHASE_LOCK = 0.001 in constants.mcl
 
 ## What's Next
 
-### Step 6: Sort by GEN — Counting sort (3 kernels)
+### Step 9: Tune and validate
 
-32 buckets, one per GEN value. 32 = 2^5 = warp size.
+1. **Run at 29M** — verify sort + ring coupling don't crash or degrade fps
+2. **Profile** — check sort kernel times (should be ~1ms total at census intervals)
+3. **Observe ring behavior** — does OMEGA flow along the Viviani curve as expected?
+4. **Tune K_PHASE_LOCK** — too high = kills natural dynamics, too low = no coherence
+5. **Verify conservation** — total OMEGA should be conserved minus decay losses
+6. **Check crystal behavior** — do crystallized suns interact correctly with ring coupling?
+   (They should be skipped — CYCLE fires before section 15.5)
 
-```
-Kernel A: COUNT_GEN
-  For each particle: atomicAdd(histogram[GEN], 1)
-  32 shared-memory atomics. Fits in one cache line.
+### Potential issues to watch for
 
-Kernel B: SCAN_GEN (single warp, 32 elements)
-  Exclusive prefix sum over histogram → offsets[0..31]
-  Unrolled, 5 steps. Trivial.
+- **Sort at census intervals may be too infrequent** — if GEN changes faster than
+  census period, warps de-align between sorts. Monitor ring coupling quality
+  degradation over time.
+- **First sort** — the initial unsorted state means ring coupling runs against random
+  neighbors until the first census. Should be harmless (bounded by clamp) but
+  may cause a visible transient.
+- **NPART vs sorted count** — sort scatters NPART particles. If spawn adds particles
+  between sorts, new particles land at array end unsorted. They participate in
+  shuffle with whatever warp they land in. Acceptable — sort catches up at next census.
 
-Kernel C: SCATTER_GEN
-  For each particle: idx = atomicAdd(offsets[GEN], 1); sorted[idx] = particle
-  Writes are coalesced within each GEN bucket.
-```
+## Current Performance (before ring coupling + sort)
 
-After sort: particles with same GEN are contiguous. Groups of 32 consecutive
-particles span all 32 ring positions. Each warp = one complete ring traversal.
-
-Sort frequency: every N frames (at census intervals). GEN changes slowly
-(phase advance wraps the ring over ~1000 frames).
-
-### Step 7: SORT_BY_GEN directive
-
-New MCL directive — compiler-generated kernels, NOT runtime C:
-
-```
-SORT_BY_GEN FLAGS, POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT
-```
-
-Lists all particle arrays permuted together. Compiler generates histogram,
-scan, and scatter kernels + temporary buffers.
-
-Called in main loop at census intervals.
-
-### Step 8: Ring coupling physics
-
-Add to fluid_subs.mcl as section 17.5 (after density siphon, before thresholds):
-
-```
-! ── 17.5. RING COUPLING (topological, not spatial) ───────
-! Metabolic exchange: OMEGA flows along ring via FLOW_W direction
-OMEGA_PREV := RING_PREV(OMEGA)
-OMEGA_NEXT := RING_NEXT(OMEGA)
-
-DEFICIT := TARGET - OMEGA
-TRANSFER := MIN(ABS(DEFICIT), ABS(Z_C) * DT)
-IF FLOW_WG > 0.0 THEN
-  OMEGA := OMEGA + TRANSFER * SIGN(1.0, OMEGA_NEXT - OMEGA)
-ELSE
-  OMEGA := OMEGA + TRANSFER * SIGN(1.0, OMEGA_PREV - OMEGA)
-ENDIF
-
-! Phase lock: restoring toward reference Viviani spacing
-PH_NEXT := RING_NEXT(PH)
-PH_DIFF := IAND(PH_NEXT - PH + PHASE_MASK + 1, PHASE_MASK)
-PH_ERR := PH_DIFF - SEAM_STEP_PH
-OMEGA := OMEGA - REAL(PH_ERR) * K_PHASE_LOCK * DT
-```
-
-New constant: K_PHASE_LOCK (start ~0.001, tune empirically)
-
-Data shuffled per neighbor: OMEGA (float) + PH (integer) = 8 bytes.
-Zero memory traffic — register to register within warp.
-
-### Step 9: Tune
-
-- K_PHASE_LOCK empirically against simulation behavior
-- Verify metabolic conservation (total OMEGA in ring minus decay)
-- Check that phase-locking doesn't suppress natural ring dynamics
-
-## Design Principles
-
-- Ring coupling is **topological, not spatial** — two ring-adjacent particles
-  can be far apart in 3D. The coupling is a functional pathway, not a force.
-- 3D spatial coupling (gravity, density siphon) stays in the grid — **orthogonal and additive**
-- BLAS insight: don't pack data, change the access pattern. SoA with coalesced
-  warp access is already optimal for GPU. The sort reorders particles so the
-  warp topology matches the ring topology.
-- Allocator insight: tolerate gaps, don't compact. Dead crystal slots cost
-  near-zero compute (CYCLE branch).
-
-## Current Performance
-
-- Headless: 141 fps at 29M (7.1ms/frame: scatter 1.2ms, stencil 0.007ms, physics 5.9ms)
-- Render: 74 fps at 30M (13.5ms/frame: compute 7ms + vertex 6.5ms)
+- Headless: 141 fps at 29M (7.1ms/frame)
+- Render: 74 fps at 30M (13.5ms/frame)
 - RTX 2060, f32, DEVICE_LOCAL buffers
+
+Expected impact: ring coupling adds 3 shuffle ops per particle (register-only,
+near-zero cost). Sort adds ~1ms every census interval (every 50-2000 frames).
+Per-frame cost increase should be negligible.
 
 ## Build
 
@@ -115,37 +67,33 @@ python -m mcl --target spirv --precision f32 --no-split -o galaxy_gpu galaxy_str
 # Render (strip VERIFY for no-oracle mode):
 sed '/VERIFY/,/4250/d' galaxy_structured.mcl > /tmp/nonet.mcl
 python -m mcl --target spirv --precision f32 --no-split --render -N 29000000 -M 30000000 -o galaxy_render /tmp/nonet.mcl
+
+# Headless benchmark (5000 frames):
+sed '/VERIFY/,/4250/d' galaxy_structured.mcl | sed 's/DEFAULT_FRAMES = 2147483647/DEFAULT_FRAMES = 5000/' > /tmp/bench.mcl
+python -m mcl --target spirv --precision f32 --no-split -N 29000000 -M 30000000 -o galaxy_gpu /tmp/bench.mcl
+ERGO_PROFILE=1 timeout 120 ./galaxy_gpu
 ```
 
 ## Key Files
 
 ```
 structured/
-  constants.mcl       — LUTs, parameters, PFLAG_*, PFLAG_BANKED, phase encoding
-  fluid_state.mcl     — Particle arrays (SoA), spawn control
-  waveguide_state.mcl — Grid arrays, GRID_CRYSTAL, census state
-  fluid_subs.mcl      — Physics + spawn kernel (ring coupling goes here)
-  waveguide_subs.mcl  — Clear, scatter (crystal banking), stencil
-  census.mcl          — CPU observation
-  main.mcl            — Pipeline orchestration (SORT_BY_GEN goes here)
+  constants.mcl       — K_PHASE_LOCK, PFLAG_BANKED, phase encoding
+  fluid_subs.mcl      — Physics kernel with ring coupling (section 15.5)
+  waveguide_subs.mcl  — Crystal banking in scatter, crystal field in stencil
+  main.mcl            — SORT_BY_GEN at census intervals
 
 mcl/
-  ir.py               — IR nodes + Op enum (RING_PREV, RING_NEXT added)
-  ir_builder.py       — Intrinsic recognition (RING_PREV, RING_NEXT added)
-  spirv.py            — SPIRV codegen (SubgroupShuffle added)
-  ir_codegen.py       — C/SPIRV driver codegen
-  parser.py           — MCL parser
-  driver.py           — Build driver
-
-mcl/runtime/
-  vk_host.c           — Vulkan runtime
-  render_points.vert  — Point cloud vertex shader (direct SoA read)
-  render_points.frag  — Point cloud fragment shader (branchless heat palette)
-  render_shaders.h    — Embedded SPIRV (auto-generated by build_shaders.sh)
-
-allocator/
-  sq2core.f           — Torus allocator (F77) — design reference for gap tolerance
+  tokens.py           — KW_SORT_BY_GEN token
+  ast_nodes.py        — SortByGenStmt AST node
+  parser.py           — _parse_sort_by_gen()
+  checker.py          — Array name validation
+  ir.py               — Op.RING_PREV, Op.RING_NEXT, Op.SORT_BY_GEN
+  ir_builder.py       — Intrinsic recognition + sort lowering
+  ir_gpu.py           — SortByGenPlan, kernel extraction
+  backends/spirv.py   — SubgroupShuffle + 3 sort kernels
+  ir_codegen.py       — Sort dispatch + pointer swap
 
 tests/
-  gpu_ring_shuffle.mcl — Validates RING_PREV/RING_NEXT wrapping on GPU
+  gpu_ring_shuffle.mcl — Validates ring intrinsics on GPU
 ```
