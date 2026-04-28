@@ -205,6 +205,56 @@ After all phases complete, run the full system for 50,000+ frames and check:
 - [ ] Galaxy structure is recognizable and dynamic
 - [ ] FPS stable at 60-74 rendered, 130+ headless
 
+## Pitfall: Register Pressure
+
+GPU performance can drop suddenly and seemingly at random when kernel
+register usage crosses a hardware threshold. The SM has a fixed register
+file (65,536 on Turing). More registers per thread = fewer resident
+warps = less latency hiding = slower execution.
+
+**Why it looks random:** Adding one local variable to the physics kernel
+can push register count from 32 to 33, dropping max occupancy from 100%
+to 67%. The code change is trivial but the performance impact is 1.5x.
+This looks like "the GPU just got slower" with no obvious cause.
+
+**How to detect:**
+
+```bash
+# Profile with nsys — look for "stall: not selected" or low occupancy
+nsys profile --trace=vulkan ./galaxy_render
+
+# Or use ERGO_PROFILE=1 and compare k2 (physics) time before/after
+# any code change. If k2 jumps by >20% without algorithmic change,
+# register pressure is the likely cause.
+```
+
+**Symptoms:**
+- Physics kernel time (k2) increases >20% after adding a variable
+- No change in particle count or algorithm
+- Reverting the variable addition restores performance
+- Performance is fine at small N but degrades at large N (more warps
+  competing for the same register file)
+
+**The fix:** Split the kernel into two passes with fewer live variables
+each. The natural split point is between spatial physics (gravity,
+envelope, steering) and ring topology (coupling, winding, spillover).
+Each half uses ~24-28 registers instead of ~48-62 combined.
+
+**Cost of splitting:** One extra compute barrier between passes (~0.01ms)
+plus any variables that are live across the split become intermediate
+buffer arrays. The --promote-locals compiler flag handles this.
+
+**Rule of thumb:**
+- ≤32 regs/thread: full speed, don't worry
+- 33-48 regs/thread: acceptable, monitor occupancy
+- 49-64 regs/thread: consider splitting
+- >64 regs/thread: split immediately, spills are killing you
+
+**Current physics kernel:** ~102 inlined locals, estimated 48-62
+registers after SSA optimization. In the warning zone. If fps drops
+unexpectedly after adding ring coupling features, register pressure
+is the first thing to check.
+
 ## Locked Values
 
 Once tuned, record final values here:

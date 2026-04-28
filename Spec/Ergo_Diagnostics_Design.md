@@ -110,6 +110,8 @@ or are too noisy for build output.
 | FLOW classification report    | Both        | PERF      |
 | Classification degradation    | Compiler    | WARNING   |
 | Manual clamp → CLAMP hint     | Compiler    | PERF      |
+| Register pressure estimate    | Extension   | PERF      |
+| Kernel split suggestion       | Extension   | PERF      |
 
 ---
 
@@ -490,6 +492,68 @@ WARNING: Parallel reduction may produce nondeterministic FP results
 ```
 
 Core to Ergo's identity as a deterministic simulation language.
+
+### 18. Register Pressure Estimate
+
+GPU kernels have a fixed register file per SM (65,536 on Turing).
+High register usage per thread reduces occupancy — fewer warps can
+be resident, less latency hiding, random-seeming performance drops.
+
+**The danger:** This manifests as unexplained slowdowns. The kernel
+"looks fine" but runs 2x slower than expected because the SM can only
+schedule 16 warps instead of 64. The code didn't change — but adding
+one more local variable pushed register count past a threshold.
+
+**Estimate from IR:**
+
+Count unique live variables at any point in the kernel. The compiler
+can approximate this from SSA liveness analysis:
+
+```
+PERF: Physics kernel — estimated 48 registers/thread
+      SM occupancy: ~42% (682/1024 threads per SM)
+      Consider splitting kernel to reduce register pressure
+```
+
+**Thresholds (Turing / RTX 2060):**
+
+| Registers/thread | Max threads/SM | Occupancy | Status |
+|---|---|---|---|
+| ≤ 32 | 2048 | 100% | Optimal |
+| 33-48 | 1365-1024 | 50-67% | Acceptable |
+| 49-64 | 1024-682 | 33-50% | Warning zone |
+| 65-96 | 682-455 | 22-33% | Register spill likely |
+| >96 | <455 | <22% | Critical — split kernel |
+
+**When to warn:**
+
+- Extension hover over a GPU-extracted loop shows estimated register count
+- If >48, show PERF warning with occupancy estimate
+- If >64, suggest kernel split points (separate spatial physics from ring coupling)
+
+### 19. Kernel Split Suggestion
+
+When register pressure is high, suggest splitting the monolithic
+physics kernel into passes:
+
+```
+PERF: Physics kernel uses ~62 registers/thread (45% occupancy)
+      Suggestion: split into two passes:
+        Pass 1: Gravity + envelope + steering (spatial, ~28 regs)
+        Pass 2: Ring coupling + threshold + spawn (topological, ~24 regs)
+      Each pass achieves ~100% occupancy
+      Cost: one extra barrier between passes
+```
+
+The split boundary should follow the natural separation between
+spatial physics (sections 1-14) and ring topology (sections 15-18).
+The barrier cost (~0.01ms) is negligible compared to the occupancy
+gain at high register counts.
+
+**Implementation:** Count unique variables live across the split point.
+Variables live in both passes become intermediate buffer arrays
+(promoted to STATIC). The IR already has the infrastructure for this
+(--promote-locals flag from the colony GPU port).
 
 ---
 
