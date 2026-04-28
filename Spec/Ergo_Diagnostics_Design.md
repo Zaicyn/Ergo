@@ -72,6 +72,9 @@ or are too noisy for build output.
 | Mixed continuous/discrete     | Extension   | WARNING   |
 | Ring coherence monitor        | Extension   | DEBUG     |
 | Determinism / FP reassociation| Extension   | WARNING   |
+| FLOW classification report    | Both        | PERF      |
+| Classification degradation    | Compiler    | WARNING   |
+| Manual clamp → CLAMP hint     | Compiler    | PERF      |
 
 ---
 
@@ -221,6 +224,78 @@ ERGO ERROR line 5:
 
 Compile-time overflow is always provable and always an error.
 Runtime overflow follows the --checked-int flag.
+
+### 9. FLOW Taxonomy Integration
+
+The loop classification system (INJECTIVE / SCATTER / SHIFT / REDUCTION)
+is the backbone of GPU extraction. The compiler already computes it —
+surface it to the user.
+
+**Compiler output (always, when GPU target):**
+
+```
+[spirv] Loop at line 87 classified as INJECTIVE — GPU extracted
+[spirv] Loop at line 145 classified as SCATTER — GPU extracted (atomic)
+[spirv] Loop at line 200 not extracted: REDUCTION dependency on 'TOTAL'
+```
+
+This already partially exists. Improve the format to name the classification
+explicitly and include the reason.
+
+**Classification degradation (WARNING):**
+
+If a transformation (inlining, fusion, or user edit) causes a loop's
+classification to degrade:
+
+```
+ERGO WARNING line 200:
+  Loop classification degraded: INJECTIVE → SCATTER
+  Caused by: grid write at line 205 introduces atomic dependency
+  Previous classification was optimal for GPU mapping
+```
+
+This protects the "SCATTER must remain rare" invariant from the
+performance constitution. The compiler tracks classification before
+and after transformations and warns on degradation.
+
+**Extension inline (PERF):**
+
+```
+DO I = 1, NPART                    ← PERF: INJECTIVE — full GPU utilization
+  POS_X(I) := POS_X(I) + VX(I)
+ENDDO
+
+DO I = 1, NPART                    ← PERF: SCATTER — atomic contention on grid
+  GRID(CI, CJ, CK) := GRID(CI, CJ, CK) + 1
+ENDDO
+```
+
+Gutter markers color-coded: green for INJECTIVE, yellow for SCATTER,
+red for unextracted. Teaches the user to stay in the high-performance
+regime.
+
+### 10. Manual Clamp Pattern
+
+Detect manual clamp-to-range patterns and suggest the CLAMP intrinsic:
+
+```
+IF X < 0.0 THEN
+  X := 0.0
+ENDIF
+IF X > 1.0 THEN
+  X := 1.0
+ENDIF
+```
+
+```
+ERGO PERF line 42:
+  Manual clamp pattern detected on 'X' in range [0.0, 1.0]
+  Consider: X := CLAMP(X, 0.0, 1.0)
+  CLAMP may compile to branchless instruction (MIN/MAX)
+```
+
+Implementation: checker.py, pattern match IF/assignment/ENDIF pairs
+where the assignment sets the variable to the comparison bound.
 
 ---
 
@@ -441,25 +516,28 @@ that's a critical bug — not a feature.
 3. Division safety warning (checker.py, ~40 lines)
 4. Unmodified loop variable warning (checker.py, ~30 lines)
 5. PARAMETER integer overflow error (checker.py, ~15 lines)
-6. GPU extraction failure formatting (already exists, improve messages)
+6. FLOW classification in extraction output (ir_gpu.py, ~10 lines — already computed, just format)
+7. Manual clamp pattern hint (checker.py, ~30 lines)
 
 ### Phase 2 (extension MVP)
-7. Array memory footprint hover
-8. GPU extraction failure inline hints with transformation suggestions
-9. Branch divergence markers
-10. Sort order preservation correctness checks
-11. Mixed continuous/discrete update warnings
+8. Array memory footprint hover
+9. GPU extraction failure inline hints with transformation suggestions
+10. Branch divergence markers
+11. FLOW classification gutter markers (green/yellow/red)
+12. Sort order preservation correctness checks
+13. Mixed continuous/discrete update warnings
 
 ### Phase 3 (extension full)
-12. Scatter contention estimates
-13. SoA/AoS layout hints
-14. Integration stability detection
-15. Ring coherence debug overlay
-16. Determinism diagnostics
+14. Scatter contention estimates
+15. SoA/AoS layout hints
+16. Classification degradation warnings (track before/after transforms)
+17. Integration stability detection
+18. Ring coherence debug overlay
+19. Determinism diagnostics
 
 ### Phase 4 (compiler maturity)
-17. GPU aliasing ERROR (needs alias analysis)
-18. Allocation lifetime analysis
-19. --checked-int debug mode
-20. Range analysis for division guards
-21. Diagnostic suppression syntax (!$SUPPRESS / !$PUSH / !$POP)
+20. GPU aliasing ERROR (needs alias analysis)
+21. Allocation lifetime analysis
+22. --checked-int debug mode
+23. Range analysis for division guards
+24. Diagnostic suppression syntax (!$SUPPRESS / !$PUSH / !$POP)
