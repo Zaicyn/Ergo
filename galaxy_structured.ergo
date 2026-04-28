@@ -1017,8 +1017,13 @@ END
 
 SUBROUTINE STENCIL_GRID()
   INTEGER :: I, J, K, IM, IP, JM, JP, KM, KP
-  INTEGER :: BP
+  INTEGER :: BP, MAT_RAW, ELEM
+  INTEGER :: M_COHER, M_ENERG, M_MOBIL, M_REACT, M_PERST
+  INTEGER :: DN
   REAL :: COV
+  REAL :: SELF_LOSS, AGENT_LOSS, STRESS_LOSS, TOTAL_LOSS, GRAD_MAG
+  INTEGER :: NEW_COH, NEW_ENR, NEW_MOB
+  INTEGER :: COH_D, ENR_D, MOB_D
 
   DO K = 1, GRID_SIZE
     KM := MOD(K - 2 + GRID_SIZE, GRID_SIZE) + 1
@@ -1071,15 +1076,98 @@ SUBROUTINE STENCIL_GRID()
         GRID_MET_GATE(I, J, K) := 0.2 + 1.3 * COV / 8.0
 
         ! ── Material decay ──────────────────────────────────
-        ! TODO: Decay channels disabled until codegen fixes STATIC
-        ! array indexing in CPU-side loops. MAT_COHERENCE(ELEM)
-        ! generates pointer-to-array instead of flat access in C.
-        ! GCC error: "assignment to 'int' from 'int (*)[32]'"
-        !
-        ! The archetype LUT, GRID_MATERIAL grid, and crystal banking
-        ! are all in place. Only the stencil unpacking + decay math
-        ! needs the codegen fix. See Spec/Ergo_Decay_Systems_Design.md
-        ! for the three-channel model to implement once this compiles.
+        IF GRID_CRYSTAL(I, J, K) > 0 THEN
+          MAT_RAW := GRID_MATERIAL(I, J, K)
+          ELEM := IAND(ISHFT(MAT_RAW, -24), 255) + 1
+
+          ! Fast path: pristine (no deltas)
+          IF IAND(MAT_RAW, 16777215) = 0 THEN
+            M_COHER := MAT_COHERENCE(ELEM)
+            M_ENERG := MAT_ENERGY(ELEM)
+            M_MOBIL := MAT_MOBILITY(ELEM)
+            M_REACT := MAT_REACTIVITY(ELEM)
+            M_PERST := MAT_PERSISTENCE(ELEM)
+          ELSE
+            ! Unpack signed nibble deltas (inline NIBBLE_SIGNED)
+            DN := IAND(ISHFT(MAT_RAW, -20), 15)
+            IF DN > 7 THEN
+              DN := DN - 16
+            ENDIF
+            M_COHER := MAT_COHERENCE(ELEM) + DN
+            DN := IAND(ISHFT(MAT_RAW, -16), 15)
+            IF DN > 7 THEN
+              DN := DN - 16
+            ENDIF
+            M_ENERG := MAT_ENERGY(ELEM) + DN
+            DN := IAND(ISHFT(MAT_RAW, -12), 15)
+            IF DN > 7 THEN
+              DN := DN - 16
+            ENDIF
+            M_MOBIL := MAT_MOBILITY(ELEM) + DN
+            DN := IAND(ISHFT(MAT_RAW, -8), 15)
+            IF DN > 7 THEN
+              DN := DN - 16
+            ENDIF
+            M_REACT := MAT_REACTIVITY(ELEM) + DN
+            DN := IAND(ISHFT(MAT_RAW, -4), 15)
+            IF DN > 7 THEN
+              DN := DN - 16
+            ENDIF
+            M_PERST := MAT_PERSISTENCE(ELEM) + DN
+          ENDIF
+
+          ! Clamp to valid range
+          M_COHER := CLAMP(M_COHER, 0, 15)
+          M_ENERG := CLAMP(M_ENERG, 0, 15)
+          M_MOBIL := CLAMP(M_MOBIL, 0, 15)
+          M_REACT := CLAMP(M_REACT, 0, 15)
+          M_PERST := CLAMP(M_PERST, 0, 15)
+
+          ! Channel 1: Radiative (self-decay)
+          SELF_LOSS := REAL(15 - M_PERST) * RADIATIVE_RATE
+
+          ! Channel 2: Agent-driven (live density consumes crystal)
+          AGENT_LOSS := REAL(GRID_DENSITY(I, J, K)) * REAL(M_REACT) * REAL(M_ENERG) * AGENT_DECAY_RATE
+
+          ! Channel 3: Stress (gradient tears structure)
+          GRAD_MAG := SQRT(GRID_GRAD_X(I,J,K)**2 + GRID_GRAD_Y(I,J,K)**2 + GRID_GRAD_Z(I,J,K)**2)
+          STRESS_LOSS := MAX(GRAD_MAG - REAL(M_COHER), 0.0) * STRESS_RATE
+
+          ! Total coherence loss
+          TOTAL_LOSS := SELF_LOSS + AGENT_LOSS + STRESS_LOSS
+
+          ! Update deltas (write back to GRID_MATERIAL)
+          IF TOTAL_LOSS > 0.1 THEN
+            NEW_COH := MAX(M_COHER - INT(TOTAL_LOSS), 0)
+            NEW_ENR := MAX(M_ENERG - INT(AGENT_LOSS), 0)
+            NEW_MOB := MIN(M_MOBIL + INT(TOTAL_LOSS * 0.5), 15)
+            ! Pack deltas back
+            COH_D := CLAMP(NEW_COH - MAT_COHERENCE(ELEM), -8, 7)
+            ENR_D := CLAMP(NEW_ENR - MAT_ENERGY(ELEM), -8, 7)
+            MOB_D := CLAMP(NEW_MOB - MAT_MOBILITY(ELEM), -8, 7)
+            ! Encode signed nibbles (negative → add 16)
+            IF COH_D < 0 THEN
+              COH_D := COH_D + 16
+            ENDIF
+            IF ENR_D < 0 THEN
+              ENR_D := ENR_D + 16
+            ENDIF
+            IF MOB_D < 0 THEN
+              MOB_D := MOB_D + 16
+            ENDIF
+            GRID_MATERIAL(I,J,K) := IOR(IOR(IOR( &
+              ISHFT(IAND(ISHFT(MAT_RAW, -24), 255), 24), &
+              ISHFT(IAND(COH_D, 15), 20)), &
+              ISHFT(IAND(ENR_D, 15), 16)), &
+              ISHFT(IAND(MOB_D, 15), 12))
+          ENDIF
+
+          ! Crystal removal: coherence gone = structure dissolved
+          IF NEW_COH ≤ 0 THEN
+            GRID_CRYSTAL(I, J, K) := MAX(GRID_CRYSTAL(I, J, K) - 1, 0)
+            GRID_MATERIAL(I, J, K) := 0
+          ENDIF
+        ENDIF
       ENDDO
     ENDDO
   ENDDO
