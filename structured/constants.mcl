@@ -11,9 +11,9 @@
 ! Zero constants produce zero contributions downstream — natural skip.
 
 ! ── Simulation sizing ──────────────────────────────────────
-PARAMETER INTEGER :: MAXPART = 3000000
+PARAMETER INTEGER :: MAXPART = 30000000
 PARAMETER INTEGER :: DEFAULT_N = 12
-PARAMETER INTEGER :: DEFAULT_FRAMES = 5000
+PARAMETER INTEGER :: DEFAULT_FRAMES = 2147483647
 
 ! ── Central mass + geometry ────────────────────────────────
 PARAMETER REAL :: BH_MASS = 100.0
@@ -56,6 +56,7 @@ PARAMETER INTEGER :: PFLAG_EJECTED = 2
 PARAMETER INTEGER :: PFLAG_VENT    = 4
 PARAMETER INTEGER :: PFLAG_CRYSTAL = 8
 PARAMETER INTEGER :: PFLAG_NOVA    = 16
+PARAMETER INTEGER :: PFLAG_BANKED  = 32
 
 ! ── Phase encoding in FLAGS ───────────────────────────────
 ! GEN (ring segment 0-31) in bits 8-12

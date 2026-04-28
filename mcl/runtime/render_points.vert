@@ -1,15 +1,13 @@
 #version 450
 
 /*
- * Point cloud vertex shader for particle simulations.
+ * Point cloud vertex shader — direct SoA read.
  *
- * Each invocation = one particle. gl_VertexIndex = particle index.
- * Reads position from 3 separate storage buffers (SoA layout).
- * Reads color value from a 4th buffer.
- * Supports f32 (--precision f32) via float buffers.
+ * 4 storage buffers read with coalesced access per warp.
+ * No pack/transpose — BLAS trick: same data, different indexing.
  */
 
-layout(location = 0) out float v_value; /* normalized color value */
+layout(location = 0) out float v_value;
 
 layout(set = 0, binding = 0) buffer BufX { float px[]; };
 layout(set = 0, binding = 1) buffer BufY { float py[]; };
@@ -21,20 +19,20 @@ layout(push_constant) uniform PC {
     float point_size;
     float val_min;
     float val_max;
-    float world_scale; /* 1/world_radius: maps world coords to ~[-1,1] */
+    float world_scale;
 } pc;
 
 void main() {
     int i = gl_VertexIndex;
 
-    float x = px[i] * pc.world_scale;
-    float y = py[i] * pc.world_scale;
-    float z = pz[i] * pc.world_scale;
+    vec4 pos = vec4(px[i] * pc.world_scale,
+                    py[i] * pc.world_scale,
+                    pz[i] * pc.world_scale,
+                    1.0);
 
-    gl_Position = pc.viewProj * vec4(x, y, z, 1.0);
-    gl_PointSize = pc.point_size;
+    gl_Position = pc.viewProj * pos;
+    gl_PointSize = 1.0;
 
-    float val = cv[i];
-    v_value = clamp((val - pc.val_min) / (pc.val_max - pc.val_min + 1e-10),
+    v_value = clamp((cv[i] - pc.val_min) / (pc.val_max - pc.val_min + 1e-10),
                     0.0, 1.0);
 }

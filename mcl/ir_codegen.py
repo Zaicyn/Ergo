@@ -1019,22 +1019,14 @@ class IRCodeGen:
             self._frame_ended_early = _saved_ended_early
 
     def _emit_minmax_scan(self, arr: str, count_expr: str):
-        """Emit a CPU-side min/max scan over a REAL array.
+        """Emit fixed value range for render color mapping.
 
-        The CPU is the oracle — it owns the data and computes the display
-        range. The GPU renderer just receives the values.
-
-        Emits C code that sets float _vmin and _vmax in the current scope.
+        The color array (typically OMEGA_NAT) has known bounds from the
+        simulation constants. A CPU-side scan over millions of elements
+        would stall the pipeline every frame. Use fixed range instead.
         """
-        self._put(f"/* CPU oracle: scan {arr} for value range */")
-        self._put(f"float _vmin = (float){arr}[0], _vmax = (float){arr}[0];")
-        self._put(f"for (int _i = 1; _i < {count_expr}; _i++) {{")
-        self.indent += 1
-        self._put(f"if ((float){arr}[_i] < _vmin) _vmin = (float){arr}[_i];")
-        self._put(f"if ((float){arr}[_i] > _vmax) _vmax = (float){arr}[_i];")
-        self.indent -= 1
-        self._put("}")
-        self._put("if (_vmax <= _vmin) _vmax = _vmin + 1e-6f;")
+        self._put(f"/* Fixed color range — no CPU scan */")
+        self._put(f"float _vmin = 0.0f, _vmax = 2.0f;")
 
     def _infer_grid(self, shape: tuple | None) -> tuple[str, str]:
         """Infer 2D grid dimensions from a 1D array shape.

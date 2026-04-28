@@ -35,7 +35,7 @@ END
 ! ── SCATTER: fluid → waveguide ────────────────────────────
 ! Each particle deposits its presence into the field.
 ! Phase advance + GEN packing + density + bin presence.
-! Zero-flagged particles (ejected/crystal): SKIP.
+! Ejected: skip. Crystal: bank into GRID_CRYSTAL once, then skip.
 !
 ! This is the generational handoff — the particle declares
 ! its lifecycle state into the field.
@@ -44,10 +44,23 @@ SUBROUTINE SCATTER_GRID()
   INTEGER :: I, CI, CJ, CK, GEN, BIN, PH
 
   DO I = 1, NPART
-    ! Zero check: ejected/crystal = off, skip entirely
-    IF IAND(FLAGS(I), IOR(PFLAG_EJECTED, PFLAG_CRYSTAL)) ≠ 0 THEN
+    ! Ejected: gone, skip entirely
+    IF IAND(FLAGS(I), PFLAG_EJECTED) ≠ 0 THEN
       CYCLE
     ENDIF
+
+    ! Crystal: deposit into permanent grid once, then skip
+    IF IAND(FLAGS(I), PFLAG_CRYSTAL) ≠ 0 THEN
+      IF IAND(FLAGS(I), PFLAG_BANKED) = 0 THEN
+        CI := CLAMP(INT(POS_X(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+        CJ := CLAMP(INT(POS_Y(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+        CK := CLAMP(INT(POS_Z(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+        GRID_CRYSTAL(CI, CJ, CK) := GRID_CRYSTAL(CI, CJ, CK) + 1
+        FLAGS(I) := IOR(FLAGS(I), PFLAG_BANKED)
+      ENDIF
+      CYCLE
+    ENDIF
+
     IF IAND(FLAGS(I), IOR(PFLAG_ACTIVE, PFLAG_NOVA)) = 0 THEN
       CYCLE
     ENDIF
@@ -94,6 +107,9 @@ SUBROUTINE STENCIL_GRID()
       DO I = 1, GRID_SIZE
         IM := MOD(I - 2 + GRID_SIZE, GRID_SIZE) + 1
         IP := MOD(I, GRID_SIZE) + 1
+
+        ! Crystal field: permanent density from frozen suns
+        GRID_DENSITY(I, J, K) := GRID_DENSITY(I, J, K) + GRID_CRYSTAL(I, J, K)
 
         ! Oracle blend: local + alpha * (global - local)
         GRID_DENSITY(I, J, K) := INT(REAL(GRID_DENSITY(I, J, K)) + FIELD_BLEND * (GRID_DENSITY_GLOBAL(I, J, K) - REAL(GRID_DENSITY(I, J, K))))

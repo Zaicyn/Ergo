@@ -144,7 +144,7 @@ static struct {
     VkShaderModule           vert_shader;
     VkShaderModule           frag_shader;
 
-    /* Point cloud pipeline */
+    /* Point cloud pipeline (reads from packed vec4 buffer) */
     VkPipeline               pts_pipeline;
     VkPipelineLayout         pts_layout;
     VkDescriptorSetLayout    pts_ds_layout;
@@ -278,7 +278,7 @@ int ergo_vk_init(int headless) {
         }
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
         glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-        g.window = glfwCreateWindow(960, 720, "Ergo", NULL, NULL);
+        g.window = glfwCreateWindow(1280, 720, "Ergo", NULL, NULL);
         if (!g.window) {
             fprintf(stderr, "ergo_vk: window creation failed\n");
             glfwTerminate();
@@ -1201,6 +1201,13 @@ void ergo_vk_frame_end(void) {
 void ergo_vk_frame_wait(void) {
     if (!g.device) return;
     if (g_frame_waited) return;  /* idempotent */
+    /* When rendering, the compute→vertex pipeline barrier in
+     * render_points handles GPU-side sync. Only block on the
+     * compute fence when headless (CPU needs results). */
+    if (!g.headless) {
+        g_frame_waited = 1;
+        return;
+    }
     VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
     g_frame_waited = 1;
 }
@@ -1324,12 +1331,28 @@ static void render_create_swapchain(void) {
     }
     free(fmts);
 
-    /* Extent */
-    if (caps.currentExtent.width != UINT32_MAX) {
-        g.sc_extent = caps.currentExtent;
-    } else {
-        g.sc_extent.width = 800;
-        g.sc_extent.height = 600;
+    /* Extent — query actual framebuffer size from GLFW.
+     * On Wayland/Hyprland the compositor may report a different
+     * currentExtent than what was requested; use glfwGetFramebufferSize
+     * as the authoritative source and clamp to surface limits. */
+    {
+        int fb_w = 1280, fb_h = 720;
+#ifndef ERGO_VK_ANDROID
+        if (!g.headless && g.window)
+            glfwGetFramebufferSize(g.window, &fb_w, &fb_h);
+#endif
+        g.sc_extent.width  = (uint32_t)fb_w;
+        g.sc_extent.height = (uint32_t)fb_h;
+        if (g.sc_extent.width  < caps.minImageExtent.width)
+            g.sc_extent.width  = caps.minImageExtent.width;
+        if (g.sc_extent.height < caps.minImageExtent.height)
+            g.sc_extent.height = caps.minImageExtent.height;
+        if (caps.maxImageExtent.width > 0 &&
+            g.sc_extent.width > caps.maxImageExtent.width)
+            g.sc_extent.width  = caps.maxImageExtent.width;
+        if (caps.maxImageExtent.height > 0 &&
+            g.sc_extent.height > caps.maxImageExtent.height)
+            g.sc_extent.height = caps.maxImageExtent.height;
     }
 
     uint32_t img_count = caps.minImageCount + 1;
@@ -1350,7 +1373,25 @@ static void render_create_swapchain(void) {
     sc_ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sc_ci.preTransform = caps.currentTransform;
     sc_ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    sc_ci.presentMode = VK_PRESENT_MODE_FIFO_KHR; /* vsync */
+    /* ERGO_NOVSYNC=1 → uncapped framerate (MAILBOX or IMMEDIATE) */
+    sc_ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    if (getenv("ERGO_NOVSYNC")) {
+        uint32_t n_modes = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(g.phys_device, g.surface,
+                                                   &n_modes, NULL);
+        VkPresentModeKHR *modes = malloc(n_modes * sizeof(VkPresentModeKHR));
+        vkGetPhysicalDeviceSurfacePresentModesKHR(g.phys_device, g.surface,
+                                                   &n_modes, modes);
+        for (uint32_t i = 0; i < n_modes; i++) {
+            if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
+                sc_ci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+                break;
+            }
+            if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR)
+                sc_ci.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        }
+        free(modes);
+    }
     sc_ci.clipped = VK_TRUE;
 
     VK_CHECK(vkCreateSwapchainKHR(g.device, &sc_ci, NULL, &g.swapchain));
@@ -1702,15 +1743,10 @@ static void render_create_points_pipeline(void) {
     ds.depthWriteEnable = VK_TRUE;
     ds.depthCompareOp = VK_COMPARE_OP_LESS;
 
-    /* Alpha blending for soft point edges */
+    /* Opaque points — no blending, allows early-Z rejection.
+     * With blend ON the GPU must shade every fragment (no depth cull). */
     VkPipelineColorBlendAttachmentState blend_att = {0};
-    blend_att.blendEnable = VK_TRUE;
-    blend_att.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-    blend_att.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blend_att.colorBlendOp = VK_BLEND_OP_ADD;
-    blend_att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-    blend_att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-    blend_att.alphaBlendOp = VK_BLEND_OP_ADD;
+    blend_att.blendEnable = VK_FALSE;
     blend_att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
                                VK_COLOR_COMPONENT_G_BIT |
                                VK_COLOR_COMPONENT_B_BIT |
@@ -1721,7 +1757,7 @@ static void render_create_points_pipeline(void) {
     cb.attachmentCount = 1;
     cb.pAttachments = &blend_att;
 
-    /* 4 storage buffers: pos_x, pos_y, pos_z, color_value */
+    /* 4 storage buffers: pos_x, pos_y, pos_z, color — direct SoA read */
     VkDescriptorSetLayoutBinding bindings[4];
     for (int i = 0; i < 4; i++) {
         memset(&bindings[i], 0, sizeof(VkDescriptorSetLayoutBinding));
@@ -1929,7 +1965,7 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
                             float world_scale) {
     if (g.headless) return;
 
-    /* Wait for previous frame */
+    /* Wait for previous render to finish before reusing command buffer */
     VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence, VK_TRUE, UINT64_MAX));
     VK_CHECK(vkResetFences(g.device, 1, &g.render_fence));
 
@@ -1940,25 +1976,29 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
                                           &img_idx);
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
 
-    /* Update descriptor set: 4 storage buffers */
-    ErgoVkBuf bufs_arr[4] = { buf_x, buf_y, buf_z, buf_color };
-    VkDescriptorBufferInfo buf_infos[4];
-    VkWriteDescriptorSet writes[4];
-    for (int i = 0; i < 4; i++) {
-        BufSlot *b = &g.bufs[bufs_arr[i]];
-        buf_infos[i].buffer = b->buffer;
-        buf_infos[i].offset = g.render_offset;
-        buf_infos[i].range = b->size - g.render_offset;
+    /* Bind 4 SoA buffers once — no pack, no copy, just reindex */
+    static int pts_ds_bound = 0;
+    if (!pts_ds_bound) {
+        ErgoVkBuf bufs_arr[4] = { buf_x, buf_y, buf_z, buf_color };
+        VkDescriptorBufferInfo buf_infos[4];
+        VkWriteDescriptorSet writes[4];
+        for (int i = 0; i < 4; i++) {
+            BufSlot *b = &g.bufs[bufs_arr[i]];
+            buf_infos[i].buffer = b->buffer;
+            buf_infos[i].offset = g.render_offset;
+            buf_infos[i].range = b->size - g.render_offset;
 
-        memset(&writes[i], 0, sizeof(VkWriteDescriptorSet));
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = g.pts_ds;
-        writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &buf_infos[i];
+            memset(&writes[i], 0, sizeof(VkWriteDescriptorSet));
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = g.pts_ds;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(g.device, 4, writes, 0, NULL);
+        pts_ds_bound = 1;
     }
-    vkUpdateDescriptorSets(g.device, 4, writes, 0, NULL);
 
     /* Build camera matrix */
     float aspect = (float)g.sc_extent.width / (float)g.sc_extent.height;
@@ -1991,7 +2031,6 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-    VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
     VK_CHECK(vkResetCommandBuffer(g.render_cmd_buf, 0));
     VK_CHECK(vkBeginCommandBuffer(g.render_cmd_buf, &begin_info));
 
@@ -2059,10 +2098,6 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     present.pImageIndices = &img_idx;
 
     vkQueuePresentKHR(g.compute_queue, &present);
-
-    /* Ensure present completes before next frame's compute dispatches
-       reuse the same queue and semaphores. */
-    vkDeviceWaitIdle(g.device);
 }
 
 int ergo_vk_should_close(void) {

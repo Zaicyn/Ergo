@@ -17,6 +17,12 @@ STATIC REAL :: GRID_GRAD_Z(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 STATIC REAL :: GRID_MET_GATE(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 STATIC INTEGER :: BIN_PRESENCE(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 
+! ── Crystal density (permanent — never cleared) ───────────
+! When a particle crystallizes, its grid cell gets +1 here.
+! Blended into GRID_DENSITY at stencil time so frozen suns
+! still exert field influence without per-particle compute.
+STATIC INTEGER :: GRID_CRYSTAL(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+
 ! ── Oracle consensus (external correction) ────────────────
 STATIC REAL :: GRID_DENSITY_GLOBAL(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 
