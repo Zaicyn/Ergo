@@ -58,10 +58,20 @@ SUBROUTINE SIM_INIT(N, CAP, SEED)
   ENDDO
 
   DO I = 1, N
-    X := (RNGF() * 2.0 - 1.0) * DISK_OUTER_R
-    Y := (RNGF() * 2.0 - 1.0) * DISK_OUTER_R * 0.3
-    Z := (RNGF() * 2.0 - 1.0) * DISK_OUTER_R
-
+    ! Sample within a sphere: draw from cube, normalize if outside
+    X := (RNGF() * 2.0 - 1.0)
+    Y := (RNGF() * 2.0 - 1.0)
+    Z := (RNGF() * 2.0 - 1.0)
+    R := SQRT(X * X + Y * Y + Z * Z)
+    IF R > 1.0 THEN
+      S := RNGF() / R
+      X := X * S
+      Y := Y * S
+      Z := Z * S
+    ENDIF
+    X := X * DISK_OUTER_R
+    Y := Y * DISK_OUTER_R * 0.3
+    Z := Z * DISK_OUTER_R
     R := SQRT(X * X + Y * Y + Z * Z)
     IF R < 1.0 THEN
       S := 1.0 / R
@@ -177,6 +187,9 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
   REAL :: DRIVE, TARGET, INSTABILITY
   REAL :: WEAK_DOT_R, WEAK_STR
   REAL :: OMEGA_PREV, OMEGA_NEXT, DEFICIT, TRANSFER
+  REAL :: DIFF, FLOW_DIR, TRANSFER_FROM_PREV
+  INTEGER :: WINDING, WINDING_ERR
+  REAL :: OMEGA_SUM, OMEGA_MEAN
   INTEGER :: PH_NEXT, PH_DIFF, PH_ERR
   REAL :: GDX, GDY, GDZ, GD_R, GTX, GTY, GTZ
   ! Spawn vars
@@ -377,6 +390,89 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
     ENDIF
     IF OMEGA < 0.0 THEN
       OMEGA := 0.0
+    ENDIF
+
+    ! ── 15.6. ZERO-SUM METABOLIC EXCHANGE (ring, not spatial) ─
+    ! Each thread computes a signed forward transfer to RING_NEXT.
+    ! RING_PREV retrieves what the previous thread sent TO us.
+    ! Conservation: thread I loses TRANSFER, thread I+1 gains it.
+    ! FLOW_WG gates direction: positive = forward, negative = backward.
+    ! Zero FLOW_WG (poles GEN 1,17) = no exchange = reflecting boundary.
+    OMEGA_NEXT := RING_NEXT(OMEGA)
+    DIFF := (OMEGA - OMEGA_NEXT) * OMEGA_EXCHANGE_RATE
+    FLOW_DIR := FLOW_WG
+
+    ! Gate: only allow flow in the FLOW_W direction
+    IF FLOW_DIR > 0.0 THEN
+      TRANSFER := MAX(DIFF, 0.0) * ABS(Z_C) * DT
+    ELSEIF FLOW_DIR < 0.0 THEN
+      TRANSFER := MIN(DIFF, 0.0) * ABS(Z_C) * DT
+    ELSE
+      TRANSFER := 0.0
+    ENDIF
+
+    ! Cap transfer to prevent over-drain
+    TRANSFER := MAX(TRANSFER, -OMEGA * 0.5)
+    TRANSFER := MIN(TRANSFER, OMEGA * 0.5)
+
+    ! Apply: lose what we send forward, gain what PREV sent to us
+    OMEGA := OMEGA - TRANSFER
+    TRANSFER_FROM_PREV := RING_PREV(TRANSFER)
+    OMEGA := OMEGA + TRANSFER_FROM_PREV
+
+    ! Final clamp
+    IF OMEGA > OMEGA_MAX THEN
+      OMEGA := OMEGA_MAX
+    ENDIF
+    IF OMEGA < 0.0 THEN
+      OMEGA := 0.0
+    ENDIF
+
+    ! ── 15.7. TOPOLOGICAL CHARGE STABILIZATION ───────────────
+    ! Measure warp-level winding number Q and correct toward Q = 1.
+    ! Q = sum(PH_DIFF) / (PHASE_MASK+1). For Q=1: total = 32768.
+    ! Only applies to complete rings (MET_GATE = 1.5 → all 8 gen bins).
+    ! Butterfly reduction: all lanes converge to same sum after 5 rounds.
+    IF MET_GATE > 1.49 THEN
+      WINDING := PH_DIFF
+      WINDING := WINDING + RING_SHIFT(WINDING, 16)
+      WINDING := WINDING + RING_SHIFT(WINDING, 8)
+      WINDING := WINDING + RING_SHIFT(WINDING, 4)
+      WINDING := WINDING + RING_SHIFT(WINDING, 2)
+      WINDING := WINDING + RING_SHIFT(WINDING, 1)
+
+      ! Error from Q = 1 target (32 segments × 1024 = 32768)
+      WINDING_ERR := WINDING - (PHASE_MASK + 1)
+
+      ! Correct OMEGA proportionally — gentle global restoring force
+      OMEGA := OMEGA - REAL(WINDING_ERR) * (1.0 / 32768.0) * K_WINDING * DT
+
+      ! Clamp after winding correction
+      IF OMEGA > OMEGA_MAX THEN
+        OMEGA := OMEGA_MAX
+      ENDIF
+      IF OMEGA < 0.0 THEN
+        OMEGA := 0.0
+      ENDIF
+    ENDIF
+
+    ! ── 15.8. RING SPILLOVER (collective collapse) ───────────
+    ! When mean OMEGA across the warp drops below OMEGA_CRITICAL,
+    ! the ring has lost coherence. Hammer OMEGA down to accelerate
+    ! dissolution — natural physics (decay, drift to COAST) does
+    ! the rest. Only complete rings (MET_GATE > 1.49) can spill.
+    IF MET_GATE > 1.49 THEN
+      OMEGA_SUM := OMEGA
+      OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 16)
+      OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 8)
+      OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 4)
+      OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 2)
+      OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 1)
+      OMEGA_MEAN := OMEGA_SUM * (1.0 / 32.0)
+
+      IF OMEGA_MEAN < OMEGA_CRITICAL THEN
+        OMEGA := OMEGA * SPILL_DECAY
+      ENDIF
     ENDIF
 
     ! ── 16. POSITION ACCUMULATION ────────────────────────

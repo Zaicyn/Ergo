@@ -1,189 +1,171 @@
-# Next Session: Zero-Sum Metabolic Exchange on the Ring
+# Next Session: Hopfion Spillover + DO WHILE
 
 ## What's Done
 
-Everything up to phase-lock ring coupling is working:
+Full ring coupling pipeline operational at 30M@60-74fps:
 
 - **RING_PREV / RING_NEXT** — warp shuffle intrinsics, wrapping modular index
-- **SORT_BY_GEN** — compiler-generated counting sort (histogram → prefix sum → scatter → pointer swap), runs at census intervals
-- **Phase lock** — `OMEGA -= PH_ERR * K_PHASE_LOCK * DT` with signed wrap, normalized to [-1,1]. Running at 30M@60-74fps.
-- **Crystal field** — GRID_CRYSTAL permanent density, PFLAG_BANKED, frozen suns contribute to field without per-particle compute.
+- **RING_SHIFT(val, delta)** — parameterized shuffle for butterfly reductions
+- **SORT_BY_GEN** — compiler-generated counting sort, pointer swap, census intervals
+- **Phase lock (15.5)** — PH_ERR with signed wrap, restoring toward SEAM_STEP_PH spacing
+- **Zero-sum metabolic exchange (15.6)** — directional OMEGA diffusion gated by FLOW_W, RING_PREV(TRANSFER) for conservation, poles reflect
+- **Topological charge stabilization (15.7)** — butterfly reduction of PH_DIFF across warp, winding error correction toward Q=1, gated on MET_GATE > 1.49 (complete rings only)
+- **Crystal field** — GRID_CRYSTAL permanent density, PFLAG_BANKED
 
-## The Problem
+## Task 1: Hopfion Spillover (Section 15.8)
 
-The original metabolic exchange (commented out) inflated OMEGA because:
+When a complete ring (Q=1) can't maintain coherence due to low OMEGA,
+the ring spills — particles are released with an energy penalty and
+natural physics dissolves the structure over subsequent frames.
+
+### The Physics
+
+Spillover is a **collective** collapse — the ring breaks as a unit when
+the mean OMEGA drops below viability. This is distinct from crystallization
+(individual particles freezing when their personal OMEGA < 0.008).
+Spillover fires BEFORE crystallization catches individual particles.
+
+OMEGA_CRITICAL = 0.04 (50% of OMEGA_BASE). The ring spills when its
+mean metabolic rate drops to half the background level.
+
+### Implementation
+
+Section 15.8, after the winding correction, gated on MET_GATE > 1.49:
 
 ```
-TRANSFER := MIN(ABS(DEFICIT), ABS(Z_C) * DT)
-IF OMEGA_NEXT > OMEGA THEN
-  OMEGA := OMEGA + TRANSFER   ← receiver gains
-ELSE
-  OMEGA := OMEGA - TRANSFER   ← but donor doesn't lose (different thread!)
+! ── 15.8. HOPFION SPILLOVER ──────────────────────────────
+! Ring cannot maintain Q=1 when mean OMEGA is too low.
+! Spilled particles get an energy penalty; natural physics
+! (COAST → crystallize) handles dissolution over time.
+! Gate: complete rings only (MET_GATE > 1.49).
+
+! Warp mean OMEGA via butterfly reduction (same pattern as 15.7)
+OMEGA_SUM := OMEGA
+OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 16)
+OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 8)
+OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 4)
+OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 2)
+OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 1)
+OMEGA_MEAN := OMEGA_SUM / 32.0
+
+IF OMEGA_MEAN < OMEGA_CRITICAL THEN
+  OMEGA := OMEGA * SPILL_DECAY
 ENDIF
 ```
 
-Each thread independently decides to gain or lose based on its neighbor's value,
-but the neighbor is a separate thread making its own independent decision. There's
-no coordination — both threads can simultaneously decide to gain from each other.
-With the [0, OMEGA_MAX] clamp, losses are bounded but gains accumulate. Net result:
-global OMEGA inflation → everything turns yellow.
+No flag changes, no mode changes. Just hammer OMEGA down by SPILL_DECAY
+(0.5). Low OMEGA → COUPLING=0 (COAST segments) → natural decoupling from
+field → drift toward crystallization over ~100-500 frames. The ring dissolves
+naturally. The winding correction in 15.7 stops firing because MET_GATE drops
+below 1.49 as particles scatter out of the cell.
 
-## The Fix: Zero-Sum Warp Exchange
-
-Metabolic energy must be **conserved** within the ring. If thread A gains X from
-thread B, thread B must lose exactly X. This requires coordination between threads.
-
-### Approach: Shuffle-Based Half-Exchange
-
-Each thread computes a **signed transfer** with its RING_NEXT neighbor. The transfer
-is positive if energy flows forward (GEN → GEN+1) and negative if backward.
-Both threads see the same transfer value (one via direct compute, one via shuffle),
-so the exchange is automatically zero-sum.
+### New Constants
 
 ```
-! Each thread computes: how much should flow from ME to my NEXT neighbor?
-OMEGA_NEXT := RING_NEXT(OMEGA)
-
-! Diffusion: energy flows from high to low, gated by FLOW_W direction
-DIFF := (OMEGA - OMEGA_NEXT) * 0.5    ! signed: positive = I have more
-FLOW_DIR := FLOW_WG                    ! FLOW_W sign determines allowed direction
-
-! Gate: only allow flow in the FLOW_W direction
-IF FLOW_DIR > 0.0 THEN
-  ! Forward flow allowed: clamp to non-negative (I can only send forward)
-  TRANSFER := MAX(DIFF, 0.0) * ABS(Z_C) * DT
-ELSE
-  ! Backward flow allowed: clamp to non-positive (I can only send backward)
-  TRANSFER := MIN(DIFF, 0.0) * ABS(Z_C) * DT
-ENDIF
-
-! Cap transfer to prevent over-drain
-TRANSFER := MAX(TRANSFER, -OMEGA * 0.5)
-TRANSFER := MIN(TRANSFER, OMEGA * 0.5)
-
-! I lose TRANSFER (positive = I'm sending forward)
-OMEGA := OMEGA - TRANSFER
-
-! My PREV neighbor's TRANSFER is what flows TO me
-! (their "forward send" is my "receive from behind")
-TRANSFER_FROM_PREV := RING_PREV(TRANSFER)
-OMEGA := OMEGA + TRANSFER_FROM_PREV
+PARAMETER REAL :: OMEGA_CRITICAL = 0.04
+PARAMETER REAL :: SPILL_DECAY = 0.5
 ```
 
-Why this is zero-sum:
-- Thread I sends TRANSFER to thread I+1
-- Thread I+1 receives that same TRANSFER via RING_PREV
-- Thread I loses exactly what thread I+1 gains
-- No independent decisions — the transfer value is computed once and shuffled
-
-### Data Flow
+### New Variables
 
 ```
-Thread:    [0]  [1]  [2]  ... [31]
-           ↓    ↓    ↓        ↓
-Compute:   T₀   T₁   T₂       T₃₁    (each computes its forward transfer)
-           ↓    ↓    ↓        ↓
-Send:      -T₀  -T₁  -T₂      -T₃₁   (lose what you send)
-Receive:   +T₃₁ +T₀  +T₁      +T₃₀   (gain what PREV sent, via shuffle)
-           ↓    ↓    ↓        ↓
-Net:       T₃₁-T₀  T₀-T₁  T₁-T₂  T₃₀-T₃₁   (sum = 0, conservation holds)
+REAL :: OMEGA_SUM, OMEGA_MEAN
 ```
 
-### Shuffle Count
-
-3 shuffles per frame per particle:
-- RING_NEXT(OMEGA) — read neighbor's omega for diffusion
-- RING_PREV(TRANSFER) — receive incoming transfer from behind
-- RING_NEXT(PH) — phase lock (already working)
-
-All register-to-register. Zero memory traffic.
-
-## Implementation
-
-### fluid_subs.mcl changes
-
-Replace the commented-out metabolic exchange in section 15.5 with the
-zero-sum formulation above. Keep the existing phase lock. New variables:
-
-```
-REAL :: DIFF, FLOW_DIR, TRANSFER, TRANSFER_FROM_PREV
-```
-
-Add to the declarations at the top of SIM_PHYSICS_STEP (line ~179).
-
-### Constants
-
-May want a new constant for exchange rate damping:
-
-```
-PARAMETER REAL :: OMEGA_EXCHANGE_RATE = 0.5   ! fraction of diffusion applied per DT
-```
-
-Start at 0.5, tune empirically. The Z_COUPLING already gates per-segment
-strength, this is a global damping on top.
+Add to declarations at top of SIM_PHYSICS_STEP (~line 179).
 
 ### Verification
 
-1. **Conservation test**: Sum OMEGA across all particles before and after
-   a frame. Should be equal (minus OMEGA_DECAY losses, which are separate).
-   Can do this in census.
+1. Run at 30M — rings that lose energy should visibly dissolve (color fades
+   from green/yellow to blue, then particles crystallize)
+2. High-energy rings should remain stable (Q=1 maintained)
+3. Census: monitor crystal count growth rate — should see bursts when rings
+   spill, not steady trickle
 
-2. **Visual test**: Should NOT turn yellow. Energy flows along the ring
-   directionally (FLOW_W gated), not uniformly.
+## Task 2: DO WHILE Language Feature
 
-3. **Ring structure**: With sort active, energy should visibly flow along
-   Viviani ring segments — particles in FLOW mode push energy forward,
-   COAST particles receive but don't transmit.
+### Syntax
 
-### What to watch for
+```
+DO WHILE condition
+  body
+ENDDO
+```
 
-- **Numerical drift**: Floating point means the exchange isn't perfectly
-  zero-sum. The clamp at [0, OMEGA_MAX] catches drift, but if the per-frame
-  error is systematic, it could still accumulate. Monitor via census.
+Condition must be a scalar boolean expression (comparison result).
+No truthy integers, no implicit conversions. Reevaluated every iteration.
 
-- **Over-damping**: If OMEGA_EXCHANGE_RATE × Z_C × DT > 0.5, the exchange
-  overshoots and oscillates. Keep the product well under 1.
+### Parser Changes
 
-- **Dead threads**: Crystallized particles (PFLAG_CRYSTAL) CYCLE before
-  section 15.5. Their lanes in the warp have stale OMEGA values from before
-  crystallization. The shuffle reads stale data — but since the crystal
-  particle itself doesn't write back, this only affects its live neighbors.
-  The live neighbor receives stale OMEGA from the crystal slot, which is
-  bounded and finite. Acceptable — the crystal's field influence is in
-  GRID_CRYSTAL, not in the ring exchange.
+In `parser.py`, extend `_parse_do` to recognize `DO WHILE`:
+- If token after DO is KW_WHILE (new keyword), parse condition expression,
+  expect THEN or newline, parse body until ENDDO
+- Return new AST node: `DoWhileStmt(condition, body)`
 
-## Current Performance
+New token: `KW_WHILE` in tokens.py (or reuse DO + peek for WHILE identifier).
 
-- Headless: 141 fps at 29M (7.1ms/frame)
-- Render with sort + phase lock: 60-74 fps at 30M
-- RTX 2060, f32, DEVICE_LOCAL buffers
+### IR Changes
 
-Expected impact: 1 additional shuffle (RING_PREV on TRANSFER) + ~10 ALU ops.
-Negligible — shuffles are register-to-register, ALU is hidden by memory latency.
+New IR node: `IRWhileLoop(condition, body)` — no loop variable, no bounds.
+Lower in ir_builder.py: condition → IRBranch at top, body, unconditional
+branch back to condition.
+
+### Codegen
+
+C: `while (condition) { body }`
+SPIRV: same as current unextractable loops — the GPU extractor skips them
+(frame loop is already unextracted). DO WHILE is for CPU-side control flow
+(main loop, convergence loops).
+
+### Why
+
+`DEFAULT_FRAMES = 2147483647` is a hack. The main loop should be:
+
+```
+DO WHILE (.TRUE.)
+  CALL CLEAR_GRID()
+  ...
+ENDDO
+```
+
+Also enables convergence loops, retry loops, and other CPU-side patterns
+that currently require artificial counted bounds.
+
+### Loop Family After This
+
+| Construct       | Meaning                         |
+|-----------------|----------------------------------|
+| DO I = A, B     | counted deterministic iteration  |
+| DO WHILE cond   | condition-controlled iteration   |
+| CYCLE           | continue (both loop types)       |
+| EXIT            | break (both loop types)          |
+
+Complete structured loop algebra. No iterators, no generators, no closures.
 
 ## Build
 
 ```bash
 ./structured/build.sh
-# Strip VERIFY for no-oracle, remove SORT_BY_GEN if sort still broken:
 sed '/VERIFY/,/4250/d' galaxy_structured.mcl > /tmp/nonet.mcl
 python -m mcl --target spirv --precision f32 --no-split --render -N 29000000 -M 30000000 -o galaxy_render /tmp/nonet.mcl
-
-# Headless benchmark:
-sed '/VERIFY/,/4250/d' galaxy_structured.mcl | sed 's/DEFAULT_FRAMES = 2147483647/DEFAULT_FRAMES = 5000/' > /tmp/bench.mcl
-python -m mcl --target spirv --precision f32 --no-split -N 29000000 -M 30000000 -o galaxy_gpu /tmp/bench.mcl
-ERGO_PROFILE=1 timeout 120 ./galaxy_gpu
 ```
 
 ## Key Files
 
 ```
 structured/
-  constants.mcl       — K_PHASE_LOCK, OMEGA_EXCHANGE_RATE (new)
-  fluid_subs.mcl      — Section 15.5: phase lock + metabolic exchange (modify)
-  main.mcl            — SORT_BY_GEN at census intervals
+  constants.mcl       — OMEGA_CRITICAL, SPILL_DECAY (new)
+  fluid_subs.mcl      — Section 15.8 (spillover), declarations
 
 mcl/
-  backends/spirv.py   — Sort kernel atomics (fixed), shuffle emission
-  ir_codegen.py       — Sort dispatch with barriers, MAXPART-sized buffers
+  tokens.py           — KW_WHILE (new, for DO WHILE)
+  ast_nodes.py        — DoWhileStmt (new)
+  parser.py           — _parse_do extended for WHILE variant
+  ir.py               — IRWhileLoop (new)
+  ir_builder.py       — Lower DoWhileStmt to IRWhileLoop
+  ir_codegen.py       — Emit while() in C
+  backends/spirv.py   — Skip extraction (same as frame loop)
+
+structured/
+  main.mcl            — Replace DO FRAME = 1, DEFAULT_FRAMES with DO WHILE (.TRUE.)
 ```
