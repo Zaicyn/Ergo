@@ -1,0 +1,218 @@
+# Ergo Threshold Tuning Guide
+
+## Principle
+
+Observe first, then adjust one constant at a time. Never tune two
+simultaneously — you can't tell which one caused the change.
+
+## Current Constants (starting values)
+
+| Constant | Value | Location | Purpose |
+|---|---|---|---|
+| K_PHASE_LOCK | 0.001 | constants.ergo:70 | Phase restoring strength between ring neighbors |
+| OMEGA_EXCHANGE_RATE | 0.5 | constants.ergo:71 | Fraction of metabolic diffusion applied per DT |
+| OMEGA_CRITICAL | 0.04 | constants.ergo:72 | Mean warp OMEGA below which ring spills |
+| SPILL_DECAY | 0.5 | constants.ergo:73 | OMEGA multiplier on spillover (0.5 = halve) |
+| K_WINDING | 0.0001 | constants.ergo:74 | Winding number Q correction strength |
+| OMEGA_CRYSTAL_THRESH | 0.008 | constants.ergo:40 | Individual particle crystallization threshold |
+| OMEGA_BASE | 0.08 | constants.ergo:34 | Background metabolic rate (always present) |
+| OMEGA_DECAY | 0.15 | constants.ergo:37 | Per-frame omega decay rate |
+| OMEGA_NOVA_THRESH | 0.65 | constants.ergo:39 | Supernova trigger threshold |
+
+## Tuning Order
+
+Tune in this order. Each step depends on the previous being stable.
+
+### Phase 0: Instrument Census
+
+Before touching any constant, add warp-level statistics to census.
+Currently census only prints NPART and FRAME.
+
+**Add to census.ergo or a new census_ring.ergo:**
+
+```
+! Per-frame counters (updated in physics kernel, read at census)
+STATIC INTEGER :: CRYSTAL_COUNT = 0
+STATIC INTEGER :: SPILLOVER_COUNT = 0
+STATIC REAL :: OMEGA_WARP_MIN = 999.0
+STATIC REAL :: OMEGA_WARP_MAX = 0.0
+STATIC REAL :: WINDING_ERR_MAX = 0.0
+```
+
+At census intervals, print:
+```
+PRINT CRYSTAL_COUNT
+PRINT SPILLOVER_COUNT
+PRINT OMEGA_WARP_MIN       ! lowest warp mean OMEGA in system
+PRINT OMEGA_WARP_MAX       ! highest warp mean OMEGA
+PRINT WINDING_ERR_MAX      ! largest |Q - 1| error across warps
+```
+
+Reset counters after printing.
+
+**What to look for:**
+- OMEGA_WARP_MIN tells you the natural floor of healthy rings
+- OMEGA_WARP_MAX tells you the ceiling (should be near OMEGA_MAX=2.0 for active rings)
+- WINDING_ERR_MAX tells you how well phase lock is holding Q near 1
+- CRYSTAL_COUNT growth rate tells you how fast particles are dying
+- SPILLOVER_COUNT tells you how often rings break (should be rare events, not constant)
+
+---
+
+### Phase 1: Baseline (no ring coupling)
+
+**Config:** Disable sections 15.5-15.8 entirely. Run pure spatial physics.
+
+**Run:** 10,000+ frames at 29M particles.
+
+**Record:**
+- [ ] OMEGA distribution: what range do particles naturally occupy?
+- [ ] Crystal rate: how many crystallize per 1000 frames?
+- [ ] Visual: does the galaxy form recognizable structure?
+
+**Expected:** OMEGA settles between OMEGA_BASE (0.08) and ~0.4 for most
+particles. COAST particles decay toward crystallization. Active particles
+maintain higher OMEGA from density coupling.
+
+**This is the reference.** All tuning compares against this baseline.
+
+---
+
+### Phase 2: Phase Lock Only (K_PHASE_LOCK)
+
+**Config:** Enable section 15.5 only. Sort active. No metabolic exchange,
+no winding correction, no spillover.
+
+**Tuning target:** Q should drift toward 1 for complete rings but not
+be artificially clamped. WINDING_ERR_MAX should be small but nonzero.
+
+| Symptom | Meaning | Action |
+|---|---|---|
+| Q stays exactly 1.000 | Over-clamped | Reduce K_PHASE_LOCK |
+| Q wanders (0.5-1.5) | Under-clamped | Increase K_PHASE_LOCK |
+| OMEGA distribution narrows | Phase lock is draining energy | Reduce K_PHASE_LOCK |
+| OMEGA distribution unchanged from baseline | Phase lock has no effect | Increase K_PHASE_LOCK |
+| Everything turns yellow | OMEGA inflating | K_PHASE_LOCK too high, PH_ERR is biased |
+
+**Search range:** 0.0001 → 0.01, multiply by 3 each step.
+
+**Record:**
+- [ ] K_PHASE_LOCK value that gives Q ∈ [0.95, 1.05] for healthy rings
+- [ ] OMEGA distribution with phase lock vs baseline — should be similar
+- [ ] Visual: any color shift? Should look like baseline.
+
+---
+
+### Phase 3: Metabolic Exchange (OMEGA_EXCHANGE_RATE)
+
+**Config:** Enable sections 15.5 + 15.6. Sort active.
+
+**Tuning target:** OMEGA should flow directionally along the ring (FLOW_W
+gated), not inflate uniformly. Total OMEGA should be approximately
+conserved (minus OMEGA_DECAY losses).
+
+| Symptom | Meaning | Action |
+|---|---|---|
+| Everything turns yellow/green | OMEGA inflating | Reduce OMEGA_EXCHANGE_RATE |
+| No visible change from Phase 2 | Exchange too weak | Increase OMEGA_EXCHANGE_RATE |
+| OMEGA_WARP_MIN drops fast | Exchange is draining weak rings | Reduce OMEGA_EXCHANGE_RATE |
+| Ring structure visible in color | Working correctly | Lock this value |
+| COAST particles gain OMEGA | Exchange leaking to non-coupled | Check FLOW_W gating at poles |
+
+**Search range:** 0.1 → 1.0, step by 0.2.
+
+**Conservation check:** Sum OMEGA before and after 1000 frames.
+Difference should be explainable entirely by OMEGA_DECAY. If the
+sum grows, the zero-sum exchange has a leak.
+
+**Record:**
+- [ ] OMEGA_EXCHANGE_RATE value where exchange is visible but not inflationary
+- [ ] Total OMEGA conservation error per 1000 frames
+- [ ] Visual: directional energy flow along ring segments
+
+---
+
+### Phase 4: Winding Correction (K_WINDING)
+
+**Config:** Enable sections 15.5 + 15.6 + 15.7. Sort active.
+
+**Tuning target:** Q stays very close to 1 for complete rings (MET_GATE=8).
+The correction should be barely perceptible — local phase lock does the
+heavy lifting, winding correction just prevents drift.
+
+| Symptom | Meaning | Action |
+|---|---|---|
+| WINDING_ERR_MAX stays near 0 | Correction working | Good |
+| WINDING_ERR_MAX grows over time | Correction too weak | Increase K_WINDING |
+| OMEGA oscillates per frame | Correction too strong | Reduce K_WINDING |
+| Only some rings maintain Q=1 | Expected — incomplete rings don't get correction | Correct behavior |
+
+**Search range:** 0.00001 → 0.001, multiply by 3 each step.
+
+**Record:**
+- [ ] K_WINDING value where WINDING_ERR_MAX < 100 after 10,000 frames
+- [ ] No visible oscillation or jitter in particle motion
+
+---
+
+### Phase 5: Spillover (OMEGA_CRITICAL + SPILL_DECAY)
+
+**Config:** Enable all sections 15.5-15.8. Sort active. Full system.
+
+**Pre-step:** From Phase 3 data, note OMEGA_WARP_MIN for healthy rings.
+Call this OMEGA_FLOOR.
+
+**Set initial OMEGA_CRITICAL:**
+- Start at OMEGA_FLOOR × 0.5 (generous — only truly dying rings spill)
+
+**Tuning target:** Dying rings spill and dissolve. Healthy rings never
+trigger spillover. Spillover events should be rare (few per 1000 frames),
+not constant.
+
+| Symptom | Meaning | Action |
+|---|---|---|
+| No spillover events ever | Threshold too low | Raise OMEGA_CRITICAL |
+| Healthy rings spilling | Threshold too high | Lower OMEGA_CRITICAL |
+| Rings dissolve in ~100 frames after spill | SPILL_DECAY correct | Good |
+| Rings dissolve instantly | SPILL_DECAY too aggressive | Raise toward 0.8 |
+| Spilled particles linger for 1000+ frames | SPILL_DECAY too gentle | Lower toward 0.3 |
+| Burst of crystals after spillover | Expected — ring dissolution | Correct behavior |
+
+**OMEGA_CRITICAL search:** Binary search between OMEGA_FLOOR × 0.3 and
+OMEGA_FLOOR × 0.9.
+
+**SPILL_DECAY search:** 0.3 → 0.9, step by 0.1. This is mostly visual —
+how fast do you want dying rings to fade?
+
+**Record:**
+- [ ] OMEGA_CRITICAL value where spillover is rare but real
+- [ ] SPILL_DECAY value that gives visible dissolution over ~200-500 frames
+- [ ] Crystal count growth: should show bursts (ring deaths) not steady trickle
+- [ ] Visual: rings fade from green/yellow → blue → crystallize after spill
+
+---
+
+## Final Validation
+
+After all phases complete, run the full system for 50,000+ frames and check:
+
+- [ ] OMEGA distribution is stable (not drifting up or down over time)
+- [ ] Q ≈ 1 for complete rings, undefined for partial rings
+- [ ] Crystal count grows in bursts (ring spillovers), not linearly
+- [ ] GRID_CRYSTAL accumulates — frozen suns visibly affect live particles
+- [ ] No yellow sponge (OMEGA inflation)
+- [ ] No immediate mass crystallization (OMEGA deflation)
+- [ ] Galaxy structure is recognizable and dynamic
+- [ ] FPS stable at 60-74 rendered, 130+ headless
+
+## Locked Values
+
+Once tuned, record final values here:
+
+| Constant | Tuned value | Phase | Notes |
+|---|---|---|---|
+| K_PHASE_LOCK | TBD | 2 | |
+| OMEGA_EXCHANGE_RATE | TBD | 3 | |
+| K_WINDING | TBD | 4 | |
+| OMEGA_CRITICAL | TBD | 5 | |
+| SPILL_DECAY | TBD | 5 | |
