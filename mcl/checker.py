@@ -66,6 +66,7 @@ class Checker:
         self.diagnostics: list[Diagnostic] = []
         self._in_function: str | None = None
         self._in_loop: int = 0  # nesting depth for CYCLE validation
+        self._stmt_line: int = 0  # line of enclosing statement (for expr errors)
 
     def check(self, tree: ast.Program) -> list[str]:
         """Check the program. Returns list of error strings (empty = success)."""
@@ -288,6 +289,10 @@ class Checker:
     # ── statements ──────────────────────────────────────────
 
     def _check_stmt(self, node):
+        # Track enclosing statement line for expression-level errors
+        stmt_line = getattr(node, 'line', 0)
+        if stmt_line:
+            self._stmt_line = stmt_line
         if isinstance(node, ast.AssignStmt):
             self._check_assign(node)
         elif isinstance(node, ast.IfStmt):
@@ -467,7 +472,8 @@ class Checker:
                 return fsym.return_type if fsym else "REAL"
             sym = self.symtab.lookup(node.name)
             if sym is None:
-                self._error(f"Undeclared variable '{node.name}'")
+                self._error(f"Undeclared variable '{node.name}'",
+                            self._stmt_line)
                 return None
             # Allocation state check
             if sym.is_allocatable and sym.alloc_state == AllocState.UNALLOCATED:

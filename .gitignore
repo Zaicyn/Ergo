@@ -3,7 +3,7 @@
 !.gitignore
 !structured/
 !structured/**
-!galaxy_structured.mcl
+!galaxy_structured.ergo
 !mcl/
 !mcl/**
 !Spec/

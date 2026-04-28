@@ -146,16 +146,16 @@ Complete structured loop algebra. No iterators, no generators, no closures.
 
 ```bash
 ./structured/build.sh
-sed '/VERIFY/,/4250/d' galaxy_structured.mcl > /tmp/nonet.mcl
-python -m mcl --target spirv --precision f32 --no-split --render -N 29000000 -M 30000000 -o galaxy_render /tmp/nonet.mcl
+sed '/VERIFY/,/4250/d' galaxy_structured.ergo > /tmp/nonet.ergo
+python -m mcl --target spirv --precision f32 --no-split --render -N 29000000 -M 30000000 -o galaxy_render /tmp/nonet.ergo
 ```
 
 ## Key Files
 
 ```
 structured/
-  constants.mcl       — OMEGA_CRITICAL, SPILL_DECAY (new)
-  fluid_subs.mcl      — Section 15.8 (spillover), declarations
+  constants.ergo       — OMEGA_CRITICAL, SPILL_DECAY (new)
+  fluid_subs.ergo      — Section 15.8 (spillover), declarations
 
 mcl/
   tokens.py           — KW_WHILE (new, for DO WHILE)
@@ -167,5 +167,5 @@ mcl/
   backends/spirv.py   — Skip extraction (same as frame loop)
 
 structured/
-  main.mcl            — Replace DO FRAME = 1, DEFAULT_FRAMES with DO WHILE (.TRUE.)
+  main.ergo            — Replace DO FRAME = 1, DEFAULT_FRAMES with DO WHILE (.TRUE.)
 ```

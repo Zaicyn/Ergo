@@ -1,5 +1,5 @@
 ================================================================================
-MCL (MATHEMATICAL COMPUTE LANGUAGE) — DESIGN COMPLETE & LOCKED
+ERGO — DESIGN COMPLETE & LOCKED
 ================================================================================
 
 STATUS: Ready for implementation. No design decisions remain.

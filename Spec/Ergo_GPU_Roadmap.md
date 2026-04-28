@@ -537,7 +537,7 @@ output through the IR path. The old AST-to-C codegen is preserved as fallback.
    loops. The compiler fuses them when it can prove safety. The programmer is
    told what happened.
 
-4. **One source, two targets.** The same `.mcl` file compiles to CPU (gcc) or
+4. **One source, two targets.** The same `.ergo` file compiles to CPU (gcc) or
    GPU (NVVM + CUDA Driver). The `--gpu` flag selects the target. Non-extractable
    code stays on the host automatically.
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-A Language Server Protocol (LSP) extension for Ergo (.mcl files).
+A Language Server Protocol (LSP) extension for Ergo (.ergo files).
 Syntax highlighting, inline diagnostics, hover info, and GPU performance
 hints — all powered by the existing Python compiler infrastructure.
 
@@ -50,7 +50,7 @@ Syntax highlighting only — no semantic analysis. Regex-based tokenization.
 | `PFLAG_*`, `GRID_*`, `OMEGA_*` | variable.other.constant | bold |
 | `DATA` | keyword.other.data | blue |
 
-**File association:** `*.mcl` → language ID `ergo`
+**File association:** `*.ergo` → language ID `ergo`
 
 **Estimated size:** ~150 lines of JSON.
 
@@ -164,7 +164,7 @@ def on_hover(params):
 {
   "name": "ergo-lang",
   "displayName": "Ergo Language",
-  "description": "Language support for Ergo (.mcl) — simulation language",
+  "description": "Language support for Ergo (.ergo) — simulation language",
   "version": "0.1.0",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Programming Languages"],
@@ -172,7 +172,7 @@ def on_hover(params):
     "languages": [{
       "id": "ergo",
       "aliases": ["Ergo", "MCL"],
-      "extensions": [".mcl"],
+      "extensions": [".ergo"],
       "configuration": "./language-configuration.json"
     }],
     "grammars": [{
@@ -263,7 +263,7 @@ No other dependencies. The LSP server imports from the existing `mcl/` package.
 1. Write ergo.tmLanguage.json
 2. Write package.json + language-configuration.json
 3. Write minimal extension.js (no LSP yet, just syntax)
-4. Test: open .mcl file in VSCodium, verify colors
+4. Test: open .ergo file in VSCodium, verify colors
 
 ### Session 2: LSP Diagnostics
 5. pip install pygls

@@ -484,25 +484,25 @@ This validates that MCL can express its own implementation. If you find gaps, fi
 ## Test Cases for Week 1
 
 ```mcl
-! test_arithmetic.mcl
+! test_arithmetic.ergo
 REAL :: x, y, z
 x := 5.0
 y := 3.0
 z := x + y * 2.0
 PRINT z  ! Should be 11.0
 
-! test_matmul.mcl
+! test_matmul.ergo
 REAL :: A(2, 3), B(3, 2), C(2, 2)
 ! ... fill A and B ...
 C := MATMUL(A, B)
 PRINT C
 
-! test_loop.mcl
+! test_loop.ergo
 DO i = 1, 10, 1
   PRINT i
 ENDDO
 
-! test_chaining.mcl
+! test_chaining.ergo
 INTEGER :: x
 x := 5
 IF 0 < x ≤ 10:

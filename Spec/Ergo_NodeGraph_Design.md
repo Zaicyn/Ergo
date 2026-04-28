@@ -388,7 +388,7 @@ A graph can compile to multiple targets:
 
 | Target          | Output                        | Use case                |
 |-----------------|-------------------------------|-------------------------|
-| Ergo source     | `.mcl` file                   | Human-readable, editable|
+| Ergo source     | `.ergo` file                   | Human-readable, editable|
 | C executable    | Binary via gcc                | Standalone simulation   |
 | C function      | `.c` + `.h` pair              | Embed in larger program |
 | Tick function   | Function called per-timestep  | Simulation loop body    |
@@ -405,8 +405,8 @@ Because Ergo source and node graphs are semantically equivalent:
 
 This means a user could:
 1. Build a graph visually.
-2. Export to `.mcl`.
-3. Hand-edit the `.mcl` (add optimizations, restructure).
+2. Export to `.ergo`.
+3. Hand-edit the `.ergo` (add optimizations, restructure).
 4. Re-import into the graph editor.
 
 Round-trip fidelity is possible because Ergo has no hidden state — the graph

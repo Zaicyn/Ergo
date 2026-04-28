@@ -8,8 +8,8 @@ Run Ergo simulations on GPU via Vulkan compute, with optional window
 rendering. Same source file, two modes:
 
 ```
-mcl sim.mcl --target spirv                  # headless compute
-mcl sim.mcl --target spirv --render         # compute + live window
+mcl sim.ergo --target spirv                  # headless compute
+mcl sim.ergo --target spirv --render         # compute + live window
 ```
 
 ---

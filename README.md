@@ -10,14 +10,14 @@ Performance is predictable because the language forbids the patterns that make i
 
 ```bash
 # Compile and run
-python3 -m mcl tests/test_first.mcl -o test_first
+python3 -m mcl tests/test_first.ergo -o test_first
 ./test_first
 
 # Emit generated C (inspect what the compiler produces)
-python3 -m mcl tests/test_first.mcl --emit-c
+python3 -m mcl tests/test_first.ergo --emit-c
 
 # Compile with fast-math (FP reassociation, aggressive vectorization)
-python3 -m mcl tests/buc_colony.mcl -o buc_colony --fast-math
+python3 -m mcl tests/buc_colony.ergo -o buc_colony --fast-math
 ./buc_colony
 ```
 
@@ -184,7 +184,7 @@ The checker catches these errors before any C is generated:
 The codegen emits `#line` directives in the generated C. When gcc catches something the checker missed, errors point to your Ergo source file and line number — not generated C.
 
 ```
-gcc error → #line 42 "membrane.mcl" → you fix line 42 in your source
+gcc error → #line 42 "membrane.ergo" → you fix line 42 in your source
 ```
 
 ## Node Graph
@@ -220,7 +220,7 @@ The graph compiler emits **typed SSA form** — each node gets one assignment, e
 
 | Target | Output | Use case |
 |--------|--------|----------|
-| Ergo source | `.mcl` file | Human-readable, editable |
+| Ergo source | `.ergo` file | Human-readable, editable |
 | C executable | Binary via gcc | Standalone simulation |
 | Tick function | Loop body | Simulation per-timestep |
 
@@ -230,10 +230,10 @@ See `Spec/Ergo_NodeGraph_Design.md` for the full specification including Nuklear
 
 | Program | Lines | What it tests |
 |---------|-------|---------------|
-| `test_first.mcl` | 19 | Arithmetic, loops, comparison chaining |
-| `sq2core.mcl` | 160 | Squaragon V2 allocator (1.8ns/alloc, biology-inspired torus) |
-| `buc_membrane_unit.mcl` | 203 | Nernst-Planck membrane physics, 5 experiments, CSV output |
-| `buc_colony.mcl` | 443 | 64x32 cell grid: diffusion, division, death, ANSI visualization |
+| `test_first.ergo` | 19 | Arithmetic, loops, comparison chaining |
+| `sq2core.ergo` | 160 | Squaragon V2 allocator (1.8ns/alloc, biology-inspired torus) |
+| `buc_membrane_unit.ergo` | 203 | Nernst-Planck membrane physics, 5 experiments, CSV output |
+| `buc_colony.ergo` | 443 | 64x32 cell grid: diffusion, division, death, ANSI visualization |
 
 ### Validation Results
 
@@ -258,10 +258,10 @@ Ergo/
     errors.py               Error/diagnostic classes
     __main__.py             CLI entry point
   tests/                  Ergo test programs
-    test_first.mcl          Basic arithmetic and control flow
-    sq2core.mcl             Squaragon V2 torus allocator
-    buc_membrane_unit.mcl   Single-cell membrane physics
-    buc_colony.mcl          Colony simulator with ANSI display
+    test_first.ergo          Basic arithmetic and control flow
+    sq2core.ergo             Squaragon V2 torus allocator
+    buc_membrane_unit.ergo   Single-cell membrane physics
+    buc_colony.ergo          Colony simulator with ANSI display
   Spec/                   Language specification (locked)
     MCL_Design_COMPLETE.md                Full language design + performance constitution
     MCL_Intrinsic_Signatures_Complete.md  Intrinsic function reference

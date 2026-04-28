@@ -184,15 +184,15 @@ zero output when any input is zero. That's free.
 ```
 structured/
     DESIGN.md           — this file
-    constants.mcl       — Layer 1: LUTs, parameters, seed geometry
-    waveguide.mcl       — Layer 2: grid subroutines (clear, scatter, stencil, blend)
-    fluid.mcl           — Layer 3: physics step, spawn
-    census.mcl          — CPU sampling: population stats, oracle communication
-    main.mcl            — pipeline orchestration: init → frame loop
+    constants.ergo       — Layer 1: LUTs, parameters, seed geometry
+    waveguide.ergo       — Layer 2: grid subroutines (clear, scatter, stencil, blend)
+    fluid.ergo           — Layer 3: physics step, spawn
+    census.ergo          — CPU sampling: population stats, oracle communication
+    main.ergo            — pipeline orchestration: init → frame loop
 ```
 
 When Ergo gets USE/INCLUDE, these become separate modules.
-Until then, they concatenate into galaxy_structured.mcl in dependency order.
+Until then, they concatenate into galaxy_structured.ergo in dependency order.
 
 
 ## The Key Insight

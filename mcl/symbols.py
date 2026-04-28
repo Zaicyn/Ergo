@@ -27,6 +27,7 @@ class Symbol:
     is_parameter: bool = False
     const_value: int | float | None = None  # compile-time value for PARAMETERs
     alloc_state: AllocState = AllocState.ALWAYS
+    is_external: bool = False  # True if pre-seeded from another file (LSP cross-file)
     line: int = 0
     col: int = 0
 
@@ -81,6 +82,11 @@ class SymbolTable:
         """Declare a symbol in the current scope. Returns error string if duplicate."""
         scope = self.scopes[-1]
         if sym.name in scope:
+            existing = scope[sym.name]
+            # Allow re-declaration if it shadows a pre-seeded cross-file symbol
+            if existing.is_external:
+                scope[sym.name] = sym
+                return None
             return f"Variable '{sym.name}' already declared in this scope"
         scope[sym.name] = sym
         return None

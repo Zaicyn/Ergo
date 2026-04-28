@@ -84,7 +84,7 @@ leak loop is a separate pass. Split into:
 
 ## What to Change
 
-1. **buc_colony_gpu.mcl**: Restructure the physics DO loop into
+1. **buc_colony_gpu.ergo**: Restructure the physics DO loop into
    separate passes. Add `WILEAK_BUF`, `WIK_BUF`, `WIH_BUF`,
    `IPUMP_BUF` arrays. Move membrane update to its own loop.
 
