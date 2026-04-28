@@ -140,6 +140,16 @@ class VerifyStmt:
 
 
 @dataclass
+class SortByGenStmt:
+    """SORT_BY_GEN arr1, arr2, ... — sort particles by GEN field.
+    arrays: list of array names permuted together.
+    Compiler generates histogram, scan, and scatter kernels.
+    """
+    arrays: list
+    line: int = 0
+
+
+@dataclass
 class WriteStmt:
     """WRITE(unit, fmt) args — formatted output.
     unit: 0=stderr, *=stdout

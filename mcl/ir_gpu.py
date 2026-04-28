@@ -74,19 +74,31 @@ class KernelPlan:
 
 
 @dataclass
+class SortByGenPlan:
+    """Compiler-generated sort-by-GEN kernels."""
+    arrays: list[str]              # arrays to permute together
+    source_line: int               # source line of SORT_BY_GEN directive
+    histogram_kernel_id: int = -1  # assigned during SPIRV generation
+    scan_kernel_id: int = -1
+    scatter_kernel_id: int = -1
+
+
+@dataclass
 class GPUPlan:
     """Result of kernel extraction analysis on a module."""
     kernels: list[KernelPlan] = field(default_factory=list)
     rejections: list[tuple[int, str]] = field(default_factory=list)  # (line, reason)
     warnings: list[tuple[int, str]] = field(default_factory=list)    # (line, message)
     fusions: list[tuple[int, int, int]] = field(default_factory=list)  # (k1_id, k2_id, fused_id)
+    sort_plans: list[SortByGenPlan] = field(default_factory=list)
 
 
 # I/O and memory ops that disqualify a body item.
 # ZERO (memset) is bulk — it zeros an entire array, not one element
 # per thread, so it cannot be a per-element kernel item.
 _DISQUALIFYING_OPS = {Op.PRINT, Op.WRITE, Op.FLUSH, Op.ALLOC, Op.FREE,
-                      Op.CALL, Op.CALL_VOID, Op.STOP, Op.ZERO}
+                      Op.CALL, Op.CALL_VOID, Op.STOP, Op.ZERO,
+                      Op.SORT_BY_GEN}
 
 
 def _resolve_bound(op: Operand, param_values: dict[str, int]) -> int | None:
@@ -928,6 +940,14 @@ def extract_kernels(module: IRModule, allow_split: bool = True) -> GPUPlan:
     def _scan(items: list, outer_loop_vars: set[str] = frozenset()):
         for idx, item in enumerate(items):
             if not isinstance(item, IRLoop):
+                # Check for SORT_BY_GEN directives in blocks
+                if isinstance(item, IRBlock):
+                    for inst in item.insts:
+                        if inst.op == Op.SORT_BY_GEN:
+                            plan.sort_plans.append(SortByGenPlan(
+                                arrays=inst.meta["arrays"],
+                                source_line=inst.line,
+                            ))
                 if isinstance(item, IRIf):
                     _scan(item.then_body, outer_loop_vars)
                     if item.else_body:

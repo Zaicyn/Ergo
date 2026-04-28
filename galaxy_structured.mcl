@@ -67,6 +67,7 @@ PARAMETER INTEGER :: PHASE_SHIFT = 16
 PARAMETER INTEGER :: PHASE_MASK  = 32767
 PARAMETER REAL :: PHASE_INC_SCALE = 86.89
 PARAMETER INTEGER :: SEAM_STEP_PH = 1024
+PARAMETER REAL :: K_PHASE_LOCK = 0.001
 
 ! ── Census interval bounds ────────────────────────────────
 PARAMETER INTEGER :: CENSUS_INTERVAL_MIN = 50
@@ -459,7 +460,7 @@ END
 
 SUBROUTINE SIM_PHYSICS_STEP(DT)
   REAL :: DT
-  INTEGER :: I, GEN, FMODE, CI, CJ, CK
+  INTEGER :: I, GEN, PH, FMODE, CI, CJ, CK
   REAL :: PX, PY, PZ, VX, VY, VZ
   REAL :: R3D_SQ, R3D, INV_R3D, R_SAFE, INV_R
   REAL :: RX, RY, RZ, GRAVITY
@@ -477,6 +478,8 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
   REAL :: STRONG
   REAL :: DRIVE, TARGET, INSTABILITY
   REAL :: WEAK_DOT_R, WEAK_STR
+  REAL :: OMEGA_PREV, OMEGA_NEXT, DEFICIT, TRANSFER
+  INTEGER :: PH_NEXT, PH_DIFF, PH_ERR
   REAL :: GDX, GDY, GDZ, GD_R, GTX, GTY, GTZ
   ! Spawn vars
   INTEGER :: SLOT, PH_CHILD, GEN_CHILD
@@ -499,6 +502,7 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
 
     ! ── GEN + mode ────────────────────────────────────────
     GEN := IAND(ISHFT(FLAGS(I), -GEN_SHIFT), GEN_MASK) + 1
+    PH := IAND(ISHFT(FLAGS(I), -PHASE_SHIFT), PHASE_MASK)
     FMODE := FLOW_MODE(GEN)
 
     ! ── 1. GRAVITY (always — the universal downhill) ──────
@@ -646,6 +650,41 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
     OMEGA := OMEGA + (TARGET - OMEGA) * OMEGA_RESPONSE * DT
     INSTABILITY := MAX(OMEGA - 0.4, 0.0)
     OMEGA := OMEGA + INSTABILITY * INSTABILITY * 0.5 * DT
+    IF OMEGA > OMEGA_MAX THEN
+      OMEGA := OMEGA_MAX
+    ENDIF
+    IF OMEGA < 0.0 THEN
+      OMEGA := 0.0
+    ENDIF
+
+    ! ── 15.5. RING COUPLING (topological, not spatial) ────
+    ! Metabolic exchange: OMEGA flows along ring via FLOW_W direction
+    OMEGA_PREV := RING_PREV(OMEGA)
+    OMEGA_NEXT := RING_NEXT(OMEGA)
+
+    DEFICIT := TARGET - OMEGA
+    TRANSFER := MIN(ABS(DEFICIT), ABS(Z_C) * DT)
+    IF FLOW_WG > 0.0 THEN
+      IF OMEGA_NEXT > OMEGA THEN
+        OMEGA := OMEGA + TRANSFER
+      ELSE
+        OMEGA := OMEGA - TRANSFER
+      ENDIF
+    ELSE
+      IF OMEGA_PREV > OMEGA THEN
+        OMEGA := OMEGA + TRANSFER
+      ELSE
+        OMEGA := OMEGA - TRANSFER
+      ENDIF
+    ENDIF
+
+    ! Phase lock: restoring toward reference Viviani spacing
+    PH_NEXT := RING_NEXT(PH)
+    PH_DIFF := IAND(PH_NEXT - PH + PHASE_MASK + 1, PHASE_MASK)
+    PH_ERR := PH_DIFF - SEAM_STEP_PH
+    OMEGA := OMEGA - REAL(PH_ERR) * K_PHASE_LOCK * DT
+
+    ! Re-clamp after ring exchange
     IF OMEGA > OMEGA_MAX THEN
       OMEGA := OMEGA_MAX
     ENDIF
@@ -983,6 +1022,8 @@ DO FRAME = 1, DEFAULT_FRAMES
     ! rubber-banding because codegen inserts unconditional downloads.
     ! TODO: fix codegen to only download inside conditional blocks.
     CALL SIM_CENSUS_ADAPTIVE(NPART, FRAME, CENSUS_INTERVAL)
+    ! Sort particles by GEN so warps align with ring topology
+    SORT_BY_GEN FLAGS, POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT
     NEXT_CENSUS := FRAME + CENSUS_INTERVAL
   ENDIF
 

@@ -324,6 +324,12 @@ class Checker:
                 if not sym:
                     self._error(f"Undefined array '{arr_name}' in VERIFY",
                                 node.line)
+        elif isinstance(node, ast.SortByGenStmt):
+            for arr_name in node.arrays:
+                sym = self.symtab.lookup(arr_name)
+                if not sym:
+                    self._error(f"Undefined array '{arr_name}' in SORT_BY_GEN",
+                                node.line)
 
     def _check_assign(self, node: ast.AssignStmt):
         # Reject assignment to PARAMETER

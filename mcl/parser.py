@@ -335,6 +335,8 @@ class Parser:
             return ast.FlushStmt()
         if self._at(TT.KW_VERIFY):
             return self._parse_verify()
+        if self._at(TT.KW_SORT_BY_GEN):
+            return self._parse_sort_by_gen()
         # Declaration (inside function body)
         if self._at(*TYPE_KEYWORDS):
             return self._parse_declaration()
@@ -500,6 +502,16 @@ class Parser:
         return ast.VerifyStmt(arrays, oracle_size, every, tolerance,
                               net_host=net_host, net_gpu_id=net_gpu_id,
                               line=line)
+
+    def _parse_sort_by_gen(self) -> ast.SortByGenStmt:
+        """Parse: SORT_BY_GEN arr1, arr2, ..."""
+        line = self._cur().line
+        self._eat(TT.KW_SORT_BY_GEN)
+        arrays = [self._eat(TT.IDENT).value]
+        while self._match(TT.COMMA):
+            arrays.append(self._eat(TT.IDENT).value)
+        self._eat_newline()
+        return ast.SortByGenStmt(arrays, line=line)
 
     def _parse_print(self) -> ast.PrintStmt:
         line = self._cur().line

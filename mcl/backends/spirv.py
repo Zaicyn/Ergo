@@ -20,7 +20,7 @@ from ..ir import (
     IRModule, IRVar, IRBlock, IRIf, IRLoop, IRSelect,
     IRInst, IRConst, IRRef, IRType, StorageClass, Op, Operand,
 )
-from ..ir_gpu import KernelPlan, GPUPlan
+from ..ir_gpu import KernelPlan, GPUPlan, SortByGenPlan
 from . import KernelBackend, register_backend
 
 
@@ -104,6 +104,16 @@ class SPIRVBackend(KernelBackend):
         parts = []
         for kernel in self.plan.kernels:
             parts.append(self._emit_kernel_module(kernel))
+        # Generate compiler-created sort-by-GEN kernels
+        next_kid = len(self.plan.kernels)
+        for sp in self.plan.sort_plans:
+            sp.histogram_kernel_id = next_kid
+            sp.scan_kernel_id = next_kid + 1
+            sp.scatter_kernel_id = next_kid + 2
+            parts.append(self._emit_sort_histogram(sp, next_kid))
+            parts.append(self._emit_sort_scan(sp, next_kid + 1))
+            parts.append(self._emit_sort_scatter(sp, next_kid + 2))
+            next_kid += 3
         return "\n".join(parts)
 
     def generate_host_launches(self) -> str:
@@ -134,6 +144,453 @@ class SPIRVBackend(KernelBackend):
                           array_shapes)
         ctx.emit_module()
         return "\n".join(ctx.lines) + "\n"
+
+    # ── sort-by-GEN kernel generators ────────────────────────
+    #
+    # These produce self-contained SPIR-V modules for the 3-stage
+    # counting sort: histogram, prefix-sum (scan), scatter.
+    # All operate on i32 (FLAGS, histogram, offsets) and f32 arrays.
+
+    def _emit_sort_histogram(self, sp: SortByGenPlan, kid: int) -> str:
+        """Kernel A: COUNT_GEN — atomicAdd histogram[GEN] for each particle.
+        Buffers: FLAGS (read, binding 0), histogram (rw atomic, binding 1)
+        Push constants: NPART (i32), GEN_SHIFT (i32), GEN_MASK (i32)
+        """
+        return f"""; SPIR-V
+; Version: 1.3
+; Generator: Ergo
+; Source: sort_histogram (kernel_{kid})
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid_var
+               OpExecutionMode %main LocalSize 256 1 1
+
+               OpDecorate %rta_i32 ArrayStride 4
+               OpDecorate %sb_flags Block
+               OpMemberDecorate %sb_flags 0 Offset 0
+               OpDecorate %v_flags DescriptorSet 0
+               OpDecorate %v_flags Binding 0
+               OpDecorate %sb_hist Block
+               OpMemberDecorate %sb_hist 0 Offset 0
+               OpDecorate %v_hist DescriptorSet 0
+               OpDecorate %v_hist Binding 1
+               OpMemberDecorate %pc_type 0 Offset 0
+               OpMemberDecorate %pc_type 1 Offset 4
+               OpMemberDecorate %pc_type 2 Offset 8
+               OpDecorate %pc_type Block
+               OpDecorate %gid_var BuiltIn GlobalInvocationId
+
+     %void   = OpTypeVoid
+     %func   = OpTypeFunction %void
+     %bool   = OpTypeBool
+     %u32    = OpTypeInt 32 0
+     %i32    = OpTypeInt 32 1
+     %v3u    = OpTypeVector %u32 3
+     %pv3u   = OpTypePointer Input %v3u
+     %rta_i32 = OpTypeRuntimeArray %i32
+     %sb_flags = OpTypeStruct %rta_i32
+     %p_sb_flags = OpTypePointer StorageBuffer %sb_flags
+     %sb_hist = OpTypeStruct %rta_i32
+     %p_sb_hist = OpTypePointer StorageBuffer %sb_hist
+     %p_sb_i32 = OpTypePointer StorageBuffer %i32
+     %pc_type = OpTypeStruct %i32 %i32 %i32
+     %p_pc   = OpTypePointer PushConstant %pc_type
+     %p_pc_i = OpTypePointer PushConstant %i32
+     %c0     = OpConstant %i32 0
+     %c1     = OpConstant %i32 1
+     %c2     = OpConstant %i32 2
+     %cu0    = OpConstant %u32 0
+     %scope_dev = OpConstant %u32 1
+     %mem_none  = OpConstant %u32 0
+
+     %v_flags = OpVariable %p_sb_flags StorageBuffer
+     %v_hist  = OpVariable %p_sb_hist StorageBuffer
+     %pc_var  = OpVariable %p_pc PushConstant
+     %gid_var = OpVariable %pv3u Input
+
+     %main   = OpFunction %void None %func
+     %entry  = OpLabel
+               ; Load global invocation ID
+         %gid = OpLoad %v3u %gid_var
+         %idx_u = OpCompositeExtract %u32 %gid 0
+         %idx = OpBitcast %i32 %idx_u
+               ; Load NPART from push constants
+         %pc_npart_p = OpAccessChain %p_pc_i %pc_var %c0
+         %npart = OpLoad %i32 %pc_npart_p
+               ; Bounds check
+         %in_bounds = OpSLessThan %bool %idx %npart
+               OpSelectionMerge %done None
+               OpBranchConditional %in_bounds %body %done
+     %body   = OpLabel
+               ; Load GEN_SHIFT and GEN_MASK
+         %pc_shift_p = OpAccessChain %p_pc_i %pc_var %c1
+         %gen_shift = OpLoad %i32 %pc_shift_p
+         %pc_mask_p = OpAccessChain %p_pc_i %pc_var %c2
+         %gen_mask = OpLoad %i32 %pc_mask_p
+               ; Extract GEN = (FLAGS[idx] >> GEN_SHIFT) & GEN_MASK
+         %flags_p = OpAccessChain %p_sb_i32 %v_flags %c0 %idx
+         %flags = OpLoad %i32 %flags_p
+         %shifted = OpShiftRightArithmetic %i32 %flags %gen_shift
+         %gen = OpBitwiseAnd %i32 %shifted %gen_mask
+               ; atomicAdd(histogram[gen], 1)
+         %hist_p = OpAccessChain %p_sb_i32 %v_hist %c0 %gen
+         %_old = OpAtomicIAdd %i32 %hist_p %scope_dev %mem_none %c1
+               OpBranch %done
+     %done   = OpLabel
+               OpReturn
+               OpFunctionEnd
+"""
+
+    def _emit_sort_scan(self, sp: SortByGenPlan, kid: int) -> str:
+        """Kernel B: SCAN_GEN — exclusive prefix sum over 32-element histogram.
+        Single workgroup, 32 threads. Hillis-Steele scan.
+        Buffers: histogram (read, binding 0), offsets (write, binding 1)
+        No push constants needed (fixed 32 elements).
+        """
+        # Hillis-Steele exclusive prefix sum: 5 steps for 32 elements
+        # Using workgroup shared memory and barriers
+        return f"""; SPIR-V
+; Version: 1.3
+; Generator: Ergo
+; Source: sort_scan (kernel_{kid})
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid_var
+               OpExecutionMode %main LocalSize 32 1 1
+
+               OpDecorate %rta_i32 ArrayStride 4
+               OpDecorate %sb_hist Block
+               OpMemberDecorate %sb_hist 0 Offset 0
+               OpDecorate %v_hist DescriptorSet 0
+               OpDecorate %v_hist Binding 0
+               OpDecorate %sb_off Block
+               OpMemberDecorate %sb_off 0 Offset 0
+               OpDecorate %v_off DescriptorSet 0
+               OpDecorate %v_off Binding 1
+               OpDecorate %gid_var BuiltIn LocalInvocationId
+
+     %void   = OpTypeVoid
+     %func   = OpTypeFunction %void
+     %bool   = OpTypeBool
+     %u32    = OpTypeInt 32 0
+     %i32    = OpTypeInt 32 1
+     %v3u    = OpTypeVector %u32 3
+     %pv3u   = OpTypePointer Input %v3u
+     %rta_i32 = OpTypeRuntimeArray %i32
+     %sb_hist = OpTypeStruct %rta_i32
+     %p_sb_hist = OpTypePointer StorageBuffer %sb_hist
+     %sb_off = OpTypeStruct %rta_i32
+     %p_sb_off = OpTypePointer StorageBuffer %sb_off
+     %p_sb_i32 = OpTypePointer StorageBuffer %i32
+     %c0     = OpConstant %i32 0
+     %c32u   = OpConstant %u32 32
+     %arr32  = OpTypeArray %i32 %c32u
+     %p_wg   = OpTypePointer Workgroup %arr32
+     %p_wg_i = OpTypePointer Workgroup %i32
+     %c1u    = OpConstant %u32 1
+     %c2u    = OpConstant %u32 2
+     %c4u    = OpConstant %u32 4
+     %c8u    = OpConstant %u32 8
+     %c16u   = OpConstant %u32 16
+     %cu0    = OpConstant %u32 0
+     %scope_wg = OpConstant %u32 2
+     %mem_wg = OpConstant %u32 256
+
+     %v_hist = OpVariable %p_sb_hist StorageBuffer
+     %v_off  = OpVariable %p_sb_off StorageBuffer
+     %shared = OpVariable %p_wg Workgroup
+     %gid_var = OpVariable %pv3u Input
+
+     %main   = OpFunction %void None %func
+     %entry  = OpLabel
+         %gid = OpLoad %v3u %gid_var
+         %tid = OpCompositeExtract %u32 %gid 0
+         %tid_i = OpBitcast %i32 %tid
+               ; Load histogram[tid] into shared memory
+         %hp  = OpAccessChain %p_sb_i32 %v_hist %c0 %tid_i
+         %hval = OpLoad %i32 %hp
+         %sp0 = OpAccessChain %p_wg_i %shared %tid
+               OpStore %sp0 %hval
+               OpControlBarrier %scope_wg %scope_wg %mem_wg
+
+               ; Step 1: stride 1
+         %ge1 = OpUGreaterThanEqual %bool %tid %c1u
+               OpSelectionMerge %m1 None
+               OpBranchConditional %ge1 %s1y %s1n
+     %s1y    = OpLabel
+         %i1  = OpISub %u32 %tid %c1u
+         %p1  = OpAccessChain %p_wg_i %shared %i1
+         %v1  = OpLoad %i32 %p1
+               OpBranch %m1
+     %s1n    = OpLabel
+               OpBranch %m1
+     %m1     = OpLabel
+         %a1  = OpPhi %i32 %v1 %s1y %c0 %s1n
+         %r1  = OpIAdd %i32 %hval %a1
+               OpControlBarrier %scope_wg %scope_wg %mem_wg
+         %sp1 = OpAccessChain %p_wg_i %shared %tid
+               OpStore %sp1 %r1
+               OpControlBarrier %scope_wg %scope_wg %mem_wg
+
+               ; Step 2: stride 2
+         %ge2 = OpUGreaterThanEqual %bool %tid %c2u
+               OpSelectionMerge %m2 None
+               OpBranchConditional %ge2 %s2y %s2n
+     %s2y    = OpLabel
+         %i2  = OpISub %u32 %tid %c2u
+         %p2  = OpAccessChain %p_wg_i %shared %i2
+         %v2  = OpLoad %i32 %p2
+               OpBranch %m2
+     %s2n    = OpLabel
+               OpBranch %m2
+     %m2     = OpLabel
+         %a2  = OpPhi %i32 %v2 %s2y %c0 %s2n
+         %r2  = OpIAdd %i32 %r1 %a2
+               OpControlBarrier %scope_wg %scope_wg %mem_wg
+         %sp2 = OpAccessChain %p_wg_i %shared %tid
+               OpStore %sp2 %r2
+               OpControlBarrier %scope_wg %scope_wg %mem_wg
+
+               ; Step 3: stride 4
+         %ge4 = OpUGreaterThanEqual %bool %tid %c4u
+               OpSelectionMerge %m4 None
+               OpBranchConditional %ge4 %s4y %s4n
+     %s4y    = OpLabel
+         %i4  = OpISub %u32 %tid %c4u
+         %p4  = OpAccessChain %p_wg_i %shared %i4
+         %v4  = OpLoad %i32 %p4
+               OpBranch %m4
+     %s4n    = OpLabel
+               OpBranch %m4
+     %m4     = OpLabel
+         %a4  = OpPhi %i32 %v4 %s4y %c0 %s4n
+         %r4  = OpIAdd %i32 %r2 %a4
+               OpControlBarrier %scope_wg %scope_wg %mem_wg
+         %sp4 = OpAccessChain %p_wg_i %shared %tid
+               OpStore %sp4 %r4
+               OpControlBarrier %scope_wg %scope_wg %mem_wg
+
+               ; Step 4: stride 8
+         %ge8 = OpUGreaterThanEqual %bool %tid %c8u
+               OpSelectionMerge %m8 None
+               OpBranchConditional %ge8 %s8y %s8n
+     %s8y    = OpLabel
+         %i8  = OpISub %u32 %tid %c8u
+         %p8  = OpAccessChain %p_wg_i %shared %i8
+         %v8  = OpLoad %i32 %p8
+               OpBranch %m8
+     %s8n    = OpLabel
+               OpBranch %m8
+     %m8     = OpLabel
+         %a8  = OpPhi %i32 %v8 %s8y %c0 %s8n
+         %r8  = OpIAdd %i32 %r4 %a8
+               OpControlBarrier %scope_wg %scope_wg %mem_wg
+         %sp8 = OpAccessChain %p_wg_i %shared %tid
+               OpStore %sp8 %r8
+               OpControlBarrier %scope_wg %scope_wg %mem_wg
+
+               ; Step 5: stride 16
+         %ge16 = OpUGreaterThanEqual %bool %tid %c16u
+               OpSelectionMerge %m16 None
+               OpBranchConditional %ge16 %s16y %s16n
+     %s16y   = OpLabel
+         %i16 = OpISub %u32 %tid %c16u
+         %p16 = OpAccessChain %p_wg_i %shared %i16
+         %v16 = OpLoad %i32 %p16
+               OpBranch %m16
+     %s16n   = OpLabel
+               OpBranch %m16
+     %m16    = OpLabel
+         %a16 = OpPhi %i32 %v16 %s16y %c0 %s16n
+         %r16 = OpIAdd %i32 %r8 %a16
+               OpControlBarrier %scope_wg %scope_wg %mem_wg
+
+               ; Convert inclusive to exclusive: offsets[tid] = scan[tid] - histogram[tid]
+         %excl = OpISub %i32 %r16 %hval
+         %op  = OpAccessChain %p_sb_i32 %v_off %c0 %tid_i
+               OpStore %op %excl
+               OpReturn
+               OpFunctionEnd
+"""
+
+    def _emit_sort_scatter(self, sp: SortByGenPlan, kid: int) -> str:
+        """Kernel C: SCATTER_GEN — scatter particles to sorted positions.
+        For each particle: GEN = extract from FLAGS, dest = atomicAdd(offsets[GEN], 1)
+        Then copy all arrays from source to dest in temp buffers.
+        Buffers: FLAGS(read, 0), offsets(rw atomic, 1), then for each array:
+                 src_arr(read), dst_arr(write) — paired.
+        Push constants: NPART (i32), GEN_SHIFT (i32), GEN_MASK (i32)
+        """
+        from ..ir import get_real_precision
+        is_f32 = get_real_precision() == 32
+
+        lines = []
+        lines.append(f"; SPIR-V")
+        lines.append(f"; Version: 1.3")
+        lines.append(f"; Generator: Ergo")
+        lines.append(f"; Source: sort_scatter (kernel_{kid})")
+        lines.append(f"               OpCapability Shader")
+        lines.append(f"               OpMemoryModel Logical GLSL450")
+        lines.append(f"               OpEntryPoint GLCompute %main \"main\" %gid_var")
+        lines.append(f"               OpExecutionMode %main LocalSize 256 1 1")
+        lines.append(f"")
+
+        # Build array list: FLAGS is always first (for GEN extraction),
+        # then the user-specified arrays (each has src + dst buffer pair)
+        arrays = sp.arrays
+        # Determine types for each array
+        arr_types = {}  # name -> 'real' or 'int'
+        for name in arrays:
+            t = self._var_types.get(name, IRType.REAL)
+            arr_types[name] = 'int' if t == IRType.INTEGER else 'real'
+
+        # Binding layout:
+        # 0: FLAGS (read)
+        # 1: offsets (rw atomic)
+        # 2..2+N-1: src arrays (read)  — source particle data
+        # 2+N..2+2N-1: dst arrays (write) — sorted destination
+        n_arrays = len(arrays)
+        total_bindings = 2 + 2 * n_arrays
+
+        # Decorations
+        real_stride = 4 if is_f32 else 8
+        lines.append(f"               OpDecorate %rta_i32 ArrayStride 4")
+        if is_f32:
+            lines.append(f"               OpDecorate %rta_f32 ArrayStride 4")
+        else:
+            lines.append(f"               OpDecorate %rta_f64 ArrayStride 8")
+
+        # FLAGS buffer
+        lines.append(f"               OpDecorate %sb_flags Block")
+        lines.append(f"               OpMemberDecorate %sb_flags 0 Offset 0")
+        lines.append(f"               OpDecorate %v_flags DescriptorSet 0")
+        lines.append(f"               OpDecorate %v_flags Binding 0")
+        # offsets buffer
+        lines.append(f"               OpDecorate %sb_off Block")
+        lines.append(f"               OpMemberDecorate %sb_off 0 Offset 0")
+        lines.append(f"               OpDecorate %v_off DescriptorSet 0")
+        lines.append(f"               OpDecorate %v_off Binding 1")
+        # src + dst array buffers
+        for i, name in enumerate(arrays):
+            is_int = arr_types[name] == 'int'
+            rta = 'rta_i32' if is_int else ('rta_f32' if is_f32 else 'rta_f64')
+            # Source
+            lines.append(f"               OpDecorate %sb_src_{name} Block")
+            lines.append(f"               OpMemberDecorate %sb_src_{name} 0 Offset 0")
+            lines.append(f"               OpDecorate %v_src_{name} DescriptorSet 0")
+            lines.append(f"               OpDecorate %v_src_{name} Binding {2 + i}")
+            # Destination
+            lines.append(f"               OpDecorate %sb_dst_{name} Block")
+            lines.append(f"               OpMemberDecorate %sb_dst_{name} 0 Offset 0")
+            lines.append(f"               OpDecorate %v_dst_{name} DescriptorSet 0")
+            lines.append(f"               OpDecorate %v_dst_{name} Binding {2 + n_arrays + i}")
+
+        # Push constant block
+        lines.append(f"               OpMemberDecorate %pc_type 0 Offset 0")
+        lines.append(f"               OpMemberDecorate %pc_type 1 Offset 4")
+        lines.append(f"               OpMemberDecorate %pc_type 2 Offset 8")
+        lines.append(f"               OpDecorate %pc_type Block")
+        lines.append(f"               OpDecorate %gid_var BuiltIn GlobalInvocationId")
+        lines.append(f"")
+
+        # Types
+        lines.append(f"     %void   = OpTypeVoid")
+        lines.append(f"     %func   = OpTypeFunction %void")
+        lines.append(f"     %bool   = OpTypeBool")
+        lines.append(f"     %u32    = OpTypeInt 32 0")
+        lines.append(f"     %i32    = OpTypeInt 32 1")
+        if is_f32:
+            lines.append(f"     %f32    = OpTypeFloat 32")
+        else:
+            lines.append(f"     %f64    = OpTypeFloat 64")
+        lines.append(f"     %v3u    = OpTypeVector %u32 3")
+        lines.append(f"     %pv3u   = OpTypePointer Input %v3u")
+        lines.append(f"     %rta_i32 = OpTypeRuntimeArray %i32")
+        if is_f32:
+            lines.append(f"     %rta_f32 = OpTypeRuntimeArray %f32")
+        else:
+            lines.append(f"     %rta_f64 = OpTypeRuntimeArray %f64")
+        real_type = 'f32' if is_f32 else 'f64'
+        lines.append(f"     %p_sb_i32 = OpTypePointer StorageBuffer %i32")
+        lines.append(f"     %p_sb_{real_type} = OpTypePointer StorageBuffer %{real_type}")
+
+        # Struct types for each buffer
+        lines.append(f"     %sb_flags = OpTypeStruct %rta_i32")
+        lines.append(f"     %p_sb_flags = OpTypePointer StorageBuffer %sb_flags")
+        lines.append(f"     %sb_off = OpTypeStruct %rta_i32")
+        lines.append(f"     %p_sb_off = OpTypePointer StorageBuffer %sb_off")
+        for name in arrays:
+            is_int = arr_types[name] == 'int'
+            rta = 'rta_i32' if is_int else f'rta_{real_type}'
+            lines.append(f"     %sb_src_{name} = OpTypeStruct %{rta}")
+            lines.append(f"     %p_sb_src_{name} = OpTypePointer StorageBuffer %sb_src_{name}")
+            lines.append(f"     %sb_dst_{name} = OpTypeStruct %{rta}")
+            lines.append(f"     %p_sb_dst_{name} = OpTypePointer StorageBuffer %sb_dst_{name}")
+
+        # Push constant type
+        lines.append(f"     %pc_type = OpTypeStruct %i32 %i32 %i32")
+        lines.append(f"     %p_pc   = OpTypePointer PushConstant %pc_type")
+        lines.append(f"     %p_pc_i = OpTypePointer PushConstant %i32")
+
+        # Constants
+        lines.append(f"     %c0     = OpConstant %i32 0")
+        lines.append(f"     %c1     = OpConstant %i32 1")
+        lines.append(f"     %c2     = OpConstant %i32 2")
+        lines.append(f"     %cu0    = OpConstant %u32 0")
+        lines.append(f"     %scope_dev = OpConstant %u32 1")
+        lines.append(f"     %mem_none  = OpConstant %u32 0")
+        lines.append(f"")
+
+        # Variables
+        lines.append(f"     %v_flags = OpVariable %p_sb_flags StorageBuffer")
+        lines.append(f"     %v_off  = OpVariable %p_sb_off StorageBuffer")
+        for name in arrays:
+            lines.append(f"     %v_src_{name} = OpVariable %p_sb_src_{name} StorageBuffer")
+            lines.append(f"     %v_dst_{name} = OpVariable %p_sb_dst_{name} StorageBuffer")
+        lines.append(f"     %pc_var = OpVariable %p_pc PushConstant")
+        lines.append(f"     %gid_var = OpVariable %pv3u Input")
+        lines.append(f"")
+
+        # Function
+        lines.append(f"     %main   = OpFunction %void None %func")
+        lines.append(f"     %entry  = OpLabel")
+        lines.append(f"         %gid = OpLoad %v3u %gid_var")
+        lines.append(f"         %idx_u = OpCompositeExtract %u32 %gid 0")
+        lines.append(f"         %idx = OpBitcast %i32 %idx_u")
+        # Load push constants
+        lines.append(f"         %pc_npart_p = OpAccessChain %p_pc_i %pc_var %c0")
+        lines.append(f"         %npart = OpLoad %i32 %pc_npart_p")
+        lines.append(f"         %in_bounds = OpSLessThan %bool %idx %npart")
+        lines.append(f"               OpSelectionMerge %done None")
+        lines.append(f"               OpBranchConditional %in_bounds %body %done")
+        lines.append(f"     %body   = OpLabel")
+        # Extract GEN
+        lines.append(f"         %pc_shift_p = OpAccessChain %p_pc_i %pc_var %c1")
+        lines.append(f"         %gen_shift = OpLoad %i32 %pc_shift_p")
+        lines.append(f"         %pc_mask_p = OpAccessChain %p_pc_i %pc_var %c2")
+        lines.append(f"         %gen_mask = OpLoad %i32 %pc_mask_p")
+        lines.append(f"         %flags_p = OpAccessChain %p_sb_i32 %v_flags %c0 %idx")
+        lines.append(f"         %flags = OpLoad %i32 %flags_p")
+        lines.append(f"         %shifted = OpShiftRightArithmetic %i32 %flags %gen_shift")
+        lines.append(f"         %gen = OpBitwiseAnd %i32 %shifted %gen_mask")
+        # atomicAdd(offsets[gen], 1) → dest index
+        lines.append(f"         %off_p = OpAccessChain %p_sb_i32 %v_off %c0 %gen")
+        lines.append(f"         %dest = OpAtomicIAdd %i32 %off_p %scope_dev %mem_none %c1")
+        # Copy each array: dst[dest] = src[idx]
+        for name in arrays:
+            is_int = arr_types[name] == 'int'
+            elem_type = 'i32' if is_int else real_type
+            p_type = 'p_sb_i32' if is_int else f'p_sb_{real_type}'
+            lines.append(f"         %src_{name}_p = OpAccessChain %{p_type} %v_src_{name} %c0 %idx")
+            lines.append(f"         %src_{name}_v = OpLoad %{elem_type} %src_{name}_p")
+            lines.append(f"         %dst_{name}_p = OpAccessChain %{p_type} %v_dst_{name} %c0 %dest")
+            lines.append(f"               OpStore %dst_{name}_p %src_{name}_v")
+        lines.append(f"               OpBranch %done")
+        lines.append(f"     %done   = OpLabel")
+        lines.append(f"               OpReturn")
+        lines.append(f"               OpFunctionEnd")
+        lines.append(f"")
+        return "\n".join(lines) + "\n"
 
     # ── host launch code ────────────────────────────────────
 
@@ -216,6 +673,9 @@ class _EmitContext:
         # Track which GLSL.std.450 instructions we need
         self._needs_glsl_ext = False
 
+        # Track whether kernel uses subgroup shuffle (RING_PREV/RING_NEXT)
+        self._needs_subgroup = False
+
         # Section buffers — filled during emit, flushed in order
         self._header: list[str] = []
         self._decorations: list[str] = []
@@ -253,6 +713,9 @@ class _EmitContext:
 
         # GlobalInvocationID variable
         self.id_gl_global_inv: int = 0
+
+        # SubgroupInvocationID variable (for ring shuffle)
+        self.id_gl_subgroup_inv: int = 0
 
         # Track array element types for LOAD/STORE
         self._array_elem_types: dict[str, IRType] = {}
@@ -345,8 +808,10 @@ class _EmitContext:
         buf_vars = self._declare_buffers()
         pc_member_ids = self._declare_push_constants()
 
-        # --- Phase 3: Declare GlobalInvocationID ---
+        # --- Phase 3: Declare GlobalInvocationID (and SubgroupInvocationID if needed) ---
         self._declare_builtin()
+        if self._needs_subgroup:
+            self._declare_subgroup_builtin()
 
         # --- Phase 4: Build header (must know all interface variables) ---
         self._build_header(buf_vars, pc_member_ids)
@@ -366,38 +831,41 @@ class _EmitContext:
         self.lines.extend(self._function)
 
     def _scan_for_glsl_ext(self, items: list):
-        """Check if any instruction needs GLSL.std.450."""
+        """Check if any instruction needs GLSL.std.450 or subgroup ops."""
         for item in items:
             if isinstance(item, IRBlock):
                 for inst in item.insts:
                     if inst.op in GLSL_EXT:
                         self._needs_glsl_ext = True
-                        return
                     if inst.op == Op.CLAMP:
                         self._needs_glsl_ext = True
-                        return
                     if inst.op == Op.LOG10:
                         self._needs_glsl_ext = True
+                    if inst.op in (Op.RING_PREV, Op.RING_NEXT):
+                        self._needs_subgroup = True
+                    if self._needs_glsl_ext and self._needs_subgroup:
                         return
             elif isinstance(item, IRIf):
                 self._scan_for_glsl_ext(item.then_body)
-                if self._needs_glsl_ext:
-                    return
                 if item.else_body:
                     self._scan_for_glsl_ext(item.else_body)
-                    if self._needs_glsl_ext:
-                        return
+                if self._needs_glsl_ext and self._needs_subgroup:
+                    return
 
     # ── type declarations ──────────────────────────────────
 
     def _declare_types(self):
         """Declare all SPIR-V types needed by the kernel."""
+        from ..ir import get_real_precision
+        is_f32 = get_real_precision() == 32
+
         # Core types
         self.id_void = self._alloc("void")
         self.id_func_void = self._alloc("func_void")
         self.id_bool = self._alloc("bool")
         self.id_u32 = self._alloc("u32")
         self.id_i32 = self._alloc("i32")
+        self.id_f32 = self._alloc("f32")
         self.id_f64 = self._alloc("f64")
         self.id_v3uint = self._alloc("v3uint")
 
@@ -406,9 +874,9 @@ class _EmitContext:
         self._types.append(f"     {self._id(self.id_bool)} = OpTypeBool")
         self._types.append(f"     {self._id(self.id_u32)} = OpTypeInt 32 0")
         self._types.append(f"     {self._id(self.id_i32)} = OpTypeInt 32 1")
-        self.id_f32 = self._alloc("f32")
         self._types.append(f"     {self._id(self.id_f32)} = OpTypeFloat 32")
-        self._types.append(f"     {self._id(self.id_f64)} = OpTypeFloat 64")
+        if not is_f32:
+            self._types.append(f"     {self._id(self.id_f64)} = OpTypeFloat 64")
         self._types.append(f"     {self._id(self.id_v3uint)} = OpTypeVector {self._id(self.id_u32)} 3")
 
         # Pointer to v3uint (Input) — for GlobalInvocationID
@@ -416,12 +884,13 @@ class _EmitContext:
         self._types.append(
             f"     {self._id(self.id_ptr_input_v3uint)} = OpTypePointer Input {self._id(self.id_v3uint)}")
 
-        # Runtime array of f64 (for storage buffers)
+        # Runtime array of f64 (for storage buffers) — only in f64 mode
         self.id_rta_f64 = self._alloc("rta_f64")
-        self._types.append(
-            f"     {self._id(self.id_rta_f64)} = OpTypeRuntimeArray {self._id(self.id_f64)}")
-        self._decorations.append(
-            f"               OpDecorate {self._id(self.id_rta_f64)} ArrayStride 8")
+        if not is_f32:
+            self._types.append(
+                f"     {self._id(self.id_rta_f64)} = OpTypeRuntimeArray {self._id(self.id_f64)}")
+            self._decorations.append(
+                f"               OpDecorate {self._id(self.id_rta_f64)} ArrayStride 8")
 
         # Runtime array of f32 (for f32-precision storage buffers)
         self.id_rta_f32 = self._alloc("rta_f32")
@@ -437,10 +906,11 @@ class _EmitContext:
         self._decorations.append(
             f"               OpDecorate {self._id(self.id_rta_i32)} ArrayStride 4")
 
-        # Pointer to f64 in StorageBuffer
+        # Pointer to f64 in StorageBuffer — only in f64 mode
         self.id_ptr_sb_f64 = self._alloc("ptr_sb_f64")
-        self._types.append(
-            f"     {self._id(self.id_ptr_sb_f64)} = OpTypePointer StorageBuffer {self._id(self.id_f64)}")
+        if not is_f32:
+            self._types.append(
+                f"     {self._id(self.id_ptr_sb_f64)} = OpTypePointer StorageBuffer {self._id(self.id_f64)}")
 
         # Pointer to f32 in StorageBuffer
         self.id_ptr_sb_f32 = self._alloc("ptr_sb_f32")
@@ -618,6 +1088,21 @@ class _EmitContext:
             f"               OpDecorate {self._id(self.id_gl_global_inv)} "
             f"BuiltIn GlobalInvocationId")
 
+    def _declare_subgroup_builtin(self):
+        """Declare gl_SubgroupInvocationID input variable for ring shuffle."""
+        # Pointer type: Input pointer to u32
+        self.id_ptr_input_u32 = self._alloc("ptr_input_u32")
+        self._types.append(
+            f"     {self._id(self.id_ptr_input_u32)} = OpTypePointer Input {self._id(self.id_u32)}")
+        # Variable
+        self.id_gl_subgroup_inv = self._alloc("gl_SubgroupInvocationID")
+        self._globals.append(
+            f"     {self._id(self.id_gl_subgroup_inv)} = OpVariable "
+            f"{self._id(self.id_ptr_input_u32)} Input")
+        self._decorations.append(
+            f"               OpDecorate {self._id(self.id_gl_subgroup_inv)} "
+            f"BuiltIn SubgroupLocalInvocationId")
+
     def _peek_id(self, name: str) -> int:
         """Get an ID that will be allocated later, pre-allocating it now."""
         if name not in self._named_ids:
@@ -660,6 +1145,11 @@ class _EmitContext:
                         f"               OpExtension \"SPV_EXT_shader_atomic_float_add\"")
                     break
 
+        # Subgroup capabilities for ring shuffle (explicit index for wrapping)
+        if self._needs_subgroup:
+            self._header.append(f"               OpCapability GroupNonUniform")
+            self._header.append(f"               OpCapability GroupNonUniformShuffle")
+
         # GLSL extended instruction set
         if self._needs_glsl_ext:
             glsl_ext = self._alloc("glsl_ext")
@@ -671,6 +1161,8 @@ class _EmitContext:
         # Entry point — only Input/Output variables in the interface
         # (StorageBuffer and PushConstant are NOT listed here in SPIR-V ≤ 1.3)
         interface_ids = [self._id(self.id_gl_global_inv)]
+        if self._needs_subgroup:
+            interface_ids.append(self._id(self.id_gl_subgroup_inv))
 
         main_id = self._peek_id("main")
         iface_str = " ".join(interface_ids)
@@ -1399,6 +1891,58 @@ class _EmitContext:
                     f"         {self._id(result)} = OpShiftLeftLogical "
                     f"{self._id(self.id_i32)} {self._id(a)} {self._id(b)}")
             self._set_ssa_type(result, self.id_i32)
+            if inst.result:
+                ssa_map[inst.result] = result
+            return False
+
+        # RING_PREV / RING_NEXT — subgroup shuffle for ring-neighbor coupling
+        # Uses OpGroupNonUniformShuffle with explicit wrapping index:
+        #   RING_PREV: source = (lane - 1 + 32) % 32
+        #   RING_NEXT: source = (lane + 1) % 32
+        if op in (Op.RING_PREV, Op.RING_NEXT):
+            a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
+            is_fp = self._is_real_id(a)
+            result_type = self.id_real if is_fp else self.id_i32
+
+            # Load SubgroupInvocationID (lane index, u32)
+            lane = self._alloc()
+            self._function.append(
+                f"         {self._id(lane)} = OpLoad {self._id(self.id_u32)} "
+                f"{self._id(self.id_gl_subgroup_inv)}")
+            self._set_ssa_type(lane, self.id_u32)
+
+            # Compute wrapped neighbor index
+            const_1 = self._get_u32_const(1)
+            const_31 = self._get_u32_const(31)
+            if op == Op.RING_PREV:
+                # (lane + 31) & 31  ≡  (lane - 1 + 32) % 32
+                added = self._alloc()
+                self._function.append(
+                    f"         {self._id(added)} = OpIAdd {self._id(self.id_u32)} "
+                    f"{self._id(lane)} {self._id(const_31)}")
+                self._set_ssa_type(added, self.id_u32)
+            else:
+                # (lane + 1) & 31
+                added = self._alloc()
+                self._function.append(
+                    f"         {self._id(added)} = OpIAdd {self._id(self.id_u32)} "
+                    f"{self._id(lane)} {self._id(const_1)}")
+                self._set_ssa_type(added, self.id_u32)
+
+            source_idx = self._alloc()
+            self._function.append(
+                f"         {self._id(source_idx)} = OpBitwiseAnd {self._id(self.id_u32)} "
+                f"{self._id(added)} {self._id(const_31)}")
+            self._set_ssa_type(source_idx, self.id_u32)
+
+            # OpGroupNonUniformShuffle with explicit source lane
+            scope = self._get_u32_const(3)  # Scope = Subgroup
+            result = self._alloc()
+            self._function.append(
+                f"         {self._id(result)} = OpGroupNonUniformShuffle "
+                f"{self._id(result_type)} {self._id(scope)} "
+                f"{self._id(a)} {self._id(source_idx)}")
+            self._set_ssa_type(result, result_type)
             if inst.result:
                 ssa_map[inst.result] = result
             return False

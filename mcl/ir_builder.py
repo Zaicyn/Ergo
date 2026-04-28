@@ -446,6 +446,17 @@ class IRBuilder:
             ))
             return IRRef(t, IRType.INTEGER)
 
+        # Warp ring shuffle intrinsics
+        if upper in ("RING_PREV", "RING_NEXT"):
+            a = self._lower_expr(node.args[0], block)
+            ret_type = self._operand_type(a)
+            t = self._fresh_temp()
+            block.insts.append(IRInst(
+                op=Op.RING_PREV if upper == "RING_PREV" else Op.RING_NEXT,
+                result=t, args=[a], type=ret_type,
+            ))
+            return IRRef(t, ret_type)
+
         # Type conversions
         if upper == "REAL":
             a = self._lower_expr(node.args[0], block)
@@ -765,6 +776,14 @@ class IRBuilder:
                     "net_host": node.net_host,
                     "net_gpu_id": node.net_gpu_id,
                 }
+            ))
+            return [block]
+
+        if isinstance(node, ast.SortByGenStmt):
+            block = IRBlock(self._fresh_block("sort_by_gen"), line=node.line)
+            block.insts.append(IRInst(
+                op=Op.SORT_BY_GEN, type=IRType.VOID, line=node.line,
+                meta={"arrays": node.arrays}
             ))
             return [block]
 

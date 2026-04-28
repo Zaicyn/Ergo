@@ -179,6 +179,10 @@ class Op(Enum):
     MIN = "min"
     CLAMP = "clamp"
 
+    # Warp ring shuffle (subgroup operations)
+    RING_PREV = "ring_prev"   # value from lane-1 neighbor (wraps)
+    RING_NEXT = "ring_next"   # value from lane+1 neighbor (wraps)
+
     # Array operations
     LOAD = "load"           # load from array: result = array[indices]
     STORE = "store"         # store to array: array[indices] = value
@@ -202,6 +206,7 @@ class Op(Enum):
     RETURN_VOID = "return_void"
     STOP = "stop"
     VERIFY = "verify"       # CPU oracle checkpoint
+    SORT_BY_GEN = "sort_by_gen"  # compiler-generated sort kernels
 
     # Copy / move
     COPY = "copy"           # simple assignment: dst = src

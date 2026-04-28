@@ -82,6 +82,7 @@ class TT(Enum):
     KW_DEFAULT = auto()
     KW_ENDSELECT = auto()
     KW_VERIFY = auto()
+    KW_SORT_BY_GEN = auto()
 
     # Structure
     NEWLINE = auto()
@@ -124,6 +125,7 @@ KEYWORDS = {
     "DEFAULT": TT.KW_DEFAULT,
     "ENDSELECT": TT.KW_ENDSELECT,
     "VERIFY": TT.KW_VERIFY,
+    "SORT_BY_GEN": TT.KW_SORT_BY_GEN,
 }
 
 

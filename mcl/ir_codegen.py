@@ -1397,6 +1397,11 @@ class IRCodeGen:
             self._emit_verify(inst)
             return
 
+        # SORT_BY_GEN — compiler-generated sort dispatch
+        if op == Op.SORT_BY_GEN:
+            self._emit_sort_by_gen(inst)
+            return
+
         self._put(f"/* unhandled IR op: {op.value} */")
 
     def _emit_oracle_decls(self, items: list):
@@ -1482,6 +1487,74 @@ class IRCodeGen:
                 if r:
                     return r
         return None
+
+    def _emit_sort_by_gen(self, inst: IRInst):
+        """Emit GPU sort-by-GEN dispatch: histogram → scan → scatter → swap."""
+        arrays = inst.meta["arrays"]
+        # Find the matching sort plan
+        sp = None
+        for s in self.gpu_plan.sort_plans:
+            if s.arrays == arrays:
+                sp = s
+                break
+        if not sp:
+            self._put(f"/* SORT_BY_GEN: no matching sort plan */")
+            return
+
+        hk = sp.histogram_kernel_id
+        sk = sp.scan_kernel_id
+        sck = sp.scatter_kernel_id
+
+        self._put(f"/* ── SORT_BY_GEN: histogram → scan → scatter → swap ── */")
+        self._put(f"{{")
+        self.indent += 1
+
+        # Step 1: Zero the histogram buffer
+        self._put(f"ergo_vk_frame_fill(d_sort_histogram, 32 * sizeof(int));")
+
+        # Step 2: Dispatch histogram kernel
+        self._put(f"/* COUNT_GEN: atomicAdd histogram[GEN] per particle */")
+        self._put(f"ergo_vk_bind_buffer(pipe_{hk}, 0, d_FLAGS);")
+        self._put(f"ergo_vk_bind_buffer(pipe_{hk}, 1, d_sort_histogram);")
+        self._put(f"{{ struct {{ int _s_NPART; int _s_GEN_SHIFT; int _s_GEN_MASK; }} _pc = {{ NPART, GEN_SHIFT, GEN_MASK }};")
+        self._put(f"  ergo_vk_push_constants(pipe_{hk}, &_pc, sizeof(_pc)); }}")
+        self._put(f"ergo_vk_frame_dispatch(pipe_{hk}, (NPART + 255) / 256);")
+
+        # Step 3: Dispatch scan kernel (single workgroup of 32 threads)
+        self._put(f"/* SCAN_GEN: exclusive prefix sum over histogram */")
+        self._put(f"ergo_vk_bind_buffer(pipe_{sk}, 0, d_sort_histogram);")
+        self._put(f"ergo_vk_bind_buffer(pipe_{sk}, 1, d_sort_offsets);")
+        self._put(f"ergo_vk_frame_dispatch(pipe_{sk}, 1);")
+
+        # Step 4: Copy offsets for scatter (scatter atomicAdd consumes them)
+        # We need a fresh copy because scatter's atomicAdd will modify offsets
+        # Actually the scan wrote fresh values, so scatter reads them and atomicAdds.
+        # The offsets buffer IS the fresh prefix sum output. Scatter consumes it.
+
+        # Step 5: Dispatch scatter kernel
+        self._put(f"/* SCATTER_GEN: scatter particles to sorted positions */")
+        self._put(f"ergo_vk_bind_buffer(pipe_{sck}, 0, d_FLAGS);")
+        self._put(f"ergo_vk_bind_buffer(pipe_{sck}, 1, d_sort_offsets);")
+        bind_idx = 2
+        # Source arrays (read from current particle buffers)
+        for arr in arrays:
+            self._put(f"ergo_vk_bind_buffer(pipe_{sck}, {bind_idx}, d_{arr});")
+            bind_idx += 1
+        # Destination arrays (write to temp sorted buffers)
+        for arr in arrays:
+            self._put(f"ergo_vk_bind_buffer(pipe_{sck}, {bind_idx}, d_sort_{arr});")
+            bind_idx += 1
+        self._put(f"{{ struct {{ int _s_NPART; int _s_GEN_SHIFT; int _s_GEN_MASK; }} _pc = {{ NPART, GEN_SHIFT, GEN_MASK }};")
+        self._put(f"  ergo_vk_push_constants(pipe_{sck}, &_pc, sizeof(_pc)); }}")
+        self._put(f"ergo_vk_frame_dispatch(pipe_{sck}, (NPART + 255) / 256);")
+
+        # Step 6: Pointer swap — sorted buffers become the active buffers
+        self._put(f"/* Pointer swap: sorted → active */")
+        for arr in arrays:
+            self._put(f"{{ ErgoVkBuf _tmp = d_{arr}; d_{arr} = d_sort_{arr}; d_sort_{arr} = _tmp; }}")
+
+        self.indent -= 1
+        self._put(f"}}")
 
     def _emit_verify(self, inst: IRInst):
         """Emit CPU oracle verification checkpoint.
@@ -1859,19 +1932,26 @@ class IRCodeGen:
         device_code = self.backend.generate()
         parts = device_code.split("; SPIR-V")
         # Map sequential SPIR-V modules to kernel IDs from the plan
+        # First: extracted kernels, then sort kernels (histogram, scan, scatter)
         kernel_ids = [k.kernel_id for k in self.gpu_plan.kernels]
+        sort_kids = []
+        for sp in self.gpu_plan.sort_plans:
+            sort_kids.extend([sp.histogram_kernel_id, sp.scan_kernel_id,
+                              sp.scatter_kernel_id])
+        all_kids = kernel_ids + sort_kids
         part_idx = 0
         for part in parts:
             if not part.strip():
                 continue
-            if part_idx >= len(kernel_ids):
+            if part_idx >= len(all_kids):
                 break
-            kid = kernel_ids[part_idx]
+            kid = all_kids[part_idx]
             # Skip SPIRV assembly for init-only kernels (no GPU buffers)
-            k_obj = self.gpu_plan.kernels[part_idx]
-            if not self._is_gpu_kernel(k_obj):
-                part_idx += 1
-                continue
+            if part_idx < len(kernel_ids):
+                k_obj = self.gpu_plan.kernels[part_idx]
+                if not self._is_gpu_kernel(k_obj):
+                    part_idx += 1
+                    continue
             spvasm = "; SPIR-V" + part
 
             # Write text assembly to temp file
@@ -1939,6 +2019,10 @@ class IRCodeGen:
 
         if not particle_arrays:
             return  # no particle arrays, nothing to scale
+
+        # Only emit VRAM capacity code if program declares MAXPART
+        if "MAXPART" not in self._var_types:
+            return
 
         # Sum bytes per particle (resolve sizeof to actual byte count)
         from .ir import get_real_precision
@@ -2065,6 +2149,32 @@ class IRCodeGen:
                       f"kernel_{k.kernel_id}_spv, kernel_{k.kernel_id}_spv_size, "
                       f"{n_bufs}, {pc_size});")
         self._put("")
+
+        # Sort-by-GEN buffers and pipelines
+        for sp in self.gpu_plan.sort_plans:
+            self._put("/* Sort-by-GEN: temporary buffers */")
+            self._put(f"ErgoVkBuf d_sort_histogram = ergo_vk_create_buffer(32 * sizeof(int));")
+            self._put(f"ErgoVkBuf d_sort_offsets = ergo_vk_create_buffer(32 * sizeof(int));")
+            for arr in sp.arrays:
+                sz = self._gpu_sizeof(arr)
+                self._put(f"ErgoVkBuf d_sort_{arr} = ergo_vk_create_buffer("
+                          f"CAPACITY * {sz});")
+            self._put("")
+            # Histogram kernel: 2 buffers (FLAGS, histogram), 3 push constants (NPART, GEN_SHIFT, GEN_MASK)
+            self._put("/* Sort-by-GEN: compute pipelines */")
+            self._put(f"ErgoVkPipe pipe_{sp.histogram_kernel_id} = ergo_vk_load_shader("
+                      f"kernel_{sp.histogram_kernel_id}_spv, kernel_{sp.histogram_kernel_id}_spv_size, "
+                      f"2, 12);")
+            # Scan kernel: 2 buffers (histogram, offsets), 0 push constants
+            self._put(f"ErgoVkPipe pipe_{sp.scan_kernel_id} = ergo_vk_load_shader("
+                      f"kernel_{sp.scan_kernel_id}_spv, kernel_{sp.scan_kernel_id}_spv_size, "
+                      f"2, 0);")
+            # Scatter kernel: 2 + 2*N buffers, 3 push constants
+            n_arrays = len(sp.arrays)
+            self._put(f"ErgoVkPipe pipe_{sp.scatter_kernel_id} = ergo_vk_load_shader("
+                      f"kernel_{sp.scatter_kernel_id}_spv, kernel_{sp.scatter_kernel_id}_spv_size, "
+                      f"{2 + 2 * n_arrays}, 12);")
+            self._put("")
 
         # Initial upload of all GPU arrays
         self._put("/* Upload initial state */")
