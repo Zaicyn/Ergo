@@ -657,40 +657,11 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
       OMEGA := 0.0
     ENDIF
 
-    ! ── 15.5. RING COUPLING (topological, not spatial) ────
-    ! Metabolic exchange: OMEGA flows along ring via FLOW_W direction
-    OMEGA_PREV := RING_PREV(OMEGA)
-    OMEGA_NEXT := RING_NEXT(OMEGA)
-
-    DEFICIT := TARGET - OMEGA
-    TRANSFER := MIN(ABS(DEFICIT), ABS(Z_C) * DT)
-    IF FLOW_WG > 0.0 THEN
-      IF OMEGA_NEXT > OMEGA THEN
-        OMEGA := OMEGA + TRANSFER
-      ELSE
-        OMEGA := OMEGA - TRANSFER
-      ENDIF
-    ELSE
-      IF OMEGA_PREV > OMEGA THEN
-        OMEGA := OMEGA + TRANSFER
-      ELSE
-        OMEGA := OMEGA - TRANSFER
-      ENDIF
-    ENDIF
-
-    ! Phase lock: restoring toward reference Viviani spacing
-    PH_NEXT := RING_NEXT(PH)
-    PH_DIFF := IAND(PH_NEXT - PH + PHASE_MASK + 1, PHASE_MASK)
-    PH_ERR := PH_DIFF - SEAM_STEP_PH
-    OMEGA := OMEGA - REAL(PH_ERR) * K_PHASE_LOCK * DT
-
-    ! Re-clamp after ring exchange
-    IF OMEGA > OMEGA_MAX THEN
-      OMEGA := OMEGA_MAX
-    ENDIF
-    IF OMEGA < 0.0 THEN
-      OMEGA := 0.0
-    ENDIF
+    ! ── 15.5. RING COUPLING — disabled until SORT_BY_GEN works
+    ! Without sort, shuffle exchanges with random warp neighbors,
+    ! not ring neighbors. This pumps OMEGA uniformly → yellow sponge.
+    ! Re-enable after sort atomic memory semantics are fixed.
+    ! (VUID-StandaloneSpirv-MemorySemantics-10871 in sort kernels)
 
     ! ── 16. POSITION ACCUMULATION ────────────────────────
     POS_X(I) := PX + VX * DT

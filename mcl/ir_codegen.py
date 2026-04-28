@@ -1519,17 +1519,14 @@ class IRCodeGen:
         self._put(f"{{ struct {{ int _s_NPART; int _s_GEN_SHIFT; int _s_GEN_MASK; }} _pc = {{ NPART, GEN_SHIFT, GEN_MASK }};")
         self._put(f"  ergo_vk_push_constants(pipe_{hk}, &_pc, sizeof(_pc)); }}")
         self._put(f"ergo_vk_frame_dispatch(pipe_{hk}, (NPART + 255) / 256);")
+        self._put(f"ergo_vk_frame_barrier();")
 
         # Step 3: Dispatch scan kernel (single workgroup of 32 threads)
         self._put(f"/* SCAN_GEN: exclusive prefix sum over histogram */")
         self._put(f"ergo_vk_bind_buffer(pipe_{sk}, 0, d_sort_histogram);")
         self._put(f"ergo_vk_bind_buffer(pipe_{sk}, 1, d_sort_offsets);")
         self._put(f"ergo_vk_frame_dispatch(pipe_{sk}, 1);")
-
-        # Step 4: Copy offsets for scatter (scatter atomicAdd consumes them)
-        # We need a fresh copy because scatter's atomicAdd will modify offsets
-        # Actually the scan wrote fresh values, so scatter reads them and atomicAdds.
-        # The offsets buffer IS the fresh prefix sum output. Scatter consumes it.
+        self._put(f"ergo_vk_frame_barrier();")
 
         # Step 5: Dispatch scatter kernel
         self._put(f"/* SCATTER_GEN: scatter particles to sorted positions */")
@@ -2158,7 +2155,7 @@ class IRCodeGen:
             for arr in sp.arrays:
                 sz = self._gpu_sizeof(arr)
                 self._put(f"ErgoVkBuf d_sort_{arr} = ergo_vk_create_buffer("
-                          f"CAPACITY * {sz});")
+                          f"MAXPART * {sz});")
             self._put("")
             # Histogram kernel: 2 buffers (FLAGS, histogram), 3 push constants (NPART, GEN_SHIFT, GEN_MASK)
             self._put("/* Sort-by-GEN: compute pipelines */")
