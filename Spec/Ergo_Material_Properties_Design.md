@@ -240,6 +240,69 @@ DATA MAT_PERSISTENCE(5) / 2 /  ! decays quickly
 DATA MAT_MASS(5) / 1.0 /       ! unit mass
 ```
 
+## Emergent Properties
+
+### Hysteresis (material memory)
+
+Because the archetype is immutable and deltas persist, the system has
+natural memory. A heated rock gains MOBILITY delta. When cooled, it does
+NOT return to STATE = 0 — the COHERENCE loss from thermal stress remains.
+
+This means annealing, fatigue, embrittlement, weathering, and scar
+formation all emerge without explicit modeling. The delta IS the history.
+
+Most simulations fail because matter has no memory. This architecture
+stores present + deviation-from-origin. Temporal depth for free.
+
+### Pristine fast path (computational efficiency)
+
+95%+ of frozen cells are pristine (STATE = 0). These take a single
+LUT lookup — no delta unpacking, no arithmetic, no writes, no cache
+churn. Stable things become computationally cheap automatically.
+Chaotic things (nonzero deltas) become expensive. The simulation
+naturally allocates compute where it matters.
+
+This is hierarchical entropy compression: low-entropy regions are
+cheap, high-entropy regions are expensive. Physically correct scaling.
+
+## Future Directions (not now)
+
+### Energy channel split
+
+ENERGY currently conflates thermal, chemical, strain, and electrical.
+If emergent systems need to distinguish heat from fuel from stress:
+
+```
+THERMAL  — motion/excitation
+CHEMICAL — consumable free energy
+STRAIN   — stored structural stress
+CHARGE   — electrical/plasma state
+```
+
+Would require expanding from 24-bit STATE to 32-bit (use a second
+integer) or reducing other delta precision. Not needed at current scale.
+
+### Tensor coherence
+
+Real materials are directional. Wood is strong along grain, weak across.
+Crystal lattices are anisotropic. Future evolution:
+
+```
+COHERENCE_X, COHERENCE_Y, COHERENCE_Z
+```
+
+or compressed directional bonding masks. Enables directional crack
+propagation, shear bands, grain structure. Current scalar COHERENCE
+is the correct starting point.
+
+### Graph-material transition
+
+COHERENCE is secretly bond persistence probability. When it evolves
+toward `COHERENCE = probability neighbor bonds survive`, cracks,
+cavitation, shear, and fracture propagation become emergent topology
+events rather than field dynamics. This is the path from voxel
+materials to lattice field theory. Far future.
+
 ## Implementation Priority
 
 1. Define archetype LUT structure (constants.ergo, ~30 lines)
