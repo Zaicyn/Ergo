@@ -1251,10 +1251,11 @@ PRINT NPART
 SPAWN_COUNTER(1) := NPART
 
 ! ── VERIFY: oracle probe + NET for field exchange ─────────
-! Uncomment when oracle server is running on port 4250.
-! Without oracle: leave commented, simulation runs standalone.
-! VERIFY POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT &
-!   ORACLE 12 EVERY 100 TOL 1.0E-4 NET "127.0.0.1:4250"
+! Consensus layer controlled at runtime by ERGO_CONSENSUS=1 env var.
+! Default: off (standalone mode). Set ERGO_CONSENSUS=1 to enable
+! oracle connection on the NET address below.
+VERIFY POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT &
+  ORACLE 12 EVERY 100 TOL 1.0E-4 NET "127.0.0.1:4250"
 
 ! ── FRAME LOOP: GPU executes, CPU observes at intervals ───
 DO FRAME = 1, DEFAULT_FRAMES

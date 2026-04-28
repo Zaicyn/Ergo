@@ -231,7 +231,7 @@ class IRCodeGen:
 
         # NET shutdown
         if has_net:
-            self._put("ergo_net_close(&_ergo_net);")
+            self._put("if (_consensus_enabled) ergo_net_close(&_ergo_net);")
 
         self._put("return 0;")
         self.indent -= 1
@@ -671,7 +671,9 @@ class IRCodeGen:
             # NET hook: detect end of inlined SIM_CENSUS_ADAPTIVE
             if (self._has_net and
                     getattr(item, 'inlined_end', None) == "SIM_CENSUS_ADAPTIVE"):
+                self._put("if (_consensus_enabled) {")
                 self._emit_census_net_send()
+                self._put("}")
 
         # If the body ends after a dispatch, download for any
         # subsequent CPU code (e.g. PRINT after last loop).
@@ -819,7 +821,9 @@ class IRCodeGen:
             # NET: non-blocking drain of incoming global field from oracle.
             # If complete, replace local GRID_DENSITY before stencil.
             if self._has_net:
+                self._put("if (_consensus_enabled) {")
                 self._emit_field_recv()
+                self._put("}")
                 # Stop flag: allow graceful termination from JNI/signal
                 self._put(f"{{ extern volatile int ergo_stop_requested "
                           f"__attribute__((weak));")
@@ -1423,7 +1427,9 @@ class IRCodeGen:
                                 f"{size_expr} * {sz});")
             # NET hook: send census packet after adaptive census call
             if func == "SIM_CENSUS_ADAPTIVE" and self._has_net:
+                self._put("if (_consensus_enabled) {")
                 self._emit_census_net_send()
+                self._put("}")
             return
 
         # PRINT
@@ -1529,6 +1535,13 @@ class IRCodeGen:
             self._put(f"int _net_gpu = "
                       f"(&ergo_gpu_id) ? ergo_gpu_id "
                       f": {gpu_id};")
+            self._put(f"int _consensus_enabled = "
+                      f"(getenv(\"ERGO_CONSENSUS\") != NULL);")
+            self._put(f"ergo_field_rx_t _field_rx;")
+            self._put(f"memset(&_field_rx, 0, sizeof(_field_rx));")
+            self._put(f"uint32_t _field_send_id = 0;")
+            self._put(f"if (_consensus_enabled) {{")
+            self.indent += 1
             self._put(f"if (ergo_net_init(&_ergo_net, _net_host, "
                       f"_net_port, 0, _net_gpu) < 0) {{")
             self.indent += 1
@@ -1537,12 +1550,15 @@ class IRCodeGen:
             self._put(f"return 1;")
             self.indent -= 1
             self._put(f"}}")
-            # Field exchange state
-            self._put(f"ergo_field_rx_t _field_rx;")
-            self._put(f"ergo_field_rx_reset(&_field_rx);")
-            self._put(f"uint32_t _field_send_id = 0;")
-            # Join multicast group for O(1) field broadcast from oracle
+            # Init field exchange + join multicast (already declared above)
             self._put(f"ergo_net_mcast_init_recv(&_ergo_net);")
+            self.indent -= 1
+            self._put(f"}} else {{")
+            self.indent += 1
+            self._put(f"fprintf(stderr, \"[NET] Consensus disabled "
+                      f"(set ERGO_CONSENSUS=1 to enable)\\n\");")
+            self.indent -= 1
+            self._put(f"}}")
         self._put("")
 
     def _find_verify_meta(self, items: list) -> dict | None:
@@ -1743,6 +1759,7 @@ class IRCodeGen:
         # NET: send verify payload to oracle (672 bytes = 12 particles × 7 doubles)
         net_host = inst.meta.get("net_host")
         if net_host:
+            self._put(f"if (_consensus_enabled) {{")
             self._put(f"/* NET: pack and send Lagrangian probe */")
             self._put(f"{{")
             self.indent += 1
@@ -1773,6 +1790,7 @@ class IRCodeGen:
             self._put(f"    _oracle_spawn.next_census, _oracle_spawn.flags);")
             self.indent -= 1
             self._put(f"}}")
+            self._put(f"}} /* end consensus */")
 
         self.indent -= 1
         self._put(f"}}")
