@@ -33,7 +33,7 @@ server = LanguageServer(
 # ── project-wide symbol discovery ─────────────────────────────
 
 def _discover_project_symbols(root: str) -> tuple[list[Symbol], list[FuncSymbol]]:
-    """Scan all .mcl files for PARAMETER/STATIC declarations and subroutine signatures.
+    """Scan all .ergo files for PARAMETER/STATIC declarations and subroutine signatures.
 
     Returns (symbols, func_symbols) to pre-seed into the checker so cross-file
     references don't produce undeclared-variable errors in single-file analysis.
@@ -46,7 +46,7 @@ def _discover_project_symbols(root: str) -> tuple[list[Symbol], list[FuncSymbol]
     if not root_path.is_dir():
         return symbols, func_symbols
 
-    for mcl_file in root_path.rglob("*.mcl"):
+    for mcl_file in root_path.rglob("*.ergo"):
         if "archive" in mcl_file.parts:
             continue
         try:
