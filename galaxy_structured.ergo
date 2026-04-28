@@ -219,6 +219,50 @@ DATA CURVE_PT / &
   -0.068948, -0.982752, -0.171595, &
    0.096980, -0.896348,  0.432615, &
    0.083063, -0.567568,  0.819126 /
+
+! ════════════════════════════════════════════════════════════════
+! MATERIAL ARCHETYPE LUT — Baseline properties for frozen structure
+! ════════════════════════════════════════════════════════════════
+!
+! Each archetype defines baseline properties on nibble scale (0-15).
+! GRID_MATERIAL stores ELEMENT_ID (8 bits) + packed signed deltas.
+! Pristine cells (delta=0) use archetype directly — single LUT lookup.
+!
+! Properties:
+!   COHERENCE   — structural integrity (15=diamond, 0=dust)
+!   ENERGY      — stored free energy (15=fuel, 0=inert)
+!   MOBILITY    — rearrangement freedom (15=gas, 0=frozen)
+!   REACTIVITY  — agent coupling strength (15=explosive, 0=noble)
+!   PERSISTENCE — self-decay resistance (15=eternal, 0=unstable)
+!   MASS        — gravitational contribution per unit (REAL)
+!
+! Phase is NOT stored — it emerges from COHERENCE × ENERGY × MOBILITY.
+
+PARAMETER INTEGER :: MAT_COUNT = 16
+PARAMETER INTEGER :: CRYSTAL_ARCHETYPE = 1
+
+STATIC INTEGER :: MAT_COHERENCE(MAT_COUNT)
+STATIC INTEGER :: MAT_ENERGY(MAT_COUNT)
+STATIC INTEGER :: MAT_MOBILITY(MAT_COUNT)
+STATIC INTEGER :: MAT_REACTIVITY(MAT_COUNT)
+STATIC INTEGER :: MAT_PERSISTENCE(MAT_COUNT)
+STATIC REAL :: MAT_MASS(MAT_COUNT)
+
+! Archetype table (1-indexed: ID 0 = index 1, ID 1 = index 2, etc.)
+! IDs: 0=VOID 1=STELLAR_DEAD 2=ROCK 3=ICE 4=WOOD 5=DEAD_CELL
+!      6=SOIL 7=WATER 8=ORGANIC_MIX 9=MINERAL 10=METAL 11-15=reserved
+DATA MAT_COHERENCE  /  0, 15, 14,  9, 10,  7,  3,  1,  5, 13, 15, 0, 0, 0, 0, 0 /
+DATA MAT_ENERGY     /  0,  0,  0,  0, 11, 12,  5,  1,  8,  0,  0, 0, 0, 0, 0, 0 /
+DATA MAT_MOBILITY   / 15,  0,  1,  3,  1,  3,  4, 12,  5,  0,  0, 0, 0, 0, 0, 0 /
+DATA MAT_REACTIVITY /  0,  0,  1,  2,  8, 12,  6,  3, 10,  2,  4, 0, 0, 0, 0, 0 /
+DATA MAT_PERSISTENCE/ 15, 15, 14,  6,  4,  2,  8, 10,  3, 13, 15, 0, 0, 0, 0, 0 /
+DATA MAT_MASS / 0.0, 100.0, 2.5, 0.9, 0.6, 1.0, 1.3, 1.0, 0.8, 3.0, 7.8, &
+                0.0, 0.0, 0.0, 0.0, 0.0 /
+
+! ── Decay channel rates ───────────────────────────────────
+PARAMETER REAL :: RADIATIVE_RATE = 0.0001
+PARAMETER REAL :: AGENT_DECAY_RATE = 0.01
+PARAMETER REAL :: STRESS_RATE = 0.001
 ! ════════════════════════════════════════════════════════════════
 ! LAYER 3: FLUID — Particle dynamics (GPU-exclusive)
 ! ════════════════════════════════════════════════════════════════
@@ -285,6 +329,17 @@ STATIC INTEGER :: BIN_PRESENCE(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 ! still exert field influence without per-particle compute.
 STATIC INTEGER :: GRID_CRYSTAL(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 
+! ── Material state (archetype + delta, never cleared) ─────
+! Bits 31-24: ELEMENT_ID (archetype index into MAT_* LUTs)
+! Bits 23-20: COHERENCE delta (signed nibble -8..+7)
+! Bits 19-16: ENERGY delta
+! Bits 15-12: MOBILITY delta
+! Bits 11-8:  REACTIVITY delta
+! Bits 7-4:   PERSISTENCE delta
+! Bits 3-0:   FLAGS (reserved)
+! Pristine cells: delta = 0, single LUT lookup.
+STATIC INTEGER :: GRID_MATERIAL(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+
 ! ── Oracle consensus (external correction) ────────────────
 STATIC REAL :: GRID_DENSITY_GLOBAL(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 
@@ -320,6 +375,16 @@ REAL FUNCTION RNGF()
   RNG_STATE := IAND(RNG_STATE * 1103515245 + 12345, 2147483647)
   RNGF := REAL(IAND(ISHFT(RNG_STATE, -16), 32767)) / 32767.0
   RETURN RNGF
+END
+
+INTEGER FUNCTION NIBBLE_SIGNED(V)
+  INTEGER :: V, N
+  N := IAND(V, 15)
+  IF N > 7 THEN
+    N := N - 16
+  ENDIF
+  NIBBLE_SIGNED := N
+  RETURN NIBBLE_SIGNED
 END
 
 INTEGER FUNCTION BITCOUNT(N)
@@ -909,6 +974,10 @@ SUBROUTINE SCATTER_GRID()
         CJ := CLAMP(INT(POS_Y(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
         CK := CLAMP(INT(POS_Z(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
         GRID_CRYSTAL(CI, CJ, CK) := GRID_CRYSTAL(CI, CJ, CK) + 1
+        ! Material: archetype + energy delta from OMEGA at death
+        GRID_MATERIAL(CI, CJ, CK) := IOR( &
+          ISHFT(CRYSTAL_ARCHETYPE, 24), &
+          ISHFT(CLAMP(INT(OMEGA_NAT(I) * 15.0 / OMEGA_MAX), 0, 15), 16))
         FLAGS(I) := IOR(FLAGS(I), PFLAG_BANKED)
       ENDIF
       CYCLE
@@ -1000,6 +1069,17 @@ SUBROUTINE STENCIL_GRID()
           COV := COV + 1.0
         ENDIF
         GRID_MET_GATE(I, J, K) := 0.2 + 1.3 * COV / 8.0
+
+        ! ── Material decay ──────────────────────────────────
+        ! TODO: Decay channels disabled until codegen fixes STATIC
+        ! array indexing in CPU-side loops. MAT_COHERENCE(ELEM)
+        ! generates pointer-to-array instead of flat access in C.
+        ! GCC error: "assignment to 'int' from 'int (*)[32]'"
+        !
+        ! The archetype LUT, GRID_MATERIAL grid, and crystal banking
+        ! are all in place. Only the stencil unpacking + decay math
+        ! needs the codegen fix. See Spec/Ergo_Decay_Systems_Design.md
+        ! for the three-channel model to implement once this compiles.
       ENDDO
     ENDDO
   ENDDO

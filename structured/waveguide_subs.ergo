@@ -56,6 +56,10 @@ SUBROUTINE SCATTER_GRID()
         CJ := CLAMP(INT(POS_Y(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
         CK := CLAMP(INT(POS_Z(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
         GRID_CRYSTAL(CI, CJ, CK) := GRID_CRYSTAL(CI, CJ, CK) + 1
+        ! Material: archetype + energy delta from OMEGA at death
+        GRID_MATERIAL(CI, CJ, CK) := IOR( &
+          ISHFT(CRYSTAL_ARCHETYPE, 24), &
+          ISHFT(CLAMP(INT(OMEGA_NAT(I) * 15.0 / OMEGA_MAX), 0, 15), 16))
         FLAGS(I) := IOR(FLAGS(I), PFLAG_BANKED)
       ENDIF
       CYCLE
@@ -147,6 +151,17 @@ SUBROUTINE STENCIL_GRID()
           COV := COV + 1.0
         ENDIF
         GRID_MET_GATE(I, J, K) := 0.2 + 1.3 * COV / 8.0
+
+        ! ── Material decay ──────────────────────────────────
+        ! TODO: Decay channels disabled until codegen fixes STATIC
+        ! array indexing in CPU-side loops. MAT_COHERENCE(ELEM)
+        ! generates pointer-to-array instead of flat access in C.
+        ! GCC error: "assignment to 'int' from 'int (*)[32]'"
+        !
+        ! The archetype LUT, GRID_MATERIAL grid, and crystal banking
+        ! are all in place. Only the stencil unpacking + decay math
+        ! needs the codegen fix. See Spec/Ergo_Decay_Systems_Design.md
+        ! for the three-channel model to implement once this compiles.
       ENDDO
     ENDDO
   ENDDO

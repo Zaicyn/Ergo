@@ -23,6 +23,17 @@ STATIC INTEGER :: BIN_PRESENCE(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 ! still exert field influence without per-particle compute.
 STATIC INTEGER :: GRID_CRYSTAL(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 
+! ── Material state (archetype + delta, never cleared) ─────
+! Bits 31-24: ELEMENT_ID (archetype index into MAT_* LUTs)
+! Bits 23-20: COHERENCE delta (signed nibble -8..+7)
+! Bits 19-16: ENERGY delta
+! Bits 15-12: MOBILITY delta
+! Bits 11-8:  REACTIVITY delta
+! Bits 7-4:   PERSISTENCE delta
+! Bits 3-0:   FLAGS (reserved)
+! Pristine cells: delta = 0, single LUT lookup.
+STATIC INTEGER :: GRID_MATERIAL(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+
 ! ── Oracle consensus (external correction) ────────────────
 STATIC REAL :: GRID_DENSITY_GLOBAL(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 
