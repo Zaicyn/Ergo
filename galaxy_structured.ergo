@@ -1248,12 +1248,10 @@ PRINT NPART
 SPAWN_COUNTER(1) := NPART
 
 ! ── VERIFY: oracle probe + NET for field exchange ─────────
-! This line activates the two-wave cycle:
-!   - Sends 12 probe particles to oracle every 100 frames (Wave 2)
-!   - Receives spawn commands from oracle (Wave 1)
-!   - NET enables density grid send/recv at census intervals
-VERIFY POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT &
-  ORACLE 12 EVERY 100 TOL 1.0E-4 NET "127.0.0.1:4250"
+! Uncomment when oracle server is running on port 4250.
+! Without oracle: leave commented, simulation runs standalone.
+! VERIFY POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT &
+!   ORACLE 12 EVERY 100 TOL 1.0E-4 NET "127.0.0.1:4250"
 
 ! ── FRAME LOOP: GPU executes, CPU observes at intervals ───
 DO FRAME = 1, DEFAULT_FRAMES
