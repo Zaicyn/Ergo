@@ -255,6 +255,82 @@ registers after SSA optimization. In the warning zone. If fps drops
 unexpectedly after adding ring coupling features, register pressure
 is the first thing to check.
 
+## Measured Register Pressure (2026-04-29, RTX 2060)
+
+Profiled with `ERGO_PROFILE=1`, headless, `--precision f32 --no-split`.
+
+### Baseline — monolithic kernel (102 locals, k2 = physics)
+
+| N | k0 (scatter) | k1 (stencil) | k2 (physics) | Total | FPS |
+|---|---|---|---|---|---|
+| 1M | 0.046 ms | 0.008 ms | 0.208 ms | 0.262 ms | 3,819 |
+| 10M | 0.409 ms | 0.007 ms | 2.047 ms | 2.464 ms | 406 |
+| 29M | 1.178 ms | 0.007 ms | 5.900 ms | 7.086 ms | 141 |
+
+Scaling is linear (10x particles → 9.8x k2 time). No super-linear
+blowup = no register spilling at current local count. 29M headless
+is above the 130 fps target.
+
+### With census scratch arrays (+3 per-particle array writes in kernel)
+
+Added CENSUS_FLAGS, CENSUS_OMEGA_MEAN, CENSUS_WINDING_ERR writes
+inside the physics kernel. Extends live ranges for OMEGA_MEAN and
+WINDING_ERR. Still 102 declared locals but more simultaneous liveness.
+
+| N | k2 baseline | k2 + census | Delta | % increase |
+|---|---|---|---|---|
+| 1M | 0.208 ms | 0.278 ms | +0.070 ms | +33.7% |
+| 10M | 2.047 ms | 2.550 ms | +0.503 ms | +24.6% |
+| 29M | 5.900 ms | 7.404 ms | +1.504 ms | +25.5% |
+
+**Lesson:** 3 extra array writes = 25% regression. Every additional
+live variable in the hot kernel costs ~5-8% throughput. Census
+observation belongs in a COLD path (separate kernel at census
+intervals), not inside the HOT physics kernel.
+
+### Kernel split — Pass 1 (spatial+omega, 78 locals) + Pass 2 (ring, 41 locals)
+
+Split at section 15/15.5 boundary. Pass 1 writes VEL+OMEGA, Pass 2
+reads them back. Pass 2 re-reads GRID_DENSITY + GRID_MET_GATE (2
+grid reads) for nova/spillover gating. No ENV recomputation.
+
+| N | Baseline (monolithic) | Split (k2+k3) | Delta |
+|---|---|---|---|
+| 1M | 0.208 ms | 0.387 ms | +86% |
+| 10M | 2.047 ms | 3.763 ms | +84% |
+| 29M | 5.900 ms | 10.514 ms | +78% |
+
+**Lesson:** Split is SLOWER at current register count. The second
+memory pass over 29M particles (re-reading POS/VEL/FLAGS/OMEGA =
+~812MB bandwidth) costs more than any occupancy gain from fewer
+registers per pass. The monolithic kernel is bandwidth-limited, not
+register-limited.
+
+### When to split
+
+The split becomes profitable when register pressure causes occupancy
+to drop enough that the bandwidth cost of two passes is less than the
+latency-hiding loss from low occupancy. Based on these measurements:
+
+- **At 102 locals (current):** monolithic wins. Don't split.
+- **At ~120 locals (+18):** expect ~50% regression from register
+  pressure. Split break-even point. Profile before deciding.
+- **At ~140+ locals:** split will likely win. The monolithic kernel
+  will be spilling to local memory (LMEM), which is slower than
+  a second clean pass.
+
+**The split architecture is validated and ready.** Two subroutines
+exist: `SIM_PHYSICS_SPATIAL` (sections 1-15, 78 locals) and
+`SIM_PHYSICS_RING` (sections 15.5-18, 41 locals). Revert to
+monolithic for now; switch when locals exceed ~120.
+
+**Profiling command:**
+```bash
+bash structured/build.sh
+python -m mcl --target spirv --precision f32 --no-split -o galaxy_gpu galaxy_structured.ergo
+ERGO_PROFILE=1 ./galaxy_gpu -N 29000000 --frames 500 2>&1 | grep -A10 "GPU profile"
+```
+
 ## Locked Values
 
 Once tuned, record final values here:
