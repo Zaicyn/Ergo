@@ -48,10 +48,10 @@ DO FRAME = 1, DEFAULT_FRAMES
   CALL STENCIL_GRID()
   CALL SIM_PHYSICS_STEP(DEFAULT_DT)
 
-  ! ── CPU OBSERVATION (lazy readback at census intervals) ──
-  ! Wave 2: CPU grabs density grid, computes stats, sends to oracle.
-  ! GPU doesn't wait. CPU gets to it when it gets to it.
-
+  ! ── CPU OBSERVATION ──────────────────────────────────────
+  ! NOTE: In-loop PRINT/DOWNLOAD causes codegen to insert
+  ! per-frame stalls. For long signature collection runs,
+  ! use finite DEFAULT_FRAMES and post-loop census instead.
 
 ENDDO
 
