@@ -155,6 +155,20 @@ static struct {
     VkShaderModule           pts_vert_shader;
     VkShaderModule           pts_frag_shader;
 
+    /* Gaussian splat pipeline */
+    VkPipeline               gauss_pipeline;
+    VkPipelineLayout         gauss_layout;
+    VkDescriptorSetLayout    gauss_ds_layout;
+    VkDescriptorPool         gauss_ds_pool;
+    VkDescriptorSet          gauss_ds;
+    VkShaderModule           gauss_vert_shader;
+    VkShaderModule           gauss_frag_shader;
+    VkImage                  gauss_lut_image;
+    VkDeviceMemory           gauss_lut_memory;
+    VkImageView              gauss_lut_view;
+    VkSampler                gauss_lut_sampler;
+    int                      gauss_ds_bound;
+
     VkCommandBuffer          render_cmd_buf;
     VkSemaphore              sem_available;
     VkSemaphore              sem_finished;
@@ -239,6 +253,7 @@ static void xfer_submit_and_wait(void) {
 static void render_create_swapchain(void);
 static void render_create_pipeline(void);
 static void render_create_points_pipeline(void);
+static void render_create_gauss_pipeline(void);
 static void render_cleanup_swapchain(void);
 static void camera_mouse_button_cb(GLFWwindow *w, int button, int action, int mods);
 static void camera_cursor_pos_cb(GLFWwindow *w, double xpos, double ypos);
@@ -296,6 +311,7 @@ int ergo_vk_init(int headless) {
         glfwSetMouseButtonCallback(g.window, camera_mouse_button_cb);
         glfwSetCursorPosCallback(g.window, camera_cursor_pos_cb);
         glfwSetScrollCallback(g.window, camera_scroll_cb);
+        glfwSetKeyCallback(g.window, camera_key_cb);
     }
 #endif
 
@@ -614,6 +630,7 @@ int ergo_vk_init(int headless) {
         render_create_swapchain();
         render_create_pipeline();
         render_create_points_pipeline();
+        render_create_gauss_pipeline();
 
         /* Separate command buffer for rendering */
         VkCommandBufferAllocateInfo rcb_ai = {0};
@@ -697,6 +714,19 @@ void ergo_vk_shutdown(void) {
         vkDestroyDescriptorPool(g.device, g.pts_ds_pool, NULL);
         vkDestroyShaderModule(g.device, g.pts_vert_shader, NULL);
         vkDestroyShaderModule(g.device, g.pts_frag_shader, NULL);
+
+        if (g.gauss_pipeline) {
+            vkDestroyPipeline(g.device, g.gauss_pipeline, NULL);
+            vkDestroyPipelineLayout(g.device, g.gauss_layout, NULL);
+            vkDestroyDescriptorSetLayout(g.device, g.gauss_ds_layout, NULL);
+            vkDestroyDescriptorPool(g.device, g.gauss_ds_pool, NULL);
+            vkDestroyShaderModule(g.device, g.gauss_vert_shader, NULL);
+            vkDestroyShaderModule(g.device, g.gauss_frag_shader, NULL);
+            vkDestroySampler(g.device, g.gauss_lut_sampler, NULL);
+            vkDestroyImageView(g.device, g.gauss_lut_view, NULL);
+            vkDestroyImage(g.device, g.gauss_lut_image, NULL);
+            vkFreeMemory(g.device, g.gauss_lut_memory, NULL);
+        }
 
         render_cleanup_swapchain();
 
@@ -1325,6 +1355,18 @@ static void camera_cursor_pos_cb(GLFWwindow *w, double xpos, double ypos) {
     if (g.cam_elevation < -1.5f) g.cam_elevation = -1.5f;
 }
 
+static int g_culling_enabled = 0;  /* toggle with 'C' key */
+
+static void camera_key_cb(GLFWwindow *w, int key, int scancode, int action, int mods) {
+    (void)w; (void)scancode; (void)mods;
+    if (action != GLFW_PRESS) return;
+    if (key == GLFW_KEY_C) {
+        g_culling_enabled = !g_culling_enabled;
+        fprintf(stderr, "[ergo_vk] Culling: %s\n",
+                g_culling_enabled ? "ON" : "OFF");
+    }
+}
+
 static void camera_scroll_cb(GLFWwindow *w, double xoff, double yoff) {
     (void)w; (void)xoff;
     g.cam_distance -= (float)yoff * 0.1f;
@@ -1822,7 +1864,7 @@ static void render_create_points_pipeline(void) {
     /* Push constants: mat4(64) + point_size(4) + val_min(4) + val_max(4) + world_scale(4) = 80 */
     VkPushConstantRange pc_range = {0};
     pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    pc_range.size = 80;
+    pc_range.size = 96;
 
     VkPipelineLayoutCreateInfo pl_ci = {0};
     pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1849,6 +1891,285 @@ static void render_create_points_pipeline(void) {
 
     VK_CHECK(vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1,
                                         &gp_ci, NULL, &g.pts_pipeline));
+}
+
+/* ── Gaussian splat pipeline ─────────────────────────────── */
+
+static void gauss_create_lut(void) {
+    /* Generate 64×64 R8 gaussian falloff texture.
+     * Center = 1.0, edges (at 2-sigma) ≈ 0.018, corners = ~0. */
+    const int LUT_SIZE = 64;
+    uint8_t pixels[64 * 64];
+    for (int y = 0; y < LUT_SIZE; y++) {
+        for (int x = 0; x < LUT_SIZE; x++) {
+            float u = (x + 0.5f) / LUT_SIZE * 2.0f - 1.0f; /* [-1, 1] */
+            float v = (y + 0.5f) / LUT_SIZE * 2.0f - 1.0f;
+            float d2 = u * u + v * v;
+            float w = expf(-2.0f * d2); /* sigma = 1/2, so exp(-0.5*(d/σ)²) = exp(-2*d²) */
+            pixels[y * LUT_SIZE + x] = (uint8_t)(w * 255.0f + 0.5f);
+        }
+    }
+
+    /* Create VkImage */
+    VkImageCreateInfo img_ci = {0};
+    img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_ci.imageType = VK_IMAGE_TYPE_2D;
+    img_ci.format = VK_FORMAT_R8_UNORM;
+    img_ci.extent = (VkExtent3D){LUT_SIZE, LUT_SIZE, 1};
+    img_ci.mipLevels = 1;
+    img_ci.arrayLayers = 1;
+    img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img_ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK_CHECK(vkCreateImage(g.device, &img_ci, NULL, &g.gauss_lut_image));
+
+    VkMemoryRequirements mem_req;
+    vkGetImageMemoryRequirements(g.device, g.gauss_lut_image, &mem_req);
+    VkMemoryAllocateInfo mem_ai = {0};
+    mem_ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mem_ai.allocationSize = mem_req.size;
+    mem_ai.memoryTypeIndex = find_memory_type(mem_req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(g.device, &mem_ai, NULL, &g.gauss_lut_memory));
+    VK_CHECK(vkBindImageMemory(g.device, g.gauss_lut_image, g.gauss_lut_memory, 0));
+
+    /* Upload via staging buffer */
+    ensure_staging(LUT_SIZE * LUT_SIZE);
+    memcpy(g.staging_mapped, pixels, LUT_SIZE * LUT_SIZE);
+
+    VkCommandBufferBeginInfo begin = {0};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkResetCommandBuffer(g.xfer_cmd_buf, 0));
+    VK_CHECK(vkBeginCommandBuffer(g.xfer_cmd_buf, &begin));
+
+    /* Transition to TRANSFER_DST */
+    VkImageMemoryBarrier barrier = {0};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = g.gauss_lut_image;
+    barrier.subresourceRange = (VkImageSubresourceRange){
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(g.xfer_cmd_buf,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, NULL, 0, NULL, 1, &barrier);
+
+    VkBufferImageCopy region = {0};
+    region.imageSubresource = (VkImageSubresourceLayers){
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = (VkExtent3D){LUT_SIZE, LUT_SIZE, 1};
+    vkCmdCopyBufferToImage(g.xfer_cmd_buf, g.staging_buf, g.gauss_lut_image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    /* Transition to SHADER_READ */
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(g.xfer_cmd_buf,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 1, &barrier);
+
+    VK_CHECK(vkEndCommandBuffer(g.xfer_cmd_buf));
+    xfer_submit_and_wait();
+
+    /* Create image view */
+    VkImageViewCreateInfo iv_ci = {0};
+    iv_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    iv_ci.image = g.gauss_lut_image;
+    iv_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    iv_ci.format = VK_FORMAT_R8_UNORM;
+    iv_ci.subresourceRange = (VkImageSubresourceRange){
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(g.device, &iv_ci, NULL, &g.gauss_lut_view));
+
+    /* Create sampler */
+    VkSamplerCreateInfo samp_ci = {0};
+    samp_ci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samp_ci.magFilter = VK_FILTER_LINEAR;
+    samp_ci.minFilter = VK_FILTER_LINEAR;
+    samp_ci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samp_ci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VK_CHECK(vkCreateSampler(g.device, &samp_ci, NULL, &g.gauss_lut_sampler));
+}
+
+static void render_create_gauss_pipeline(void) {
+    gauss_create_lut();
+
+    VkShaderModuleCreateInfo vert_ci = {0};
+    vert_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    vert_ci.codeSize = render_gauss_vert_spv_size;
+    vert_ci.pCode = (const uint32_t *)render_gauss_vert_spv;
+    VK_CHECK(vkCreateShaderModule(g.device, &vert_ci, NULL, &g.gauss_vert_shader));
+
+    VkShaderModuleCreateInfo frag_ci = {0};
+    frag_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    frag_ci.codeSize = render_gauss_frag_spv_size;
+    frag_ci.pCode = (const uint32_t *)render_gauss_frag_spv;
+    VK_CHECK(vkCreateShaderModule(g.device, &frag_ci, NULL, &g.gauss_frag_shader));
+
+    VkPipelineShaderStageCreateInfo stages[2] = {{0},{0}};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = g.gauss_vert_shader;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = g.gauss_frag_shader;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vi = {0};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo ia = {0};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport viewport = {0};
+    viewport.width = (float)g.sc_extent.width;
+    viewport.height = (float)g.sc_extent.height;
+    viewport.maxDepth = 1.0f;
+
+    VkRect2D scissor = {0};
+    scissor.extent = g.sc_extent;
+
+    VkPipelineViewportStateCreateInfo vp = {0};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.pViewports = &viewport;
+    vp.scissorCount = 1;
+    vp.pScissors = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rs = {0};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms = {0};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds = {0};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_FALSE; /* Gaussians are translucent — don't write depth */
+    ds.depthCompareOp = VK_COMPARE_OP_LESS;
+
+    /* Additive blending: src*srcAlpha + dst*1
+     * Gaussian fragments accumulate light additively. */
+    VkPipelineColorBlendAttachmentState blend_att = {0};
+    blend_att.blendEnable = VK_TRUE;
+    blend_att.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blend_att.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend_att.colorBlendOp = VK_BLEND_OP_ADD;
+    blend_att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend_att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend_att.alphaBlendOp = VK_BLEND_OP_ADD;
+    blend_att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+                               VK_COLOR_COMPONENT_G_BIT |
+                               VK_COLOR_COMPONENT_B_BIT |
+                               VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo cb = {0};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &blend_att;
+
+    /* 5 descriptors: 4 storage buffers (pos_x/y/z, color) + 1 combined image sampler (LUT) */
+    VkDescriptorSetLayoutBinding bindings[5];
+    for (int i = 0; i < 4; i++) {
+        memset(&bindings[i], 0, sizeof(VkDescriptorSetLayoutBinding));
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    }
+    memset(&bindings[4], 0, sizeof(VkDescriptorSetLayoutBinding));
+    bindings[4].binding = 4;
+    bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[4].descriptorCount = 1;
+    bindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo dsl_ci = {0};
+    dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dsl_ci.bindingCount = 5;
+    dsl_ci.pBindings = bindings;
+    VK_CHECK(vkCreateDescriptorSetLayout(g.device, &dsl_ci, NULL,
+                                          &g.gauss_ds_layout));
+
+    VkDescriptorPoolSize dp_sizes[2];
+    dp_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    dp_sizes[0].descriptorCount = 4;
+    dp_sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    dp_sizes[1].descriptorCount = 1;
+
+    VkDescriptorPoolCreateInfo dp_ci = {0};
+    dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dp_ci.maxSets = 1;
+    dp_ci.poolSizeCount = 2;
+    dp_ci.pPoolSizes = dp_sizes;
+    VK_CHECK(vkCreateDescriptorPool(g.device, &dp_ci, NULL, &g.gauss_ds_pool));
+
+    VkDescriptorSetAllocateInfo ds_ai = {0};
+    ds_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ds_ai.descriptorPool = g.gauss_ds_pool;
+    ds_ai.descriptorSetCount = 1;
+    ds_ai.pSetLayouts = &g.gauss_ds_layout;
+    VK_CHECK(vkAllocateDescriptorSets(g.device, &ds_ai, &g.gauss_ds));
+
+    /* Bind the LUT texture to binding 4 (static — never changes) */
+    VkDescriptorImageInfo img_info = {0};
+    img_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    img_info.imageView = g.gauss_lut_view;
+    img_info.sampler = g.gauss_lut_sampler;
+
+    VkWriteDescriptorSet lut_write = {0};
+    lut_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    lut_write.dstSet = g.gauss_ds;
+    lut_write.dstBinding = 4;
+    lut_write.descriptorCount = 1;
+    lut_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    lut_write.pImageInfo = &img_info;
+    vkUpdateDescriptorSets(g.device, 1, &lut_write, 0, NULL);
+
+    /* Push constants: same layout as points (mat4 + 4 floats = 80 bytes) */
+    VkPushConstantRange pc_range = {0};
+    pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pc_range.size = 96;
+
+    VkPipelineLayoutCreateInfo pl_ci = {0};
+    pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl_ci.setLayoutCount = 1;
+    pl_ci.pSetLayouts = &g.gauss_ds_layout;
+    pl_ci.pushConstantRangeCount = 1;
+    pl_ci.pPushConstantRanges = &pc_range;
+    VK_CHECK(vkCreatePipelineLayout(g.device, &pl_ci, NULL, &g.gauss_layout));
+
+    VkGraphicsPipelineCreateInfo gp_ci = {0};
+    gp_ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp_ci.stageCount = 2;
+    gp_ci.pStages = stages;
+    gp_ci.pVertexInputState = &vi;
+    gp_ci.pInputAssemblyState = &ia;
+    gp_ci.pViewportState = &vp;
+    gp_ci.pRasterizationState = &rs;
+    gp_ci.pMultisampleState = &ms;
+    gp_ci.pDepthStencilState = &ds;
+    gp_ci.pColorBlendState = &cb;
+    gp_ci.layout = g.gauss_layout;
+    gp_ci.renderPass = g.render_pass;
+    gp_ci.subpass = 0;
+
+    VK_CHECK(vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1,
+                                        &gp_ci, NULL, &g.gauss_pipeline));
 }
 
 /* ── ergo_vk_render_frame (3D) ───────────────────────────── */
@@ -2126,6 +2447,142 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     vkQueuePresentKHR(g.compute_queue, &present);
 }
 
+/* ── ergo_vk_render_gaussians ──────────────────────────────── */
+
+void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
+                               ErgoVkBuf buf_color, int n_points,
+                               float point_size, float val_min, float val_max,
+                               float world_scale) {
+    if (g.headless) return;
+
+    VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence, VK_TRUE, UINT64_MAX));
+    VK_CHECK(vkResetFences(g.device, 1, &g.render_fence));
+
+    uint32_t img_idx;
+    VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX,
+                                          g.sem_available, VK_NULL_HANDLE,
+                                          &img_idx);
+    if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
+
+    /* Bind 4 SoA buffers */
+    if (!g.gauss_ds_bound) {
+        ErgoVkBuf bufs_arr[4] = { buf_x, buf_y, buf_z, buf_color };
+        VkDescriptorBufferInfo buf_infos[4];
+        VkWriteDescriptorSet writes[4];
+        for (int i = 0; i < 4; i++) {
+            BufSlot *b = &g.bufs[bufs_arr[i]];
+            buf_infos[i].buffer = b->buffer;
+            buf_infos[i].offset = g.render_offset;
+            buf_infos[i].range = b->size - g.render_offset;
+
+            memset(&writes[i], 0, sizeof(VkWriteDescriptorSet));
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = g.gauss_ds;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(g.device, 4, writes, 0, NULL);
+        g.gauss_ds_bound = 1;
+    }
+
+    /* Camera */
+    float aspect = (float)g.sc_extent.width / (float)g.sc_extent.height;
+    Mat4 proj = mat4_perspective(45.0f * 3.14159265f / 180.0f, aspect,
+                                 0.01f, 100.0f);
+    float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);
+    float ce = cosf(g.cam_elevation), se = sinf(g.cam_elevation);
+    float ex = g.cam_distance * ce * sa;
+    float ey = g.cam_distance * se;
+    float ez = g.cam_distance * ce * ca;
+    Mat4 view = mat4_look_at(ex, ey, ez, 0, 0, 0, 0, 1, 0);
+    Mat4 viewProj = mat4_mul(proj, view);
+
+    struct {
+        float viewProj[16];
+        float point_size;
+        float val_min;
+        float val_max;
+        float world_scale;
+    } pc;
+    memcpy(pc.viewProj, viewProj.m, 64);
+    pc.point_size = point_size;
+    pc.val_min = val_min;
+    pc.val_max = val_max;
+    pc.world_scale = world_scale;
+
+    VkCommandBufferBeginInfo begin_info = {0};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    VK_CHECK(vkResetCommandBuffer(g.render_cmd_buf, 0));
+    VK_CHECK(vkBeginCommandBuffer(g.render_cmd_buf, &begin_info));
+
+    if (g.cmd_buf) {
+        VkMemoryBarrier mb = {0};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g.render_cmd_buf,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+            0, 1, &mb, 0, NULL, 0, NULL);
+    }
+
+    VkClearValue clears[2];
+    clears[0].color = (VkClearColorValue){{0.0f, 0.0f, 0.0f, 1.0f}};
+    clears[1].depthStencil = (VkClearDepthStencilValue){1.0f, 0};
+
+    VkRenderPassBeginInfo rp_begin = {0};
+    rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp_begin.renderPass = g.render_pass;
+    rp_begin.framebuffer = g.sc_fbs[img_idx];
+    rp_begin.renderArea.extent = g.sc_extent;
+    rp_begin.clearValueCount = 2;
+    rp_begin.pClearValues = clears;
+
+    vkCmdBeginRenderPass(g.render_cmd_buf, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+    vkCmdBindPipeline(g.render_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      g.gauss_pipeline);
+    vkCmdBindDescriptorSets(g.render_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            g.gauss_layout, 0, 1, &g.gauss_ds, 0, NULL);
+
+    vkCmdPushConstants(g.render_cmd_buf, g.gauss_layout,
+                       VK_SHADER_STAGE_VERTEX_BIT,
+                       0, sizeof(pc), &pc);
+
+    /* Instanced draw: 6 vertices per quad, n_points instances */
+    vkCmdDraw(g.render_cmd_buf, 6, n_points, 0, 0);
+
+    vkCmdEndRenderPass(g.render_cmd_buf);
+    VK_CHECK(vkEndCommandBuffer(g.render_cmd_buf));
+
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo si = {0};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.waitSemaphoreCount = 1;
+    si.pWaitSemaphores = &g.sem_available;
+    si.pWaitDstStageMask = &wait_stage;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g.render_cmd_buf;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &g.sem_finished;
+
+    VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.render_fence));
+
+    VkPresentInfoKHR present = {0};
+    present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    present.waitSemaphoreCount = 1;
+    present.pWaitSemaphores = &g.sem_finished;
+    present.swapchainCount = 1;
+    present.pSwapchains = &g.swapchain;
+    present.pImageIndices = &img_idx;
+
+    vkQueuePresentKHR(g.compute_queue, &present);
+}
+
 int ergo_vk_should_close(void) {
     if (g.headless) return 0;
 #ifdef ERGO_VK_ANDROID
@@ -2149,6 +2606,15 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
                             ErgoVkBuf buf_color, int n_points,
                             float point_size, float val_min, float val_max,
                             float world_scale) {
+    (void)buf_x; (void)buf_y; (void)buf_z; (void)buf_color;
+    (void)n_points; (void)point_size;
+    (void)val_min; (void)val_max; (void)world_scale;
+}
+
+void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
+                               ErgoVkBuf buf_color, int n_points,
+                               float point_size, float val_min, float val_max,
+                               float world_scale) {
     (void)buf_x; (void)buf_y; (void)buf_z; (void)buf_color;
     (void)n_points; (void)point_size;
     (void)val_min; (void)val_max; (void)world_scale;

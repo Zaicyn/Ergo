@@ -73,26 +73,5 @@ SUBROUTINE SIM_CENSUS_REPORT(COUNT, FRAME)
     PRINT CENSUS_OMEGA_HIST(B)
   ENDDO
 
-  ! Resonance signatures collected since last census
-  ! Sentinel -999 marks start/end of signature block for parser
-  IF SIG_COUNT(1) > 0 THEN
-    PRINT -999
-    PRINT SIG_COUNT(1)
-    DO I = 1, SIG_COUNT(1)
-      IF I ≤ SIG_MAX THEN
-        PRINT SIG_OMEGA(I)
-        PRINT SIG_RHO(I)
-        PRINT SIG_FMODE(I)
-        PRINT SIG_VMAG(I)
-        PRINT SIG_RNORM(I)
-        PRINT SIG_MGATE(I)
-        PRINT SIG_ZC(I)
-        PRINT SIG_FW(I)
-      ENDIF
-    ENDDO
-    PRINT -999
-    SIG_COUNT(1) := 0
-  ENDIF
-
   RETURN
 END

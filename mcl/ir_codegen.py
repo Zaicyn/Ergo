@@ -947,7 +947,14 @@ class IRCodeGen:
                 if hasattr(self, '_pp_arrays') and self._pp_arrays:
                     self._put(f"ergo_vk_set_render_offset("
                               f"(size_t)_pp_wr_offset * sizeof(float));")
-                self._put(f"ergo_vk_render_points("
+                self._put(f"if (getenv(\"ERGO_RENDER\") && "
+                          f"strcmp(getenv(\"ERGO_RENDER\"), \"gauss\") == 0)")
+                self._put(f"  ergo_vk_render_gaussians("
+                          f"d_{particle['pos_x']}, d_{particle['pos_y']}, "
+                          f"d_{particle['pos_z']}, _color_buf, "
+                          f"{count}, 0.003f, _vmin, _vmax, {ws});")
+                self._put(f"else")
+                self._put(f"  ergo_vk_render_points("
                           f"d_{particle['pos_x']}, d_{particle['pos_y']}, "
                           f"d_{particle['pos_z']}, _color_buf, "
                           f"{count}, 3.0f, _vmin, _vmax, {ws});")
@@ -1098,12 +1105,11 @@ class IRCodeGen:
         would stall the pipeline every frame. Use fixed range instead.
         """
         # Color range: ERGO_VMIN/ERGO_VMAX env vars override defaults.
-        # Default 0.0-0.15 covers the OMEGA floor (~0.05) with full palette.
-        # Set ERGO_VMAX=2.0 to see the full range (mostly blue).
+        # Default 0.0-3.0 covers velocity range with visible palette.
         self._put(f"float _vmin = getenv(\"ERGO_VMIN\") ? "
                   f"atof(getenv(\"ERGO_VMIN\")) : 0.0f;")
         self._put(f"float _vmax = getenv(\"ERGO_VMAX\") ? "
-                  f"atof(getenv(\"ERGO_VMAX\")) : 0.15f;")
+                  f"atof(getenv(\"ERGO_VMAX\")) : 3.0f;")
 
     def _infer_grid(self, shape: tuple | None) -> tuple[str, str]:
         """Infer 2D grid dimensions from a 1D array shape.

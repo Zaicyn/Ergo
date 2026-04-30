@@ -151,19 +151,43 @@ a fallback. The gaussian + meshlet pipeline is an upgrade path:
    - Aggregate distant cells into single gaussians
    - Smooth transition to avoid popping
 
+## Gaussian Evaluation: Texture LUT
+
+Replace per-fragment exp() with precomputed gaussian texture:
+
+```
+Precompute: 64×64 texture, R8 format, gaussian falloff from center
+Upload once at init. Total cost: 4KB.
+
+Vertex shader: emit quad with UVs spanning [-2σ, +2σ]
+Fragment shader: weight = texture(gaussianLUT, uv).r
+
+exp() = 10-15 ALU cycles per fragment
+texture sample = 1-2 cycles (L2 cache hit, hardware bilinear)
+```
+
+The texture unit does free bilinear interpolation — smooth falloff
+with zero ALU. At 30M particles × ~4 fragments each = 120M fragment
+evaluations per frame. The LUT saves ~1.2 billion ALU cycles per frame.
+
+Gaussian size clamp: when projected size < 1px, skip the quad and
+draw a 1px point instead. This degrades gracefully to the current
+point renderer at distance — free LOD transition.
+
 ## Performance Estimates (RTX 2060)
 
-| Component | Current (points) | Phase 1 (gaussians) | Phase 2+ (full) |
-|---|---|---|---|
-| Vertex shader | 30M invocations | 30M quad expansions | 30M + meshlets |
-| Fragment shader | 30M × 1px | 30M × ~4px (gaussian) | + meshlet shading |
-| Overdraw | Minimal (1px) | Moderate (gaussian overlap) | Managed (depth sort) |
-| Memory | Zero extra | Zero extra | ~1MB meshlet buffer |
-| Expected FPS at 30M | 74 | ~40-50 | ~50-60 with culling |
+| Configuration | Visible splats | FPS |
+|---|---|---|
+| Current points (30M) | 30M | 74 |
+| Gaussians, no culling | 30M | 30-40 |
+| + shell culling | 2-5M | 60-80 |
+| + cell LOD (far cells = 1 splat) | 500K-1M | 100-130 |
+| + crystal occlusion | 300K-800K | 120-150 |
 
-Gaussians are more expensive per-pixel than points but the visual
-quality leap is enormous. Grid culling recovers some of the cost
-by skipping empty regions entirely.
+The path to beating 74 fps is LOD + culling, not faster gaussian
+math. The texture LUT ensures per-fragment cost doesn't tank you.
+Shell culling is the biggest single win (30M → 2-5M visible).
+Cell LOD is the second biggest (2-5M → 500K-1M rendered).
 
 ## Shell-Based Front-to-Back Rendering
 

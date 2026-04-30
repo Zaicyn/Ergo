@@ -216,6 +216,16 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
                             float world_scale);
 
 /*
+ * Render particles as gaussian splats (instanced quads with LUT falloff).
+ * Same interface as render_points. Uses additive blending.
+ * Activate with ERGO_RENDER=gauss environment variable.
+ */
+void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
+                               ErgoVkBuf buf_color, int n_points,
+                               float point_size, float val_min, float val_max,
+                               float world_scale);
+
+/*
  * Poll window events. Returns 1 if the window should close.
  */
 int ergo_vk_should_close(void);

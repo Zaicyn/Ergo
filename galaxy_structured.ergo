@@ -305,20 +305,6 @@ STATIC INTEGER :: CENSUS_OMEGA_HIST(20)
 ! State counters: [1]=active, [2]=crystal, [3]=coast, [4]=nova/ejected
 STATIC INTEGER :: CENSUS_STATE_COUNT(4)
 
-! ── Resonance signature collector (GPU writes, CPU reads) ─────
-! 8 separate 1D arrays — avoids 2D indexing confusion across GPU/CPU.
-! GPU atomicAdds SIG_COUNT to get write slot. CPU reads at census.
-PARAMETER INTEGER :: SIG_MAX = 4096
-STATIC REAL :: SIG_OMEGA(4096)
-STATIC REAL :: SIG_RHO(4096)
-STATIC REAL :: SIG_FMODE(4096)
-STATIC REAL :: SIG_VMAG(4096)
-STATIC REAL :: SIG_RNORM(4096)
-STATIC REAL :: SIG_MGATE(4096)
-STATIC REAL :: SIG_ZC(4096)
-STATIC REAL :: SIG_FW(4096)
-STATIC INTEGER :: SIG_COUNT(1)
-
 ! ── Oracle control (CPU instructions, applied as amplitudes) ──
 STATIC INTEGER :: NET_SPAWN_ACTIVE = 0
 STATIC REAL :: NET_SPAWN_RATE = 0.0
@@ -983,16 +969,6 @@ SUBROUTINE DOWNLOAD_PARTICLES()
   DP := VEL_X(1)
   DP := VEL_Y(1)
   DP := VEL_Z(1)
-  ! Resonance signature arrays
-  DP := SIG_OMEGA(1)
-  DP := SIG_RHO(1)
-  DP := SIG_FMODE(1)
-  DP := SIG_VMAG(1)
-  DP := SIG_RNORM(1)
-  DP := SIG_MGATE(1)
-  DP := SIG_ZC(1)
-  DP := SIG_FW(1)
-  DI := SIG_COUNT(1)
   RETURN
 END
 
@@ -1016,8 +992,6 @@ END
 
 SUBROUTINE SCATTER_GRID()
   INTEGER :: I, CI, CJ, CK, GEN, BIN, PH
-  INTEGER :: SIG_SLOT, FMODE_I
-  REAL :: V_MAG, R_NORM, RHO_NORM, LOC_ZC, LOC_FW
 
   DO I = 1, NPART
     ! Ejected: gone, skip entirely
@@ -1036,27 +1010,6 @@ SUBROUTINE SCATTER_GRID()
         GRID_MATERIAL(CI, CJ, CK) := IOR( &
           ISHFT(CRYSTAL_ARCHETYPE, 24), &
           ISHFT(CLAMP(INT(OMEGA_NAT(I) * 15.0 / OMEGA_MAX), 0, 15), 16))
-
-        ! Capture resonance signature into ring buffer
-        SIG_SLOT := SIG_COUNT(1) + 1
-        IF SIG_SLOT ≤ SIG_MAX THEN
-          SIG_COUNT(1) := SIG_SLOT
-          GEN := IAND(ISHFT(FLAGS(I), -GEN_SHIFT), GEN_MASK) + 1
-          FMODE_I := FLOW_MODE(GEN)
-          V_MAG := SQRT(VEL_X(I) * VEL_X(I) + VEL_Y(I) * VEL_Y(I) + VEL_Z(I) * VEL_Z(I))
-          R_NORM := SQRT(POS_X(I) * POS_X(I) + POS_Y(I) * POS_Y(I) + POS_Z(I) * POS_Z(I)) / DISK_OUTER_R
-          RHO_NORM := REAL(GRID_DENSITY(CI, CJ, CK)) / 32.0
-          LOC_ZC := ABS(Z_COUPLING(GEN))
-          LOC_FW := ABS(FLOW_W(GEN))
-          SIG_OMEGA(SIG_SLOT) := OMEGA_NAT(I)
-          SIG_RHO(SIG_SLOT) := RHO_NORM
-          SIG_FMODE(SIG_SLOT) := REAL(FMODE_I)
-          SIG_VMAG(SIG_SLOT) := V_MAG
-          SIG_RNORM(SIG_SLOT) := R_NORM
-          SIG_MGATE(SIG_SLOT) := GRID_MET_GATE(CI, CJ, CK)
-          SIG_ZC(SIG_SLOT) := LOC_ZC
-          SIG_FW(SIG_SLOT) := LOC_FW
-        ENDIF
 
         FLAGS(I) := IOR(FLAGS(I), PFLAG_BANKED)
       ENDIF
@@ -1328,27 +1281,6 @@ SUBROUTINE SIM_CENSUS_REPORT(COUNT, FRAME)
     PRINT CENSUS_OMEGA_HIST(B)
   ENDDO
 
-  ! Resonance signatures collected since last census
-  ! Sentinel -999 marks start/end of signature block for parser
-  IF SIG_COUNT(1) > 0 THEN
-    PRINT -999
-    PRINT SIG_COUNT(1)
-    DO I = 1, SIG_COUNT(1)
-      IF I ≤ SIG_MAX THEN
-        PRINT SIG_OMEGA(I)
-        PRINT SIG_RHO(I)
-        PRINT SIG_FMODE(I)
-        PRINT SIG_VMAG(I)
-        PRINT SIG_RNORM(I)
-        PRINT SIG_MGATE(I)
-        PRINT SIG_ZC(I)
-        PRINT SIG_FW(I)
-      ENDIF
-    ENDDO
-    PRINT -999
-    SIG_COUNT(1) := 0
-  ENDIF
-
   RETURN
 END
 ! ════════════════════════════════════════════════════════════════
@@ -1407,9 +1339,5 @@ DO FRAME = 1, DEFAULT_FRAMES
   ! use finite DEFAULT_FRAMES and post-loop census instead.
 
 ENDDO
-
-! Post-loop: download particle arrays then census
-CALL DOWNLOAD_PARTICLES()
-CALL SIM_CENSUS_REPORT(NPART, DEFAULT_FRAMES)
 
 PRINT NPART

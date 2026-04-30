@@ -14,6 +14,8 @@ glslc -fshader-stage=vertex   render.vert        -o render.vert.spv
 glslc -fshader-stage=fragment render.frag        -o render.frag.spv
 glslc -fshader-stage=vertex   render_points.vert -o render_points.vert.spv
 glslc -fshader-stage=fragment render_points.frag -o render_points.frag.spv
+glslc -fshader-stage=vertex   render_gauss.vert  -o render_gauss.vert.spv
+glslc -fshader-stage=fragment render_gauss.frag  -o render_gauss.frag.spv
 
 echo "Generating render_shaders.h..."
 python3 -c "
@@ -48,6 +50,10 @@ header += '\n\n/* ── Point cloud shaders ── */\n\n'
 header += emit_array('render_points_vert_spv', 'render_points.vert.spv')
 header += '\n\n'
 header += emit_array('render_points_frag_spv', 'render_points.frag.spv')
+header += '\n\n/* ── Gaussian splat shaders ── */\n\n'
+header += emit_array('render_gauss_vert_spv', 'render_gauss.vert.spv')
+header += '\n\n'
+header += emit_array('render_gauss_frag_spv', 'render_gauss.frag.spv')
 header += '\n\n#endif /* ERGO_RENDER_SHADERS_H */\n'
 
 with open('render_shaders.h', 'w') as f:
@@ -55,4 +61,4 @@ with open('render_shaders.h', 'w') as f:
 "
 
 echo "Done."
-ls -la render.vert.spv render.frag.spv render_points.vert.spv render_points.frag.spv render_shaders.h
+ls -la render.vert.spv render.frag.spv render_points.vert.spv render_points.frag.spv render_gauss.vert.spv render_gauss.frag.spv render_shaders.h
