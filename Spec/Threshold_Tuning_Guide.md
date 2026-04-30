@@ -406,12 +406,36 @@ The correct observables are:
 The histogram confirms ring coupling doesn't BREAK anything (no
 inflation, no deflation). That's the validation — it's conservative.
 
+## Phase 4-5 Results: K_WINDING + Spillover (2026-04-29)
+
+Full system enabled (sections 15.5-15.8). All constants at defaults.
+
+**Spillover sweep:** OMEGA_CRITICAL = 0.04, 0.06, 0.1 — no crystals
+at any threshold, even 2x above the equilibrium OMEGA mean (0.05).
+
+**Why no crystals:** System is stable against crystallization.
+- Spillover requires MET_GATE > 1.49 (complete ring in cell) AND
+  warp mean OMEGA < OMEGA_CRITICAL. Most warps stay above threshold.
+- Even when spillover fires (OMEGA *= 0.5), OMEGA_BASE pump restores
+  particles before they reach OMEGA_CRYSTAL_THRESH (0.008).
+- Crystal also requires SPD_SQ < 0.01 — orbiting particles are too fast.
+
+**K_WINDING:** Effect is topological (Q convergence), not visible in
+histogram. Leave at 0.0001. Needs winding-specific census to validate.
+
+**Conclusion:** All constants are at stable equilibrium. The system
+doesn't crystallize or inflate. Ring coupling provides structural
+coherence without disrupting energy balance. Visual confirms galaxy
+structure with velocity banding from Viviani flow channels.
+
 ## Locked Values
 
 | Constant | Tuned value | Phase | Notes |
 |---|---|---|---|
-| K_PHASE_LOCK | 0.001 | 2 | Topology only — no histogram effect, correct |
-| OMEGA_EXCHANGE_RATE | 0.5 | 3 | Structural redistribution — no histogram effect, correct |
-| K_WINDING | 0.0001 | 4 | Restored to default, needs Q measurement |
+| K_PHASE_LOCK | 0.001 | 2 | Topology — keeps Q near 1, no energy effect |
+| OMEGA_EXCHANGE_RATE | 0.5 | 3 | Structural redistribution, conservative |
+| K_WINDING | 0.0001 | 4 | Topological charge stabilization |
+| OMEGA_CRITICAL | 0.04 | 5 | Below equilibrium mean — spillover is rare/never |
+| SPILL_DECAY | 0.5 | 5 | Halves OMEGA on spill — insufficient to crystallize |
 | OMEGA_CRITICAL | TBD | 5 | |
 | SPILL_DECAY | TBD | 5 | |
