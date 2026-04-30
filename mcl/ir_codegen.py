@@ -104,9 +104,10 @@ class IRCodeGen:
         if not (has_px and has_py and has_pz):
             return None
 
-        # Find best color array: prefer OMEGA_NAT, then THETA, then POS_X
+        # Find best color array: prefer OMEGA_NAT, then VEL_X, then POS_X
+        # ERGO_COLOR env var overrides at runtime (e.g. ERGO_COLOR=VEL_X)
         color_arr = "POS_X"
-        for candidate in ["OMEGA_NAT", "THETA", "PUMP_SCALE", "VEL_X"]:
+        for candidate in ["OMEGA_NAT", "VEL_X", "THETA"]:
             if candidate in arrays:
                 t = self._var_types.get(candidate, IRType.REAL)
                 if t == IRType.REAL:
@@ -891,6 +892,19 @@ class IRCodeGen:
                     self._array_shapes["POS_X"][0])
                 color_arr = particle["color"]
 
+                # Runtime color channel: ERGO_COLOR=VEL_X etc.
+                real_arrays = [a for a in self._array_shapes
+                               if self._var_types.get(a) == IRType.REAL
+                               and self._array_shapes[a] == self._array_shapes.get("POS_X")]
+                if real_arrays:
+                    self._put("/* Runtime color channel selection */")
+                    self._put("const char *_color_env = getenv(\"ERGO_COLOR\");")
+                    self._put(f"ErgoVkBuf _color_buf = d_{color_arr};")
+                    for arr in real_arrays:
+                        if arr != color_arr:
+                            self._put(f"if (_color_env && strcmp(_color_env, \"{arr}\") == 0) "
+                                      f"_color_buf = d_{arr};")
+
                 # Add render arrays to upload set ONLY if CPU dirtied them.
                 # Arrays written by GPU kernels are already current on GPU —
                 # do NOT overwrite them with stale CPU data.
@@ -935,7 +949,7 @@ class IRCodeGen:
                               f"(size_t)_pp_wr_offset * sizeof(float));")
                 self._put(f"ergo_vk_render_points("
                           f"d_{particle['pos_x']}, d_{particle['pos_y']}, "
-                          f"d_{particle['pos_z']}, d_{particle['color']}, "
+                          f"d_{particle['pos_z']}, _color_buf, "
                           f"{count}, 3.0f, _vmin, _vmax, {ws});")
             elif self.render:
                 # ── Grid / heightfield rendering ──
