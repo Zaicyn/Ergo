@@ -675,6 +675,8 @@ class _EmitContext:
 
         # Track whether kernel uses subgroup shuffle (RING_PREV/RING_NEXT)
         self._needs_subgroup = False
+        # Track whether kernel uses warp ballot (nullable pattern compaction)
+        self._needs_ballot = False
 
         # Section buffers — filled during emit, flushed in order
         self._header: list[str] = []
@@ -691,6 +693,7 @@ class _EmitContext:
         self.id_i32: int = 0
         self.id_f64: int = 0
         self.id_v3uint: int = 0
+        self.id_v4uint: int = 0            # for ballot results (uvec4)
         self.id_ptr_input_v3uint: int = 0
 
         # Storage buffer pointer types
@@ -782,6 +785,18 @@ class _EmitContext:
         self._const_ids[key] = cid
         return cid
 
+    def _get_i32_const(self, value: int) -> int:
+        """Get or create an i32 constant."""
+        key = ("i32", value)
+        if key in self._const_ids:
+            return self._const_ids[key]
+        cid = self._alloc()
+        self._types.append(
+            f"         {self._id(cid)} = OpConstant {self._id(self.id_i32)} {value}")
+        self._set_ssa_type(cid, self.id_i32)
+        self._const_ids[key] = cid
+        return cid
+
     def _spirv_type_id(self, t: IRType) -> int:
         """Get the SPIR-V type ID for an IR type."""
         if t == IRType.REAL:
@@ -843,6 +858,10 @@ class _EmitContext:
                         self._needs_glsl_ext = True
                     if inst.op in (Op.RING_PREV, Op.RING_NEXT, Op.RING_SHIFT, Op.RING_BROADCAST):
                         self._needs_subgroup = True
+                    if inst.op in (Op.WARP_BALLOT, Op.WARP_BALLOT_COUNT,
+                                   Op.WARP_BALLOT_PREFIX, Op.WARP_BROADCAST_FIRST):
+                        self._needs_ballot = True
+                        self._needs_subgroup = True  # ballot implies subgroup builtins
                     if self._needs_glsl_ext and self._needs_subgroup:
                         return
             elif isinstance(item, IRIf):
@@ -868,6 +887,7 @@ class _EmitContext:
         self.id_f32 = self._alloc("f32")
         self.id_f64 = self._alloc("f64")
         self.id_v3uint = self._alloc("v3uint")
+        self.id_v4uint = self._alloc("v4uint")
 
         self._types.append(f"     {self._id(self.id_void)} = OpTypeVoid")
         self._types.append(f"     {self._id(self.id_func_void)} = OpTypeFunction {self._id(self.id_void)}")
@@ -878,6 +898,9 @@ class _EmitContext:
         if not is_f32:
             self._types.append(f"     {self._id(self.id_f64)} = OpTypeFloat 64")
         self._types.append(f"     {self._id(self.id_v3uint)} = OpTypeVector {self._id(self.id_u32)} 3")
+        # v4uint for ballot results (uvec4)
+        if self._needs_ballot:
+            self._types.append(f"     {self._id(self.id_v4uint)} = OpTypeVector {self._id(self.id_u32)} 4")
 
         # Pointer to v3uint (Input) — for GlobalInvocationID
         self.id_ptr_input_v3uint = self._alloc("ptr_input_v3uint")
@@ -1149,6 +1172,10 @@ class _EmitContext:
         if self._needs_subgroup:
             self._header.append(f"               OpCapability GroupNonUniform")
             self._header.append(f"               OpCapability GroupNonUniformShuffle")
+        # Ballot + arithmetic for nullable pattern (warp-level prefix sum)
+        if self._needs_ballot:
+            self._header.append(f"               OpCapability GroupNonUniformBallot")
+            self._header.append(f"               OpCapability GroupNonUniformArithmetic")
 
         # GLSL extended instruction set
         if self._needs_glsl_ext:
@@ -2017,6 +2044,72 @@ class _EmitContext:
                 f"         {self._id(result)} = OpGroupNonUniformShuffle "
                 f"{self._id(result_type)} {self._id(scope)} "
                 f"{self._id(a)} {self._id(src_u)}")
+            self._set_ssa_type(result, result_type)
+            if inst.result:
+                ssa_map[inst.result] = result
+            return False
+
+        # WARP_BALLOT(predicate) -> uvec4 bitmask of active lanes
+        if op == Op.WARP_BALLOT:
+            pred = self._resolve(inst.args[0], pc_member_ids, ssa_map)
+            # Predicate must be bool — convert i32 != 0 to bool
+            pred_bool = self._alloc()
+            const_0 = self._get_i32_const(0)
+            self._function.append(
+                f"         {self._id(pred_bool)} = OpINotEqual {self._id(self.id_bool)} "
+                f"{self._id(pred)} {self._id(const_0)}")
+
+            scope = self._get_u32_const(3)  # Subgroup
+            result = self._alloc()
+            self._function.append(
+                f"         {self._id(result)} = OpGroupNonUniformBallot "
+                f"{self._id(self.id_v4uint)} {self._id(scope)} "
+                f"{self._id(pred_bool)}")
+            self._set_ssa_type(result, self.id_v4uint)
+            if inst.result:
+                ssa_map[inst.result] = result
+            return False
+
+        # WARP_BALLOT_COUNT(ballot) -> u32 popcount (total set bits)
+        if op == Op.WARP_BALLOT_COUNT:
+            ballot = self._resolve(inst.args[0], pc_member_ids, ssa_map)
+            scope = self._get_u32_const(3)  # Subgroup
+            result = self._alloc()
+            self._function.append(
+                f"         {self._id(result)} = OpGroupNonUniformBallotBitCount "
+                f"{self._id(self.id_u32)} {self._id(scope)} Reduce "
+                f"{self._id(ballot)}")
+            self._set_ssa_type(result, self.id_u32)
+            if inst.result:
+                ssa_map[inst.result] = result
+            return False
+
+        # WARP_BALLOT_PREFIX(ballot) -> u32 exclusive prefix popcount
+        # Each lane gets count of set bits in lanes [0, lane_id)
+        if op == Op.WARP_BALLOT_PREFIX:
+            ballot = self._resolve(inst.args[0], pc_member_ids, ssa_map)
+            scope = self._get_u32_const(3)  # Subgroup
+            result = self._alloc()
+            self._function.append(
+                f"         {self._id(result)} = OpGroupNonUniformBallotBitCount "
+                f"{self._id(self.id_u32)} {self._id(scope)} ExclusiveScan "
+                f"{self._id(ballot)}")
+            self._set_ssa_type(result, self.id_u32)
+            if inst.result:
+                ssa_map[inst.result] = result
+            return False
+
+        # WARP_BROADCAST_FIRST(value) -> broadcast first active lane's value
+        if op == Op.WARP_BROADCAST_FIRST:
+            a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
+            is_fp = self._is_real_id(a)
+            result_type = self.id_real if is_fp else self.id_i32
+            scope = self._get_u32_const(3)  # Subgroup
+            result = self._alloc()
+            self._function.append(
+                f"         {self._id(result)} = OpGroupNonUniformBroadcastFirst "
+                f"{self._id(result_type)} {self._id(scope)} "
+                f"{self._id(a)}")
             self._set_ssa_type(result, result_type)
             if inst.result:
                 ssa_map[inst.result] = result

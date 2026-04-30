@@ -185,6 +185,12 @@ class Op(Enum):
     RING_SHIFT = "ring_shift"       # value from lane+delta neighbor (wraps)
     RING_BROADCAST = "ring_broadcast"  # broadcast one lane's value to all
 
+    # Warp ballot / prefix-sum (nullable pattern — branchless compaction)
+    WARP_BALLOT = "warp_ballot"               # ballot(pred) -> uvec4 mask
+    WARP_BALLOT_COUNT = "warp_ballot_count"   # popcount(ballot) -> u32
+    WARP_BALLOT_PREFIX = "warp_ballot_prefix" # exclusive prefix popcount -> u32
+    WARP_BROADCAST_FIRST = "warp_broadcast_first"  # broadcast first active lane's value
+
     # Array operations
     LOAD = "load"           # load from array: result = array[indices]
     STORE = "store"         # store to array: array[indices] = value
