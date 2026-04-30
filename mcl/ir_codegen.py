@@ -658,6 +658,30 @@ class IRCodeGen:
                     cpu_dirty_arrays |= cpu_writes
                     self._gpu_current -= cpu_writes
                 self._emit_loop(item)
+                # If a CPU loop contains GPU dispatches (e.g. frame loop),
+                # propagate GPU-written arrays so post-loop CPU code can
+                # trigger downloads.
+                if not kernel and self.gpu_plan:
+                    inner_gpu_written: set[str] = set()
+                    def _scan_gpu_writes(body_items):
+                        for bi in body_items:
+                            if isinstance(bi, IRLoop):
+                                ik = self._kernel_by_line.get(bi.line)
+                                if ik:
+                                    inner_gpu_written.update(ik.arrays_written)
+                                else:
+                                    _scan_gpu_writes(bi.body)
+                            elif isinstance(bi, IRBlock):
+                                pass  # blocks don't contain loops directly
+                            elif isinstance(bi, IRIf):
+                                _scan_gpu_writes(bi.then_body)
+                                if bi.else_body:
+                                    _scan_gpu_writes(bi.else_body)
+                    _scan_gpu_writes(item.body)
+                    if inner_gpu_written:
+                        if last_dispatch_arrays is None:
+                            last_dispatch_arrays = set()
+                        last_dispatch_arrays |= inner_gpu_written
                 # For SPLIT kernels, the suffix upload already synced
                 # CPU-modified arrays to GPU. Clear them from dirty set.
                 if kernel and kernel.is_partial:
@@ -1059,8 +1083,13 @@ class IRCodeGen:
         simulation constants. A CPU-side scan over millions of elements
         would stall the pipeline every frame. Use fixed range instead.
         """
-        self._put(f"/* Fixed color range — no CPU scan */")
-        self._put(f"float _vmin = 0.0f, _vmax = 2.0f;")
+        # Color range: ERGO_VMIN/ERGO_VMAX env vars override defaults.
+        # Default 0.0-0.15 covers the OMEGA floor (~0.05) with full palette.
+        # Set ERGO_VMAX=2.0 to see the full range (mostly blue).
+        self._put(f"float _vmin = getenv(\"ERGO_VMIN\") ? "
+                  f"atof(getenv(\"ERGO_VMIN\")) : 0.0f;")
+        self._put(f"float _vmax = getenv(\"ERGO_VMAX\") ? "
+                  f"atof(getenv(\"ERGO_VMAX\")) : 0.15f;")
 
     def _infer_grid(self, shape: tuple | None) -> tuple[str, str]:
         """Infer 2D grid dimensions from a 1D array shape.
