@@ -73,5 +73,25 @@ SUBROUTINE SIM_CENSUS_REPORT(COUNT, FRAME)
     PRINT CENSUS_OMEGA_HIST(B)
   ENDDO
 
+  ! Resonance signatures collected since last census
+  IF SIG_COUNT(1) > 0 THEN
+    PRINT SIG_COUNT(1)
+    DO I = 1, SIG_COUNT(1)
+      IF I ≤ SIG_MAX THEN
+        ! Print 8 signature values per crystallization event
+        PRINT SIG_BUF(1, I)
+        PRINT SIG_BUF(2, I)
+        PRINT SIG_BUF(3, I)
+        PRINT SIG_BUF(4, I)
+        PRINT SIG_BUF(5, I)
+        PRINT SIG_BUF(6, I)
+        PRINT SIG_BUF(7, I)
+        PRINT SIG_BUF(8, I)
+      ENDIF
+    ENDDO
+    ! Reset counter for next census interval
+    SIG_COUNT(1) := 0
+  ENDIF
+
   RETURN
 END

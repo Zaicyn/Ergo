@@ -305,6 +305,15 @@ STATIC INTEGER :: CENSUS_OMEGA_HIST(20)
 ! State counters: [1]=active, [2]=crystal, [3]=coast, [4]=nova/ejected
 STATIC INTEGER :: CENSUS_STATE_COUNT(4)
 
+! ── Resonance signature collector (GPU writes, CPU reads) ─────
+! Ring buffer of 8-float signatures captured at crystallization.
+! GPU atomicAdds SIG_COUNT to get write slot. CPU reads at census
+! and dumps to file for offline clustering.
+! Each signature: OMEGA, RHO, FMODE, V_MAG, R_NORM, MET_GATE, Z_C, FLOW_W
+PARAMETER INTEGER :: SIG_MAX = 4096
+STATIC REAL :: SIG_BUF(8, 4096)
+STATIC INTEGER :: SIG_COUNT(1)
+
 ! ── Oracle control (CPU instructions, applied as amplitudes) ──
 STATIC INTEGER :: NET_SPAWN_ACTIVE = 0
 STATIC REAL :: NET_SPAWN_RATE = 0.0
@@ -969,6 +978,9 @@ SUBROUTINE DOWNLOAD_PARTICLES()
   DP := VEL_X(1)
   DP := VEL_Y(1)
   DP := VEL_Z(1)
+  ! Resonance signature buffer
+  DP := SIG_BUF(1, 1)
+  DI := SIG_COUNT(1)
   RETURN
 END
 
@@ -992,6 +1004,8 @@ END
 
 SUBROUTINE SCATTER_GRID()
   INTEGER :: I, CI, CJ, CK, GEN, BIN, PH
+  INTEGER :: SIG_SLOT, FMODE_I
+  REAL :: V_MAG, R_NORM, RHO_NORM, SIG_ZC, SIG_FW
 
   DO I = 1, NPART
     ! Ejected: gone, skip entirely
@@ -1010,6 +1024,28 @@ SUBROUTINE SCATTER_GRID()
         GRID_MATERIAL(CI, CJ, CK) := IOR( &
           ISHFT(CRYSTAL_ARCHETYPE, 24), &
           ISHFT(CLAMP(INT(OMEGA_NAT(I) * 15.0 / OMEGA_MAX), 0, 15), 16))
+
+        ! Capture resonance signature into ring buffer
+        SIG_SLOT := SIG_COUNT(1) + 1
+        IF SIG_SLOT ≤ SIG_MAX THEN
+          SIG_COUNT(1) := SIG_SLOT
+          GEN := IAND(ISHFT(FLAGS(I), -GEN_SHIFT), GEN_MASK) + 1
+          FMODE_I := FLOW_MODE(GEN)
+          V_MAG := SQRT(VEL_X(I) * VEL_X(I) + VEL_Y(I) * VEL_Y(I) + VEL_Z(I) * VEL_Z(I))
+          R_NORM := SQRT(POS_X(I) * POS_X(I) + POS_Y(I) * POS_Y(I) + POS_Z(I) * POS_Z(I)) / DISK_OUTER_R
+          RHO_NORM := REAL(GRID_DENSITY(CI, CJ, CK)) / 32.0
+          SIG_ZC := ABS(Z_COUPLING(GEN))
+          SIG_FW := ABS(FLOW_W(GEN))
+          SIG_BUF(1, SIG_SLOT) := OMEGA_NAT(I)
+          SIG_BUF(2, SIG_SLOT) := RHO_NORM
+          SIG_BUF(3, SIG_SLOT) := REAL(FMODE_I)
+          SIG_BUF(4, SIG_SLOT) := V_MAG
+          SIG_BUF(5, SIG_SLOT) := R_NORM
+          SIG_BUF(6, SIG_SLOT) := GRID_MET_GATE(CI, CJ, CK)
+          SIG_BUF(7, SIG_SLOT) := SIG_ZC
+          SIG_BUF(8, SIG_SLOT) := SIG_FW
+        ENDIF
+
         FLAGS(I) := IOR(FLAGS(I), PFLAG_BANKED)
       ENDIF
       CYCLE
@@ -1279,6 +1315,26 @@ SUBROUTINE SIM_CENSUS_REPORT(COUNT, FRAME)
   DO B = 1, 20
     PRINT CENSUS_OMEGA_HIST(B)
   ENDDO
+
+  ! Resonance signatures collected since last census
+  IF SIG_COUNT(1) > 0 THEN
+    PRINT SIG_COUNT(1)
+    DO I = 1, SIG_COUNT(1)
+      IF I ≤ SIG_MAX THEN
+        ! Print 8 signature values per crystallization event
+        PRINT SIG_BUF(1, I)
+        PRINT SIG_BUF(2, I)
+        PRINT SIG_BUF(3, I)
+        PRINT SIG_BUF(4, I)
+        PRINT SIG_BUF(5, I)
+        PRINT SIG_BUF(6, I)
+        PRINT SIG_BUF(7, I)
+        PRINT SIG_BUF(8, I)
+      ENDIF
+    ENDDO
+    ! Reset counter for next census interval
+    SIG_COUNT(1) := 0
+  ENDIF
 
   RETURN
 END
