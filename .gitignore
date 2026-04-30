@@ -8,6 +8,8 @@
 !mcl/**
 !Spec/
 !Spec/**
+!tools/
+!tools/**
 !README.md
 !NEXT_SESSION.md
 
