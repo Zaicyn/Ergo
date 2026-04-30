@@ -165,6 +165,58 @@ Gaussians are more expensive per-pixel than points but the visual
 quality leap is enormous. Grid culling recovers some of the cost
 by skipping empty regions entirely.
 
+## Shell-Based Front-to-Back Rendering
+
+The density grid isn't just a culling oracle — it IS the rendering
+primitive. The 32^3 grid projected into view space gives a shell
+structure. Render front-to-back, early-terminate on opacity.
+
+### How it works
+
+1. Sort grid layers by view direction (32 slices)
+2. For each shell (front to back):
+   - Project non-empty cells onto screen-space meshlets
+   - Render gaussian splats for particles in those cells
+   - Accumulate opacity per pixel
+3. When a pixel's opacity exceeds threshold → stop traversing
+4. Dense crystal cells are fully opaque → immediate termination
+
+### Why it solves overdraw
+
+- Each pixel is touched by at most one shell's particles
+- Crystal meshlets are hard occlusion boundaries
+- The back half of the galaxy never renders (occluded by front)
+- Typically 8-12 shells before opacity saturates (out of 32 max)
+
+### Numbers
+
+```
+32 shells (worst case, looking through full grid)
+32×32 = 1024 cells per shell
+8-12 shells before opacity saturates = ~8K-12K meshlets
+Particles in visible front cells: ~2-5M out of 30M
+Everything else culled before fragment shader
+```
+
+Instead of 30M gaussians competing for screen space, you get 2-5M
+in the visible front-facing cells with zero overdraw. The shell
+structure guarantees each pixel is written once.
+
+### Implementation
+
+This works in the existing Vulkan rasterization pipeline — no compute
+ray marching needed:
+
+- Compute pre-pass: sort grid cells by view depth (32K sorts, trivial)
+- Vertex shader: expand meshlets for front-visible cells
+- Fragment shader: gaussian evaluation with opacity accumulation
+- Early-Z + depth test handles the shell ordering naturally
+
+The crystal field makes this even better: crystal cells are fully
+opaque, so any crystal meshlet immediately terminates that ray through
+the grid. Dense crystal regions become free hard occlusion for the
+live fluid behind them.
+
 ## Connection to Material System
 
 The material archetype drives meshlet appearance:
