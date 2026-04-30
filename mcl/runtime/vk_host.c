@@ -167,12 +167,23 @@ static struct {
     VkDeviceMemory           gauss_lut_memory;
     VkImageView              gauss_lut_view;
     VkSampler                gauss_lut_sampler;
-    int                      gauss_ds_bound;
 
-    VkCommandBuffer          render_cmd_buf;
-    VkSemaphore              sem_available;
-    VkSemaphore              sem_finished;
-    VkFence                  render_fence;
+    VkCommandBuffer          render_cmd_buf[ERGO_VK_MAX_SWAPCHAIN];
+    VkSemaphore              sem_available[ERGO_VK_MAX_SWAPCHAIN];
+    VkSemaphore              sem_finished[ERGO_VK_MAX_SWAPCHAIN];
+    VkFence                  render_fence[ERGO_VK_MAX_SWAPCHAIN];
+    uint32_t                 current_frame;
+
+    VkBuffer                 render_ubo;
+    VkDeviceMemory           render_ubo_mem;
+    void                    *render_ubo_mapped;
+
+    VkBuffer                 indirect_buf;
+    VkDeviceMemory           indirect_mem;
+    void                    *indirect_mapped;
+
+    int                      render_recorded;
+    int                      render_mode;  /* 0=points, 1=gaussians */
 
     /* Orbit camera state */
     float                    cam_azimuth;   /* radians, horizontal angle */
@@ -235,7 +246,7 @@ static void submit_and_wait(void) {
 /* Transfer submit — uses xfer_cmd_buf + xfer_fence.
  * Safe to call while cmd_buf is recording (mid-frame). */
 static int g_frame_waited = 0;  /* 1 = fence already waited since last frame_end */
-int pts_ds_bound = 0;           /* 1 = render descriptor set bound; reset on sort swap */
+/* pts_ds_bound removed — persistent render handles descriptor binding at record time */
 
 static void xfer_submit_and_wait(void) {
     VkSubmitInfo si = {0};
@@ -258,6 +269,9 @@ static void render_cleanup_swapchain(void);
 static void camera_mouse_button_cb(GLFWwindow *w, int button, int action, int mods);
 static void camera_cursor_pos_cb(GLFWwindow *w, double xpos, double ypos);
 static void camera_scroll_cb(GLFWwindow *w, double xoff, double yoff);
+static void camera_key_cb(GLFWwindow *w, int key, int scancode, int action, int mods);
+static void render_persistent_init(void);
+static void render_persistent_cleanup(void);
 #endif
 
 /* ── ergo_vk_init ────────────────────────────────────────── */
@@ -632,24 +646,11 @@ int ergo_vk_init(int headless) {
         render_create_points_pipeline();
         render_create_gauss_pipeline();
 
-        /* Separate command buffer for rendering */
-        VkCommandBufferAllocateInfo rcb_ai = {0};
-        rcb_ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        rcb_ai.commandPool = g.cmd_pool;
-        rcb_ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        rcb_ai.commandBufferCount = 1;
-        VK_CHECK(vkAllocateCommandBuffers(g.device, &rcb_ai, &g.render_cmd_buf));
+        /* Persistent render: per-image cmd bufs, sync objects, UBO, indirect */
+        render_persistent_init();
 
-        /* Sync objects for rendering */
-        VkSemaphoreCreateInfo sem_ci = {0};
-        sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        VK_CHECK(vkCreateSemaphore(g.device, &sem_ci, NULL, &g.sem_available));
-        VK_CHECK(vkCreateSemaphore(g.device, &sem_ci, NULL, &g.sem_finished));
-
-        VkFenceCreateInfo rf_ci = {0};
-        rf_ci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        rf_ci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        VK_CHECK(vkCreateFence(g.device, &rf_ci, NULL, &g.render_fence));
+        /* Key callback for culling toggle (C key) */
+        glfwSetKeyCallback(g.window, camera_key_cb);
     }
 #endif
 
@@ -697,9 +698,7 @@ void ergo_vk_shutdown(void) {
 
 #ifndef ERGO_VK_HEADLESS_ONLY
     if (!g.headless) {
-        vkDestroySemaphore(g.device, g.sem_available, NULL);
-        vkDestroySemaphore(g.device, g.sem_finished, NULL);
-        vkDestroyFence(g.device, g.render_fence, NULL);
+        render_persistent_cleanup();
 
         vkDestroyPipeline(g.device, g.gfx_pipeline, NULL);
         vkDestroyPipelineLayout(g.device, g.gfx_layout, NULL);
@@ -1826,8 +1825,8 @@ static void render_create_points_pipeline(void) {
     cb.attachmentCount = 1;
     cb.pAttachments = &blend_att;
 
-    /* 4 storage buffers: pos_x, pos_y, pos_z, color — direct SoA read */
-    VkDescriptorSetLayoutBinding bindings[4];
+    /* 4 storage buffers (binding 0-3) + 1 UBO (binding 5) — no push constants */
+    VkDescriptorSetLayoutBinding bindings[5];
     for (int i = 0; i < 4; i++) {
         memset(&bindings[i], 0, sizeof(VkDescriptorSetLayoutBinding));
         bindings[i].binding = i;
@@ -1835,23 +1834,30 @@ static void render_create_points_pipeline(void) {
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     }
+    memset(&bindings[4], 0, sizeof(VkDescriptorSetLayoutBinding));
+    bindings[4].binding = 5;
+    bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[4].descriptorCount = 1;
+    bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     VkDescriptorSetLayoutCreateInfo dsl_ci = {0};
     dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dsl_ci.bindingCount = 4;
+    dsl_ci.bindingCount = 5;
     dsl_ci.pBindings = bindings;
     VK_CHECK(vkCreateDescriptorSetLayout(g.device, &dsl_ci, NULL,
                                           &g.pts_ds_layout));
 
-    VkDescriptorPoolSize dp_size = {0};
-    dp_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    dp_size.descriptorCount = 4;
+    VkDescriptorPoolSize dp_sizes[2];
+    dp_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    dp_sizes[0].descriptorCount = 4;
+    dp_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    dp_sizes[1].descriptorCount = 1;
 
     VkDescriptorPoolCreateInfo dp_ci = {0};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dp_ci.maxSets = 1;
-    dp_ci.poolSizeCount = 1;
-    dp_ci.pPoolSizes = &dp_size;
+    dp_ci.poolSizeCount = 2;
+    dp_ci.pPoolSizes = dp_sizes;
     VK_CHECK(vkCreateDescriptorPool(g.device, &dp_ci, NULL, &g.pts_ds_pool));
 
     VkDescriptorSetAllocateInfo ds_ai = {0};
@@ -1861,17 +1867,11 @@ static void render_create_points_pipeline(void) {
     ds_ai.pSetLayouts = &g.pts_ds_layout;
     VK_CHECK(vkAllocateDescriptorSets(g.device, &ds_ai, &g.pts_ds));
 
-    /* Push constants: mat4(64) + point_size(4) + val_min(4) + val_max(4) + world_scale(4) = 80 */
-    VkPushConstantRange pc_range = {0};
-    pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    pc_range.size = 96;
-
     VkPipelineLayoutCreateInfo pl_ci = {0};
     pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pl_ci.setLayoutCount = 1;
     pl_ci.pSetLayouts = &g.pts_ds_layout;
-    pl_ci.pushConstantRangeCount = 1;
-    pl_ci.pPushConstantRanges = &pc_range;
+    pl_ci.pushConstantRangeCount = 0;
     VK_CHECK(vkCreatePipelineLayout(g.device, &pl_ci, NULL, &g.pts_layout));
 
     VkGraphicsPipelineCreateInfo gp_ci = {0};
@@ -2083,8 +2083,8 @@ static void render_create_gauss_pipeline(void) {
     cb.attachmentCount = 1;
     cb.pAttachments = &blend_att;
 
-    /* 5 descriptors: 4 storage buffers (pos_x/y/z, color) + 1 combined image sampler (LUT) */
-    VkDescriptorSetLayoutBinding bindings[5];
+    /* 6 descriptors: 4 SSBOs (binding 0-3) + sampler (binding 4) + UBO (binding 5) */
+    VkDescriptorSetLayoutBinding bindings[6];
     for (int i = 0; i < 4; i++) {
         memset(&bindings[i], 0, sizeof(VkDescriptorSetLayoutBinding));
         bindings[i].binding = i;
@@ -2097,24 +2097,31 @@ static void render_create_gauss_pipeline(void) {
     bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[4].descriptorCount = 1;
     bindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    memset(&bindings[5], 0, sizeof(VkDescriptorSetLayoutBinding));
+    bindings[5].binding = 5;
+    bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[5].descriptorCount = 1;
+    bindings[5].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     VkDescriptorSetLayoutCreateInfo dsl_ci = {0};
     dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dsl_ci.bindingCount = 5;
+    dsl_ci.bindingCount = 6;
     dsl_ci.pBindings = bindings;
     VK_CHECK(vkCreateDescriptorSetLayout(g.device, &dsl_ci, NULL,
                                           &g.gauss_ds_layout));
 
-    VkDescriptorPoolSize dp_sizes[2];
+    VkDescriptorPoolSize dp_sizes[3];
     dp_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     dp_sizes[0].descriptorCount = 4;
     dp_sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     dp_sizes[1].descriptorCount = 1;
+    dp_sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    dp_sizes[2].descriptorCount = 1;
 
     VkDescriptorPoolCreateInfo dp_ci = {0};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dp_ci.maxSets = 1;
-    dp_ci.poolSizeCount = 2;
+    dp_ci.poolSizeCount = 3;
     dp_ci.pPoolSizes = dp_sizes;
     VK_CHECK(vkCreateDescriptorPool(g.device, &dp_ci, NULL, &g.gauss_ds_pool));
 
@@ -2140,17 +2147,11 @@ static void render_create_gauss_pipeline(void) {
     lut_write.pImageInfo = &img_info;
     vkUpdateDescriptorSets(g.device, 1, &lut_write, 0, NULL);
 
-    /* Push constants: same layout as points (mat4 + 4 floats = 80 bytes) */
-    VkPushConstantRange pc_range = {0};
-    pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    pc_range.size = 96;
-
     VkPipelineLayoutCreateInfo pl_ci = {0};
     pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pl_ci.setLayoutCount = 1;
     pl_ci.pSetLayouts = &g.gauss_ds_layout;
-    pl_ci.pushConstantRangeCount = 1;
-    pl_ci.pPushConstantRanges = &pc_range;
+    pl_ci.pushConstantRangeCount = 0;
     VK_CHECK(vkCreatePipelineLayout(g.device, &pl_ci, NULL, &g.gauss_layout));
 
     VkGraphicsPipelineCreateInfo gp_ci = {0};
@@ -2172,6 +2173,9 @@ static void render_create_gauss_pipeline(void) {
                                         &gp_ci, NULL, &g.gauss_pipeline));
 }
 
+/* ── Persistent render pipeline (pre-recorded cmd bufs) ──── */
+#include "vk_render.c"
+
 /* ── ergo_vk_render_frame (3D) ───────────────────────────── */
 
 void ergo_vk_render_frame(ErgoVkBuf buf, int width, int height,
@@ -2179,14 +2183,17 @@ void ergo_vk_render_frame(ErgoVkBuf buf, int width, int height,
                            float height_scale) {
     if (g.headless) return;
 
-    /* Wait for previous frame */
-    VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence, VK_TRUE, UINT64_MAX));
-    VK_CHECK(vkResetFences(g.device, 1, &g.render_fence));
+    /* Grid render uses slot 0 of the per-image sync arrays.
+     * Grid and particle render are never active simultaneously. */
+    uint32_t fi = g.current_frame % g.sc_count;
+    g.current_frame++;
 
-    /* Acquire swapchain image */
+    VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence[fi], VK_TRUE, UINT64_MAX));
+    VK_CHECK(vkResetFences(g.device, 1, &g.render_fence[fi]));
+
     uint32_t img_idx;
     VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX,
-                                          g.sem_available, VK_NULL_HANDLE,
+                                          g.sem_available[fi], VK_NULL_HANDLE,
                                           &img_idx);
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
 
@@ -2206,147 +2213,6 @@ void ergo_vk_render_frame(ErgoVkBuf buf, int width, int height,
     write.pBufferInfo = &buf_info;
     vkUpdateDescriptorSets(g.device, 1, &write, 0, NULL);
 
-    /* ── Build camera matrix ── */
-    float aspect = (float)g.sc_extent.width / (float)g.sc_extent.height;
-    Mat4 proj = mat4_perspective(45.0f * (float)M_PI / 180.0f, aspect, 0.01f, 100.0f);
-
-    float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);
-    float ce = cosf(g.cam_elevation), se = sinf(g.cam_elevation);
-    float ex = g.cam_distance * ce * sa;
-    float ey = g.cam_distance * se;
-    float ez = g.cam_distance * ce * ca;
-    Mat4 view = mat4_look_at(ex, ey, ez, 0, 0, 0, 0, 1, 0);
-    Mat4 viewProj = mat4_mul(proj, view);
-
-    /* ── Push constant block (must match shader layout) ── */
-    struct {
-        float viewProj[16]; /* mat4  */
-        int   grid_w;       /* int   */
-        int   grid_h;       /* int   */
-        float val_min;      /* float */
-        float val_max;      /* float */
-        float height_scale; /* float */
-    } pc;
-    memcpy(pc.viewProj, viewProj.m, 64);
-    pc.grid_w = width;
-    pc.grid_h = height;
-    pc.val_min = val_min;
-    pc.val_max = val_max;
-    pc.height_scale = height_scale;
-
-    /* Record command buffer */
-    VkCommandBufferBeginInfo begin_info = {0};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    /* Wait for any in-flight compute to finish before rendering */
-    VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
-
-    VK_CHECK(vkResetCommandBuffer(g.render_cmd_buf, 0));
-    VK_CHECK(vkBeginCommandBuffer(g.render_cmd_buf, &begin_info));
-
-    VkClearValue clears[2];
-    clears[0].color = (VkClearColorValue){{0.0f, 0.0f, 0.0f, 1.0f}};
-    clears[1].depthStencil = (VkClearDepthStencilValue){1.0f, 0};
-
-    VkRenderPassBeginInfo rp_begin = {0};
-    rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp_begin.renderPass = g.render_pass;
-    rp_begin.framebuffer = g.sc_fbs[img_idx];
-    rp_begin.renderArea.extent = g.sc_extent;
-    rp_begin.clearValueCount = 2;
-    rp_begin.pClearValues = clears;
-
-    vkCmdBeginRenderPass(g.render_cmd_buf, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
-
-    vkCmdBindPipeline(g.render_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                      g.gfx_pipeline);
-    vkCmdBindDescriptorSets(g.render_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            g.gfx_layout, 0, 1, &g.gfx_ds, 0, NULL);
-
-    vkCmdPushConstants(g.render_cmd_buf, g.gfx_layout,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       0, sizeof(pc), &pc);
-
-    /* Draw: (grid_w - 1) * (grid_h - 1) cells, 6 vertices per cell */
-    int n_cells = (width - 1) * (height - 1);
-    vkCmdDraw(g.render_cmd_buf, n_cells * 6, 1, 0, 0);
-
-    vkCmdEndRenderPass(g.render_cmd_buf);
-    VK_CHECK(vkEndCommandBuffer(g.render_cmd_buf));
-
-    /* Submit with semaphore synchronization */
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSubmitInfo si = {0};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.waitSemaphoreCount = 1;
-    si.pWaitSemaphores = &g.sem_available;
-    si.pWaitDstStageMask = &wait_stage;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &g.render_cmd_buf;
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &g.sem_finished;
-
-    VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.render_fence));
-
-    /* Present */
-    VkPresentInfoKHR present = {0};
-    present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &g.sem_finished;
-    present.swapchainCount = 1;
-    present.pSwapchains = &g.swapchain;
-    present.pImageIndices = &img_idx;
-
-    vkQueuePresentKHR(g.compute_queue, &present);
-}
-
-/* ── ergo_vk_render_points (particle cloud) ─────────────── */
-
-void ergo_vk_set_render_offset(size_t byte_offset) {
-    g.render_offset = byte_offset;
-}
-
-void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
-                            ErgoVkBuf buf_color, int n_points,
-                            float point_size, float val_min, float val_max,
-                            float world_scale) {
-    if (g.headless) return;
-
-    /* Wait for previous render to finish before reusing command buffer */
-    VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence, VK_TRUE, UINT64_MAX));
-    VK_CHECK(vkResetFences(g.device, 1, &g.render_fence));
-
-    /* Acquire swapchain image */
-    uint32_t img_idx;
-    VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX,
-                                          g.sem_available, VK_NULL_HANDLE,
-                                          &img_idx);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
-
-    /* Bind 4 SoA buffers — rebind after sort pointer swaps */
-    if (!pts_ds_bound) {
-        ErgoVkBuf bufs_arr[4] = { buf_x, buf_y, buf_z, buf_color };
-        VkDescriptorBufferInfo buf_infos[4];
-        VkWriteDescriptorSet writes[4];
-        for (int i = 0; i < 4; i++) {
-            BufSlot *b = &g.bufs[bufs_arr[i]];
-            buf_infos[i].buffer = b->buffer;
-            buf_infos[i].offset = g.render_offset;
-            buf_infos[i].range = b->size - g.render_offset;
-
-            memset(&writes[i], 0, sizeof(VkWriteDescriptorSet));
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = g.pts_ds;
-            writes[i].dstBinding = i;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(g.device, 4, writes, 0, NULL);
-        pts_ds_bound = 1;
-    }
-
     /* Build camera matrix */
     float aspect = (float)g.sc_extent.width / (float)g.sc_extent.height;
     Mat4 proj = mat4_perspective(45.0f * (float)M_PI / 180.0f, aspect, 0.01f, 100.0f);
@@ -2359,39 +2225,31 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     Mat4 view = mat4_look_at(ex, ey, ez, 0, 0, 0, 0, 1, 0);
     Mat4 viewProj = mat4_mul(proj, view);
 
-    /* Push constants */
     struct {
         float viewProj[16];
-        float point_size;
+        int   grid_w;
+        int   grid_h;
         float val_min;
         float val_max;
-        float world_scale;
+        float height_scale;
     } pc;
     memcpy(pc.viewProj, viewProj.m, 64);
-    pc.point_size = point_size;
+    pc.grid_w = width;
+    pc.grid_h = height;
     pc.val_min = val_min;
     pc.val_max = val_max;
-    pc.world_scale = world_scale;
+    pc.height_scale = height_scale;
 
-    /* Record command buffer */
+    /* Grid render still records per-frame (push constants change) */
+    VkCommandBuffer cmd = g.render_cmd_buf[img_idx];
     VkCommandBufferBeginInfo begin_info = {0};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-    VK_CHECK(vkResetCommandBuffer(g.render_cmd_buf, 0));
-    VK_CHECK(vkBeginCommandBuffer(g.render_cmd_buf, &begin_info));
+    VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
 
-    /* Barrier: compute shader writes → vertex shader reads */
-    {
-        VkMemoryBarrier mb = {0};
-        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(g.render_cmd_buf,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
-            0, 1, &mb, 0, NULL, 0, NULL);
-    }
+    VK_CHECK(vkResetCommandBuffer(cmd, 0));
+    VK_CHECK(vkBeginCommandBuffer(cmd, &begin_info));
 
     VkClearValue clears[2];
     clears[0].color = (VkClearColorValue){{0.0f, 0.0f, 0.0f, 1.0f}};
@@ -2405,41 +2263,39 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     rp_begin.clearValueCount = 2;
     rp_begin.pClearValues = clears;
 
-    vkCmdBeginRenderPass(g.render_cmd_buf, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
-    vkCmdBindPipeline(g.render_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                      g.pts_pipeline);
-    vkCmdBindDescriptorSets(g.render_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            g.pts_layout, 0, 1, &g.pts_ds, 0, NULL);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.gfx_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            g.gfx_layout, 0, 1, &g.gfx_ds, 0, NULL);
 
-    vkCmdPushConstants(g.render_cmd_buf, g.pts_layout,
-                       VK_SHADER_STAGE_VERTEX_BIT,
+    vkCmdPushConstants(cmd, g.gfx_layout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(pc), &pc);
 
-    vkCmdDraw(g.render_cmd_buf, n_points, 1, 0, 0);
+    int n_cells = (width - 1) * (height - 1);
+    vkCmdDraw(cmd, n_cells * 6, 1, 0, 0);
 
-    vkCmdEndRenderPass(g.render_cmd_buf);
-    VK_CHECK(vkEndCommandBuffer(g.render_cmd_buf));
+    vkCmdEndRenderPass(cmd);
+    VK_CHECK(vkEndCommandBuffer(cmd));
 
-    /* Submit */
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si = {0};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.waitSemaphoreCount = 1;
-    si.pWaitSemaphores = &g.sem_available;
+    si.pWaitSemaphores = &g.sem_available[fi];
     si.pWaitDstStageMask = &wait_stage;
     si.commandBufferCount = 1;
-    si.pCommandBuffers = &g.render_cmd_buf;
+    si.pCommandBuffers = &cmd;
     si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &g.sem_finished;
+    si.pSignalSemaphores = &g.sem_finished[fi];
 
-    VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.render_fence));
+    VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.render_fence[fi]));
 
-    /* Present */
     VkPresentInfoKHR present = {0};
     present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &g.sem_finished;
+    present.pWaitSemaphores = &g.sem_finished[fi];
     present.swapchainCount = 1;
     present.pSwapchains = &g.swapchain;
     present.pImageIndices = &img_idx;
@@ -2447,140 +2303,17 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     vkQueuePresentKHR(g.compute_queue, &present);
 }
 
-/* ── ergo_vk_render_gaussians ──────────────────────────────── */
+/* ergo_vk_render_points and ergo_vk_render_gaussians are now
+ * provided by vk_render.c (persistent pre-recorded command buffers) */
 
-void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
-                               ErgoVkBuf buf_color, int n_points,
-                               float point_size, float val_min, float val_max,
-                               float world_scale) {
-    if (g.headless) return;
+void ergo_vk_set_render_offset(size_t byte_offset) {
+    g.render_offset = byte_offset;
+    /* Offset changed — force re-record of persistent cmd bufs */
+    g.render_recorded = 0;
+}
 
-    VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence, VK_TRUE, UINT64_MAX));
-    VK_CHECK(vkResetFences(g.device, 1, &g.render_fence));
-
-    uint32_t img_idx;
-    VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX,
-                                          g.sem_available, VK_NULL_HANDLE,
-                                          &img_idx);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
-
-    /* Bind 4 SoA buffers */
-    if (!g.gauss_ds_bound) {
-        ErgoVkBuf bufs_arr[4] = { buf_x, buf_y, buf_z, buf_color };
-        VkDescriptorBufferInfo buf_infos[4];
-        VkWriteDescriptorSet writes[4];
-        for (int i = 0; i < 4; i++) {
-            BufSlot *b = &g.bufs[bufs_arr[i]];
-            buf_infos[i].buffer = b->buffer;
-            buf_infos[i].offset = g.render_offset;
-            buf_infos[i].range = b->size - g.render_offset;
-
-            memset(&writes[i], 0, sizeof(VkWriteDescriptorSet));
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = g.gauss_ds;
-            writes[i].dstBinding = i;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(g.device, 4, writes, 0, NULL);
-        g.gauss_ds_bound = 1;
-    }
-
-    /* Camera */
-    float aspect = (float)g.sc_extent.width / (float)g.sc_extent.height;
-    Mat4 proj = mat4_perspective(45.0f * 3.14159265f / 180.0f, aspect,
-                                 0.01f, 100.0f);
-    float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);
-    float ce = cosf(g.cam_elevation), se = sinf(g.cam_elevation);
-    float ex = g.cam_distance * ce * sa;
-    float ey = g.cam_distance * se;
-    float ez = g.cam_distance * ce * ca;
-    Mat4 view = mat4_look_at(ex, ey, ez, 0, 0, 0, 0, 1, 0);
-    Mat4 viewProj = mat4_mul(proj, view);
-
-    struct {
-        float viewProj[16];
-        float point_size;
-        float val_min;
-        float val_max;
-        float world_scale;
-    } pc;
-    memcpy(pc.viewProj, viewProj.m, 64);
-    pc.point_size = point_size;
-    pc.val_min = val_min;
-    pc.val_max = val_max;
-    pc.world_scale = world_scale;
-
-    VkCommandBufferBeginInfo begin_info = {0};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    VK_CHECK(vkResetCommandBuffer(g.render_cmd_buf, 0));
-    VK_CHECK(vkBeginCommandBuffer(g.render_cmd_buf, &begin_info));
-
-    if (g.cmd_buf) {
-        VkMemoryBarrier mb = {0};
-        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(g.render_cmd_buf,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
-            0, 1, &mb, 0, NULL, 0, NULL);
-    }
-
-    VkClearValue clears[2];
-    clears[0].color = (VkClearColorValue){{0.0f, 0.0f, 0.0f, 1.0f}};
-    clears[1].depthStencil = (VkClearDepthStencilValue){1.0f, 0};
-
-    VkRenderPassBeginInfo rp_begin = {0};
-    rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp_begin.renderPass = g.render_pass;
-    rp_begin.framebuffer = g.sc_fbs[img_idx];
-    rp_begin.renderArea.extent = g.sc_extent;
-    rp_begin.clearValueCount = 2;
-    rp_begin.pClearValues = clears;
-
-    vkCmdBeginRenderPass(g.render_cmd_buf, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
-
-    vkCmdBindPipeline(g.render_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                      g.gauss_pipeline);
-    vkCmdBindDescriptorSets(g.render_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            g.gauss_layout, 0, 1, &g.gauss_ds, 0, NULL);
-
-    vkCmdPushConstants(g.render_cmd_buf, g.gauss_layout,
-                       VK_SHADER_STAGE_VERTEX_BIT,
-                       0, sizeof(pc), &pc);
-
-    /* Instanced draw: 6 vertices per quad, n_points instances */
-    vkCmdDraw(g.render_cmd_buf, 6, n_points, 0, 0);
-
-    vkCmdEndRenderPass(g.render_cmd_buf);
-    VK_CHECK(vkEndCommandBuffer(g.render_cmd_buf));
-
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSubmitInfo si = {0};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.waitSemaphoreCount = 1;
-    si.pWaitSemaphores = &g.sem_available;
-    si.pWaitDstStageMask = &wait_stage;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &g.render_cmd_buf;
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &g.sem_finished;
-
-    VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.render_fence));
-
-    VkPresentInfoKHR present = {0};
-    present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &g.sem_finished;
-    present.swapchainCount = 1;
-    present.pSwapchains = &g.swapchain;
-    present.pImageIndices = &img_idx;
-
-    vkQueuePresentKHR(g.compute_queue, &present);
+void ergo_vk_render_invalidate(void) {
+    g.render_recorded = 0;
 }
 
 int ergo_vk_should_close(void) {
@@ -2618,6 +2351,13 @@ void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     (void)buf_x; (void)buf_y; (void)buf_z; (void)buf_color;
     (void)n_points; (void)point_size;
     (void)val_min; (void)val_max; (void)world_scale;
+}
+
+void ergo_vk_set_render_offset(size_t byte_offset) {
+    (void)byte_offset;
+}
+
+void ergo_vk_render_invalidate(void) {
 }
 
 int ergo_vk_should_close(void) {

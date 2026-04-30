@@ -1707,8 +1707,8 @@ class IRCodeGen:
         self._put(f"/* Pointer swap: sorted → active */")
         for arr in arrays:
             self._put(f"{{ ErgoVkBuf _tmp = d_{arr}; d_{arr} = d_sort_{arr}; d_sort_{arr} = _tmp; }}")
-        # Force render descriptor set rebind — buffer handles changed
-        self._put(f"{{ extern int pts_ds_bound; pts_ds_bound = 0; }}")
+        # Force render re-record — buffer handles changed
+        self._put(f"ergo_vk_render_invalidate();")
 
         self.indent -= 1
         self._put(f"}}")

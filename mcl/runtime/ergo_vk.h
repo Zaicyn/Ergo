@@ -183,6 +183,9 @@ void ergo_vk_profile_report(void);
 /* Set byte offset for ping-pong render (call before render_points). */
 void ergo_vk_set_render_offset(size_t byte_offset);
 
+/* Invalidate persistent render cmd bufs (call after sort pointer swaps). */
+void ergo_vk_render_invalidate(void);
+
 /* ── Render (Phase E — 3D) ───────────────────────────────── */
 
 /*
