@@ -80,7 +80,7 @@ SUBROUTINE SIM_INIT(N, CAP, SEED)
       Z := Z * S
     ENDIF
     X := X * DISK_OUTER_R
-    Y := Y * DISK_OUTER_R * 0.3
+    Y := Y * DISK_OUTER_R
     Z := Z * DISK_OUTER_R
     R := SQRT(X * X + Y * Y + Z * Z)
     IF R < 1.0 THEN
