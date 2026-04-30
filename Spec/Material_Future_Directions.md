@@ -1,99 +1,106 @@
 # Material System — Future Directions
 
 Captured from Grok's review of the archetype + delta design (2026-04-29).
-These are not immediate tasks — they're architectural notes for when the
-resonance database and multi-domain simulations are ready.
+These are architectural notes for when the resonance database and multi-domain simulations mature.
 
-## 1. Resonance → Archetype Selection at Quench
+## 1. Resonance-Driven Archetype Selection at Quench
 
-Currently: crystallization uses a flat `CRYSTAL_ARCHETYPE` parameter.
-Every crystal in a domain is the same material.
+**Current limitation:** Crystallization uses a flat `CRYSTAL_ARCHETYPE` parameter per domain. Every crystal cell becomes the same material regardless of local conditions.
 
-Future: when a hopfion/soliton cluster reaches crystallization threshold,
-compute the local harmonic signature and match against a resonance library
-to select the appropriate ELEMENT_ID dynamically.
+**Future state:** When a hopfion/soliton cluster reaches crystallization threshold (via phason flip + energy loss), compute the local harmonic stack and match it against the resonance library to dynamically select `ELEMENT_ID`.
 
 ```
-! At crystallization time (in scatter, crystal banking):
-ELEM_ID := RESONANCE_MATCH(local_harmonics, particle_state)
-ENERGY_DELTA := CLAMP(INT(OMEGA * 15.0 / OMEGA_MAX), 0, 15)
-COHERENCE_DELTA := CLAMP(INT(MATCH_QUALITY * 7.0), -8, 7)
-GRID_MATERIAL(CI,CJ,CK) := IOR(ISHFT(ELEM_ID, 24), ...)
+! In scatter / crystal banking section:
+local_harmonics = compute_harmonic_signature(pos, vel, theta, psi, envelope)
+ELEM_ID         = RESONANCE_MATCH(local_harmonics, particle_state)
+MATCH_QUALITY   = resonance_score(...)          ! 0.0 to 1.0
+
+ENERGY_DELTA    = CLAMP(INT(OMEGA * 15.0 / OMEGA_MAX), 0, 15)
+COHERENCE_DELTA = CLAMP(INT(MATCH_QUALITY * 7.0), -8, 7)
+
+GRID_MATERIAL(CI,CJ,CK) = IOR(ISHFT(ELEM_ID, 24), &
+                        ISHFT(ENERGY_DELTA, 16), &
+                        ISHFT(COHERENCE_DELTA, 20), ...)
 ```
 
-The match quality score sets initial COHERENCE — clean phase lock at
-quench → high coherence crystal. Noisy quench → lower starting
-coherence → decays faster. Natural "quality of crystallization."
+Higher match quality → higher initial COHERENCE → more stable, longer-lived
+crystal. Noisy or poorly phase-locked quenches produce fragile material that
+decays faster. Natural quality metric.
 
-## 2. Delta Precision
+## 2. Delta Precision Trade-offs
 
-Current: 4 bits per property (±7 range). Fine for galaxy sim where
-dead stars don't decay. May be too coarse for biological/chemical
-contexts where energy gradients need finer resolution.
+Current 4-bit signed deltas (±7) are acceptable for galaxy-scale (stellar_dead
+has almost no decay). Biological and chemical simulations will likely need
+finer control.
 
-Options:
-- **Keep 24-bit STATE** — acceptable for current scale
-- **Split to two 32-bit ints** (256 KB total) — 8 bits per delta,
-  ±127 range. Only if biological sim needs it.
-- **Floating-point overlay** — for cells that need full precision,
-  store a secondary float grid indexed by the FLAGS nibble
+Options (in order of preference):
+- Keep current 24-bit STATE for now (fast, cache-friendly)
+- Expand to two 32-bit integers per cell (256 KB total) → 8-bit deltas (±127)
+- Hybrid: Use FLAGS nibble to index into a sparse high-precision overlay grid
+  when needed
 
-No action needed until a concrete simulation hits the resolution limit.
+No immediate change required. Monitor biological runs for quantization artifacts.
 
-## 3. Resonance LUT Format
+## 3. Resonance Library Format
 
-The material resonance library needs a compact GPU-queryable format.
-Each archetype has a harmonic signature that the quench code matches
-against. Options:
+Needs to be compact and GPU-friendly for fast per-quench lookups.
 
-- **Fixed-size signature** — 8 floats per archetype (harmonic
-  coefficients). 256 archetypes × 8 × 4 bytes = 8 KB. Trivially
-  fits in push constants or small SSBO.
-- **Spectral hash** — compress the signature to a 32-bit integer
-  for fast comparison. Collisions acceptable since there are only
-  16-256 archetypes.
+Recommended starting design:
+- Fixed signature per archetype: 8-12 floats (dominant harmonic coefficients
+  + spin/orbital weights)
+- Total size: 256 archetypes × 12 × 4 bytes = 12 KB → easily fits in push
+  constants or constant buffer
+- Optional: Add a 32-bit spectral hash for ultra-fast rejection before full
+  comparison
 
-## 4. Multi-Material Interfaces
+The `RESONANCE_MATCH()` function should return both the best ELEMENT_ID and a
+normalized match quality score.
 
-When adjacent grid cells have different archetypes, the boundary
-behavior matters:
+## 4. Multi-Material Interfaces & Reactions
 
-- **Gradient blending** — interpolate properties across the boundary.
-  Natural for liquids/gases, wrong for solid/solid interfaces.
-- **Sharp interfaces** — maintain distinct properties. Correct for
-  crystal boundaries. Needs boundary detection in stencil.
-- **Reaction zones** — cells where two materials interact may produce
-  a third (chemical reactions, alloys, biological processes).
+When adjacent cells have different archetypes:
+- Sharp interfaces for solid-solid boundaries
+- Gradient blending for fluid-like materials
+- Optional reaction zones where differing archetypes trigger new archetype
+  creation or delta shifts (alloys, chemical reactions, biological decomposition)
 
-This is a Phase 3+ concern. Current single-archetype-per-domain
-avoids the problem entirely.
+This becomes relevant once resonance-based selection is active and multiple
+materials can appear in the same simulation.
 
-## 5. Particle-Field Coupling Modulation
+## 5. Material-Modulated Particle Coupling
 
-How material properties affect live particles (not yet implemented):
+Material properties should influence live particle behavior through the waveguide:
+- High COHERENCE: Stable, predictable gradients → clean orbital steering
+- High MOBILITY: Noisy field → increased particle jitter
+- High ENERGY: Stronger attraction to consumers
+- High REACTIVITY: Amplified OMEGA/phase exchange rate
 
-- **High COHERENCE cells** — stable gradients, steering is predictable.
-  Particles near high-coherence structure orbit cleanly.
-- **High MOBILITY cells** — field is noisy, gradient fluctuates.
-  Particles near high-mobility structure jitter.
-- **High ENERGY cells** — attract consumers (density siphon enhanced).
-  Particles are pulled toward energy-rich crystal.
-- **High REACTIVITY cells** — coupling strength amplified. Particles
-  near reactive material exchange OMEGA faster.
-
-These would be multipliers on existing physics terms:
+Example modulation:
 ```
-! In physics kernel, waveguide read:
-RHO := REAL(GRID_DENSITY(CI,CJ,CK)) * COUPLING
-! Future: modulate by material reactivity
-! RHO := RHO * (1.0 + REAL(M_REACT) / 15.0)
+coupling = 1.0 + (REAL(M_REACTIVITY) / 15.0) * REACTIVITY_FACTOR
+rho      = REAL(GRID_DENSITY(...)) * coupling
 ```
 
-## 6. Current State (for reference)
+These multipliers plug into existing force terms without major refactoring.
 
-- CRYSTAL_ARCHETYPE = 1 (STELLAR_DEAD) for galaxy domain
-- 11 archetypes defined in LUT (VOID through METAL)
-- 4-bit signed nibble deltas, 24-bit STATE
-- Three decay channels operational (radiative, agent, stress)
-- Pristine fast path: 95%+ cells skip delta unpacking
-- Galaxy sim: zero decay (STELLAR_DEAD properties produce zero loss)
+## 6. Current State Summary (April 2026)
+
+- Still using static CRYSTAL_ARCHETYPE per domain
+- 11 archetypes defined (VOID through METAL)
+- 4-bit signed nibbles for deltas, 24-bit STATE
+- Strong pristine fast path (95%+ cells)
+- Galaxy domain uses STELLAR_DEAD (zero decay)
+- Material system is architecturally ready for resonance injection
+
+The archetype + delta design provides an excellent foundation. Once the
+resonance database and harmonic signature computation are complete,
+switching from fixed archetype to dynamic `RESONANCE_MATCH()` at quench
+time should be relatively straightforward.
+
+## Priority Order
+
+1. Resonance signature computation + matching kernel
+2. Dynamic ELEMENT_ID selection at crystallization
+3. Match-quality → initial COHERENCE mapping
+4. Material-property modulation of particle physics
+5. Multi-material boundary handling
