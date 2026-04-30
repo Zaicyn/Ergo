@@ -57,6 +57,7 @@ PARAMETER INTEGER :: PFLAG_VENT    = 4
 PARAMETER INTEGER :: PFLAG_CRYSTAL = 8
 PARAMETER INTEGER :: PFLAG_NOVA    = 16
 PARAMETER INTEGER :: PFLAG_BANKED  = 32
+PARAMETER INTEGER :: PFLAG_SIGNED  = 64
 
 ! ── Phase encoding in FLAGS ───────────────────────────────
 ! GEN (ring segment 0-31) in bits 8-12
@@ -311,6 +312,21 @@ STATIC REAL :: NET_SPAWN_RATE = 0.0
 STATIC INTEGER :: NET_SPAWN_PAUSE = 0
 STATIC INTEGER :: NET_CENSUS_OVERRIDE = 0
 STATIC INTEGER :: NET_SPAWN_COUNT = 0
+
+! ── Crystal lane signature buffers (nullable pattern) ─────
+! Collected in physics kernel dead time — zero overhead.
+! SIG_COUNT(1) is an atomic counter for dense slot allocation.
+! SIG_MAX limits buffer size (set to MAXPART / 100 — ~1% crystal rate).
+PARAMETER INTEGER :: SIG_MAX = 250000
+STATIC INTEGER :: SIG_COUNT(1)
+STATIC REAL :: SIG_OMEGA(SIG_MAX)
+STATIC REAL :: SIG_RHO(SIG_MAX)
+STATIC REAL :: SIG_FMODE(SIG_MAX)
+STATIC REAL :: SIG_VMAG(SIG_MAX)
+STATIC REAL :: SIG_RNORM(SIG_MAX)
+STATIC REAL :: SIG_MGATE(SIG_MAX)
+STATIC REAL :: SIG_ZC(SIG_MAX)
+STATIC REAL :: SIG_FW(SIG_MAX)
 
 ! ════════════════════════════════════════════════════════════════
 ! PRNG (deterministic, reproducible)
@@ -577,10 +593,41 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
   ! Spawn vars
   INTEGER :: SLOT, PH_CHILD, GEN_CHILD
   REAL :: HASH, SPX, SPY, SPZ, SR_XZ, SV_CIRC
+  ! Crystal lane signature vars
+  INTEGER :: SIG_SLOT
 
   DO I = 1, NPART
     ! ── Skip crystallized (off) and ejected (gone) ────────
     IF IAND(FLAGS(I), IOR(PFLAG_CRYSTAL, PFLAG_EJECTED)) ≠ 0 THEN
+
+      ! ── Crystal lane: collect signature in warp dead time ──
+      ! ~15 ops hidden behind ~300 ops of active-thread physics.
+      ! PFLAG_SIGNED prevents double-collection.
+      IF IAND(FLAGS(I), PFLAG_CRYSTAL) ≠ 0 THEN
+        IF IAND(FLAGS(I), PFLAG_SIGNED) = 0 THEN
+          SIG_SLOT := SIG_COUNT(1) + 1
+          IF SIG_SLOT ≤ SIG_MAX THEN
+            SIG_COUNT(1) := SIG_SLOT
+
+            GEN := IAND(ISHFT(FLAGS(I), -GEN_SHIFT), GEN_MASK) + 1
+            CI := CLAMP(INT(POS_X(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+            CJ := CLAMP(INT(POS_Y(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+            CK := CLAMP(INT(POS_Z(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+
+            SIG_OMEGA(SIG_SLOT) := OMEGA_NAT(I)
+            SIG_RHO(SIG_SLOT) := REAL(GRID_DENSITY(CI, CJ, CK)) / 32.0
+            SIG_FMODE(SIG_SLOT) := REAL(FLOW_MODE(GEN))
+            SIG_VMAG(SIG_SLOT) := SQRT(VEL_X(I)*VEL_X(I) + VEL_Y(I)*VEL_Y(I) + VEL_Z(I)*VEL_Z(I))
+            SIG_RNORM(SIG_SLOT) := SQRT(POS_X(I)*POS_X(I) + POS_Y(I)*POS_Y(I) + POS_Z(I)*POS_Z(I)) / DISK_OUTER_R
+            SIG_MGATE(SIG_SLOT) := GRID_MET_GATE(CI, CJ, CK)
+            SIG_ZC(SIG_SLOT) := ABS(Z_COUPLING(GEN))
+            SIG_FW(SIG_SLOT) := ABS(FLOW_W(GEN))
+
+            FLAGS(I) := IOR(FLAGS(I), PFLAG_SIGNED)
+          ENDIF
+        ENDIF
+      ENDIF
+
       CYCLE
     ENDIF
 

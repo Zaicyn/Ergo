@@ -57,6 +57,7 @@ PARAMETER INTEGER :: PFLAG_VENT    = 4
 PARAMETER INTEGER :: PFLAG_CRYSTAL = 8
 PARAMETER INTEGER :: PFLAG_NOVA    = 16
 PARAMETER INTEGER :: PFLAG_BANKED  = 32
+PARAMETER INTEGER :: PFLAG_SIGNED  = 64
 
 ! ── Phase encoding in FLAGS ───────────────────────────────
 ! GEN (ring segment 0-31) in bits 8-12

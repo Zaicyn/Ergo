@@ -45,6 +45,21 @@ STATIC INTEGER :: NET_SPAWN_PAUSE = 0
 STATIC INTEGER :: NET_CENSUS_OVERRIDE = 0
 STATIC INTEGER :: NET_SPAWN_COUNT = 0
 
+! ── Crystal lane signature buffers (nullable pattern) ─────
+! Collected in physics kernel dead time — zero overhead.
+! SIG_COUNT(1) is an atomic counter for dense slot allocation.
+! SIG_MAX limits buffer size (set to MAXPART / 100 — ~1% crystal rate).
+PARAMETER INTEGER :: SIG_MAX = 250000
+STATIC INTEGER :: SIG_COUNT(1)
+STATIC REAL :: SIG_OMEGA(SIG_MAX)
+STATIC REAL :: SIG_RHO(SIG_MAX)
+STATIC REAL :: SIG_FMODE(SIG_MAX)
+STATIC REAL :: SIG_VMAG(SIG_MAX)
+STATIC REAL :: SIG_RNORM(SIG_MAX)
+STATIC REAL :: SIG_MGATE(SIG_MAX)
+STATIC REAL :: SIG_ZC(SIG_MAX)
+STATIC REAL :: SIG_FW(SIG_MAX)
+
 ! ════════════════════════════════════════════════════════════════
 ! PRNG (deterministic, reproducible)
 ! ════════════════════════════════════════════════════════════════
