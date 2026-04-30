@@ -97,10 +97,93 @@ resonance database and harmonic signature computation are complete,
 switching from fixed archetype to dynamic `RESONANCE_MATCH()` at quench
 time should be relatively straightforward.
 
+## 7. Crystallization Criterion Evolution
+
+**Current limitation:** Crystallization is `OMEGA < 0.008 AND V < 0.01` — a
+scalar low-energy condition. But OMEGA equilibrates at ~0.05 due to
+OMEGA_BASE (0.08) providing a constant floor. The threshold is unreachable
+under normal dynamics. All particles that crystallize do so the same way
+(COAST decay to floor), producing only 2 material classes (DENSE_INNER vs
+HALO_DUST) differentiated solely by density × radius.
+
+**The deeper finding:** The physics conserves too much mobility. The field
+has a nonzero mobility attractor. Damping alone does not produce inert
+matter. Equilibrium is active, not frozen.
+
+### Option A: Variance-based crystallization (detect frozen dynamics)
+
+Instead of low absolute energy, detect that energy *stopped changing*:
+
+```
+IF ABS(OMEGA - OMEGA_PREV) < EPSILON .AND. SPD_SQ < 0.01 THEN
+  PFLAG_CRYSTAL := set
+ENDIF
+```
+
+Requires storing OMEGA_PREV per particle (1 extra array, 4 bytes × MAXPART).
+Detects truly frozen particles regardless of their absolute OMEGA level.
+A particle at OMEGA=0.05 that hasn't changed in 1000 frames is more
+"crystal" than one at OMEGA=0.01 that's oscillating.
+
+### Option B: Local sink mechanism (irreversible energy extraction)
+
+Add a mechanism that drains OMEGA below the floor in specific conditions:
+
+```
+! Dense regions: binding lock — neighbors absorb mobility
+IF RHO > DENSE_LIMIT THEN
+  OMEGA := OMEGA * 0.95
+ENDIF
+
+! Or: hysteresis — reactivation harder than activation
+IF IAND(FLAGS, PFLAG_DORMANT) ≠ 0 THEN
+  OMEGA_DECAY := OMEGA_DECAY * 4.0
+ENDIF
+```
+
+Creates a path to low OMEGA that OMEGA_BASE alone can't maintain.
+Different sink mechanisms produce different death paths = richer signatures.
+
+### Option C: Two-stage phase state (strongest long-term)
+
+Replace binary ACTIVE/CRYSTAL with three states:
+
+| State   | Meaning                                    |
+|---------|---------------------------------------------|
+| ACTIVE  | High mobility, full field coupling           |
+| DORMANT | Low mobility, reduced coupling, reversible   |
+| CRYSTAL | Structurally locked, irreversible, field only |
+
+Crystallization becomes topology-dependent:
+
+```
+IF OMEGA < DORMANT_LIMIT
+  .AND. NEIGHBOR_ALIGNMENT > ALIGN_LIMIT
+  .AND. AGE > MIN_AGE
+THEN
+  PFLAG_CRYSTAL := set
+ENDIF
+```
+
+This matches the hopfion architecture — a ring that loses coherence
+becomes DORMANT (can recover), but a ring that loses coherence AND
+has high neighbor alignment becomes CRYSTAL (locked structure).
+Different paths to crystal = different signatures = richer materials.
+
+### Measured baseline (2026-04-30)
+
+At threshold 0.048 (above equilibrium floor), 500K frames, 5M particles:
+- 4096 crystallization events captured
+- 2 material classes: DENSE_INNER (33%, core) and HALO_DUST (67%, edge)
+- Differentiation on density × radius only
+- All other signature fields identical at death (OMEGA≈0.037, V≈0.1, FMODE=0)
+- Ring coupling has no effect on crystallization signatures at equilibrium
+
 ## Priority Order
 
-1. Resonance signature computation + matching kernel
-2. Dynamic ELEMENT_ID selection at crystallization
-3. Match-quality → initial COHERENCE mapping
-4. Material-property modulation of particle physics
-5. Multi-material boundary handling
+1. **Crystallization criterion evolution** (Option A or C above)
+2. Resonance signature computation + matching kernel
+3. Dynamic ELEMENT_ID selection at crystallization
+4. Match-quality → initial COHERENCE mapping
+5. Material-property modulation of particle physics
+6. Multi-material boundary handling
