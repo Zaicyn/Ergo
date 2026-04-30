@@ -29,6 +29,15 @@ PARAMETER REAL :: SPAWN_RATE_DEFAULT = 0.01
 STATIC REAL :: SPAWN_RATE = 0.01
 STATIC INTEGER :: SPAWN_COUNTER(1)
 
+! ── Census diagnostic buffers (GPU scatter, CPU reads at census) ──
+! OMEGA histogram: 20 bins covering [0.0, 2.0] in steps of 0.1
+! Each particle atomicAdds into the bin matching its OMEGA.
+! Small enough to download at census (~80 bytes).
+PARAMETER INTEGER :: CENSUS_BINS = 20
+STATIC INTEGER :: CENSUS_OMEGA_HIST(20)
+! State counters: [1]=active, [2]=crystal, [3]=coast, [4]=nova/ejected
+STATIC INTEGER :: CENSUS_STATE_COUNT(4)
+
 ! ── Oracle control (CPU instructions, applied as amplitudes) ──
 STATIC INTEGER :: NET_SPAWN_ACTIVE = 0
 STATIC REAL :: NET_SPAWN_RATE = 0.0

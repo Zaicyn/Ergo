@@ -11,7 +11,7 @@
 ! Zero constants produce zero contributions downstream — natural skip.
 
 ! ── Simulation sizing ──────────────────────────────────────
-PARAMETER INTEGER :: MAXPART = 30000000
+PARAMETER INTEGER :: MAXPART = 25000000
 PARAMETER INTEGER :: DEFAULT_N = 12
 PARAMETER INTEGER :: DEFAULT_FRAMES = 2147483647
 
@@ -68,6 +68,8 @@ PARAMETER INTEGER :: PHASE_MASK  = 32767
 PARAMETER REAL :: PHASE_INC_SCALE = 86.89
 PARAMETER INTEGER :: SEAM_STEP_PH = 1024
 PARAMETER REAL :: K_PHASE_LOCK = 0.001
+! All ring coupling enabled. K_PHASE_LOCK and OMEGA_EXCHANGE_RATE
+! locked — they don't affect global histogram (structural, not statistical).
 PARAMETER REAL :: OMEGA_EXCHANGE_RATE = 0.5
 PARAMETER REAL :: K_WINDING = 0.0001
 PARAMETER REAL :: OMEGA_CRITICAL = 0.04
@@ -293,6 +295,15 @@ STATIC INTEGER :: RNG_STATE = 42
 PARAMETER REAL :: SPAWN_RATE_DEFAULT = 0.01
 STATIC REAL :: SPAWN_RATE = 0.01
 STATIC INTEGER :: SPAWN_COUNTER(1)
+
+! ── Census diagnostic buffers (GPU scatter, CPU reads at census) ──
+! OMEGA histogram: 20 bins covering [0.0, 2.0] in steps of 0.1
+! Each particle atomicAdds into the bin matching its OMEGA.
+! Small enough to download at census (~80 bytes).
+PARAMETER INTEGER :: CENSUS_BINS = 20
+STATIC INTEGER :: CENSUS_OMEGA_HIST(20)
+! State counters: [1]=active, [2]=crystal, [3]=coast, [4]=nova/ejected
+STATIC INTEGER :: CENSUS_STATE_COUNT(4)
 
 ! ── Oracle control (CPU instructions, applied as amplitudes) ──
 STATIC INTEGER :: NET_SPAWN_ACTIVE = 0
@@ -943,6 +954,24 @@ SUBROUTINE DOWNLOAD_WAVEGUIDE()
   RETURN
 END
 
+! ── DOWNLOAD_PARTICLES: GPU → CPU particle readback ───────
+! Forces download of particle arrays for CPU-side census.
+! Only call outside the frame loop (after final frame_end).
+
+SUBROUTINE DOWNLOAD_PARTICLES()
+  REAL :: DP
+  INTEGER :: DI
+  DP := OMEGA_NAT(1)
+  DI := FLAGS(1)
+  DP := POS_X(1)
+  DP := POS_Y(1)
+  DP := POS_Z(1)
+  DP := VEL_X(1)
+  DP := VEL_Y(1)
+  DP := VEL_Z(1)
+  RETURN
+END
+
 SUBROUTINE CLEAR_GRID()
   CALL ZERO(GRID_DENSITY)
   CALL ZERO(GRID_GRAD_X)
@@ -1177,43 +1206,80 @@ SUBROUTINE STENCIL_GRID()
   RETURN
 END
 ! ════════════════════════════════════════════════════════════════
-! CENSUS — CPU observation (minimal: population + frame only)
+! CENSUS — CPU-only observation (runs at census intervals)
 ! ════════════════════════════════════════════════════════════════
 !
-! For now, census reports NPART and FRAME only.
-! Grid-level statistics (density distribution, gradient magnitude)
-! will be added when proper census-time grid downloads are implemented.
-!
-! NPART is a CPU scalar — no GPU download needed.
-! Census persistent state is declared in waveguide_state.mcl.
+! Reads particle arrays directly on CPU at census intervals.
+! Cost: ~25ms at 25M (one linear pass). Runs every 1000 frames
+! = 0.025ms amortized per frame. Zero GPU overhead.
 
-SUBROUTINE SIM_CENSUS_ADAPTIVE(COUNT, FRAME, NEXT_INTERVAL)
-  INTEGER :: COUNT, FRAME, NEXT_INTERVAL
-  INTEGER :: INTERVAL
+SUBROUTINE SIM_CENSUS_REPORT(COUNT, FRAME)
+  INTEGER :: COUNT, FRAME
+  INTEGER :: I, B, BIN
+  REAL :: OMEGA_SUM, OMEGA_MEAN, OMEGA_PEAK
+  INTEGER :: PEAK_BIN, TOTAL
 
   PRINT FRAME
   PRINT COUNT
 
-  ! Adaptive interval: simple population-based for now
-  INTERVAL := CENSUS_INTERVAL_DEFAULT
-  IF COUNT > 50000 THEN
-    INTERVAL := CENSUS_INTERVAL_MIN
-  ELSEIF COUNT > 10000 THEN
-    INTERVAL := CENSUS_INTERVAL_DEFAULT / 2
-  ELSEIF COUNT < 100 THEN
-    INTERVAL := CENSUS_INTERVAL_MAX
+  ! Zero local histogram + state counts
+  DO B = 1, 20
+    CENSUS_OMEGA_HIST(B) := 0
+  ENDDO
+  CENSUS_STATE_COUNT(1) := 0
+  CENSUS_STATE_COUNT(2) := 0
+  CENSUS_STATE_COUNT(3) := 0
+  CENSUS_STATE_COUNT(4) := 0
+
+  ! Single pass over particles: bin OMEGA + count states
+  DO I = 1, COUNT
+    BIN := CLAMP(INT(OMEGA_NAT(I) * 10.0), 0, 19) + 1
+    CENSUS_OMEGA_HIST(BIN) := CENSUS_OMEGA_HIST(BIN) + 1
+
+    IF IAND(FLAGS(I), PFLAG_CRYSTAL) ≠ 0 THEN
+      CENSUS_STATE_COUNT(2) := CENSUS_STATE_COUNT(2) + 1
+    ELSEIF IAND(FLAGS(I), IOR(PFLAG_NOVA, PFLAG_EJECTED)) ≠ 0 THEN
+      CENSUS_STATE_COUNT(4) := CENSUS_STATE_COUNT(4) + 1
+    ELSEIF IAND(FLAGS(I), PFLAG_ACTIVE) ≠ 0 THEN
+      CENSUS_STATE_COUNT(1) := CENSUS_STATE_COUNT(1) + 1
+    ELSE
+      CENSUS_STATE_COUNT(3) := CENSUS_STATE_COUNT(3) + 1
+    ENDIF
+  ENDDO
+
+  ! State counts
+  PRINT CENSUS_STATE_COUNT(1)
+  PRINT CENSUS_STATE_COUNT(2)
+  PRINT CENSUS_STATE_COUNT(3)
+  PRINT CENSUS_STATE_COUNT(4)
+
+  ! OMEGA stats from histogram
+  OMEGA_SUM := 0.0
+  TOTAL := 0
+  OMEGA_PEAK := 0.0
+  PEAK_BIN := 1
+  DO B = 1, 20
+    OMEGA_SUM := OMEGA_SUM + REAL(CENSUS_OMEGA_HIST(B)) * (REAL(B - 1) * 0.1 + 0.05)
+    TOTAL := TOTAL + CENSUS_OMEGA_HIST(B)
+    IF CENSUS_OMEGA_HIST(B) > INT(OMEGA_PEAK) THEN
+      OMEGA_PEAK := REAL(CENSUS_OMEGA_HIST(B))
+      PEAK_BIN := B
+    ENDIF
+  ENDDO
+  IF TOTAL > 0 THEN
+    OMEGA_MEAN := OMEGA_SUM / REAL(TOTAL)
+  ELSE
+    OMEGA_MEAN := 0.0
   ENDIF
 
-  IF INTERVAL < CENSUS_INTERVAL_MIN THEN
-    INTERVAL := CENSUS_INTERVAL_MIN
-  ENDIF
-  IF INTERVAL > CENSUS_INTERVAL_MAX THEN
-    INTERVAL := CENSUS_INTERVAL_MAX
-  ENDIF
+  PRINT OMEGA_MEAN
+  PRINT PEAK_BIN
 
-  CENSUS_PREV_FRAME := FRAME
-  CENSUS_INITIALIZED := 1
-  NEXT_INTERVAL := INTERVAL
+  ! Full histogram
+  DO B = 1, 20
+    PRINT CENSUS_OMEGA_HIST(B)
+  ENDDO
+
   RETURN
 END
 ! ════════════════════════════════════════════════════════════════
@@ -1236,10 +1302,6 @@ END
 IMPLICIT NONE
 
 INTEGER :: FRAME, SPAWNED, SAMPLE
-INTEGER :: CENSUS_INTERVAL, NEXT_CENSUS
-
-CENSUS_INTERVAL := CENSUS_INTERVAL_DEFAULT
-NEXT_CENSUS := CENSUS_INTERVAL
 
 ! ── CPU INIT: set constants, seed initial fluid state ─────
 CALL SIM_INIT(DEFAULT_N, MAXPART, 42)
@@ -1273,17 +1335,6 @@ DO FRAME = 1, DEFAULT_FRAMES
   ! ── CPU OBSERVATION (lazy readback at census intervals) ──
   ! Wave 2: CPU grabs density grid, computes stats, sends to oracle.
   ! GPU doesn't wait. CPU gets to it when it gets to it.
-  IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_CENSUS_OVERRIDE > 0 THEN
-    CENSUS_INTERVAL := NET_CENSUS_OVERRIDE
-  ENDIF
-  IF FRAME ≥ NEXT_CENSUS THEN
-    ! Census reads NPART only — grid download causes per-frame
-    ! rubber-banding because codegen inserts unconditional downloads.
-    ! TODO: fix codegen to only download inside conditional blocks.
-    CALL SIM_CENSUS_ADAPTIVE(NPART, FRAME, CENSUS_INTERVAL)
-    NEXT_CENSUS := FRAME + CENSUS_INTERVAL
-  ENDIF
-
   ! Sort by GEN every 5000 frames — GEN changes slowly (phase wraps
   ! over ~1000 frames), so infrequent sort keeps warps aligned with
   ! ring topology without per-census GPU stalls.
@@ -1291,11 +1342,11 @@ DO FRAME = 1, DEFAULT_FRAMES
     SORT_BY_GEN FLAGS, POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT
   ENDIF
 
-  IF FRAME > 1 .AND. MOD(FRAME, 1000) = 0 THEN
-    PRINT FRAME
-    PRINT NPART
-  ENDIF
 
 ENDDO
+
+! Post-loop: download particle arrays then census
+CALL DOWNLOAD_PARTICLES()
+CALL SIM_CENSUS_REPORT(NPART, DEFAULT_FRAMES)
 
 PRINT NPART

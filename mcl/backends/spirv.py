@@ -1349,9 +1349,14 @@ class _EmitContext:
         op = inst.op
 
         # SUB for index computation (i - 1) -> reuse idx_0
+        # Only apply when the first operand is the loop variable itself,
+        # not a computed value like BIN in scatter kernels.
         if op == Op.SUB and inst.result and inst.result.startswith("_idx"):
-            ssa_map[inst.result] = idx_0
-            return False
+            first_arg = inst.args[0] if inst.args else None
+            if (isinstance(first_arg, IRRef) and
+                    first_arg.name == self.kernel.loop_var):
+                ssa_map[inst.result] = idx_0
+                return False
 
         # LOAD from array
         if op == Op.LOAD:

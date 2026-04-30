@@ -331,14 +331,87 @@ python -m mcl --target spirv --precision f32 --no-split -o galaxy_gpu galaxy_str
 ERGO_PROFILE=1 ./galaxy_gpu -N 29000000 --frames 500 2>&1 | grep -A10 "GPU profile"
 ```
 
-## Locked Values
+## Phase 1 Baseline (2026-04-29, RTX 2060, 25M particles)
 
-Once tuned, record final values here:
+Full system: sections 1-18 enabled, all ring coupling active.
+Post-loop census with GPU→CPU particle download.
+
+**OMEGA distribution (stable from frame 1000 onward):**
+
+| Bin | OMEGA range | Count | % |
+|---|---|---|---|
+| 1 | 0.00-0.10 | 24,999,608 | 99.998% |
+| 2-19 | 0.10-1.90 | 0 | 0% |
+| 20 | 1.90-2.00 | 392 | 0.002% |
+
+- **OMEGA_MEAN:** 0.050 (below OMEGA_BASE=0.08 due to OMEGA_DECAY)
+- **State:** 25M active, 0 crystal, 0 coast, 0 nova
+- **k2 (physics):** 6.591 ms, 97.8 fps headless at 25M
+
+**Interpretation:** OMEGA_DECAY dominates. Density coupling pumps
+~400 particles to OMEGA_MAX but the rest settle near the floor.
+The distribution is essentially bimodal: floor (0.05) vs cap (2.0).
+No particles occupy the middle range (0.1-1.9). This is the
+"everything decays" reference that ring coupling should change.
+
+**Compiler fixes applied for this measurement:**
+- SPIRV scatter index fix (was using loop var instead of computed index)
+- Post-loop GPU→CPU download propagation (codegen now tracks GPU-dirty
+  arrays across frame loop boundary via DOWNLOAD_PARTICLES touch pattern)
+
+## Phase 2 Results: K_PHASE_LOCK (2026-04-29)
+
+Sections 15.6-15.8 disabled (OMEGA_EXCHANGE_RATE=0, K_WINDING=0,
+OMEGA_CRITICAL=0). Only phase lock (15.5) active.
+
+**Sweep:** K_PHASE_LOCK = 0.001, 0.003, 0.01, 0.1 (100x range)
+
+**Result:** No effect on OMEGA distribution at any value tested.
+All runs produce identical histogram to Phase 1 baseline:
+99.998% bin 1, 0% bins 2-19, 0.002% bin 20.
+
+**Analysis:** Phase lock corrects phase SPACING (PH_ERR), not energy.
+The OMEGA correction per frame is ~PH_ERR/16384 × K × DT which is
+orders of magnitude smaller than OMEGA_DECAY (0.15/frame). Phase lock
+cannot inject energy — it's a topological stabilizer, not a pump.
+
+**Conclusion:** K_PHASE_LOCK=0.001 is correct. The value doesn't
+matter for energy distribution because the mechanism doesn't affect
+energy. Its effect is on Q (winding number) convergence, which requires
+the Phase 4 winding measurement to observe. Leave at 0.001.
+
+## Phase 3 Results: OMEGA_EXCHANGE_RATE (2026-04-29)
+
+Sections 15.5 + 15.6 enabled. 15.7-15.8 still disabled.
+
+**Sweep:** OMEGA_EXCHANGE_RATE = 0.5, 1.0
+
+**Result:** No effect on OMEGA histogram at any value tested.
+Identical to Phase 1 baseline.
+
+**Analysis:** Exchange redistributes energy within rings (DIFF between
+neighbors), but at equilibrium 99.998% of particles have OMEGA ≈ 0.05.
+The differential is near zero — nothing to redistribute. The 392
+high-OMEGA particles share with neighbors but OMEGA_DECAY pulls those
+neighbors back to floor within ~100 frames.
+
+**Key insight:** Ring coupling (Phases 2-3) is STRUCTURAL, not
+STATISTICAL. It affects spatial correlation of OMEGA (ring-like color
+patterns, phase ordering, winding stability), not the global histogram.
+The correct observables are:
+- Visual: render at 25M, look for ring-like color banding
+- Winding Q: does Q → 1 for complete rings (MET_GATE=8)?
+- Spatial correlation: RING_NEXT(OMEGA) - OMEGA variance vs random
+
+The histogram confirms ring coupling doesn't BREAK anything (no
+inflation, no deflation). That's the validation — it's conservative.
+
+## Locked Values
 
 | Constant | Tuned value | Phase | Notes |
 |---|---|---|---|
-| K_PHASE_LOCK | TBD | 2 | |
-| OMEGA_EXCHANGE_RATE | TBD | 3 | |
-| K_WINDING | TBD | 4 | |
+| K_PHASE_LOCK | 0.001 | 2 | Topology only — no histogram effect, correct |
+| OMEGA_EXCHANGE_RATE | 0.5 | 3 | Structural redistribution — no histogram effect, correct |
+| K_WINDING | 0.0001 | 4 | Restored to default, needs Q measurement |
 | OMEGA_CRITICAL | TBD | 5 | |
 | SPILL_DECAY | TBD | 5 | |

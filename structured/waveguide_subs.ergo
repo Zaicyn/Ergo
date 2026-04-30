@@ -25,6 +25,24 @@ SUBROUTINE DOWNLOAD_WAVEGUIDE()
   RETURN
 END
 
+! ── DOWNLOAD_PARTICLES: GPU → CPU particle readback ───────
+! Forces download of particle arrays for CPU-side census.
+! Only call outside the frame loop (after final frame_end).
+
+SUBROUTINE DOWNLOAD_PARTICLES()
+  REAL :: DP
+  INTEGER :: DI
+  DP := OMEGA_NAT(1)
+  DI := FLAGS(1)
+  DP := POS_X(1)
+  DP := POS_Y(1)
+  DP := POS_Z(1)
+  DP := VEL_X(1)
+  DP := VEL_Y(1)
+  DP := VEL_Z(1)
+  RETURN
+END
+
 SUBROUTINE CLEAR_GRID()
   CALL ZERO(GRID_DENSITY)
   CALL ZERO(GRID_GRAD_X)

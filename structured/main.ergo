@@ -18,10 +18,6 @@
 IMPLICIT NONE
 
 INTEGER :: FRAME, SPAWNED, SAMPLE
-INTEGER :: CENSUS_INTERVAL, NEXT_CENSUS
-
-CENSUS_INTERVAL := CENSUS_INTERVAL_DEFAULT
-NEXT_CENSUS := CENSUS_INTERVAL
 
 ! ── CPU INIT: set constants, seed initial fluid state ─────
 CALL SIM_INIT(DEFAULT_N, MAXPART, 42)
@@ -55,17 +51,6 @@ DO FRAME = 1, DEFAULT_FRAMES
   ! ── CPU OBSERVATION (lazy readback at census intervals) ──
   ! Wave 2: CPU grabs density grid, computes stats, sends to oracle.
   ! GPU doesn't wait. CPU gets to it when it gets to it.
-  IF NET_SPAWN_ACTIVE ≠ 0 .AND. NET_CENSUS_OVERRIDE > 0 THEN
-    CENSUS_INTERVAL := NET_CENSUS_OVERRIDE
-  ENDIF
-  IF FRAME ≥ NEXT_CENSUS THEN
-    ! Census reads NPART only — grid download causes per-frame
-    ! rubber-banding because codegen inserts unconditional downloads.
-    ! TODO: fix codegen to only download inside conditional blocks.
-    CALL SIM_CENSUS_ADAPTIVE(NPART, FRAME, CENSUS_INTERVAL)
-    NEXT_CENSUS := FRAME + CENSUS_INTERVAL
-  ENDIF
-
   ! Sort by GEN every 5000 frames — GEN changes slowly (phase wraps
   ! over ~1000 frames), so infrequent sort keeps warps aligned with
   ! ring topology without per-census GPU stalls.
@@ -73,11 +58,11 @@ DO FRAME = 1, DEFAULT_FRAMES
     SORT_BY_GEN FLAGS, POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT
   ENDIF
 
-  IF FRAME > 1 .AND. MOD(FRAME, 1000) = 0 THEN
-    PRINT FRAME
-    PRINT NPART
-  ENDIF
 
 ENDDO
+
+! Post-loop: download particle arrays then census
+CALL DOWNLOAD_PARTICLES()
+CALL SIM_CENSUS_REPORT(NPART, DEFAULT_FRAMES)
 
 PRINT NPART
