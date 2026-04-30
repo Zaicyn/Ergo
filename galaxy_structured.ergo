@@ -72,7 +72,7 @@ PARAMETER REAL :: K_PHASE_LOCK = 0.001
 ! locked — they don't affect global histogram (structural, not statistical).
 PARAMETER REAL :: OMEGA_EXCHANGE_RATE = 0.5
 PARAMETER REAL :: K_WINDING = 0.0001
-PARAMETER REAL :: OMEGA_CRITICAL = 0.1
+PARAMETER REAL :: OMEGA_CRITICAL = 0.04
 PARAMETER REAL :: SPILL_DECAY = 0.5
 
 ! ── Census interval bounds ────────────────────────────────
@@ -1335,12 +1335,6 @@ DO FRAME = 1, DEFAULT_FRAMES
   ! ── CPU OBSERVATION (lazy readback at census intervals) ──
   ! Wave 2: CPU grabs density grid, computes stats, sends to oracle.
   ! GPU doesn't wait. CPU gets to it when it gets to it.
-  ! Sort by GEN every 5000 frames — GEN changes slowly (phase wraps
-  ! over ~1000 frames), so infrequent sort keeps warps aligned with
-  ! ring topology without per-census GPU stalls.
-  IF MOD(FRAME, 5000) = 0 THEN
-    SORT_BY_GEN FLAGS, POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT
-  ENDIF
 
 
 ENDDO
