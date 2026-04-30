@@ -41,9 +41,9 @@ FIELD_NAMES = [
 def parse_signatures(lines):
     """Extract 8-float signatures from simulation output.
 
-    The census prints SIG_COUNT followed by 8 floats per signature.
-    We look for sequences of 8 consecutive float-parseable lines
-    that follow a count line.
+    The census prints sentinel -999, then SIG_COUNT, then 8 floats per
+    signature, then sentinel -999 again. This cleanly separates
+    signatures from histogram and state count data.
     """
     signatures = []
     i = 0
@@ -51,43 +51,51 @@ def parse_signatures(lines):
         line = lines[i].strip()
         i += 1
 
-        # Try to find a signature count (integer followed by 8*N floats)
-        try:
-            count = int(line)
-        except ValueError:
+        # Look for sentinel -999
+        if line != "-999":
             continue
 
-        # Sanity: count should be reasonable (1-4096)
+        # Next line should be the count
+        if i >= len(lines):
+            break
+        try:
+            count = int(lines[i].strip())
+        except ValueError:
+            continue
+        i += 1
+
         if count < 1 or count > 4096:
             continue
 
-        # Check if we have enough lines for count * 8 floats
-        if i + count * 8 > len(lines):
-            continue
-
-        # Try to parse count signatures
-        valid = True
+        # Read count × 8 floats
         batch = []
         for s in range(count):
             sig = []
             for f in range(8):
                 if i >= len(lines):
-                    valid = False
+                    break
+                val_str = lines[i].strip()
+                # Stop if we hit the closing sentinel
+                if val_str == "-999":
                     break
                 try:
-                    val = float(lines[i].strip())
-                    sig.append(val)
+                    sig.append(float(val_str))
                     i += 1
                 except ValueError:
-                    valid = False
                     break
-            if not valid:
-                break
             if len(sig) == 8:
                 batch.append(sig)
+            else:
+                break
 
         if batch:
             signatures.extend(batch)
+
+        # Skip past closing sentinel if we haven't already
+        while i < len(lines) and lines[i].strip() != "-999":
+            i += 1
+        if i < len(lines):
+            i += 1  # skip the -999 itself
 
     return np.array(signatures) if signatures else None
 

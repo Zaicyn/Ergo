@@ -74,22 +74,23 @@ SUBROUTINE SIM_CENSUS_REPORT(COUNT, FRAME)
   ENDDO
 
   ! Resonance signatures collected since last census
+  ! Sentinel -999 marks start/end of signature block for parser
   IF SIG_COUNT(1) > 0 THEN
+    PRINT -999
     PRINT SIG_COUNT(1)
     DO I = 1, SIG_COUNT(1)
       IF I ≤ SIG_MAX THEN
-        ! Print 8 signature values per crystallization event
-        PRINT SIG_BUF(1, I)
-        PRINT SIG_BUF(2, I)
-        PRINT SIG_BUF(3, I)
-        PRINT SIG_BUF(4, I)
-        PRINT SIG_BUF(5, I)
-        PRINT SIG_BUF(6, I)
-        PRINT SIG_BUF(7, I)
-        PRINT SIG_BUF(8, I)
+        PRINT SIG_OMEGA(I)
+        PRINT SIG_RHO(I)
+        PRINT SIG_FMODE(I)
+        PRINT SIG_VMAG(I)
+        PRINT SIG_RNORM(I)
+        PRINT SIG_MGATE(I)
+        PRINT SIG_ZC(I)
+        PRINT SIG_FW(I)
       ENDIF
     ENDDO
-    ! Reset counter for next census interval
+    PRINT -999
     SIG_COUNT(1) := 0
   ENDIF
 

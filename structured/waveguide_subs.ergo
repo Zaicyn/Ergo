@@ -40,8 +40,15 @@ SUBROUTINE DOWNLOAD_PARTICLES()
   DP := VEL_X(1)
   DP := VEL_Y(1)
   DP := VEL_Z(1)
-  ! Resonance signature buffer
-  DP := SIG_BUF(1, 1)
+  ! Resonance signature arrays
+  DP := SIG_OMEGA(1)
+  DP := SIG_RHO(1)
+  DP := SIG_FMODE(1)
+  DP := SIG_VMAG(1)
+  DP := SIG_RNORM(1)
+  DP := SIG_MGATE(1)
+  DP := SIG_ZC(1)
+  DP := SIG_FW(1)
   DI := SIG_COUNT(1)
   RETURN
 END
@@ -67,7 +74,7 @@ END
 SUBROUTINE SCATTER_GRID()
   INTEGER :: I, CI, CJ, CK, GEN, BIN, PH
   INTEGER :: SIG_SLOT, FMODE_I
-  REAL :: V_MAG, R_NORM, RHO_NORM, SIG_ZC, SIG_FW
+  REAL :: V_MAG, R_NORM, RHO_NORM, LOC_ZC, LOC_FW
 
   DO I = 1, NPART
     ! Ejected: gone, skip entirely
@@ -96,16 +103,16 @@ SUBROUTINE SCATTER_GRID()
           V_MAG := SQRT(VEL_X(I) * VEL_X(I) + VEL_Y(I) * VEL_Y(I) + VEL_Z(I) * VEL_Z(I))
           R_NORM := SQRT(POS_X(I) * POS_X(I) + POS_Y(I) * POS_Y(I) + POS_Z(I) * POS_Z(I)) / DISK_OUTER_R
           RHO_NORM := REAL(GRID_DENSITY(CI, CJ, CK)) / 32.0
-          SIG_ZC := ABS(Z_COUPLING(GEN))
-          SIG_FW := ABS(FLOW_W(GEN))
-          SIG_BUF(1, SIG_SLOT) := OMEGA_NAT(I)
-          SIG_BUF(2, SIG_SLOT) := RHO_NORM
-          SIG_BUF(3, SIG_SLOT) := REAL(FMODE_I)
-          SIG_BUF(4, SIG_SLOT) := V_MAG
-          SIG_BUF(5, SIG_SLOT) := R_NORM
-          SIG_BUF(6, SIG_SLOT) := GRID_MET_GATE(CI, CJ, CK)
-          SIG_BUF(7, SIG_SLOT) := SIG_ZC
-          SIG_BUF(8, SIG_SLOT) := SIG_FW
+          LOC_ZC := ABS(Z_COUPLING(GEN))
+          LOC_FW := ABS(FLOW_W(GEN))
+          SIG_OMEGA(SIG_SLOT) := OMEGA_NAT(I)
+          SIG_RHO(SIG_SLOT) := RHO_NORM
+          SIG_FMODE(SIG_SLOT) := REAL(FMODE_I)
+          SIG_VMAG(SIG_SLOT) := V_MAG
+          SIG_RNORM(SIG_SLOT) := R_NORM
+          SIG_MGATE(SIG_SLOT) := GRID_MET_GATE(CI, CJ, CK)
+          SIG_ZC(SIG_SLOT) := LOC_ZC
+          SIG_FW(SIG_SLOT) := LOC_FW
         ENDIF
 
         FLAGS(I) := IOR(FLAGS(I), PFLAG_BANKED)

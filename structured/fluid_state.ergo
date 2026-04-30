@@ -39,12 +39,17 @@ STATIC INTEGER :: CENSUS_OMEGA_HIST(20)
 STATIC INTEGER :: CENSUS_STATE_COUNT(4)
 
 ! ── Resonance signature collector (GPU writes, CPU reads) ─────
-! Ring buffer of 8-float signatures captured at crystallization.
-! GPU atomicAdds SIG_COUNT to get write slot. CPU reads at census
-! and dumps to file for offline clustering.
-! Each signature: OMEGA, RHO, FMODE, V_MAG, R_NORM, MET_GATE, Z_C, FLOW_W
+! 8 separate 1D arrays — avoids 2D indexing confusion across GPU/CPU.
+! GPU atomicAdds SIG_COUNT to get write slot. CPU reads at census.
 PARAMETER INTEGER :: SIG_MAX = 4096
-STATIC REAL :: SIG_BUF(8, 4096)
+STATIC REAL :: SIG_OMEGA(4096)
+STATIC REAL :: SIG_RHO(4096)
+STATIC REAL :: SIG_FMODE(4096)
+STATIC REAL :: SIG_VMAG(4096)
+STATIC REAL :: SIG_RNORM(4096)
+STATIC REAL :: SIG_MGATE(4096)
+STATIC REAL :: SIG_ZC(4096)
+STATIC REAL :: SIG_FW(4096)
 STATIC INTEGER :: SIG_COUNT(1)
 
 ! ── Oracle control (CPU instructions, applied as amplitudes) ──
