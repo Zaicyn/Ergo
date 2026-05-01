@@ -246,6 +246,17 @@ void ergo_vk_render_grid_gaussians(ErgoVkBuf buf_grad_x, ErgoVkBuf buf_grad_y,
                                     float world_scale);
 
 /*
+ * Render meshlet shells with octahedral-projected point colors.
+ * Points rendered into octa map, shells sample it by direction.
+ */
+void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
+                              ErgoVkBuf buf_color, int n_points,
+                              ErgoVkBuf buf_grad_x, ErgoVkBuf buf_grad_y,
+                              ErgoVkBuf buf_grad_z, ErgoVkBuf buf_met_gate,
+                              int grid_size, float val_min, float val_max,
+                              float world_scale);
+
+/*
  * Poll window events. Returns 1 if the window should close.
  */
 int ergo_vk_should_close(void);

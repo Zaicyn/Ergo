@@ -17,6 +17,11 @@ glslc -fshader-stage=fragment render_points.frag -o render_points.frag.spv
 glslc -fshader-stage=vertex   render_gauss.vert       -o render_gauss.vert.spv
 glslc -fshader-stage=fragment render_gauss.frag       -o render_gauss.frag.spv
 glslc -fshader-stage=vertex   render_grid_gauss.vert  -o render_grid_gauss.vert.spv
+glslc -fshader-stage=compute  meshlet_gen.comp        -o meshlet_gen.comp.spv
+glslc -fshader-stage=compute  atlas_gen.comp          -o atlas_gen.comp.spv
+glslc -fshader-stage=vertex   render_octa_points.vert -o render_octa_points.vert.spv
+glslc -fshader-stage=vertex   render_meshlet.vert     -o render_meshlet.vert.spv
+glslc -fshader-stage=fragment render_meshlet.frag     -o render_meshlet.frag.spv
 
 echo "Generating render_shaders.h..."
 python3 -c "
@@ -57,6 +62,16 @@ header += '\n\n'
 header += emit_array('render_gauss_frag_spv', 'render_gauss.frag.spv')
 header += '\n\n/* ── Grid gaussian shaders (O(cells) render) ── */\n\n'
 header += emit_array('render_grid_gauss_vert_spv', 'render_grid_gauss.vert.spv')
+header += '\n\n/* ── Meshlet shell shaders ── */\n\n'
+header += emit_array('meshlet_gen_comp_spv', 'meshlet_gen.comp.spv')
+header += '\n\n'
+header += emit_array('atlas_gen_comp_spv', 'atlas_gen.comp.spv')
+header += '\n\n'
+header += emit_array('render_octa_points_vert_spv', 'render_octa_points.vert.spv')
+header += '\n\n'
+header += emit_array('render_meshlet_vert_spv', 'render_meshlet.vert.spv')
+header += '\n\n'
+header += emit_array('render_meshlet_frag_spv', 'render_meshlet.frag.spv')
 header += '\n\n#endif /* ERGO_RENDER_SHADERS_H */\n'
 
 with open('render_shaders.h', 'w') as f:
@@ -64,4 +79,4 @@ with open('render_shaders.h', 'w') as f:
 "
 
 echo "Done."
-ls -la render.vert.spv render.frag.spv render_points.vert.spv render_points.frag.spv render_gauss.vert.spv render_gauss.frag.spv render_grid_gauss.vert.spv render_shaders.h
+ls -la render.vert.spv render.frag.spv render_points.vert.spv render_points.frag.spv render_gauss.vert.spv render_gauss.frag.spv render_grid_gauss.vert.spv meshlet_gen.comp.spv render_meshlet.vert.spv render_meshlet.frag.spv render_shaders.h

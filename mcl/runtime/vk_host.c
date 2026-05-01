@@ -178,10 +178,33 @@ static struct {
     VkShaderModule           grid_gauss_vert_shader;
     int                      grid_gauss_ds_bound;
 
+    /* Meshlet shell pipeline */
+    VkPipeline               meshlet_pipeline;
+    VkPipelineLayout         meshlet_layout;
+    VkDescriptorSetLayout    meshlet_ds_layout;
+    VkDescriptorPool         meshlet_ds_pool;
+    VkDescriptorSet          meshlet_ds;
+    VkShaderModule           meshlet_vert_shader;
+    VkShaderModule           meshlet_frag_shader;
+    int                      meshlet_ds_bound;
+
+    /* Per-cell octahedral atlas (2048x4096, 128x256 tiles of 16x16) */
+    VkImage                  atlas_image;
+    VkDeviceMemory           atlas_memory;
+    VkImageView              atlas_view;      /* sampled by shell frag shader */
+    VkImageView              atlas_storage_view; /* storage image for compute write */
+    VkSampler                atlas_sampler;
+    int                      atlas_initialized;
+
     VkCommandBuffer          render_cmd_buf;
     VkSemaphore              sem_available;
     VkSemaphore              sem_finished;
     VkFence                  render_fence;
+
+    /* Render UBO (shared by meshlet + persistent paths) */
+    VkBuffer                 render_ubo;
+    VkDeviceMemory           render_ubo_mem;
+    void                    *render_ubo_mapped;
 
     /* Orbit camera state */
     float                    cam_azimuth;   /* radians, horizontal angle */
@@ -264,6 +287,7 @@ static void render_create_pipeline(void);
 static void render_create_points_pipeline(void);
 static void render_create_gauss_pipeline(void);
 static void render_create_grid_gauss_pipeline(void);
+static void render_create_meshlet_pipeline(void);
 static void render_cleanup_swapchain(void);
 static void camera_mouse_button_cb(GLFWwindow *w, int button, int action, int mods);
 static void camera_cursor_pos_cb(GLFWwindow *w, double xpos, double ypos);
@@ -643,6 +667,7 @@ int ergo_vk_init(int headless) {
         render_create_points_pipeline();
         render_create_gauss_pipeline();
         render_create_grid_gauss_pipeline();
+        render_create_meshlet_pipeline();
 
         /* Separate command buffer for rendering */
         VkCommandBufferAllocateInfo rcb_ai = {0};
@@ -746,6 +771,19 @@ void ergo_vk_shutdown(void) {
             vkDestroyDescriptorSetLayout(g.device, g.grid_gauss_ds_layout, NULL);
             vkDestroyDescriptorPool(g.device, g.grid_gauss_ds_pool, NULL);
             vkDestroyShaderModule(g.device, g.grid_gauss_vert_shader, NULL);
+        }
+
+        if (g.meshlet_pipeline) {
+            vkDestroyPipeline(g.device, g.meshlet_pipeline, NULL);
+            vkDestroyPipelineLayout(g.device, g.meshlet_layout, NULL);
+            vkDestroyDescriptorSetLayout(g.device, g.meshlet_ds_layout, NULL);
+            vkDestroyDescriptorPool(g.device, g.meshlet_ds_pool, NULL);
+            vkDestroyShaderModule(g.device, g.meshlet_vert_shader, NULL);
+            vkDestroyShaderModule(g.device, g.meshlet_frag_shader, NULL);
+        }
+        if (g.render_ubo) {
+            vkDestroyBuffer(g.device, g.render_ubo, NULL);
+            vkFreeMemory(g.device, g.render_ubo_mem, NULL);
         }
 
         render_cleanup_swapchain();
@@ -1847,7 +1885,7 @@ static void render_create_points_pipeline(void) {
     cb.pAttachments = &blend_att;
 
     /* 4 storage buffers: pos_x, pos_y, pos_z, color — direct SoA read */
-    VkDescriptorSetLayoutBinding bindings[4];
+    VkDescriptorSetLayoutBinding bindings[5];
     for (int i = 0; i < 4; i++) {
         memset(&bindings[i], 0, sizeof(VkDescriptorSetLayoutBinding));
         bindings[i].binding = i;
@@ -1855,23 +1893,31 @@ static void render_create_points_pipeline(void) {
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     }
+    /* UBO at binding 5 — matches shader's RenderParams uniform */
+    memset(&bindings[4], 0, sizeof(VkDescriptorSetLayoutBinding));
+    bindings[4].binding = 5;
+    bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[4].descriptorCount = 1;
+    bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     VkDescriptorSetLayoutCreateInfo dsl_ci = {0};
     dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dsl_ci.bindingCount = 4;
+    dsl_ci.bindingCount = 5;
     dsl_ci.pBindings = bindings;
     VK_CHECK(vkCreateDescriptorSetLayout(g.device, &dsl_ci, NULL,
                                           &g.pts_ds_layout));
 
-    VkDescriptorPoolSize dp_size = {0};
-    dp_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    dp_size.descriptorCount = 4;
+    VkDescriptorPoolSize dp_sizes[2] = {{0},{0}};
+    dp_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    dp_sizes[0].descriptorCount = 4;
+    dp_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    dp_sizes[1].descriptorCount = 1;
 
     VkDescriptorPoolCreateInfo dp_ci = {0};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dp_ci.maxSets = 1;
-    dp_ci.poolSizeCount = 1;
-    dp_ci.pPoolSizes = &dp_size;
+    dp_ci.poolSizeCount = 2;
+    dp_ci.pPoolSizes = dp_sizes;
     VK_CHECK(vkCreateDescriptorPool(g.device, &dp_ci, NULL, &g.pts_ds_pool));
 
     VkDescriptorSetAllocateInfo ds_ai = {0};
@@ -2305,6 +2351,129 @@ static void render_create_grid_gauss_pipeline(void) {
 
     VK_CHECK(vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1,
                                         &gp_ci, NULL, &g.grid_gauss_pipeline));
+}
+
+/* ── Meshlet shell pipeline ──────────────────────────────────── */
+
+static void render_create_meshlet_pipeline(void) {
+    VkShaderModuleCreateInfo vert_ci = {0};
+    vert_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    vert_ci.codeSize = render_meshlet_vert_spv_size;
+    vert_ci.pCode = (const uint32_t *)render_meshlet_vert_spv;
+    VK_CHECK(vkCreateShaderModule(g.device, &vert_ci, NULL, &g.meshlet_vert_shader));
+
+    VkShaderModuleCreateInfo frag_ci = {0};
+    frag_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    frag_ci.codeSize = render_meshlet_frag_spv_size;
+    frag_ci.pCode = (const uint32_t *)render_meshlet_frag_spv;
+    VK_CHECK(vkCreateShaderModule(g.device, &frag_ci, NULL, &g.meshlet_frag_shader));
+
+    VkPipelineShaderStageCreateInfo stages[2] = {{0},{0}};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = g.meshlet_vert_shader;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = g.meshlet_frag_shader;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vi = {0};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    VkPipelineInputAssemblyStateCreateInfo ia = {0};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport viewport = {0};
+    viewport.width = (float)g.sc_extent.width;
+    viewport.height = (float)g.sc_extent.height;
+    viewport.maxDepth = 1.0f;
+    VkRect2D scissor = {0};
+    scissor.extent = g.sc_extent;
+    VkPipelineViewportStateCreateInfo vp = {0};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1; vp.pViewports = &viewport;
+    vp.scissorCount = 1; vp.pScissors = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rs = {0};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_BACK_BIT;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = {0};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds = {0};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS;
+
+    /* Opaque shells — no blending, early-Z */
+    VkPipelineColorBlendAttachmentState blend_att = {0};
+    blend_att.blendEnable = VK_FALSE;
+    blend_att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb = {0};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1; cb.pAttachments = &blend_att;
+
+    /* 2 SSBOs (binding 0,1) + atlas SSBO (binding 2) + UBO (binding 5) */
+    VkDescriptorSetLayoutBinding bindings[4];
+    memset(bindings, 0, sizeof(bindings));
+    for (int i = 0; i < 3; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = (i < 2) ? VK_SHADER_STAGE_VERTEX_BIT
+                                         : VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    bindings[3].binding = 5;
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[3].descriptorCount = 1;
+    bindings[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+    VkDescriptorSetLayoutCreateInfo dsl_ci = {0};
+    dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dsl_ci.bindingCount = 4; dsl_ci.pBindings = bindings;
+    VK_CHECK(vkCreateDescriptorSetLayout(g.device, &dsl_ci, NULL, &g.meshlet_ds_layout));
+
+    VkDescriptorPoolSize dp_sizes[2] = {{0},{0}};
+    dp_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    dp_sizes[0].descriptorCount = 3;
+    dp_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    dp_sizes[1].descriptorCount = 1;
+    VkDescriptorPoolCreateInfo dp_ci = {0};
+    dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dp_ci.maxSets = 1; dp_ci.poolSizeCount = 2; dp_ci.pPoolSizes = dp_sizes;
+    VK_CHECK(vkCreateDescriptorPool(g.device, &dp_ci, NULL, &g.meshlet_ds_pool));
+
+    VkDescriptorSetAllocateInfo ds_ai = {0};
+    ds_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ds_ai.descriptorPool = g.meshlet_ds_pool;
+    ds_ai.descriptorSetCount = 1; ds_ai.pSetLayouts = &g.meshlet_ds_layout;
+    VK_CHECK(vkAllocateDescriptorSets(g.device, &ds_ai, &g.meshlet_ds));
+
+    /* No push constants — uses UBO */
+    VkPipelineLayoutCreateInfo pl_ci = {0};
+    pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl_ci.setLayoutCount = 1; pl_ci.pSetLayouts = &g.meshlet_ds_layout;
+    VK_CHECK(vkCreatePipelineLayout(g.device, &pl_ci, NULL, &g.meshlet_layout));
+
+    VkGraphicsPipelineCreateInfo gp_ci = {0};
+    gp_ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp_ci.stageCount = 2; gp_ci.pStages = stages;
+    gp_ci.pVertexInputState = &vi; gp_ci.pInputAssemblyState = &ia;
+    gp_ci.pViewportState = &vp; gp_ci.pRasterizationState = &rs;
+    gp_ci.pMultisampleState = &ms; gp_ci.pDepthStencilState = &ds;
+    gp_ci.pColorBlendState = &cb;
+    gp_ci.layout = g.meshlet_layout;
+    gp_ci.renderPass = g.render_pass; gp_ci.subpass = 0;
+
+    VK_CHECK(vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1,
+                                        &gp_ci, NULL, &g.meshlet_pipeline));
 }
 
 /* ── ergo_vk_render_grid_gaussians ─────────────────────────── */
@@ -2766,6 +2935,890 @@ void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     vkQueuePresentKHR(g.compute_queue, &present);
 }
 
+/* (removed duplicate — actual octa section follows) */
+#if 0  /* duplicate octa section removed */
+static void _octa_old_removed_(void) {
+    if (g.octa_initialized) return;
+
+    /* Color image — single 2D texture */
+    VkImageCreateInfo img_ci = {0};
+    img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_ci.imageType = VK_IMAGE_TYPE_2D;
+    img_ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    img_ci.extent = (VkExtent3D){OCTA_SIZE, OCTA_SIZE, 1};
+    img_ci.mipLevels = 1;
+    img_ci.arrayLayers = 1;
+    img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img_ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK_CHECK(vkCreateImage(g.device, &img_ci, NULL, &g.octa_image));
+
+    VkMemoryRequirements mem_req;
+    vkGetImageMemoryRequirements(g.device, g.octa_image, &mem_req);
+    VkMemoryAllocateInfo mem_ai = {0};
+    mem_ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mem_ai.allocationSize = mem_req.size;
+    mem_ai.memoryTypeIndex = find_memory_type(mem_req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(g.device, &mem_ai, NULL, &g.octa_memory));
+    VK_CHECK(vkBindImageMemory(g.device, g.octa_image, g.octa_memory, 0));
+
+    VkImageViewCreateInfo iv_ci = {0};
+    iv_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    iv_ci.image = g.octa_image;
+    iv_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    iv_ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    iv_ci.subresourceRange = (VkImageSubresourceRange){
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(g.device, &iv_ci, NULL, &g.octa_view));
+
+    VkSamplerCreateInfo samp_ci = {0};
+    samp_ci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samp_ci.magFilter = VK_FILTER_LINEAR;
+    samp_ci.minFilter = VK_FILTER_LINEAR;
+    samp_ci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samp_ci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VK_CHECK(vkCreateSampler(g.device, &samp_ci, NULL, &g.octa_sampler));
+
+    /* Depth */
+    VkImageCreateInfo depth_ci = {0};
+    depth_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    depth_ci.imageType = VK_IMAGE_TYPE_2D;
+    depth_ci.format = VK_FORMAT_D32_SFLOAT;
+    depth_ci.extent = (VkExtent3D){OCTA_SIZE, OCTA_SIZE, 1};
+    depth_ci.mipLevels = 1;
+    depth_ci.arrayLayers = 1;
+    depth_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    depth_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    depth_ci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    VK_CHECK(vkCreateImage(g.device, &depth_ci, NULL, &g.octa_depth));
+
+    vkGetImageMemoryRequirements(g.device, g.octa_depth, &mem_req);
+    mem_ai.allocationSize = mem_req.size;
+    mem_ai.memoryTypeIndex = find_memory_type(mem_req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(g.device, &mem_ai, NULL, &g.octa_depth_mem));
+    VK_CHECK(vkBindImageMemory(g.device, g.octa_depth, g.octa_depth_mem, 0));
+
+    VkImageViewCreateInfo dv_ci = {0};
+    dv_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    dv_ci.image = g.octa_depth;
+    dv_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    dv_ci.format = VK_FORMAT_D32_SFLOAT;
+    dv_ci.subresourceRange = (VkImageSubresourceRange){
+        VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(g.device, &dv_ci, NULL, &g.octa_depth_view));
+
+    /* Render pass */
+    VkAttachmentDescription atts[2] = {{0},{0}};
+    atts[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+    atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    atts[1].format = VK_FORMAT_D32_SFLOAT;
+    atts[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference color_ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depth_ref = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass = {0};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_ref;
+    subpass.pDepthStencilAttachment = &depth_ref;
+
+    VkRenderPassCreateInfo rp_ci = {0};
+    rp_ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rp_ci.attachmentCount = 2;
+    rp_ci.pAttachments = atts;
+    rp_ci.subpassCount = 1;
+    rp_ci.pSubpasses = &subpass;
+    VK_CHECK(vkCreateRenderPass(g.device, &rp_ci, NULL, &g.octa_render_pass));
+
+    /* Framebuffer */
+    VkImageView fb_atts[2] = {g.octa_view, g.octa_depth_view};
+    VkFramebufferCreateInfo fb_ci = {0};
+    fb_ci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fb_ci.renderPass = g.octa_render_pass;
+    fb_ci.attachmentCount = 2;
+    fb_ci.pAttachments = fb_atts;
+    fb_ci.width = OCTA_SIZE;
+    fb_ci.height = OCTA_SIZE;
+    fb_ci.layers = 1;
+    VK_CHECK(vkCreateFramebuffer(g.device, &fb_ci, NULL, &g.octa_fb));
+
+    /* Octahedral point pipeline — uses octa vertex shader */
+    {
+        VkShaderModuleCreateInfo vert_ci = {0};
+        vert_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        vert_ci.codeSize = render_octa_points_vert_spv_size;
+        vert_ci.pCode = (const uint32_t *)render_octa_points_vert_spv;
+        VK_CHECK(vkCreateShaderModule(g.device, &vert_ci, NULL, &g.octa_vert_shader));
+
+        VkPipelineShaderStageCreateInfo stages[2] = {{0},{0}};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = g.octa_vert_shader;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = g.pts_frag_shader;  /* same heat palette frag */
+        stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo vi = {0};
+        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        VkPipelineInputAssemblyStateCreateInfo ia = {0};
+        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+
+        VkViewport viewport = {0, 0, OCTA_SIZE, OCTA_SIZE, 0, 1};
+        VkRect2D scissor = {{0,0}, {OCTA_SIZE, OCTA_SIZE}};
+        VkPipelineViewportStateCreateInfo vp = {0};
+        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vp.viewportCount = 1; vp.pViewports = &viewport;
+        vp.scissorCount = 1; vp.pScissors = &scissor;
+
+        VkPipelineRasterizationStateCreateInfo rs = {0};
+        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms = {0};
+        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo ds = {0};
+        ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        ds.depthTestEnable = VK_TRUE;
+        ds.depthWriteEnable = VK_TRUE;
+        ds.depthCompareOp = VK_COMPARE_OP_LESS;
+
+        VkPipelineColorBlendAttachmentState blend_att = {0};
+        blend_att.blendEnable = VK_FALSE;
+        blend_att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cb = {0};
+        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cb.attachmentCount = 1; cb.pAttachments = &blend_att;
+
+        VkGraphicsPipelineCreateInfo gp_ci = {0};
+        gp_ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        gp_ci.stageCount = 2; gp_ci.pStages = stages;
+        gp_ci.pVertexInputState = &vi; gp_ci.pInputAssemblyState = &ia;
+        gp_ci.pViewportState = &vp; gp_ci.pRasterizationState = &rs;
+        gp_ci.pMultisampleState = &ms; gp_ci.pDepthStencilState = &ds;
+        gp_ci.pColorBlendState = &cb;
+        gp_ci.layout = g.pts_layout;
+        gp_ci.renderPass = g.octa_render_pass;
+        gp_ci.subpass = 0;
+
+        VK_CHECK(vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1,
+                                            &gp_ci, NULL, &g.octa_pts_pipeline));
+    }
+
+    g.octa_initialized = 1;
+    fprintf(stderr, "[ergo_vk] Octahedral map initialized: %dx%d\n",
+            OCTA_SIZE, OCTA_SIZE);
+}
+
+/* Render points into octahedral map — single pass, single submit */
+static void octa_render_points(int n_points, float val_min, float val_max,
+                                float world_scale) {
+    /* UBO — octa vertex shader reads it but doesn't use viewProj
+     * (it projects manually via octahedral mapping) */
+    struct {
+        float viewProj[16];
+        float cam_x, cam_y, cam_z;
+        float cull_mode;
+        float val_min, val_max;
+        float world_scale;
+        float pad;
+    } ubo;
+    memset(ubo.viewProj, 0, 64);  /* unused */
+    ubo.cam_x = ubo.cam_y = ubo.cam_z = 0.0f;
+    ubo.cull_mode = 0.0f;
+    ubo.val_min = val_min;
+    ubo.val_max = val_max;
+    ubo.world_scale = world_scale;
+    ubo.pad = 0.0f;
+    memcpy(g.render_ubo_mapped, &ubo, 96);
+
+    /* Bind UBO to pts_ds at binding 5 */
+    {
+        VkDescriptorBufferInfo ubo_info = {0};
+        ubo_info.buffer = g.render_ubo;
+        ubo_info.offset = 0;
+        ubo_info.range = 96;
+
+        VkWriteDescriptorSet write = {0};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = g.pts_ds;
+        write.dstBinding = 5;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        write.pBufferInfo = &ubo_info;
+        vkUpdateDescriptorSets(g.device, 1, &write, 0, NULL);
+    }
+
+    VkCommandBufferBeginInfo begin = {0};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkResetCommandBuffer(g.xfer_cmd_buf, 0));
+    VK_CHECK(vkBeginCommandBuffer(g.xfer_cmd_buf, &begin));
+
+    /* Barrier: compute writes -> vertex reads */
+    {
+        VkMemoryBarrier mb = {0};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g.xfer_cmd_buf,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+            0, 1, &mb, 0, NULL, 0, NULL);
+    }
+
+    VkClearValue clears[2];
+    clears[0].color = (VkClearColorValue){{0.0f, 0.0f, 0.0f, 0.0f}};
+    clears[1].depthStencil = (VkClearDepthStencilValue){1.0f, 0};
+
+    VkRenderPassBeginInfo rp_begin = {0};
+    rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp_begin.renderPass = g.octa_render_pass;
+    rp_begin.framebuffer = g.octa_fb;
+    rp_begin.renderArea.extent = (VkExtent2D){OCTA_SIZE, OCTA_SIZE};
+    rp_begin.clearValueCount = 2;
+    rp_begin.pClearValues = clears;
+
+    vkCmdBeginRenderPass(g.xfer_cmd_buf, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      g.octa_pts_pipeline);
+    vkCmdBindDescriptorSets(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            g.pts_layout, 0, 1, &g.pts_ds, 0, NULL);
+    vkCmdDraw(g.xfer_cmd_buf, n_points, 1, 0, 0);
+    vkCmdEndRenderPass(g.xfer_cmd_buf);
+
+    VK_CHECK(vkEndCommandBuffer(g.xfer_cmd_buf));
+
+    VK_CHECK(vkResetFences(g.device, 1, &g.xfer_fence));
+    VkSubmitInfo si = {0};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g.xfer_cmd_buf;
+    VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.xfer_fence));
+    VK_CHECK(vkWaitForFences(g.device, 1, &g.xfer_fence, VK_TRUE, UINT64_MAX));
+}
+#endif /* end duplicate octa section */
+
+/* ── Per-cell octahedral atlas ──────────────────────────── */
+
+#define ATLAS_W 2048
+#define ATLAS_H 4096
+#define TILE_SIZE 16
+
+static ErgoVkPipe g_atlas_gen_pipe;
+static ErgoVkBuf  g_atlas_ssbo;  /* 2048*4096 uint32 = 32MB */
+
+static void atlas_lazy_init(void) {
+    if (g.atlas_initialized) return;
+
+    /* Atlas SSBO: 2048 * 4096 * 4 bytes = 32MB */
+    size_t atlas_size = (size_t)ATLAS_W * ATLAS_H * sizeof(uint32_t);
+    g_atlas_ssbo = ergo_vk_create_buffer(atlas_size);
+
+    /* Load atlas gen compute shader: 5 SSBOs (4 particle + 1 atlas) + 32B push constants */
+    g_atlas_gen_pipe = ergo_vk_load_shader(
+        atlas_gen_comp_spv, atlas_gen_comp_spv_size, 5, 32);
+    ergo_vk_bind_buffer(g_atlas_gen_pipe, 4, g_atlas_ssbo);
+
+    /* No image transitions needed — pure SSBO path */
+    {
+    }
+
+    g.atlas_initialized = 1;
+    fprintf(stderr, "[ergo_vk] Atlas initialized: %dx%d (%d tiles of %dx%d)\n",
+            ATLAS_W, ATLAS_H, 32*32*32, TILE_SIZE, TILE_SIZE);
+}
+
+/* Dispatch atlas generation: clear SSBO, scatter particles into tiles */
+static void atlas_gen_dispatch(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
+                                ErgoVkBuf buf_color, int n_points,
+                                float val_min, float val_max) {
+    /* Bind particle SSBOs (atlas SSBO already bound at init) */
+    ergo_vk_bind_buffer(g_atlas_gen_pipe, 0, buf_x);
+    ergo_vk_bind_buffer(g_atlas_gen_pipe, 1, buf_y);
+    ergo_vk_bind_buffer(g_atlas_gen_pipe, 2, buf_z);
+    ergo_vk_bind_buffer(g_atlas_gen_pipe, 3, buf_color);
+
+    struct {
+        int   n_points;
+        int   grid_size;
+        float cell_size;
+        float val_min;
+        float val_max;
+        float pad1, pad2, pad3;
+    } pc;
+    pc.n_points = n_points;
+    pc.grid_size = 32;
+    pc.cell_size = 75.0f;
+    pc.val_min = val_min;
+    pc.val_max = val_max;
+    pc.pad1 = pc.pad2 = pc.pad3 = 0.0f;
+    ergo_vk_push_constants(g_atlas_gen_pipe, &pc, 32);
+
+    PipeSlot *p = &g.pipes[g_atlas_gen_pipe];
+
+    VkCommandBufferBeginInfo begin = {0};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkResetCommandBuffer(g.xfer_cmd_buf, 0));
+    VK_CHECK(vkBeginCommandBuffer(g.xfer_cmd_buf, &begin));
+
+    /* Clear atlas SSBO to zero */
+    BufSlot *ab = &g.bufs[g_atlas_ssbo];
+    vkCmdFillBuffer(g.xfer_cmd_buf, ab->buffer, 0, ab->size, 0);
+
+    /* Barrier: fill -> compute write */
+    {
+        VkMemoryBarrier mb = {0};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g.xfer_cmd_buf,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &mb, 0, NULL, 0, NULL);
+    }
+
+    /* Dispatch atlas gen: one thread per particle */
+    vkCmdBindPipeline(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline);
+    vkCmdBindDescriptorSets(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            p->layout, 0, 1, &p->ds, 0, NULL);
+    if (p->pc_size > 0)
+        vkCmdPushConstants(g.xfer_cmd_buf, p->layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, p->pc_size, p->pc_data);
+    vkCmdDispatch(g.xfer_cmd_buf, (n_points + 255) / 256, 1, 1);
+
+    VK_CHECK(vkEndCommandBuffer(g.xfer_cmd_buf));
+
+    VK_CHECK(vkResetFences(g.device, 1, &g.xfer_fence));
+    VkSubmitInfo si = {0};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g.xfer_cmd_buf;
+    VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.xfer_fence));
+    VK_CHECK(vkWaitForFences(g.device, 1, &g.xfer_fence, VK_TRUE, UINT64_MAX));
+}
+
+/* ── ergo_vk_render_meshlets (shell-based O(cells) render) ── */
+
+/* Icosphere template: 1-subdivision icosahedron → 42 verts, 80 faces */
+#define ICO_NVERTS 42
+#define ICO_NFACES 80
+#define ICO_NIDX   (ICO_NFACES * 3)
+#define ICO_NVERTS_EXPANDED ICO_NIDX
+#define MESHLET_MAX 32768
+#define MESHLET_COUNTER_SIZE 20
+
+static int              g_meshlet_initialized = 0;
+static ErgoVkPipe       g_meshlet_compute_pipe;
+static ErgoVkBuf        g_meshlet_tmpl_pos;
+static ErgoVkBuf        g_meshlet_tmpl_idx;
+static ErgoVkBuf        g_meshlet_out_pos[2];   /* double-buffered */
+static ErgoVkBuf        g_meshlet_out_nv[2];    /* double-buffered */
+static int              g_meshlet_write_idx = 0; /* compute writes to this, render reads other */
+static VkBuffer         g_meshlet_counter_buf;
+static VkDeviceMemory   g_meshlet_counter_mem;
+static void            *g_meshlet_counter_mapped;
+
+static void icosphere_generate(float *out_pos, uint32_t *out_idx) {
+    const float phi = 1.6180339887f;
+    const float inv_len = 1.0f / sqrtf(1.0f + phi * phi);
+    const float a = inv_len;
+    const float b = phi * inv_len;
+
+    float base[12][3] = {
+        {-a,  b,  0}, { a,  b,  0}, {-a, -b,  0}, { a, -b,  0},
+        { 0, -a,  b}, { 0,  a,  b}, { 0, -a, -b}, { 0,  a, -b},
+        { b,  0, -a}, { b,  0,  a}, {-b,  0, -a}, {-b,  0,  a}
+    };
+
+    int base_tri[20][3] = {
+        {0,11,5},  {0,5,1},   {0,1,7},   {0,7,10},  {0,10,11},
+        {1,5,9},   {5,11,4},  {11,10,2},  {10,7,6},  {7,1,8},
+        {3,9,4},   {3,4,2},   {3,2,6},   {3,6,8},   {3,8,9},
+        {4,9,5},   {2,4,11},  {6,2,10},  {8,6,7},   {9,8,1}
+    };
+
+    int nverts = 12;
+    float verts[ICO_NVERTS][3];
+    for (int i = 0; i < 12; i++) {
+        verts[i][0] = base[i][0];
+        verts[i][1] = base[i][1];
+        verts[i][2] = base[i][2];
+    }
+
+    int mid_cache[64 * 64];
+    memset(mid_cache, -1, sizeof(mid_cache));
+
+    int nfaces = 0;
+    int tris[ICO_NFACES][3];
+
+    for (int f = 0; f < 20; f++) {
+        int v0 = base_tri[f][0], v1 = base_tri[f][1], v2 = base_tri[f][2];
+
+        /* Midpoint helper — inline to avoid macro issues */
+        int edges[3][2] = {{v0,v1}, {v1,v2}, {v2,v0}};
+        int mids[3];
+        for (int e = 0; e < 3; e++) {
+            int lo = edges[e][0] < edges[e][1] ? edges[e][0] : edges[e][1];
+            int hi = edges[e][0] < edges[e][1] ? edges[e][1] : edges[e][0];
+            int key = lo * 64 + hi;
+            if (mid_cache[key] < 0) {
+                int m = nverts++;
+                verts[m][0] = (verts[lo][0] + verts[hi][0]) * 0.5f;
+                verts[m][1] = (verts[lo][1] + verts[hi][1]) * 0.5f;
+                verts[m][2] = (verts[lo][2] + verts[hi][2]) * 0.5f;
+                float len = sqrtf(verts[m][0]*verts[m][0] +
+                                  verts[m][1]*verts[m][1] +
+                                  verts[m][2]*verts[m][2]);
+                verts[m][0] /= len;
+                verts[m][1] /= len;
+                verts[m][2] /= len;
+                mid_cache[key] = m;
+            }
+            mids[e] = mid_cache[key];
+        }
+        int ma = mids[0], mb = mids[1], mc = mids[2];
+        tris[nfaces][0] = v0; tris[nfaces][1] = ma; tris[nfaces][2] = mc; nfaces++;
+        tris[nfaces][0] = ma; tris[nfaces][1] = v1; tris[nfaces][2] = mb; nfaces++;
+        tris[nfaces][0] = mc; tris[nfaces][1] = mb; tris[nfaces][2] = v2; nfaces++;
+        tris[nfaces][0] = ma; tris[nfaces][1] = mb; tris[nfaces][2] = mc; nfaces++;
+    }
+
+    for (int i = 0; i < nverts; i++) {
+        out_pos[i * 4 + 0] = verts[i][0];
+        out_pos[i * 4 + 1] = verts[i][1];
+        out_pos[i * 4 + 2] = verts[i][2];
+        out_pos[i * 4 + 3] = 0.0f;
+    }
+    for (int f = 0; f < nfaces; f++) {
+        out_idx[f * 3 + 0] = (uint32_t)tris[f][0];
+        out_idx[f * 3 + 1] = (uint32_t)tris[f][1];
+        out_idx[f * 3 + 2] = (uint32_t)tris[f][2];
+    }
+}
+
+static void meshlet_create_host_buffer(VkBuffer *buf, VkDeviceMemory *mem,
+                                        void **mapped, size_t size,
+                                        VkBufferUsageFlags usage) {
+    VkBufferCreateInfo ci = {0};
+    ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    ci.size = size;
+    ci.usage = usage;
+    VK_CHECK(vkCreateBuffer(g.device, &ci, NULL, buf));
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g.device, *buf, &req);
+    VkMemoryAllocateInfo ai = {0};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VK_CHECK(vkAllocateMemory(g.device, &ai, NULL, mem));
+    VK_CHECK(vkBindBufferMemory(g.device, *buf, *mem, 0));
+    VK_CHECK(vkMapMemory(g.device, *mem, 0, size, 0, mapped));
+}
+
+static void meshlet_lazy_init(void) {
+    if (g_meshlet_initialized) return;
+
+    float tmpl_pos[ICO_NVERTS * 4];
+    uint32_t tmpl_idx[ICO_NIDX];
+    icosphere_generate(tmpl_pos, tmpl_idx);
+
+    g_meshlet_tmpl_pos = ergo_vk_create_buffer(ICO_NVERTS * 4 * sizeof(float));
+    g_meshlet_tmpl_idx = ergo_vk_create_buffer(ICO_NIDX * sizeof(uint32_t));
+    ergo_vk_upload(g_meshlet_tmpl_pos, tmpl_pos, ICO_NVERTS * 4 * sizeof(float));
+    ergo_vk_upload(g_meshlet_tmpl_idx, tmpl_idx, ICO_NIDX * sizeof(uint32_t));
+
+    size_t out_size = (size_t)MESHLET_MAX * ICO_NVERTS_EXPANDED * 4 * sizeof(float);
+    g_meshlet_out_pos[0] = ergo_vk_create_buffer(out_size);
+    g_meshlet_out_nv[0]  = ergo_vk_create_buffer(out_size);
+    g_meshlet_out_pos[1] = ergo_vk_create_buffer(out_size);
+    g_meshlet_out_nv[1]  = ergo_vk_create_buffer(out_size);
+
+    meshlet_create_host_buffer(&g_meshlet_counter_buf, &g_meshlet_counter_mem,
+                               &g_meshlet_counter_mapped, MESHLET_COUNTER_SIZE,
+                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+
+    g_meshlet_compute_pipe = ergo_vk_load_shader(
+        meshlet_gen_comp_spv, meshlet_gen_comp_spv_size, 9, 96);
+
+    ergo_vk_bind_buffer(g_meshlet_compute_pipe, 4, g_meshlet_tmpl_pos);
+    ergo_vk_bind_buffer(g_meshlet_compute_pipe, 5, g_meshlet_tmpl_idx);
+    /* Output buffers (6,7) bound per-frame for double-buffering */
+    ergo_vk_bind_buffer(g_meshlet_compute_pipe, 6, g_meshlet_out_pos[0]);
+    ergo_vk_bind_buffer(g_meshlet_compute_pipe, 7, g_meshlet_out_nv[0]);
+
+    /* Bind counter buffer (binding 8) — raw VkBuffer, manual descriptor */
+    {
+        VkDescriptorBufferInfo buf_info = {0};
+        buf_info.buffer = g_meshlet_counter_buf;
+        buf_info.offset = 0;
+        buf_info.range = MESHLET_COUNTER_SIZE;
+
+        VkWriteDescriptorSet write = {0};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = g.pipes[g_meshlet_compute_pipe].ds;
+        write.dstBinding = 8;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &buf_info;
+        vkUpdateDescriptorSets(g.device, 1, &write, 0, NULL);
+    }
+
+    g_meshlet_initialized = 1;
+    fprintf(stderr, "[ergo_vk] Meshlet pipeline: %d max meshlets, "
+            "%d verts/meshlet\n", MESHLET_MAX, ICO_NVERTS_EXPANDED);
+}
+
+void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
+                              ErgoVkBuf buf_color, int n_points,
+                              ErgoVkBuf buf_grad_x, ErgoVkBuf buf_grad_y,
+                              ErgoVkBuf buf_grad_z, ErgoVkBuf buf_met_gate,
+                              int grid_size, float val_min, float val_max,
+                              float world_scale) {
+    if (g.headless) return;
+
+    meshlet_lazy_init();
+    atlas_lazy_init();
+
+    static int meshlet_frame = 0;
+    if (meshlet_frame++ < 3)
+        fprintf(stderr, "[ergo_vk] Meshlet frame %d\n", meshlet_frame);
+
+    /* Bind grid buffers to compute (bindings 0-3) */
+    static ErgoVkBuf last_grad_x = 0;
+    if (last_grad_x != buf_grad_x) {
+        ergo_vk_bind_buffer(g_meshlet_compute_pipe, 0, buf_grad_x);
+        ergo_vk_bind_buffer(g_meshlet_compute_pipe, 1, buf_grad_y);
+        ergo_vk_bind_buffer(g_meshlet_compute_pipe, 2, buf_grad_z);
+        ergo_vk_bind_buffer(g_meshlet_compute_pipe, 3, buf_met_gate);
+        last_grad_x = buf_grad_x;
+    }
+
+    /* Wait for previous render to finish reading output buffers
+     * before we overwrite them with new compute results */
+    VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence, VK_TRUE, UINT64_MAX));
+
+    /* Swap double-buffer: compute writes to current, render reads previous */
+    int wr = g_meshlet_write_idx;
+    int rd = wr ^ 1;
+    g_meshlet_write_idx = rd;  /* flip for next frame */
+
+    /* Bind compute output to write-side buffers */
+    ergo_vk_bind_buffer(g_meshlet_compute_pipe, 6, g_meshlet_out_pos[wr]);
+    ergo_vk_bind_buffer(g_meshlet_compute_pipe, 7, g_meshlet_out_nv[wr]);
+
+    /* Zero counter + indirect command */
+    uint32_t zero[5] = {0, 0, 1, 0, 0};
+    memcpy(g_meshlet_counter_mapped, zero, MESHLET_COUNTER_SIZE);
+
+    /* Camera */
+    float aspect = (float)g.sc_extent.width / (float)g.sc_extent.height;
+    Mat4 proj = mat4_perspective(45.0f * (float)M_PI / 180.0f, aspect,
+                                 0.01f, 100.0f);
+    float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);
+    float ce = cosf(g.cam_elevation), se = sinf(g.cam_elevation);
+    float ex = g.cam_distance * ce * sa;
+    float ey = g.cam_distance * se;
+    float ez = g.cam_distance * ce * ca;
+    Mat4 view = mat4_look_at(ex, ey, ez, 0, 0, 0, 0, 1, 0);
+    Mat4 viewProj = mat4_mul(proj, view);
+
+    /* Compute push constants */
+    struct {
+        float viewProj[16];
+        float density_threshold;
+        float shell_radius;
+        float world_scale;
+        float cell_size;
+        int   grid_size;
+        float viewport_height;
+        int   max_meshlets;
+        float pad;
+    } compute_pc;
+
+    memcpy(compute_pc.viewProj, viewProj.m, 64);
+    compute_pc.density_threshold = 0.05f;
+    compute_pc.shell_radius = 75.0f * 0.4f;
+    compute_pc.world_scale = world_scale;
+    compute_pc.cell_size = 75.0f;
+    compute_pc.grid_size = grid_size;
+    compute_pc.viewport_height = (float)g.sc_extent.height;
+    compute_pc.max_meshlets = MESHLET_MAX;
+    compute_pc.pad = 0.0f;
+
+    ergo_vk_push_constants(g_meshlet_compute_pipe, &compute_pc, 96);
+
+    /* Record compute dispatch into xfer command buffer to avoid
+     * disturbing the frame system's cmd_buf/fence state. */
+    {
+        PipeSlot *p = &g.pipes[g_meshlet_compute_pipe];
+        VkCommandBufferBeginInfo begin = {0};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkResetCommandBuffer(g.xfer_cmd_buf, 0));
+        VK_CHECK(vkBeginCommandBuffer(g.xfer_cmd_buf, &begin));
+        vkCmdBindPipeline(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          p->pipeline);
+        vkCmdBindDescriptorSets(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                p->layout, 0, 1, &p->ds, 0, NULL);
+        if (p->pc_size > 0)
+            vkCmdPushConstants(g.xfer_cmd_buf, p->layout,
+                               VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               p->pc_size, p->pc_data);
+        int total_cells = grid_size * grid_size * grid_size;
+        vkCmdDispatch(g.xfer_cmd_buf, (total_cells + 255) / 256, 1, 1);
+        VK_CHECK(vkEndCommandBuffer(g.xfer_cmd_buf));
+
+        VkSubmitInfo si = {0};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &g.xfer_cmd_buf;
+        VK_CHECK(vkResetFences(g.device, 1, &g.xfer_fence));
+        VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.xfer_fence));
+        VK_CHECK(vkWaitForFences(g.device, 1, &g.xfer_fence, VK_TRUE, UINT64_MAX));
+    }
+
+    /* Debug: read counter to see how many meshlets were generated */
+    {
+        uint32_t *ctr = (uint32_t *)g_meshlet_counter_mapped;
+        if (meshlet_frame <= 3)
+            fprintf(stderr, "[ergo_vk] Meshlet compute: %u meshlets, "
+                    "vertexCount=%u instanceCount=%u\n",
+                    ctr[0], ctr[1], ctr[2]);
+    }
+
+    /* Now render — render_fence already waited above before compute */
+    VK_CHECK(vkResetFences(g.device, 1, &g.render_fence));
+
+    uint32_t img_idx;
+    VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX,
+                                          g.sem_available, VK_NULL_HANDLE,
+                                          &img_idx);
+    if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
+        ergo_vk_frame_begin();
+        return;
+    }
+
+    /* One-time: create render UBO if needed */
+    if (!g.render_ubo) {
+        VkBufferCreateInfo ubo_ci = {0};
+        ubo_ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        ubo_ci.size = 96;
+        ubo_ci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        VK_CHECK(vkCreateBuffer(g.device, &ubo_ci, NULL, &g.render_ubo));
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(g.device, g.render_ubo, &req);
+        VkMemoryAllocateInfo ai = {0};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VK_CHECK(vkAllocateMemory(g.device, &ai, NULL, &g.render_ubo_mem));
+        VK_CHECK(vkBindBufferMemory(g.device, g.render_ubo, g.render_ubo_mem, 0));
+        VK_CHECK(vkMapMemory(g.device, g.render_ubo_mem, 0, 96, 0,
+                             &g.render_ubo_mapped));
+    }
+
+    /* Bind read-side output buffers + octa sampler + UBO */
+    {
+        VkDescriptorBufferInfo buf_infos[2];
+        VkWriteDescriptorSet writes[4];
+
+        BufSlot *bp = &g.bufs[g_meshlet_out_pos[rd]];
+        buf_infos[0].buffer = bp->buffer;
+        buf_infos[0].offset = 0;
+        buf_infos[0].range = bp->size;
+
+        BufSlot *bn = &g.bufs[g_meshlet_out_nv[rd]];
+        buf_infos[1].buffer = bn->buffer;
+        buf_infos[1].offset = 0;
+        buf_infos[1].range = bn->size;
+
+        for (int i = 0; i < 2; i++) {
+            memset(&writes[i], 0, sizeof(VkWriteDescriptorSet));
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = g.meshlet_ds;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+
+        /* Atlas SSBO at binding 2 */
+        VkDescriptorBufferInfo atlas_info = {0};
+        BufSlot *ba = &g.bufs[g_atlas_ssbo];
+        atlas_info.buffer = ba->buffer;
+        atlas_info.offset = 0;
+        atlas_info.range = ba->size;
+
+        memset(&writes[2], 0, sizeof(VkWriteDescriptorSet));
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = g.meshlet_ds;
+        writes[2].dstBinding = 2;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[2].pBufferInfo = &atlas_info;
+
+        VkDescriptorBufferInfo ubo_info = {0};
+        ubo_info.buffer = g.render_ubo;
+        ubo_info.offset = 0;
+        ubo_info.range = 96;
+
+        memset(&writes[3], 0, sizeof(VkWriteDescriptorSet));
+        writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[3].dstSet = g.meshlet_ds;
+        writes[3].dstBinding = 5;
+        writes[3].descriptorCount = 1;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[3].pBufferInfo = &ubo_info;
+
+        vkUpdateDescriptorSets(g.device, 4, writes, 0, NULL);
+    }
+
+    /* Update render UBO */
+    struct {
+        float viewProj[16];
+        float cam_x, cam_y, cam_z;
+        float cull_mode;
+        float val_min, val_max;
+        float world_scale;
+        float pad;
+    } render_params;
+    memcpy(render_params.viewProj, viewProj.m, 64);
+    render_params.cam_x = ex;
+    render_params.cam_y = ey;
+    render_params.cam_z = ez;
+    render_params.cull_mode = g_culling_enabled ? 1.0f : 0.0f;
+    render_params.val_min = val_min;
+    render_params.val_max = val_max;
+    render_params.world_scale = world_scale;
+    render_params.pad = 0.0f;
+    /* Bind particle SoA buffers for octa point render */
+    if (!pts_ds_bound) {
+        ErgoVkBuf bufs_arr[4] = { buf_x, buf_y, buf_z, buf_color };
+        VkDescriptorBufferInfo buf_infos[4];
+        VkWriteDescriptorSet writes[4];
+        for (int i = 0; i < 4; i++) {
+            BufSlot *b = &g.bufs[bufs_arr[i]];
+            buf_infos[i].buffer = b->buffer;
+            buf_infos[i].offset = g.render_offset;
+            buf_infos[i].range = b->size - g.render_offset;
+            memset(&writes[i], 0, sizeof(VkWriteDescriptorSet));
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = g.pts_ds;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(g.device, 4, writes, 0, NULL);
+        pts_ds_bound = 1;
+    }
+
+    /* Generate per-cell atlas from particle data */
+    atlas_gen_dispatch(buf_x, buf_y, buf_z, buf_color, n_points, val_min, val_max);
+
+    /* Update UBO with user camera for shell render */
+    memcpy(g.render_ubo_mapped, &render_params, 96);
+
+    /* Record shell render command buffer */
+    VkCommandBufferBeginInfo begin_info = {0};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    VK_CHECK(vkResetCommandBuffer(g.render_cmd_buf, 0));
+    VK_CHECK(vkBeginCommandBuffer(g.render_cmd_buf, &begin_info));
+
+    /* Barrier: compute -> vertex + indirect (for meshlet shell data) */
+    {
+        VkMemoryBarrier mb = {0};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                           VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        vkCmdPipelineBarrier(g.render_cmd_buf,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+            0, 1, &mb, 0, NULL, 0, NULL);
+    }
+
+    /* Render meshlet shells sampling cubemap */
+    VkClearValue clears[2];
+    clears[0].color = (VkClearColorValue){{0.0f, 0.0f, 0.0f, 1.0f}};
+    clears[1].depthStencil = (VkClearDepthStencilValue){1.0f, 0};
+
+    VkRenderPassBeginInfo rp_begin = {0};
+    rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp_begin.renderPass = g.render_pass;
+    rp_begin.framebuffer = g.sc_fbs[img_idx];
+    rp_begin.renderArea.extent = g.sc_extent;
+    rp_begin.clearValueCount = 2;
+    rp_begin.pClearValues = clears;
+
+    vkCmdBeginRenderPass(g.render_cmd_buf, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+    vkCmdBindPipeline(g.render_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      g.meshlet_pipeline);
+    vkCmdBindDescriptorSets(g.render_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            g.meshlet_layout, 0, 1,
+                            &g.meshlet_ds, 0, NULL);
+
+    /* Indirect draw: vertexCount at offset 4 in counter buffer */
+    vkCmdDrawIndirect(g.render_cmd_buf, g_meshlet_counter_buf,
+                      4, 1, sizeof(VkDrawIndirectCommand));
+
+    vkCmdEndRenderPass(g.render_cmd_buf);
+    VK_CHECK(vkEndCommandBuffer(g.render_cmd_buf));
+
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo si = {0};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.waitSemaphoreCount = 1;
+    si.pWaitSemaphores = &g.sem_available;
+    si.pWaitDstStageMask = &wait_stage;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g.render_cmd_buf;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &g.sem_finished;
+
+    VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.render_fence));
+
+    VkPresentInfoKHR present = {0};
+    present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    present.waitSemaphoreCount = 1;
+    present.pWaitSemaphores = &g.sem_finished;
+    present.swapchainCount = 1;
+    present.pSwapchains = &g.swapchain;
+    present.pImageIndices = &img_idx;
+
+    vkQueuePresentKHR(g.compute_queue, &present);
+}
+
 int ergo_vk_should_close(void) {
     if (g.headless) return 0;
 #ifdef ERGO_VK_ANDROID
@@ -2807,6 +3860,17 @@ void ergo_vk_render_grid_gaussians(ErgoVkBuf buf_grad_x, ErgoVkBuf buf_grad_y,
                                     ErgoVkBuf buf_grad_z, ErgoVkBuf buf_met_gate,
                                     int grid_size, float val_min, float val_max,
                                     float world_scale) {
+    (void)buf_grad_x; (void)buf_grad_y; (void)buf_grad_z; (void)buf_met_gate;
+    (void)grid_size; (void)val_min; (void)val_max; (void)world_scale;
+}
+
+void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
+                              ErgoVkBuf buf_color, int n_points,
+                              ErgoVkBuf buf_grad_x, ErgoVkBuf buf_grad_y,
+                              ErgoVkBuf buf_grad_z, ErgoVkBuf buf_met_gate,
+                              int grid_size, float val_min, float val_max,
+                              float world_scale) {
+    (void)buf_x; (void)buf_y; (void)buf_z; (void)buf_color; (void)n_points;
     (void)buf_grad_x; (void)buf_grad_y; (void)buf_grad_z; (void)buf_met_gate;
     (void)grid_size; (void)val_min; (void)val_max; (void)world_scale;
 }

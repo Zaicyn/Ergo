@@ -1,0 +1,97 @@
+#version 450
+
+/*
+ * Meshlet generation compute shader.
+ *
+ * Scans 32^3 grid cells. For each occupied cell, expands an icosphere
+ * template (42 verts, 80 faces = 240 triangle verts) into output SSBOs.
+ *
+ * Matches the point renderer's transform: world_pos * world_scale,
+ * color normalized by val_min/val_max.
+ */
+
+layout(local_size_x = 256) in;
+
+/* Input: grid data */
+layout(set = 0, binding = 0) readonly buffer BufGradX  { float grad_x[];  };
+layout(set = 0, binding = 1) readonly buffer BufGradY  { float grad_y[];  };
+layout(set = 0, binding = 2) readonly buffer BufGradZ  { float grad_z[];  };
+layout(set = 0, binding = 3) readonly buffer BufMGate  { float met_gate[]; };
+
+/* Input: icosphere template */
+layout(set = 0, binding = 4) readonly buffer TemplPos  { vec4 tmpl_pos[]; };
+layout(set = 0, binding = 5) readonly buffer TemplIdx  { uint tmpl_idx[]; };
+
+/* Output: expanded triangle vertices */
+layout(set = 0, binding = 6) writeonly buffer OutPos   { vec4 out_pos[]; };
+layout(set = 0, binding = 7) writeonly buffer OutNV    { vec4 out_nv[];  };
+
+/* Atomic counter + indirect draw command */
+layout(set = 0, binding = 8) buffer CounterBuf {
+    uint meshlet_count;
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance;
+};
+
+layout(push_constant) uniform PC {
+    mat4  viewProj;
+    float density_threshold;
+    float shell_radius;
+    float world_scale;
+    float cell_size;
+    int   grid_size;
+    float viewport_height;
+    int   max_meshlets;
+    float pad;
+};
+
+void main() {
+    uint cell = gl_GlobalInvocationID.x;
+    int total_cells = grid_size * grid_size * grid_size;
+    if (cell >= total_cells) return;
+
+    float gate = met_gate[cell];
+
+    /* Decode cell 3D index */
+    int gs = grid_size;
+    int gs2 = gs * gs;
+    int ck = int(cell) / gs2;
+    int rem = int(cell) - ck * gs2;
+    int cj = rem / gs;
+    int ci = rem - cj * gs;
+
+    float half_gs = float(gs) * 0.5;
+    vec3 center = vec3(
+        (float(ci) - half_gs + 0.5) * cell_size,
+        (float(cj) - half_gs + 0.5) * cell_size,
+        (float(ck) - half_gs + 0.5) * cell_size
+    );
+
+    /* Allocate meshlet slot */
+    uint slot = atomicAdd(meshlet_count, 1);
+    if (slot >= max_meshlets) return;
+
+    uint base_vert = slot * 240;
+
+    /* Cell index for atlas tile lookup */
+    float cell_idx_f = float(cell);
+
+    /* Expand 80 triangles into 240 vertices */
+    for (uint tri = 0; tri < 80; tri++) {
+        for (uint v = 0; v < 3; v++) {
+            uint src_idx = tmpl_idx[tri * 3 + v];
+            vec3 pos = tmpl_pos[src_idx].xyz;
+
+            vec3 world_pos = (center + pos * shell_radius) * world_scale;
+
+            uint dst = base_vert + tri * 3 + v;
+            out_pos[dst] = vec4(world_pos, 1.0);
+            /* xyz = unit sphere normal, w = cell index for atlas lookup */
+            out_nv[dst]  = vec4(pos, cell_idx_f);
+        }
+    }
+
+    atomicMax(vertexCount, (slot + 1) * 240);
+}
