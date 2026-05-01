@@ -3,9 +3,12 @@
 /*
  * Gaussian splat vertex shader — instanced quad expansion.
  *
- * Each particle (instance) expands to a screen-aligned quad.
- * gl_InstanceIndex = particle index, gl_VertexIndex = quad corner (0-5).
- * Render params via UBO (binding 5).
+ * Each particle (instance) expands to a screen-aligned quad (2 triangles, 6 verts).
+ * gl_InstanceIndex = particle index into SoA buffers
+ * gl_VertexIndex = quad corner (0-5)
+ *
+ * Hemisphere culling: when cull_mode > 0, discard particles
+ * behind the camera plane.
  */
 
 layout(location = 0) out vec2  v_uv;
@@ -16,17 +19,17 @@ layout(set = 0, binding = 1) buffer BufY { float py[]; };
 layout(set = 0, binding = 2) buffer BufZ { float pz[]; };
 layout(set = 0, binding = 3) buffer BufC { float cv[]; };
 
-layout(set = 0, binding = 5) uniform RenderParams {
+layout(push_constant) uniform PC {
     mat4  viewProj;
+    float point_size;
+    float val_min;
+    float val_max;
+    float world_scale;
     float cam_x;
     float cam_y;
     float cam_z;
     float cull_mode;
-    float val_min;
-    float val_max;
-    float world_scale;
-    float pad;
-} rp;
+} pc;
 
 void main() {
     int particle = gl_InstanceIndex;
@@ -43,11 +46,11 @@ void main() {
 
     vec2 offset = corners[corner];
 
-    vec3 world_pos = vec3(px[particle], py[particle], pz[particle]) * rp.world_scale;
+    vec3 world_pos = vec3(px[particle], py[particle], pz[particle]) * pc.world_scale;
 
     // Hemisphere cull
-    if (rp.cull_mode > 0.5) {
-        vec3 cam = vec3(rp.cam_x, rp.cam_y, rp.cam_z);
+    if (pc.cull_mode > 0.5) {
+        vec3 cam = vec3(pc.cam_x, pc.cam_y, pc.cam_z);
         vec3 cam_fwd = normalize(-cam);
         float d = dot(world_pos - cam, cam_fwd);
         if (d < 0.0) {
@@ -58,13 +61,12 @@ void main() {
         }
     }
 
-    vec4 clip_center = rp.viewProj * vec4(world_pos, 1.0);
+    vec4 clip_center = pc.viewProj * vec4(world_pos, 1.0);
 
     float raw_val = cv[particle];
-    float t = clamp((raw_val - rp.val_min) / (rp.val_max - rp.val_min + 1e-10), 0.0, 1.0);
+    float t = clamp((raw_val - pc.val_min) / (pc.val_max - pc.val_min + 1e-10), 0.0, 1.0);
 
-    // Splat size: 0.003 base, scaled by energy
-    float radius = 0.003 * (0.5 + t);
+    float radius = pc.point_size * (0.5 + t);
 
     gl_Position = clip_center;
     gl_Position.xy += offset * radius * clip_center.w;

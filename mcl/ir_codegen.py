@@ -948,6 +948,12 @@ class IRCodeGen:
                     self._put(f"ergo_vk_set_render_offset("
                               f"(size_t)_pp_wr_offset * sizeof(float));")
                 self._put(f"if (getenv(\"ERGO_RENDER\") && "
+                          f"strcmp(getenv(\"ERGO_RENDER\"), \"grid\") == 0)")
+                self._put(f"  ergo_vk_render_grid_gaussians("
+                          f"d_GRID_GRAD_X, d_GRID_GRAD_Y, "
+                          f"d_GRID_GRAD_Z, d_GRID_MET_GATE, "
+                          f"GRID_SIZE, _vmin, _vmax, {ws});")
+                self._put(f"else if (getenv(\"ERGO_RENDER\") && "
                           f"strcmp(getenv(\"ERGO_RENDER\"), \"gauss\") == 0)")
                 self._put(f"  ergo_vk_render_gaussians("
                           f"d_{particle['pos_x']}, d_{particle['pos_y']}, "

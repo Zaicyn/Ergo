@@ -229,6 +229,23 @@ void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
                                float world_scale);
 
 /*
+ * Render grid cells as gaussian splats (O(cells) instead of O(particles)).
+ * Reads grid density, gradients, and metabolic gate directly.
+ *
+ * buf_grad_x:   GRID_GRAD_X buffer (float, flattened 3D)
+ * buf_grad_y:   GRID_GRAD_Y buffer (float)
+ * buf_grad_z:   GRID_GRAD_Z buffer (float)
+ * buf_met_gate: GRID_MET_GATE buffer (float)
+ * grid_size:    Grid dimension (32)
+ * val_min, val_max: value range for color mapping
+ * world_scale:  1/world_radius
+ */
+void ergo_vk_render_grid_gaussians(ErgoVkBuf buf_grad_x, ErgoVkBuf buf_grad_y,
+                                    ErgoVkBuf buf_grad_z, ErgoVkBuf buf_met_gate,
+                                    int grid_size, float val_min, float val_max,
+                                    float world_scale);
+
+/*
  * Poll window events. Returns 1 if the window should close.
  */
 int ergo_vk_should_close(void);
