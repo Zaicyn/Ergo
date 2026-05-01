@@ -1,13 +1,9 @@
 #version 450
 
 /*
- * Atlas generation compute shader — per-cell octahedral tiles.
- *
- * One thread per particle. Writes heat palette color into a flat
- * SSBO atlas buffer (2048 x 4096 = 8M pixels, packed as uint RGBA8).
- *
- * Atlas layout: 128 x 256 tiles of 16x16 pixels
- * Cell index i maps to tile (i % 128, i / 128)
+ * Atlas generation compute shader — per-cell tiles.
+ * Uses Collignon quincuncial equal-area projection (Appendix B of Petroff 2021).
+ * Every texel covers equal solid angle — no area distortion.
  */
 
 layout(local_size_x = 256) in;
@@ -16,8 +12,6 @@ layout(set = 0, binding = 0) readonly buffer BufX { float px[]; };
 layout(set = 0, binding = 1) readonly buffer BufY { float py[]; };
 layout(set = 0, binding = 2) readonly buffer BufZ { float pz[]; };
 layout(set = 0, binding = 3) readonly buffer BufC { float cv[]; };
-
-/* Atlas as flat SSBO — 2048*4096 uint32 pixels (RGBA8 packed) */
 layout(set = 0, binding = 4) buffer AtlasBuf { uint atlas_pixels[]; };
 
 layout(push_constant) uniform PC {
@@ -26,22 +20,47 @@ layout(push_constant) uniform PC {
     float cell_size;
     float val_min;
     float val_max;
-    float pad1;
-    float pad2;
-    float pad3;
+    float pad1, pad2, pad3;
 };
 
-vec2 dir_to_octa_uv(vec3 n) {
-    n /= (abs(n.x) + abs(n.y) + abs(n.z));
-    if (n.z < 0.0) {
-        vec2 wrapped = (1.0 - abs(n.yx)) * vec2(
-            n.x >= 0.0 ? 1.0 : -1.0,
-            n.y >= 0.0 ? 1.0 : -1.0
-        );
-        n.x = wrapped.x;
-        n.y = wrapped.y;
-    }
-    return n.xy * 0.5 + 0.5;
+#define PI 3.14159265359
+#define SQRT2 1.41421356237
+
+/* Collignon quincuncial equal-area projection.
+ * Input: direction vector (will be normalized).
+ * Output: (x,y) in [-1, 1] mapped to [0, 1] UV. */
+vec2 equal_area_octa_uv(vec3 dir) {
+    dir = normalize(dir);
+
+    /* Convert to spherical: latitude phi, longitude lambda */
+    float phi = asin(clamp(dir.y, -1.0, 1.0));          /* [-pi/2, pi/2] */
+    float lambda = atan(dir.x, dir.z);                   /* [-pi, pi] */
+
+    /* Collignon quincuncial (Petroff 2021 Appendix B, eq 75-81) */
+    int q = int(floor(2.0 * lambda / PI));               /* octant 0-3 */
+    if (lambda < 0.0) q -= 1;                            /* handle negative */
+    q = clamp(q, -2, 1);
+
+    float lambda_0 = lambda - (PI / 2.0) * float(q) - PI / 4.0;
+
+    float cos_phi = cos(abs(phi) / 2.0 + PI / 4.0);
+
+    float x = -(2.0 * SQRT2 / PI) * lambda_0 * cos_phi;
+    float y;
+    if (phi < 0.0)
+        y = 1.0 - cos_phi / SQRT2;
+    else
+        y = cos_phi / SQRT2;
+
+    /* Rotate by octant */
+    float xt, yt;
+    if (q == 0)       { xt = x + y;  yt = x - y; }
+    else if (q == 1)  { xt = -x - y; yt = x - y; }
+    else if (q == -1) { xt = x + y;  yt = -x + y; }
+    else              { xt = -x - y; yt = -x + y; } /* q == -2 */
+
+    /* Map from [-1,1] to [0,1] */
+    return clamp(vec2(xt, yt) * 0.5 + 0.5, vec2(0.0), vec2(1.0));
 }
 
 void main() {
@@ -50,7 +69,6 @@ void main() {
 
     vec3 pos = vec3(px[idx], py[idx], pz[idx]);
 
-    /* Determine grid cell */
     int gs = grid_size;
     float half_extent = float(gs) * 0.5 * cell_size;
 
@@ -60,42 +78,34 @@ void main() {
 
     int cell_idx = ck * gs * gs + cj * gs + ci;
 
-    /* Cell center */
-    vec3 center = vec3(
+    vec3 cell_center = vec3(
         (float(ci) - float(gs) * 0.5 + 0.5) * cell_size,
         (float(cj) - float(gs) * 0.5 + 0.5) * cell_size,
         (float(ck) - float(gs) * 0.5 + 0.5) * cell_size
     );
 
-    /* Direction from cell center to particle */
-    vec3 dir = pos - center;
-    float dist = length(dir);
-    if (dist < 1e-8) return;
-    dir /= dist;
+    vec3 dir = pos - cell_center;
+    if (length(dir) < 1e-8) return;
 
-    /* Octa UV within 16x16 tile */
-    vec2 uv = dir_to_octa_uv(dir);
-    ivec2 local_px = clamp(ivec2(uv * 16.0), ivec2(0), ivec2(15));
+    vec2 uv = equal_area_octa_uv(dir);
+    ivec2 local_px = clamp(ivec2(uv * 64.0), ivec2(0), ivec2(63));
 
-    /* Atlas pixel position */
     int tile_x = cell_idx % 128;
     int tile_y = cell_idx / 128;
-    ivec2 atlas_px = ivec2(tile_x * 16, tile_y * 16) + local_px;
+    ivec2 tile_origin = ivec2(tile_x * 64, tile_y * 64);
 
-    /* Heat palette */
     float t = clamp((cv[idx] - val_min) / (val_max - val_min + 1e-10), 0.0, 1.0);
     float r = clamp(t * 4.0 - 2.0, 0.0, 1.0);
     float g_val = clamp(1.0 - abs(t * 4.0 - 2.0), 0.0, 1.0) +
                   clamp(t * 4.0 - 2.0, 0.0, 1.0) * step(0.5, t);
     float b = clamp(1.0 - t * 4.0, 0.0, 1.0);
 
-    /* Pack RGBA8 as uint32 */
     uint packed = (uint(r * 255.0) & 0xFFu) |
-                  ((uint(g_val * 255.0) & 0xFFu) << 8u) |
+                  ((uint(clamp(g_val, 0.0, 1.0) * 255.0) & 0xFFu) << 8u) |
                   ((uint(b * 255.0) & 0xFFu) << 16u) |
                   (0xFFu << 24u);
 
-    /* Write to atlas (last-write-wins for overlapping particles) */
-    uint pixel_idx = uint(atlas_px.y) * 2048u + uint(atlas_px.x);
+    ivec2 atlas_px = tile_origin + local_px;
+    uint pixel_idx = uint(atlas_px.y) * 8192u + uint(atlas_px.x);
     atlas_pixels[pixel_idx] = packed;
 }

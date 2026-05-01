@@ -3219,9 +3219,9 @@ static void octa_render_points(int n_points, float val_min, float val_max,
 
 /* ── Per-cell octahedral atlas ──────────────────────────── */
 
-#define ATLAS_W 2048
-#define ATLAS_H 4096
-#define TILE_SIZE 16
+#define TILE_SIZE 64
+#define ATLAS_W (128 * TILE_SIZE)   /* 8192 */
+#define ATLAS_H (256 * TILE_SIZE)   /* 16384 */
 
 static ErgoVkPipe g_atlas_gen_pipe;
 static ErgoVkBuf  g_atlas_ssbo;  /* 2048*4096 uint32 = 32MB */
