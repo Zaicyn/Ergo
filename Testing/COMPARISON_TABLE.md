@@ -252,6 +252,113 @@ with 4 GB of arrays (near the RTX 2060 ceiling) would pay
 ~76 ms of one-time allocation cost. Still amortizable; still
 invisible against a multi-minute simulation runtime.
 
+## Sub-table 2b: GPU instruction-count characterization
+
+This is a *characterization*, not a comparison. The two systems
+emit code at different abstraction levels and counting their ops
+side-by-side requires a structural disclaimer up front.
+
+**The abstraction-level mismatch:**
+
+Ergo emits SPIRV, which is an intermediate representation that the
+NVIDIA Vulkan driver re-compiles into SASS at pipeline-creation
+time. V8 emits CUDA C++ that nvcc compiles to PTX that ptxas
+compiles to SASS — the same hardware ISA Ergo's SPIRV eventually
+reaches via a different compilation path. **A SPIRV op count and a
+SASS op count are not the same kind of number**, in either
+direction:
+
+- *SPIRV "expensive" → SASS "cheap"*: `OpAccessChain` is a
+  non-trivial address-computation op at the SPIRV level, but on
+  NVIDIA Vulkan it typically folds into the addressing mode of the
+  following load — contributing zero standalone SASS instructions.
+- *SPIRV "cheap" → SASS "expensive"*: `OpLoad` from a
+  StorageBuffer is a single SPIRV op, but on cache-cold paths it
+  lowers to LDG + dependency stalls totaling many cycles of
+  effective cost.
+
+There is no monotonic relationship between SPIRV op count and
+SASS op count, and no honest way to normalize them into a single
+comparable number. The table below characterizes *what each system
+does in its hot path* and leaves the reader to draw conclusions
+about where the work lives.
+
+### Ergo hot-path SPIRV ops (galaxy_structured, kernel_4 = SIM_PHYSICS_STEP)
+
+| Operation | SPIRV op count | What it is |
+|---|---:|---|
+| **Per-particle physics kernel (full body)** | 1,112 | All work for one particle-step: force computation, integration, branching for state transitions, multiple buffer reads/writes. No inner loops; straight-line code with 28 selection-merge regions (predicated IFs). |
+| **1D buffer access (e.g., POS_X(I))** | 3 | `OpISub` (1-based→0-based) + `OpAccessChain` + `OpLoad`. Two if the index is already 0-based. |
+| **3D buffer access (GRID_DENSITY(CI, CJ, CK))** | 10 | 3× `OpISub` (per-dim 1→0) + 3× `OpIMul` (strides; one redundant `× GRID_SIZE` for the K-stride) + 2× `OpIAdd` (combine) + `OpAccessChain` + `OpLoad`. |
+
+Op-mix breakdown of the 1,112-op physics kernel: 156 FMul, 144
+AccessChain, 126 Load, 91 ISub, 71 IAdd, 67 FAdd, 42 IMul, 32
+Store, 28 SelectionMerge, 28 BranchConditional, 22 Phi, plus
+smaller counts of FDiv, ExtInst (math built-ins), GroupNonUniform-
+Shuffle, etc.
+
+### V8 hot-path SASS ops (aizawa_slab_test, slab_stress_kernel)
+
+Numbers from [V8/COMPILER_DETERMINISM.md](V8/COMPILER_DETERMINISM.md)
+and [V8_VS_V22_HEAD_TO_HEAD.md](V8_VS_V22_HEAD_TO_HEAD.md). Not
+re-derived here.
+
+| Operation | SASS op count | What it is |
+|---|---:|---|
+| **viviani_slab_alloc fast path** | 10-30 amortized | Bitmap-bit claim via atomicAnd + warp-cooperative ballot + slot-to-pointer arithmetic. The range varies by class and warp-lifetime amortization of the first-range-claim setup (~100 SASS instr amortized over hundreds of allocs). |
+| **Bitmap claim inner atomic** | 4-8 | `ATOMG.E.AND.STRONG.GPU` + `__ballot_sync` + `__popc` + a conditional check on the old-value bit. |
+| **Slot-to-pointer arithmetic** | 2-3 | `MAD` or `MUL + ADD` to compute `sb->data + slot * stride`. |
+
+### What this characterization shows
+
+Each system spends its hot-path ops on what's structurally
+load-bearing for its design:
+
+- **V8 spends its ops on warp-cooperative slot allocation** — the
+  bitmap atomic, ballot consensus, and slot-to-pointer arithmetic
+  are all about coordinating 32 lanes claiming distinct slots from
+  a shared structure. The per-lane SASS budget (10-30 ops) is
+  small because the operation is simple at the algorithmic level
+  even if it requires careful warp coordination.
+
+- **Ergo spends its ops on multi-dim index linearization and
+  physics work** — most of the 1,112 SPIRV ops in the physics
+  kernel are arithmetic (FMul, FAdd, FMA-able pairs) doing actual
+  physics, not addressing. The 3D-access overhead (10 ops vs the
+  3 ops of a 1D access) is the cost of Ergo's multi-dim array
+  abstraction — every multi-dim buffer access pays it. Whether
+  it survives to SASS depends on the driver's ability to fold
+  strides into addressing modes, which it can do for some patterns
+  and can't for others.
+
+Both are legitimate work. Neither maps cleanly onto the other.
+The "1,112 SPIRV ops" headline for Ergo and the "10-30 SASS ops"
+headline for V8 are answering different questions: Ergo's number
+is "what does one particle-step of physics look like?", V8's is
+"what does one slot claim look like?" The reader who wants to
+know "is Ergo's kernel as efficient as V8's hot path" needs to ask
+a different question — see calibration below.
+
+### Calibration: physics kernel ops vs hardware budget
+
+For what it's worth: galaxy_structured at 30M particles × 60 FPS
+× 1,112 SPIRV ops per particle-step = **2.0 T SPIRV-ops/sec** sustained
+demand. The RTX 2060's peak FP32 throughput is ~6.5 TFLOPS; the
+sustained SASS-op rate across all SMs is a fraction of that.
+
+For 2.0 T SPIRV-ops/sec to fit on a 2060, the SPIRV→SASS expansion
+ratio has to average well under 1 — many SPIRV ops must fold into
+addressing modes, fuse into FMAs, or vectorize. The measured 60-74
+FPS sustained for galaxy_structured at this scale means it does fit;
+the driver is achieving the necessary folding. **No follow-up SPIRV
+peephole work is suggested by this calibration**; the kernel is
+running within hardware budget at the measured throughput.
+
+(If the kernel ran at, say, 5 FPS instead of 60, the same 1,112
+SPIRV ops would imply a SPIRV→SASS expansion ratio that exceeds
+hardware capacity by 12×, suggesting a real performance problem.
+The math goes the other way too.)
+
 ## Sub-table 3: Features and determinism
 
 Qualitative comparison. Not throughput.
@@ -326,11 +433,16 @@ relies on the Vulkan API contract.
   full characterization with falsified-hypothesis trail and four
   per-size diagnostic measurements.
 
-- **Pass 3 (GPU instruction-count comparison)**: still TBD. SPIRV
-  buffer-access pattern (Ergo) vs SASS hot path (V8) at the
-  instruction-count level. The cross-API abstraction-level mismatch
-  (Ergo emits SPIRV; V8 emits SASS) means this is structurally
-  limited but still informative per the brief's guidance. Next.
+- **Pass 3 (GPU instruction-count comparison)**: ✅ **Complete.**
+  Characterization in Sub-table 2b above. The Ergo physics kernel
+  is 1,112 SPIRV ops/particle-step (galaxy_structured kernel_4);
+  V8's slab fast path is 10-30 SASS ops/lane. The numbers answer
+  different questions (full-physics-step vs. one slot-claim) and
+  the abstraction-level mismatch is explicit in the section
+  preamble. Calibration: galaxy_structured at 30M @ 60 FPS implies
+  SPIRV→SASS expansion ratio averaging well under 1, which the
+  driver achieves via addressing-mode folding and FMA fusion. No
+  follow-up peephole work suggested by the op count.
 
 - **Cross-machine determinism for Ergo GPU**: Sub-table 3 has TBD
   for Ergo GPU bit-identical-across-machines. Determined by whether
