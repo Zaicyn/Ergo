@@ -24,6 +24,8 @@
 !Testing/**/*.md
 !Testing/Makefile
 !Testing/**/Makefile
+!Testing/*.c
+!Testing/*.cu
 !Testing/V8/*.cu
 !Testing/V8/*.cuh
 !Testing/V8/*.h
