@@ -1,5 +1,36 @@
 # x86 Determinism Fix — Implementation Brief
 
+## Status (as of stage 3 landing)
+
+- **Stage 1: landed** (commit 1093c77). DETERMINISTIC_FLAGS at four
+  GCC call sites. Galaxy hash `372e6c0230b53b92` stable.
+- **Stage 2: landed** (commit dccc79e). `--fast-math` split into
+  `--cpu-fast-math` / `--gpu-fast-math` with one-release deprecation
+  alias. 5-row validation matrix passed.
+- **Stage 3: landed** (commits 802e939, 699f7c0, 71fb024, a67ef6c).
+  Spec errata pass (8 stale flag references renamed) + Part 9.9
+  implementation-status paragraph + Determinism Contract (x86)
+  section in Part 7 + audit/brief Part 6→7 correction.
+
+- **Stage 4: deferred.** Configurable flag surface (`--cpu-opt`,
+  `--cpu-march`, `--cpu-fp-contract`). **Trigger:** ARM or RISC-V
+  port begins. Until then, the hardcoded x86-64-v3 defaults are
+  correct and the abstraction would be over-engineering. The
+  deprecation-alias precedent from stage 2 is the template for the
+  CLI surface change when this is activated.
+
+- **Stage 5: deferred.** OpenMP reduction pragmas above
+  SUM/DOT_PRODUCT/NORM2 loops. **Trigger:** profiling shows reduction
+  loops are a bottleneck. Stage 1's `-O3 -march=x86-64-v3
+  -ffp-contract=fast` already delivers SIMD on non-reduction loops;
+  reductions are the specifically-blocked case under strict IEEE.
+  Cost when activated: requires `-fopenmp`, makes determinism
+  per-thread-count rather than universal.
+
+No brief should be written for stages 4-5 until their triggers fire.
+Speculative briefs age poorly; the audit + this brief's existing
+stage 4/5 stubs are enough scaffolding when a concrete need surfaces.
+
 ## Corrections vs original brief
 
 Three gaps were caught during stage 1 implementation. Documented here so
@@ -327,7 +358,7 @@ audit; spec/code gap is currently flagged in a comment, not fixed).
 
 ## Stage 3 — Document the determinism contract in the spec
 
-**Goal:** [Spec/MCL_Design_COMPLETE.md](MCL_Design_COMPLETE.md) Part 6
+**Goal:** [Spec/MCL_Design_COMPLETE.md](MCL_Design_COMPLETE.md) Part 7
 states the determinism guarantees Ergo provides, with explicit reference
 to the build flags and the V8/V22 empirical work.
 
@@ -339,7 +370,10 @@ just in the implementer's head.
 
 **Change in [Spec/MCL_Design_COMPLETE.md](MCL_Design_COMPLETE.md):**
 
-Add a subsection to Part 6, after "Expression Evaluation Order (Locked)":
+Add a subsection to Part 7, after "IEEE Semantics for Math Intrinsics"
+(the brief originally said "Part 6, after Expression Evaluation Order";
+both were wrong — Part 6 is a 4-bullet checklist with no subsections,
+and "Expression Evaluation Order (Locked)" lives in Part 7):
 
 ```markdown
 ### Determinism Contract (x86)
@@ -390,7 +424,11 @@ Verify by:
    don't ship a contract you don't enforce.
 
 **Out of scope:** any change to existing spec sections beyond adding the
-new subsection. Don't reorganize Part 6 to accommodate it; just append.
+new subsection. Don't reorganize Part 7 to accommodate it; just append.
+(Stage 3 landed an errata-only flag-name rename across 8 stale
+`--fast-math` references and one implementation-status paragraph in
+Part 9.9 — those are factual corrections to keep the spec consistent
+with stages 1-2, not reorganization.)
 
 ## Stage 4 — Add configurable flag surface (deferred)
 
@@ -473,7 +511,7 @@ hours when picked up.
   yourself wanting to modify generated C to "help" the compiler, stop
   — that's a separate project with a separate brief.
 - **Don't optimize the spec wording in stage 3.** Add the new subsection.
-  Don't reorganize Part 6 around it. Spec churn produces review burden
+  Don't reorganize Part 7 around it. Spec churn produces review burden
   out of proportion to the value.
 - **Don't expand `-march=x86-64-v3` to `-march=native`.** Native means
   "fast on the build machine, undefined on others." For an Ergo program

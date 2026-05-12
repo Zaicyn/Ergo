@@ -410,7 +410,7 @@ This guarantees **bitwise reproducible results** across compilations and platfor
 
 Rationale: Simulation science requires reproducibility. A cell colony that produces different population dynamics on different compiler versions is useless for validation. The slight performance cost of strict evaluation order (preventing reassociation optimizations) is acceptable — the C backend at `-O2` still vectorizes loop bodies, which is where the real performance lives.
 
-Note: A future `--fast-math` flag may relax this rule for workloads where reproducibility is less important than speed. When enabled, the compiler may reassociate, fuse multiply-adds, and use non-NaN-preserving min/max. This must be opt-in, never default.
+Note: The `--cpu-fast-math` flag may relax this rule for workloads where reproducibility is less important than speed. When enabled, the compiler may reassociate, fuse multiply-adds, and use non-NaN-preserving min/max. This must be opt-in, never default.
 
 ### IEEE Semantics for Math Intrinsics
 
@@ -419,10 +419,59 @@ By default, all math intrinsics follow IEEE 754 semantics:
 - `SQRT` of negative values is a runtime error, not silent NaN
 - Division by zero behavior follows C99 rules
 
-Under `--fast-math`, these constraints are relaxed:
+Under `--cpu-fast-math`, these constraints are relaxed:
 - `CLAMP` may lower to `maxsd`/`minsd` (2 instructions, NaN not preserved)
 - `MIN`/`MAX` may use non-NaN-preserving comparisons
 - The compiler may fuse multiply-add operations
+
+### Determinism Contract (x86)
+
+Ergo guarantees bit-identical output across:
+- Repeated runs of the same binary on the same hardware.
+- Clean rebuilds of the same source on the same target triple with the
+  same compiler version and feature flags.
+
+This guarantee holds under the default build flags:
+`-O3 -march=x86-64-v3 -ffp-contract=fast -fno-math-errno -std=c11`.
+FMA is enabled by feature-level requirement (FMA3 is part of the
+`x86-64-v3` baseline), not by an explicit `-mfma`. The same source
+compiled twice with the same compiler version produces bit-identical
+program output even though the binaries themselves may differ in
+build-ID, timestamp, and similar non-semantic metadata.
+
+The guarantee does **not** extend to:
+- Cross-target builds (x86 vs ARM vs RISC-V). Each target has its own
+  determinism contract per its own audit.
+- Builds with `--cpu-fast-math`. This flag explicitly permits
+  reassociation and non-NaN-preserving min/max; bit-identity is
+  sacrificed for speed.
+- Builds with `--gpu-fast-math`. On supported GPU backends this weakens
+  FP guarantees (NVVM math intrinsic swap; SPIRV currently does not
+  consume the flag — see Part 9.9 implementation status).
+- Builds with different compiler versions (GCC 13 → GCC 14 may alter
+  bit patterns even under strict flags). Pin the compiler version for
+  long-term reproducibility.
+- Builds on CPUs without FMA support (`-ffp-contract=fast` becomes a
+  no-op). The `x86-64-v3` march requirement guarantees FMA; relaxing
+  it requires its own audit.
+
+Empirical basis: the recipe is validated by the V22 Squaragon work
+documented in `Testing/V22/COMPILER_DETERMINISM.md`. V22 is a
+hand-vectorized geometry primitive whose algebraic-zero residual
+provides a sensitive determinism oracle — small drift becomes
+detectable as a non-zero result. Under the recipe flags, the residual
+is bit-exactly `0.0`. Under `-ffast-math`, it drifts to ~0.053 over
+1M calls.
+
+**Validation tooling:** the `ERGO_HASH_FINAL=1` environment variable
+enables a runtime state-hash for regression validation. When set, the
+compiled binary hashes a canonical sequence of GPU particle arrays
+(POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT) at exit and
+prints `ERGO_FINAL_HASH=<16-hex-digits>` to stdout. See
+`mcl/ir_codegen.py:_emit_final_hash_hook` for details. The hook fires
+only when the program has GPU-resident state; CPU-only programs use
+inline source-level hashes (see `tests/sq2core.ergo` for the
+established pattern).
 
 ---
 
@@ -472,13 +521,13 @@ This creates a write conflict under parallel execution.
 If a loop is classified as SCATTER (see Part 9) and contains accumulation `A(idx) := A(idx) ⊕ value`, the compiler must:
 
 1. **Default mode (strict):** Serialize the loop. Results are identical to sequential execution. Bitwise reproducibility preserved.
-2. **`--fast-math` mode:** Emit atomic operations (`atomicAdd`, `atomicMin`, etc.). Accumulation order is undefined but numerically stable. Results are not bitwise identical to sequential execution.
+2. **`--gpu-fast-math` mode:** Emit atomic operations (`atomicAdd`, `atomicMin`, etc.). Accumulation order is undefined but numerically stable. Results are not bitwise identical to sequential execution.
 
 **CPU backend:** Always sequential execution (matches existing semantics).
 
-**GPU backend (default):** Serialize scatter loops unless `--fast-math` is enabled.
+**GPU backend (default):** Serialize scatter loops unless `--gpu-fast-math` is enabled.
 
-**GPU backend (`--fast-math`):** Emit `atomicAdd` for `+`, `atomicMin`/`atomicMax` for `MIN`/`MAX`. CAS loop for unsupported operations.
+**GPU backend (`--gpu-fast-math`):** Emit `atomicAdd` for `+`, `atomicMin`/`atomicMax` for `MIN`/`MAX`. CAS loop for unsupported operations.
 
 **Formal rule:** If a parallel loop contains non-unique writes, the compiler must either serialize execution or emit atomic operations with explicitly defined numerical semantics. Silent data races are never permitted.
 
@@ -529,7 +578,7 @@ These rules preserve all constraints from Parts 1-7:
 - Deterministic evaluation (sequential semantics are the default)
 - No implicit temporaries (register-level intermediates from fusion are not visible at the language level)
 
-**New guarantee:** Parallel execution is an implementation detail. Program semantics are identical to sequential execution unless `--fast-math` is enabled.
+**New guarantee:** Parallel execution is an implementation detail. Program semantics are identical to sequential execution unless `--gpu-fast-math` is enabled.
 
 ---
 
@@ -698,7 +747,7 @@ Dependence classification maps to execution strategy:
 | FLOW | MAP — gather/scatter kernel | Yes (asserted) | No | Yes | Yes |
 | SHIFT(k) | Sequential (wavefront future) | No (default) | No | No | Yes |
 | REDUCTION | Staged reduce (warp shuffle) | Staged | No | No | Yes |
-| SCATTER | Sequential or atomic | No (default) | Yes (`--fast-math`) | No | Yes (if serialized) |
+| SCATTER | Sequential or atomic | No (default) | Yes (`--gpu-fast-math`) | No | Yes (if serialized) |
 
 ### 9.7 Affine Analysis
 
@@ -733,9 +782,16 @@ cannot be ruled out, conservatively classify as SCATTER.
 INJECTIVE and FLOW are parallel-safe. SHIFT and SCATTER are serialized.
 REDUCTION uses deterministic staged reduction.
 
-**`--fast-math` mode:** SCATTER may use atomic operations with non-deterministic
+**`--gpu-fast-math` mode:** SCATTER may use atomic operations with non-deterministic
 accumulation order. Only allowed if the operation is associative or the user
 accepts numerical variation.
+
+**Implementation status:** as of this writing, the SPIRV backend emits atomics
+unconditionally for any SCATTER kernel with read-modify-write at a runtime
+index. The `--gpu-fast-math` gate described above is plumbed through the
+backend constructor but not consulted at the atomic-emission site. Resolution
+(wire the gate to match this spec, vs. update this section to match the
+unconditional code) is open.
 
 ---
 

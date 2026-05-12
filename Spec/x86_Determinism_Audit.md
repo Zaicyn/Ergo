@@ -2,10 +2,18 @@
 
 The V22 work established an empirical recipe for bit-exact deterministic
 float math on x86 under GCC. Ergo's design promises the same property
-(Part 6 of [MCL_Design_COMPLETE.md](MCL_Design_COMPLETE.md): "bitwise
+(Part 7 of [MCL_Design_COMPLETE.md](MCL_Design_COMPLETE.md): "bitwise
 reproducible results across compilations and platforms"). This document
 audits whether Ergo's current build pipeline inherits V22's determinism
 guarantees in practice.
+
+**Errata (corrected post-implementation):** earlier drafts of this audit
+referenced "Part 6" for the bitwise-reproducibility quote and as the
+target for the new determinism contract section. Both are actually
+Part 7 ("STATIC Storage and Performance Constitution"). Part 6 in the
+current spec is a 4-bullet checklist with no subsections. The brief
+inherited this error and stage 3 landed the new contract section in
+Part 7 correctly.
 
 Reference: [Testing/V22/COMPILER_DETERMINISM.md](../Testing/V22/COMPILER_DETERMINISM.md).
 
@@ -120,7 +128,7 @@ This means **every Ergo program currently compiles at `-O0`**. Implications:
   of TINVAR — all of those are `-O2`+ optimizations. None are happening
   in the default build.
 
-This is a much bigger gap than the FP recipe. Spec Part 6's IEEE strictness
+This is a much bigger gap than the FP recipe. Spec Part 7's IEEE strictness
 is correct under `-O0` (no reassociation happens at all), but the
 performance and the "constitution" promises rely on optimization.
 
@@ -139,7 +147,7 @@ rule in Part 8.2 of the spec. These are two separate decisions:
    denormal flushing, reciprocal approximation, no-NaN assumptions.
    Per V22's measurements, this **drifts the algebraic-zero residual to
    ~0.053 over 1M calls** — exactly the kind of failure mode Ergo's
-   Part 6 promises won't happen.
+   Part 7 promises won't happen.
 
 A user enabling `--fast-math` to get atomic scatter on GPU also gets
 GCC's full reassociation on CPU silently. That's the trap V22 documents.
@@ -265,7 +273,7 @@ effect, they need to opt in explicitly.
 ### 3. Document the determinism contract in the spec.
 
 Add a section to [Spec/MCL_Design_COMPLETE.md](MCL_Design_COMPLETE.md)
-Part 6 (or a new appendix) stating:
+Part 7 (or a new appendix) stating:
 
 - Ergo guarantees bit-identical output across rebuilds *of the same source*
   *on the same target triple* *with the same feature flags*.
