@@ -416,6 +416,55 @@ Under `--cpu-fast-math`, these constraints are relaxed:
 - `MIN`/`MAX` may use non-NaN-preserving comparisons
 - The compiler may fuse multiply-add operations
 
+### Determinism Contract (x86)
+
+Ergo guarantees bit-identical output across:
+- Repeated runs of the same binary on the same hardware.
+- Clean rebuilds of the same source on the same target triple with the
+  same compiler version and feature flags.
+
+This guarantee holds under the default build flags:
+`-O3 -march=x86-64-v3 -ffp-contract=fast -fno-math-errno -std=c11`.
+FMA is enabled by feature-level requirement (FMA3 is part of the
+`x86-64-v3` baseline), not by an explicit `-mfma`. The same source
+compiled twice with the same compiler version produces bit-identical
+program output even though the binaries themselves may differ in
+build-ID, timestamp, and similar non-semantic metadata.
+
+The guarantee does **not** extend to:
+- Cross-target builds (x86 vs ARM vs RISC-V). Each target has its own
+  determinism contract per its own audit.
+- Builds with `--cpu-fast-math`. This flag explicitly permits
+  reassociation and non-NaN-preserving min/max; bit-identity is
+  sacrificed for speed.
+- Builds with `--gpu-fast-math`. On supported GPU backends this weakens
+  FP guarantees (NVVM math intrinsic swap; SPIRV currently does not
+  consume the flag — see Part 9.9 implementation status).
+- Builds with different compiler versions (GCC 13 → GCC 14 may alter
+  bit patterns even under strict flags). Pin the compiler version for
+  long-term reproducibility.
+- Builds on CPUs without FMA support (`-ffp-contract=fast` becomes a
+  no-op). The `x86-64-v3` march requirement guarantees FMA; relaxing
+  it requires its own audit.
+
+Empirical basis: the recipe is validated by the V22 Squaragon work
+documented in `Testing/V22/COMPILER_DETERMINISM.md`. V22 is a
+hand-vectorized geometry primitive whose algebraic-zero residual
+provides a sensitive determinism oracle — small drift becomes
+detectable as a non-zero result. Under the recipe flags, the residual
+is bit-exactly `0.0`. Under `-ffast-math`, it drifts to ~0.053 over
+1M calls.
+
+**Validation tooling:** the `ERGO_HASH_FINAL=1` environment variable
+enables a runtime state-hash for regression validation. When set, the
+compiled binary hashes a canonical sequence of GPU particle arrays
+(POS_X, POS_Y, POS_Z, VEL_X, VEL_Y, VEL_Z, OMEGA_NAT) at exit and
+prints `ERGO_FINAL_HASH=<16-hex-digits>` to stdout. See
+`mcl/ir_codegen.py:_emit_final_hash_hook` for details. The hook fires
+only when the program has GPU-resident state; CPU-only programs use
+inline source-level hashes (see `tests/sq2core.ergo` for the
+established pattern).
+
 ---
 
 ## Part 8: GPU Execution Model
