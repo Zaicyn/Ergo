@@ -62,10 +62,25 @@ def main():
              "runtime VRAM capping may reduce it further.",
     )
 
-    # Math
+    # Math — fast-math split into independent CPU/GPU controls.
+    # --fast-math kept as a one-release deprecation alias that sets both.
+    parser.add_argument(
+        "--cpu-fast-math", action="store_true",
+        help="Pass -ffast-math to GCC (allows reassociation, breaks IEEE; "
+             "use only when no algebraic invariants depend on bit-exact "
+             "float math)",
+    )
+    parser.add_argument(
+        "--gpu-fast-math", action="store_true",
+        help="Allow GPU fast-math intrinsics on supported backends (NVVM "
+             "math intrinsic swap). SPIRV currently does not consume this "
+             "flag; CPU codegen is unaffected",
+    )
     parser.add_argument(
         "--fast-math", action="store_true",
-        help="Enable -ffast-math (FP reassociation, no NaN/Inf safety)",
+        help="DEPRECATED: sets both --cpu-fast-math and --gpu-fast-math. "
+             "Use the specific flags instead. Will be removed in a "
+             "future release.",
     )
     parser.add_argument(
         "--precision", choices=["f32", "f64"], default="f64",
@@ -193,8 +208,21 @@ def main():
                       file=sys.stderr)
                 sys.exit(1)
 
+        # Resolve fast-math: deprecated --fast-math implies both new flags.
+        cpu_fast_math = args.cpu_fast_math
+        gpu_fast_math = args.gpu_fast_math
+        if args.fast_math:
+            print("WARNING: --fast-math is deprecated and applies BOTH "
+                  "--cpu-fast-math and --gpu-fast-math. Use the specific "
+                  "flags instead. See Spec/x86_Determinism_Audit.md for "
+                  "the rationale.", file=sys.stderr)
+            cpu_fast_math = True
+            gpu_fast_math = True
+
         c_code = compile_file(args.source, output=args.output, emit_c=args.emit_c,
-                              fast_math=args.fast_math, target=args.target,
+                              cpu_fast_math=cpu_fast_math,
+                              gpu_fast_math=gpu_fast_math,
+                              target=args.target,
                               no_split=args.no_split,
                               render=args.render,
                               promote_locals=args.promote_locals,

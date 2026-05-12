@@ -44,6 +44,38 @@ stages 2+ pick them up:
    when `_gpu_arrays()` is empty. ~20 LOC. Removes the need for inline
    per-test hashes. Not in stage 1 scope.
 
+Two further corrections were caught during stage 2 implementation:
+
+4. **The SPIRV backend does not currently consume `fast_math` for
+   atomic emission.** The original brief framed stage 2 as "split the
+   single flag because it currently controls both SPIRV scatter
+   atomics and GCC `-ffast-math` simultaneously, which is a hazard."
+   Pre-flight grep showed only the **NVVM** backend reads `fast_math`
+   (to swap math intrinsics at
+   [mcl/backends/nvvm.py:371,590](../mcl/backends/nvvm.py#L371)).
+   The SPIRV backend plumbs the flag through `__init__` but never
+   branches on it. SCATTER atomic emission is gated by static
+   analysis (`atomic_arrays` populated in [mcl/ir_gpu.py:1802](../mcl/ir_gpu.py#L1802)),
+   not by the flag. The hazard the brief described is therefore
+   latent — the flag controls GCC `-ffast-math` + NVVM math intrinsics
+   today, not SPIRV atomics. Stage 2 still splits the flag (the
+   underlying argument that CPU and GPU FP concerns are independent
+   remains correct), but the SPIRV side is now a no-op consumer with
+   a comment flagging the spec/code gap at
+   [mcl/ir_gpu.py:15](../mcl/ir_gpu.py#L15). Future work either wires
+   the gate to match the spec or updates the spec to match the code;
+   both are valid.
+
+5. **`jit()` is signature-broken outright (no deprecation alias).**
+   The original brief noted that callers of `jit()` need updating but
+   didn't specify the migration policy. Pre-flight grep found zero
+   non-docstring callers of `jit()` anywhere in the codebase. The CLI
+   gets a one-release deprecation alias because human users type
+   `--fast-math` from memory; the Python API gets a hard break because
+   internal callers are version-pinned and have a git diff to read.
+   If a future grep finds an external `jit()` caller before stage 2
+   ships in a release, revisit and add the alias.
+
 ## What this is
 
 Ergo's C-backend build pipeline currently inherits none of the
@@ -184,98 +216,114 @@ What matters is post-change stability.
 
 ## Stage 2 — Split `--fast-math` into `--gpu-fast-math` and `--cpu-fast-math`
 
-**Goal:** the `--fast-math` CLI flag no longer silently applies GCC
-`-ffast-math` alongside SPIRV scatter atomics. Users opt into each
-explicitly.
+**Goal:** the `--fast-math` CLI flag no longer conflates GCC `-ffast-math`
+with GPU fast-math intrinsic selection. Users opt into each explicitly.
 
-**Why:** per the audit, the current single flag is a hazard — anyone
-enabling it for GPU scatter atomics also gets full reassociation on CPU
-code, which V22 measured as drifting the algebraic-zero residual to ~0.053
-over 1M calls. The two concerns are independent and should be controllable
-independently.
+**Why:** the two concerns are independent and should be controllable
+independently. Today the single flag controls GCC `-ffast-math` (at all
+four GCC call sites) *and* NVVM math intrinsic selection (at
+[mcl/backends/nvvm.py:371,590](../mcl/backends/nvvm.py#L371)). The
+SPIRV backend does not currently consume the flag — see Correction 4
+above — but the audit's underlying argument (CPU FP determinism and
+GPU FP determinism are separate audits, and users may want one without
+the other) still applies. V22 measured the algebraic-zero residual
+drifting to ~0.053 over 1M calls under `-ffast-math`; that's a CPU
+result, but the analogous GPU question is its own audit.
 
 **Change in [mcl/__main__.py](../mcl/__main__.py):**
 
-Add two new flags:
+Two new flags plus a deprecation alias:
 
 ```python
 parser.add_argument(
-    "--gpu-fast-math", action="store_true",
-    help="Allow GPU scatter atomics (loosens determinism on SPIRV "
-         "scatter reductions only; CPU codegen unaffected)",
-)
-parser.add_argument(
     "--cpu-fast-math", action="store_true",
-    help="Pass -ffast-math to GCC (allows reassociation, breaks IEEE; "
-         "use only when you've verified no algebraic invariants depend "
-         "on bit-exact float math)",
-)
+    help="Pass -ffast-math to GCC (breaks IEEE determinism)")
+parser.add_argument(
+    "--gpu-fast-math", action="store_true",
+    help="Allow GPU fast-math intrinsics on supported backends "
+         "(NVVM math intrinsic swap). SPIRV currently does not "
+         "consume this flag")
+parser.add_argument(
+    "--fast-math", action="store_true",
+    help="DEPRECATED: sets both --cpu-fast-math and --gpu-fast-math")
 ```
 
-Keep `--fast-math` for one release as a **deprecation alias** that sets
-both new flags and prints a warning to stderr:
+In the CLI dispatch, resolve the alias before passing to `compile_file`:
 
-```
-WARNING: --fast-math is deprecated and applies BOTH --gpu-fast-math and
---cpu-fast-math. Use the specific flags instead. See
-Spec/x86_Determinism_Audit.md for the rationale.
+```python
+cpu_fast_math = args.cpu_fast_math
+gpu_fast_math = args.gpu_fast_math
+if args.fast_math:
+    print("WARNING: --fast-math is deprecated and applies BOTH "
+          "--cpu-fast-math and --gpu-fast-math. ...", file=sys.stderr)
+    cpu_fast_math = True
+    gpu_fast_math = True
 ```
 
 This avoids breaking existing user invocations while signalling the
 change. Remove the alias entirely in a future release.
 
-**Change in [mcl/driver.py](../mcl/driver.py) and [mcl/jit.py](../mcl/jit.py):**
+**Change in [mcl/driver.py](../mcl/driver.py), [mcl/jit.py](../mcl/jit.py),
+and the backend constructors:**
 
-The current `fast_math: bool` parameter to `compile_source`,
-`_compile_target`, and `jit(...)` becomes two parameters:
-`gpu_fast_math: bool` and `cpu_fast_math: bool`. Update all four GCC
-call sites:
+Every `fast_math: bool` parameter becomes two:
 
-```python
-if cpu_fast_math:
-    gcc_flags.append("-ffast-math")
-```
+- `cpu_fast_math: bool` — gates the four GCC call sites' `-ffast-math`
+  emission (driver.py x3, jit.py x1).
+- `gpu_fast_math: bool` — gates GPU FP relaxation. Renamed on the
+  backend constructors ([mcl/backends/__init__.py:36](../mcl/backends/__init__.py#L36),
+  spirv.py, nvvm.py). NVVM reads it at lines 371, 590 to swap math
+  intrinsics. SPIRV plumbs it through but currently doesn't read it —
+  see Correction 4 in the corrections section, and the comment at
+  [mcl/ir_gpu.py:15](../mcl/ir_gpu.py#L15). Leave the SPIRV plumbing
+  in place even though it's a no-op consumer; future GPU-FP work will
+  use it.
 
-The SPIRV backend's atomic-emission rule reads `gpu_fast_math` instead of
-`fast_math`. Find the read site in [mcl/backends/spirv.py](../mcl/backends/spirv.py)
-or wherever Part 8.2's "fast-math mode" check lives, and update it.
+The JIT path accepts both new kwargs for signature parity with
+`compile_file`, even though `gpu_fast_math` is a no-op there (JIT is
+CPU-only). Hard signature break — grep showed no live callers before
+the change. If a future grep before stage 2 ships finds an external
+caller, revisit and add a deprecation alias.
 
-The JIT path currently has a `fast_math: bool = False` keyword argument
-on `jit(...)` ([mcl/jit.py:122](../mcl/jit.py#L122)). Splitting it is
-a backwards-incompatible signature change — grep for `jit(` callers
-(including in [tests/](../tests/)) before changing the signature.
-Consider the same one-release deprecation alias pattern as for the
-CLI flag.
+Also fix the misleading comment at
+[mcl/ir_gpu.py:15](../mcl/ir_gpu.py#L15) (was: "Sequential (default)
+or atomic (`--fast-math`)"). The current behavior is unconditional
+atomic emission via static analysis; the spec/code gap should be
+visible in the comment, not hidden.
 
-**Validation:**
+**Validation:** 5-row matrix on `galaxy_structured.ergo` (SPIRV target).
+Pre-baseline = stage-1 default hash.
 
-1. Run with neither flag → must behave identically to stage-1 build
-   (no GCC `-ffast-math`, no SPIRV scatter atomics). Hash should match
-   stage-1's hash.
-2. Run with `--gpu-fast-math` only → SPIRV atomics enabled, CPU codegen
-   unchanged. Hash differs from default *only* on programs with scatter
-   loops; otherwise identical.
-3. Run with `--cpu-fast-math` only → GCC `-ffast-math`, SPIRV scatter
-   serialized. Hash differs from default for any FP-heavy program.
-4. Run with `--fast-math` (deprecated) → both above, plus a stderr warning.
-   Behavior identical to pre-change `--fast-math`.
+| Invocation                        | Hash expectation                | stderr   |
+|-----------------------------------|---------------------------------|----------|
+| no flags                          | matches stage-1 hash            | clean    |
+| `--gpu-fast-math` only            | matches stage-1 (SPIRV no-op)   | clean    |
+| `--cpu-fast-math` only            | differs (GCC -ffast-math)       | clean    |
+| `--cpu-fast-math --gpu-fast-math` | matches `--cpu-fast-math` only  | clean    |
+| `--fast-math` (deprecated)        | matches `--cpu --gpu` together  | warning  |
 
-For each of (1)-(4), verify the now-standard back-to-back-stability and
-rebuild-stability properties.
+Plus a sq2core sanity build (no flags) to confirm CPU-path hash is
+still stage-1 stable.
+
+For each row, verify back-to-back-stability and rebuild-stability.
 
 **Failure modes to watch for:**
 
 - Any caller of `compile_source` or `_compile_target` that currently
   passes `fast_math=True` and expected both effects. Find them all
   (grep), update them to pass both new args.
-- The SPIRV atomic check might be reading the flag through a different
-  channel than the C driver (e.g., env var or AST attribute). Trace it
-  end-to-end.
-- Tests in [tests/](../tests/) that pass `--fast-math` — update or
-  verify the deprecation alias works.
+- `--gpu-fast-math` on a SPIRV target somehow perturbing the hash
+  would indicate undocumented wiring. The flag should be a no-op on
+  SPIRV per the audit; if it isn't, trace and document before
+  shipping.
+- NVVM path not exercised by the matrix above (no NVVM in the
+  typical test pipeline). If `--gpu-fast-math` is meant to be
+  validated on NVVM too, that's a separate program.
 
-**Out of scope:** changing what `-ffast-math` actually does on CPU.
-You're only splitting which user-facing flag controls it.
+**Out of scope:** changing what `-ffast-math` actually does on CPU
+(only splitting which user-facing flag controls it). Wiring the
+SPIRV side to consume `gpu_fast_math` for atomic emission (separate
+audit; spec/code gap is currently flagged in a comment, not fixed).
 
 ## Stage 3 — Document the determinism contract in the spec
 

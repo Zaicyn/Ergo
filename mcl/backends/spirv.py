@@ -84,8 +84,8 @@ class SPIRVBackend(KernelBackend):
     device_ext = ".spvasm"
 
     def __init__(self, module: IRModule, plan: GPUPlan,
-                 fast_math: bool = False):
-        super().__init__(module, plan, fast_math)
+                 gpu_fast_math: bool = False):
+        super().__init__(module, plan, gpu_fast_math)
 
         # Build type lookup from module
         self._var_types: dict[str, IRType] = {}
@@ -140,7 +140,7 @@ class SPIRVBackend(KernelBackend):
         for v in self.module.main_locals:
             if v.shape:
                 array_shapes[v.name] = v.shape
-        ctx = _EmitContext(kernel, self._var_types, self.fast_math,
+        ctx = _EmitContext(kernel, self._var_types, self.gpu_fast_math,
                           array_shapes)
         ctx.emit_module()
         return "\n".join(ctx.lines) + "\n"
@@ -653,11 +653,14 @@ class _EmitContext:
     WORKGROUP_SIZE = 256
 
     def __init__(self, kernel: KernelPlan, var_types: dict[str, IRType],
-                 fast_math: bool,
+                 gpu_fast_math: bool,
                  array_shapes: dict[str, tuple] | None = None):
         self.kernel = kernel
         self.var_types = var_types
-        self.fast_math = fast_math
+        # gpu_fast_math is plumbed through but no SPIRV emission site
+        # currently reads it. See note in mcl/ir_gpu.py near the
+        # SCATTER definition.
+        self.gpu_fast_math = gpu_fast_math
         self.array_shapes = array_shapes or {}
         # Ping-pong: arrays that are both read and written get offset push constants
         # Ping-pong disabled until offset injection bug is resolved

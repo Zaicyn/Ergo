@@ -13,7 +13,16 @@ Dependence classification (refinements of FLOW):
   REDUCTION  — scalar accumulator (sum, product, min/max).
                Staged parallel reduction.
   SCATTER    — known or possible write collisions.
-               Sequential (default) or atomic (--fast-math).
+               Spec Part 8.2 describes a --fast-math-gated choice
+               between sequential and atomic emission. That gate is
+               not currently wired: backends emit atomic operations
+               unconditionally when static analysis identifies
+               non-injective writes with read-modify-write (see
+               atomic_arrays population below). The gpu_fast_math
+               plumbing exists on the backend constructors but no
+               SPIRV emission site reads it for atomic emission.
+               Either wire the gate or update the spec — both are
+               valid; this comment exists so the gap is visible.
 
 Execution mapping:
   INJECTIVE  → GPU kernel (1 thread per iteration)

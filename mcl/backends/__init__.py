@@ -33,10 +33,10 @@ class KernelBackend:
     device_ext: str = ".ll"
 
     def __init__(self, module: 'IRModule', plan: 'GPUPlan',
-                 fast_math: bool = False):
+                 gpu_fast_math: bool = False):
         self.module = module
         self.plan = plan
-        self.fast_math = fast_math
+        self.gpu_fast_math = gpu_fast_math
 
     def generate(self) -> str:
         """Emit device code (IR text) for all extracted kernels."""

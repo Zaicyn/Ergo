@@ -34,7 +34,9 @@ DETERMINISTIC_FLAGS = [
 
 
 def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
-                   skip_check: bool = False, fast_math: bool = False,
+                   skip_check: bool = False,
+                   cpu_fast_math: bool = False,
+                   gpu_fast_math: bool = False,
                    source_path: str = None, use_ir: bool = True,
                    target: str = None, no_split: bool = False,
                    render: bool = False,
@@ -83,7 +85,8 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
                 for d in promo_diags:
                     print(d, file=sys.stderr)
             return _compile_target(ir_module, target, output, emit_c,
-                                   fast_math, no_split, render, arena_size)
+                                   cpu_fast_math, gpu_fast_math,
+                                   no_split, render, arena_size)
 
         if render:
             from .ir_inline import inline_subroutines
@@ -112,7 +115,7 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
             vk_host_c = os.path.join(runtime_dir, "vk_host.c")
             gcc_flags.insert(3, vk_host_c)
             gcc_flags.extend(["-lvulkan", "-lglfw"])
-        if fast_math:
+        if cpu_fast_math:
             gcc_flags.append("-ffast-math")
         if arena_size is not None:
             gcc_flags.append(f"-DERGO_ARENA_BYTES=((size_t){arena_size})")
@@ -134,7 +137,8 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
 
 
 def _compile_target(ir_module, target: str, output: str, emit_c: bool,
-                    fast_math: bool, no_split: bool = False,
+                    cpu_fast_math: bool, gpu_fast_math: bool,
+                    no_split: bool = False,
                     render: bool = False,
                     arena_size: int = None) -> str:
     """Kernel extraction + vendor backend compilation path."""
@@ -199,7 +203,7 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
                     "-lm", "-lvulkan", "-lglfw",
                     f"-I{runtime_dir}",
                 ])
-                if fast_math:
+                if cpu_fast_math:
                     gcc_flags.append("-ffast-math")
                 if arena_size is not None:
                     gcc_flags.append(
@@ -220,7 +224,7 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
         return c_code
 
     # Instantiate backend and generate device code
-    backend = backend_cls(ir_module, plan, fast_math=fast_math)
+    backend = backend_cls(ir_module, plan, gpu_fast_math=gpu_fast_math)
     device_code = backend.generate()
     host_launches = backend.generate_host_launches()
 
@@ -267,7 +271,7 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
             gcc_flags.append("-lglfw")
         else:
             gcc_flags.append("-DERGO_VK_HEADLESS_ONLY")
-        if fast_math:
+        if cpu_fast_math:
             gcc_flags.append("-ffast-math")
         if arena_size is not None:
             gcc_flags.append(f"-DERGO_ARENA_BYTES=((size_t){arena_size})")
@@ -301,7 +305,9 @@ def _load_backend(target: str):
 
 
 def compile_file(path: str, output: str = None, emit_c: bool = False,
-                 fast_math: bool = False, use_ir: bool = True,
+                 cpu_fast_math: bool = False,
+                 gpu_fast_math: bool = False,
+                 use_ir: bool = True,
                  target: str = None, no_split: bool = False,
                  render: bool = False,
                  promote_locals: bool = False,
@@ -316,7 +322,9 @@ def compile_file(path: str, output: str = None, emit_c: bool = False,
         output = base
 
     return compile_source(source, output=output, emit_c=emit_c,
-                          fast_math=fast_math, source_path=path,
+                          cpu_fast_math=cpu_fast_math,
+                          gpu_fast_math=gpu_fast_math,
+                          source_path=path,
                           use_ir=use_ir, target=target,
                           no_split=no_split, render=render,
                           promote_locals_flag=promote_locals,
