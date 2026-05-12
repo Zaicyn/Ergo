@@ -1553,6 +1553,34 @@ class _EmitContext:
 
         # MOD
         if op == Op.MOD:
+            # Power-of-two fold: MOD(x, k) -> x & (k-1) when x is provably
+            # non-negative and k is a positive literal power-of-two. Only
+            # case 1 from the brief (dividend is the loop variable itself);
+            # GPU loop vars are gid+1 ≥ 1 > 0 so the check is unconditional
+            # once the operand matches. Deferred: dividend = loop_var - 1
+            # / loop_var + nonneg_const (needs known-non-negative SSA
+            # tracking); dividend = PARAMETER-resolved constant (needs
+            # PARAMETER value folding upstream of the emitter).
+            a_arg = inst.args[0]
+            b_arg = inst.args[1]
+            if (isinstance(a_arg, IRRef)
+                    and a_arg.name == self.kernel.loop_var
+                    and isinstance(b_arg, IRConst)
+                    and b_arg.type == IRType.INTEGER
+                    and isinstance(b_arg.value, int)
+                    and b_arg.value > 0
+                    and (b_arg.value & (b_arg.value - 1)) == 0):
+                a = self._resolve(a_arg, pc_member_ids, ssa_map)
+                mask = self._get_const(IRType.INTEGER, b_arg.value - 1)
+                result = self._alloc()
+                self._function.append(
+                    f"         {self._id(result)} = OpBitwiseAnd "
+                    f"{self._id(self.id_i32)} {self._id(a)} {self._id(mask)}")
+                self._set_ssa_type(result, self.id_i32)
+                if inst.result:
+                    ssa_map[inst.result] = result
+                return False
+
             a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
             b = self._resolve(inst.args[1], pc_member_ids, ssa_map)
             is_fp = self._is_real_id(a) or self._is_real_id(b)
