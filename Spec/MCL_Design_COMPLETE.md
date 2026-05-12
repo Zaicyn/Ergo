@@ -402,7 +402,7 @@ This guarantees **bitwise reproducible results** across compilations and platfor
 
 Rationale: Simulation science requires reproducibility. A cell colony that produces different population dynamics on different compiler versions is useless for validation. The slight performance cost of strict evaluation order (preventing reassociation optimizations) is acceptable — the C backend at `-O2` still vectorizes loop bodies, which is where the real performance lives.
 
-Note: A future `--fast-math` flag may relax this rule for workloads where reproducibility is less important than speed. When enabled, the compiler may reassociate, fuse multiply-adds, and use non-NaN-preserving min/max. This must be opt-in, never default.
+Note: The `--cpu-fast-math` flag may relax this rule for workloads where reproducibility is less important than speed. When enabled, the compiler may reassociate, fuse multiply-adds, and use non-NaN-preserving min/max. This must be opt-in, never default.
 
 ### IEEE Semantics for Math Intrinsics
 
@@ -411,7 +411,7 @@ By default, all math intrinsics follow IEEE 754 semantics:
 - `SQRT` of negative values is a runtime error, not silent NaN
 - Division by zero behavior follows C99 rules
 
-Under `--fast-math`, these constraints are relaxed:
+Under `--cpu-fast-math`, these constraints are relaxed:
 - `CLAMP` may lower to `maxsd`/`minsd` (2 instructions, NaN not preserved)
 - `MIN`/`MAX` may use non-NaN-preserving comparisons
 - The compiler may fuse multiply-add operations
@@ -464,13 +464,13 @@ This creates a write conflict under parallel execution.
 If a loop is classified as SCATTER (see Part 9) and contains accumulation `A(idx) := A(idx) ⊕ value`, the compiler must:
 
 1. **Default mode (strict):** Serialize the loop. Results are identical to sequential execution. Bitwise reproducibility preserved.
-2. **`--fast-math` mode:** Emit atomic operations (`atomicAdd`, `atomicMin`, etc.). Accumulation order is undefined but numerically stable. Results are not bitwise identical to sequential execution.
+2. **`--gpu-fast-math` mode:** Emit atomic operations (`atomicAdd`, `atomicMin`, etc.). Accumulation order is undefined but numerically stable. Results are not bitwise identical to sequential execution.
 
 **CPU backend:** Always sequential execution (matches existing semantics).
 
-**GPU backend (default):** Serialize scatter loops unless `--fast-math` is enabled.
+**GPU backend (default):** Serialize scatter loops unless `--gpu-fast-math` is enabled.
 
-**GPU backend (`--fast-math`):** Emit `atomicAdd` for `+`, `atomicMin`/`atomicMax` for `MIN`/`MAX`. CAS loop for unsupported operations.
+**GPU backend (`--gpu-fast-math`):** Emit `atomicAdd` for `+`, `atomicMin`/`atomicMax` for `MIN`/`MAX`. CAS loop for unsupported operations.
 
 **Formal rule:** If a parallel loop contains non-unique writes, the compiler must either serialize execution or emit atomic operations with explicitly defined numerical semantics. Silent data races are never permitted.
 
@@ -521,7 +521,7 @@ These rules preserve all constraints from Parts 1-7:
 - Deterministic evaluation (sequential semantics are the default)
 - No implicit temporaries (register-level intermediates from fusion are not visible at the language level)
 
-**New guarantee:** Parallel execution is an implementation detail. Program semantics are identical to sequential execution unless `--fast-math` is enabled.
+**New guarantee:** Parallel execution is an implementation detail. Program semantics are identical to sequential execution unless `--gpu-fast-math` is enabled.
 
 ---
 
@@ -690,7 +690,7 @@ Dependence classification maps to execution strategy:
 | FLOW | MAP — gather/scatter kernel | Yes (asserted) | No | Yes | Yes |
 | SHIFT(k) | Sequential (wavefront future) | No (default) | No | No | Yes |
 | REDUCTION | Staged reduce (warp shuffle) | Staged | No | No | Yes |
-| SCATTER | Sequential or atomic | No (default) | Yes (`--fast-math`) | No | Yes (if serialized) |
+| SCATTER | Sequential or atomic | No (default) | Yes (`--gpu-fast-math`) | No | Yes (if serialized) |
 
 ### 9.7 Affine Analysis
 
@@ -725,7 +725,7 @@ cannot be ruled out, conservatively classify as SCATTER.
 INJECTIVE and FLOW are parallel-safe. SHIFT and SCATTER are serialized.
 REDUCTION uses deterministic staged reduction.
 
-**`--fast-math` mode:** SCATTER may use atomic operations with non-deterministic
+**`--gpu-fast-math` mode:** SCATTER may use atomic operations with non-deterministic
 accumulation order. Only allowed if the operation is associative or the user
 accepts numerical variation.
 
