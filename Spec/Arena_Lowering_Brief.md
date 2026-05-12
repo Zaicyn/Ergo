@@ -1,5 +1,48 @@
 # ALLOCATABLE Arena Lowering — Implementation Brief
 
+## PR-prep notes (reviewer context)
+
+These are merge-time considerations that surfaced during implementation
+and aren't otherwise discoverable from the commit messages:
+
+- **`tests/sq2core.ergo` is force-added by `x86-determinism-stage-1`,
+  not by this branch.** Test 1 was validated locally with the file
+  imported from that branch (`git checkout x86-determinism-stage-1 --
+  tests/sq2core.ergo`). The file lands in master via stage-1's merge.
+  A reviewer reproducing Test 1 against this branch needs the same
+  one-shot import until both branches merge. `galaxy_structured.ergo`
+  (tracked on spirv-peephole) is the master-native Test 1 target if
+  importing sq2core isn't feasible — same validation property,
+  different program.
+
+- **`compile_source` signature collision risk with
+  `x86-determinism-stage-2`.** Both branches modify the same
+  function signature: this branch adds `arena_size: int = None`;
+  stage-2 splits `fast_math: bool` into `cpu_fast_math: bool` +
+  `gpu_fast_math: bool`. The kwargs commute (no semantic
+  interaction), but git will flag a textual merge conflict on the
+  second branch to land. Resolution is mechanical: the merged
+  signature includes all the new kwargs from both branches. ~30
+  seconds of rebase. Same applies to `compile_file`, `_compile_target`,
+  and the `__main__.py` `compile_file(...)` call site.
+
+- **Suggested merge order:** `spirv-peephole` first (prerequisite),
+  then this branch (`arena-lowering`) before the x86 determinism
+  chain. Rationale: arena-lowering is a single PR with 5
+  self-contained commits; x86-determinism-stage-1 is slightly more
+  likely to attract review questions on the flag handling. Either
+  order ultimately works — the signature collision is the same
+  size in both directions.
+
+- **`tests/` is gitignored** (whitelist mode in `.gitignore`). This
+  is a smell — validation harnesses are part of the codebase but
+  live where force-add is required to track them. Out of scope for
+  this PR. Worth flagging as a follow-up: either un-ignore `tests/`
+  and add a deliberate `tests/.gitignore` for ephemera (compiled
+  binaries, `.spvasm` dumps), or formalize the per-branch force-add
+  convention. The friction shows up at merge time when two branches
+  independently force-add the same file.
+
 ## Corrections vs original brief
 
 Three corrections caught pre-implementation. Documented here so future
