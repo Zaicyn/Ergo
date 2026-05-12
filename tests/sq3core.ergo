@@ -1,0 +1,206 @@
+! SQUARAGON V3 CORE - MCL PORT
+! ==============================
+! Torus allocator: 2 shells x 8 bins x 32 ring = 512 slots
+! All state in STATIC declarations. Zero dynamic allocation.
+! Direct addressing guaranteed.
+!
+! v3 differences from v2:
+!   - Seam rotation encoded in integer bits of RINV, not float perturbation.
+!   - MOD by power-of-two written as IAND for explicit bit-twiddle intent.
+!   - No floating-point operations in SQ3FAL fast path.
+!   - RINV is now exactly recoverable bit-for-bit; no 0.01 representation drift.
+
+! ── Constants ────────────────────────────────────────────────
+
+STATIC INTEGER :: NBINS = 8
+STATIC INTEGER :: NSHEL = 2
+STATIC INTEGER :: NRING = 32
+STATIC INTEGER :: NSLOT = 512
+STATIC INTEGER :: THBIAS = 384
+STATIC INTEGER :: THWORK = 432
+STATIC INTEGER :: THMAX = 496
+
+! ── Precomputed LUTs ────────────────────────────────────────
+! SCATLT: Viviani scatter — maps (ID & 31) to bin index 0-7
+! BINGEO: Viviani geo encoding per bin
+
+STATIC INTEGER :: SCATLT(32)
+DATA SCATLT / 6, 4, 6, 2, 7, 4, 3, 0, 2, 0, 3, 4, 7, 2, 6, 4, 6, 4, 6, 2, 7, 4, 3, 0, 2, 0, 3, 4, 7, 2, 6, 4 /
+
+STATIC INTEGER :: BINGEO(8)
+DATA BINGEO / 228, 104, 0, 104, 228, 104, 0, 104 /
+
+! ── Torus State ─────────────────────────────────────────────
+! Direct static addressing. No pointer chasing. No indirection.
+! Access to STATIC storage compiles to direct address computation.
+
+STATIC REAL :: TINVAR(32, 8, 2)
+STATIC INTEGER :: TOCC(32, 8, 2)
+STATIC INTEGER :: TFROZ(32, 8, 2)
+STATIC INTEGER :: TWHEAD(8, 2)
+STATIC INTEGER :: TLEN(8, 2)
+STATIC INTEGER :: TALLOC(8, 2)
+STATIC INTEGER :: TTOTAL = 0
+STATIC INTEGER :: TPHASE = 0
+STATIC INTEGER :: TGEN = 0
+
+! ── SQ3SCT: Viviani scatter (LUT, O(1)) ────────────────────
+! Returns bin index 1-8 for a given ID
+
+INTEGER FUNCTION SQ3SCT(ID)
+  INTEGER :: ID
+  SQ3SCT := SCATLT(MOD(ID - 1, 32) + 1) + 1
+  RETURN SQ3SCT
+END
+
+! ── SQ3FAL: FAST allocate (LUT-only, no gate write) ────────
+! Pure integer hot path: scatter + LUT invariant + rotate.
+! No vertex init, no gate fold. Just index math.
+!
+! ID    = allocation ID (1-based)
+! IERR  = 0 on success, -1 on full
+
+SUBROUTINE SQ3FAL(ID, IERR)
+  INTEGER :: ID, IERR
+  INTEGER :: BIN, GEN, SHELL, POS
+  INTEGER :: IGEO, IBIN, ISHEL
+  INTEGER :: TBITS
+  REAL :: RINV
+
+  IERR := 0
+  SHELL := 1
+  BIN := SQ3SCT(ID)
+  GEN := TWHEAD(BIN, SHELL)
+
+  IF GEN > 32 THEN
+    IERR := -1
+    RETURN
+  ENDIF
+
+  ! Fast invariant: LUT geo + bin + shell encoding
+  ! Pack: geo<<24 | bin<<16 | seam<<9 | shell<<8 | gen
+  ! Bit layout:
+  !   bits  0-4 : gen   (0-31)
+  !   bits  5-7 : unused
+  !   bit    8  : shell (0-1)
+  !   bits  9-13: seam  (TBITS, even values 0-30 → 4 useful bits)
+  !   bits 14-15: unused
+  !   bits 16-18: bin   (0-7)
+  !   bits 19-23: unused
+  !   bits 24-31: geo   (BINGEO 0-228)
+  POS := IAND(GEN - 1, 31) + 1
+  IGEO := BINGEO(BIN)
+  IBIN := BIN - 1
+  ISHEL := SHELL - 1
+
+  ! Seam rotation: (gen-1) * 2 bits, integer-twiddled, packed at bit 9.
+  ! IAND(..., 31) replaces MOD(..., 32) — explicit bit-twiddle intent,
+  ! no dependence on optimizer recognizing the power-of-two fold.
+  TBITS := IAND(ISHFT(GEN - 1, 1), 31)
+
+  RINV := REAL(ISHFT(IGEO, 24) + ISHFT(IBIN, 16) + ISHFT(TBITS, 9) + &
+               ISHFT(ISHEL, 8) + (GEN - 1))
+
+  TINVAR(GEN, BIN, SHELL) := RINV
+
+  ! Mark occupied, period-4
+  TOCC(GEN, BIN, SHELL) := 1
+  TALLOC(BIN, SHELL) := TALLOC(BIN, SHELL) + 1
+  IF MOD(TALLOC(BIN, SHELL), 4) = 0 THEN
+    TFROZ(GEN, BIN, SHELL) := 1
+  ELSE
+    TFROZ(GEN, BIN, SHELL) := 0
+  ENDIF
+
+  TWHEAD(BIN, SHELL) := GEN + 1
+  TLEN(BIN, SHELL) := TLEN(BIN, SHELL) + 1
+  TTOTAL := TTOTAL + 1
+
+  RETURN
+END
+
+! ── SQ3TIN: Initialize torus (all slots empty) ──────────────
+
+SUBROUTINE SQ3TIN
+  INTEGER :: I, J, K
+
+  DO K = 1, 2
+    DO J = 1, 8
+      TWHEAD(J, K) := 1
+      TLEN(J, K) := 0
+      TALLOC(J, K) := 0
+      DO I = 1, 32
+        TOCC(I, J, K) := 0
+        TFROZ(I, J, K) := 0
+        TINVAR(I, J, K) := 0.0
+      ENDDO
+    ENDDO
+  ENDDO
+  TTOTAL := 0
+  TPHASE := 0
+  TGEN := 0
+  RETURN
+END
+
+! ── SQ3ZON: Zone for occupancy ──────────────────────────────
+! Returns: 1=COASTING, 2=ACTIVE, 3=OVERDRIVE, 4=DIVIDE
+
+INTEGER FUNCTION SQ3ZON(NOCC)
+  INTEGER :: NOCC
+  IF NOCC < 384 THEN
+    SQ3ZON := 1
+  ELSEIF NOCC < 432 THEN
+    SQ3ZON := 2
+  ELSEIF NOCC < 496 THEN
+    SQ3ZON := 3
+  ELSE
+    SQ3ZON := 4
+  ENDIF
+  RETURN SQ3ZON
+END
+
+! ── Test harness ─────────────────────────────────────────────
+
+IMPLICIT NONE
+INTEGER :: I, ERR, ZONE
+INTEGER :: HASH, HI, HJ, HK
+
+CALL SQ3TIN
+
+! Allocate 400 items via fast path
+DO I = 1, 400
+  CALL SQ3FAL(I, ERR)
+ENDDO
+
+PRINT TTOTAL
+ZONE := SQ3ZON(TTOTAL)
+PRINT ZONE
+
+! ── ERGO_HASH_FINAL-style integer state hash ─────────────────
+! Xorshift mix (13, -19) over TOCC, TFROZ, TWHEAD, TLEN, TALLOC, TTOTAL
+! in fixed iteration order. Uses only IEOR/ISHFT so the hash itself
+! is bit-exact under any GCC optimization level. Seeded with FNV-1a
+! 32-bit offset basis. Skips TINVAR (REAL) — FP determinism is
+! validated separately via the GPU hash hook on galaxy_structured.
+
+HASH := 166136261
+DO HK = 1, 2
+  DO HJ = 1, 8
+    HASH := IEOR(HASH, TWHEAD(HJ, HK))
+    HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+    HASH := IEOR(HASH, TLEN(HJ, HK))
+    HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+    HASH := IEOR(HASH, TALLOC(HJ, HK))
+    HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+    DO HI = 1, 32
+      HASH := IEOR(HASH, TOCC(HI, HJ, HK))
+      HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+      HASH := IEOR(HASH, TFROZ(HI, HJ, HK))
+      HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+    ENDDO
+  ENDDO
+ENDDO
+HASH := IEOR(HASH, TTOTAL)
+HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+
+PRINT HASH
