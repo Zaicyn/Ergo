@@ -242,13 +242,32 @@ CALL SQ3VAL(NBAD)
 PRINT NBAD
 
 ! ── ERGO_HASH_FINAL-style integer state hash ─────────────────
-! Xorshift mix (13, -19) over TOCC, TFROZ, TWHEAD, TLEN, TALLOC, TTOTAL
-! in fixed iteration order. Uses only IEOR/ISHFT so the hash itself
-! is bit-exact under any GCC optimization level. Seeded with FNV-1a
-! 32-bit offset basis. Skips TINVAR — its contents are verified
-! directly by SQ3VAL (called below), which checks every entry against
-! its derived bit-pack; the hash's role is regression coverage of
-! integer state, not redundant TINVAR validation.
+! Ad-hoc XOR-of-shifts mix over TOCC, TFROZ, TWHEAD, TLEN, TALLOC,
+! TTOTAL in fixed iteration order. Per-step mix is
+!   HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+! This is the single-step form (h replaced by (h<<13) ^ (h>>19)),
+! NOT the canonical Marsaglia xorshift32 (which uses three shifts in
+! sequence and preserves more bits). Adequate for state fingerprinting
+! at this scale (collisions are rare for small integer state) but
+! NOT cryptographic and NOT proven full-period.
+!
+! Seed: 166136261. Looks like FNV-1a 32-bit offset basis (2166136261)
+! with the leading 2 dropped — either deliberate truncation to fit
+! signed int32 or a transcription artifact. Not actually FNV-1a;
+! treat as an arbitrary 32-bit constant in the FNV family.
+!
+! Uses only IEOR/ISHFT so the hash itself is bit-exact under any
+! GCC optimization level — the algorithm's adequacy is about
+! collision resistance, not determinism. Determinism is solid.
+!
+! Skips TINVAR — its contents are verified directly by SQ3VAL
+! (called below), which checks every entry against its derived
+! bit-pack; the hash's role is regression coverage of integer state,
+! not redundant TINVAR validation.
+!
+! See Spec/Hash_Strengthening_Proposal.md for the upgrade path
+! (FNV-1a 64-bit or canonical xorshift32) when stronger guarantees
+! are needed.
 
 HASH := 166136261
 DO HK = 1, 2
