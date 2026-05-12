@@ -25,27 +25,36 @@ sub-tables below partition the question:
 
 ## Sub-table 1: Steady-state allocation throughput
 
-CPU rows compare against the per-arena bump (CPU Floor A) as the
-1.0× reference. GPU rows compare against the non-aggregated bump
-(GPU Floor B) as the 1.0× reference — the floor V8's lanes actually
-contend against. Smaller-is-better in the rightmost column: 1.0× is
-"at the floor"; <1.0× escapes the floor's contention pattern; >1.0×
-pays more than the floor.
+Smaller-is-better in the rightmost column: 1.0× is "at the floor";
+<1.0× escapes the floor's contention pattern; >1.0× pays more than
+the floor. Each row is referenced against its hardware-class floor
+per footnote ⁰: CPU rows against the CPU per-arena bump (0.51
+ns/op); GPU rows against GPU Floor B (0.55 ns/lane-alloc).
 
-| System | Throughput | ns/lane-op | × Floor (ns/op) | Notes |
+| System | Throughput | ns/lane-op | × respective floor (ns/op)⁰ | Notes |
 |---|---:|---:|---:|---|
-| **CPU 1t per-arena bump** | 1.95 G/s | 0.51 | 1.00× (reference) | Load + add + store |
+| **CPU 1t per-arena bump** | 1.95 G/s | 0.51 | 1.00× (CPU reference) | Load + add + store |
 | **CPU 6t per-arena bump** | 11.6 G/s | 0.09 | 0.18× | 5.96× linear scaling |
 | **CPU 1t shared atomic** | 232 M/s | 4.31 | 8.5× | Locked RMW dominates |
 | **CPU 6t shared atomic** | 158 M/s | 6.33 | 12× | Cacheline ping-pong |
 | **V22 hand-SSE 1t** | 89 M/s | 11.2¹ | — | Geometric residual, not alloc |
 | **V22 hand-SSE 6t** | 549 M/s | 1.82¹ | — | 17% drift vs prior doc² |
-| **Ergo CPU arena** | TBD (Pass 2) | TBD | TBD | Expected ≈ 1.0× (bump emit *is* the floor) |
+| **Ergo CPU arena** | 1.30 G/s | 0.77 | 1.5×⁵ | Bump + bounds-check + integer-dep chain |
 | **GPU bump Floor A** | 35.5 G/s | 0.03 | 0.08× | nvcc warp-aggregated; 1 atomic/warp |
-| **GPU bump Floor B** | 2.65 G/s | 0.38 (0.55/lane) | 1.00× (reference) | 1 atomic/lane, per-lane size varied |
+| **GPU bump Floor B** | 2.65 G/s | 0.38 (0.55/lane) | 1.00× (GPU reference) | 1 atomic/lane, per-lane size varied |
 | **V8 slab allocator** | 1.73 G/s | 0.58 | 1.05× | Per-lane bitmap atomic³ |
 | **cudaMalloc** | ~3 M/s⁴ | ~330 | ~600× | Driver call, not warp-cooperative |
 | **Ergo GPU runtime alloc** | N/A | N/A | N/A | No runtime GPU allocator; see Sub-table 2 |
+
+⁰ The "× respective floor" column references two different floors
+because CPU and GPU allocation are not directly comparable. CPU rows
+use the single-thread per-arena bump from
+[BASELINE.md](BASELINE.md) §"CPU bump-allocator floors", measured
+at 0.51 ns/op. GPU rows use Floor B from the same doc, measured at
+0.55 ns/lane-alloc (after correcting the 64B-equivalent normalization
+to actual lane cost). The bare numbers in this column tell a
+hardware-normalized story per row; cross-row CPU/GPU comparisons
+should reference Sub-table 3 for feature-level differences instead.
 
 ¹ V22 measures a 67-instruction geometric residual computation, not
 allocation. Included for cross-reference with the V22 head-to-head
@@ -61,6 +70,23 @@ in GCC 15.2.1; single-thread inner loop unchanged within noise.
 empirical prior measurement; not re-run in the bump-floor work
 because device-malloc from 8192 simultaneous threads runs the GPU
 at 100% load for minutes and adds nothing new per the V8 test source.
+
+⁵ Ergo CPU arena at 0.77 ns/alloc vs 0.51 ns/alloc CPU bump floor:
+the entire 0.26 ns delta is the per-iter bounds check (`cmp rdx,
+1073741824 / ja .L34` in the SASS, fired on every ALLOCATE).
+Measured via the `nostore` variant of [baseline_arena.c](baseline_arena.c)
+to isolate the allocator pattern from per-iter memory traffic — a
+naive bench that wrote to A[0] each iter timed at 12.9 ns/alloc,
+25× higher, dominated by DRAM write-for-ownership cost on fresh
+cachelines (see Sub-table 2). The honest framing of the 1.5× ratio:
+Ergo arena is "a bump plus a bounds check, with the bounds check
+costing exactly what a bounds check should cost." The pure-bump
+floor would happily run off the end of its arena and into segfault
+territory; Ergo's emit catches that and aborts cleanly. The 49%
+overhead is the price of not segfaulting. Future predictions about
+"cheap" integer dependency-chain ops on Zen 2 should anchor at
+~0.25 ns/op, not "negligible" — a calibration point recorded during
+Pass 2.
 
 ### The V8 vs Floor B finding
 
@@ -106,24 +132,54 @@ in steady state.
 
 | System | Init cost per buffer | Setup cost amortizable? | Notes |
 |---|---:|---|---|
-| **malloc (libc, glibc)** | ~30 ns⁵ | N/A | Single libc call; backed by sbrk/mmap |
+| **malloc (libc, glibc)** | ~30 ns⁶ | N/A | Single libc call; backed by sbrk/mmap |
 | **V22 SQ2FAL** | ~30 ns | Yes (per-thread) | Scatter LUT + bin advance |
 | **V8 viviani_slab_alloc** | ~50 ns | Yes (per-warp) | First range claim adds 100 SASS instr; amortized over warp lifetime |
 | **vkAllocateMemory (Vulkan)** | TBD (Pass 3) | No | Vulkan driver call per buffer; expected to dominate Ergo GPU init |
-| **Ergo CPU arena init** | ~0⁶ | Yes (program lifetime) | BSS-resident `_ergo_arena[]`; first ALLOCATE = bump increment |
+| **Ergo arena emit (cold, no memory store)** | ~0 ns⁷ | Yes (program lifetime) | Bump + bounds check; overlaps with surrounding work in the loop |
+| **+ first-touch (cold cacheline)** | +7.0 ns⁸ | One-time per cacheline | DRAM read-for-ownership when writing fresh memory |
+| **+ wrap-revisit (evicted cacheline)** | +5.1 ns⁹ | Avoidable via free/recycle | Revisiting cachelines evicted from L3 after wrap |
 | **Ergo GPU init (per array)** | TBD (Pass 3) | Yes (program lifetime) | One vkCreateBuffer + vkAllocateMemory + vkBindBufferMemory per declared array |
 
-⁵ malloc init cost approximated; not measured in this work.
+⁶ malloc init cost approximated; not measured in this work.
 
-⁶ "~0" means: no per-arena init step beyond what the OS loader
+⁷ "~0" means: no per-arena init step beyond what the OS loader
 already does for any BSS-resident allocation. `_ergo_arena[]` is a
 file-scope `static char[ERGO_ARENA_BYTES]`; the loader zero-fills
 it once at program load (a one-time amortized cost shared with every
 other BSS symbol in the binary), and `_ergo_arena_offset` starts at
-0. The first ALLOCATE pays the bump emit cost (load offset, round
-size, bounds check, advance offset) — same as the CPU steady-state
-floor row in Sub-table 1, no more, no less. There is no
-allocator-side setup separate from the bump itself.
+0. The arena emit's per-iter cost is 0.77 ns when measured against a
+register sink (the `nostore` variant of
+[baseline_arena.c](baseline_arena.c)) — indistinguishable from the
+per-iter accumulator work because the integer ops issue in parallel
+with the floating-point work on Zen 2. The 0.77 ns × 1.5× factor
+from Sub-table 1 is the bump+bounds-check cost; the "~0" framing
+here means there is no separate allocator setup cost on top of that.
+
+⁸ First-touch cost per 64B cacheline (cold): measured at 7.85
+ns/iter via the `walk` variant of
+[baseline_arena.c](baseline_arena.c) (bump emit + per-iter store to
+`A[0]`, no wrap). This is the DRAM read-for-ownership cost when
+writing to a fresh cacheline that wasn't in any cache level — a
+property of the memory subsystem, not of any allocator. Any
+allocator handing out fresh memory pays this; the only way to avoid
+it is to reuse already-touched memory (which a free-and-reuse
+allocator like V8 can do, and which a bump-only design fundamentally
+cannot). This row exists in the table specifically to make that
+trade-off visible.
+
+⁹ Wrap-revisit cost (evicted cacheline): measured at 12.95
+ns/iter via the `full` variant (bump emit + store + wrap when arena
+exhausted), minus the `walk` first-touch baseline of 7.85
+ns/iter = ~5.1 ns of additional cost per revisited cacheline. This
+fires once the cumulative allocation exceeds Zen 2's L3 cache size
+(~8 MB on the 3600), at which point wrap-handed-out cachelines have
+been evicted from L3 and must be re-fetched from DRAM with their
+old contents (which then get overwritten). For Ergo programs that
+allocate once at startup and never wrap, this cost is zero. For
+programs that exceed the arena and wrap, the cost is real and
+unavoidable in a bump-only design — V8's warp-cursor recycling
+specifically targets this regime.
 
 ### Why init cost matters specifically for Ergo
 
@@ -149,39 +205,39 @@ Qualitative comparison. Not throughput.
 
 | Feature | Ergo CPU | Ergo GPU | V22 (CPU) | V8 (GPU) | cudaMalloc | CPU bump | GPU bump |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| Bit-identical across rebuilds | ✓⁷ | ✓ (spec)⁷ᵃ | ✓⁸ | ✓⁹ | N/A | trivially | trivially |
+| Bit-identical across rebuilds | ✓¹⁰ | ✓ (spec)¹⁰ᵃ | ✓¹¹ | ✓¹² | N/A | trivially | trivially |
 | Bit-identical across machines | ✓ | TBD | ✓ | ✗ | ✗ | trivially | trivially |
 | Runtime allocator | ✓ (bump emit) | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Structured size classes | ✗ | ✗ | fixed | 64B/128B/256B | any | ✗ | ✗ |
-| Free / recycle | no-op¹⁰ | N/A | per-bin freelist | warp-cursor wrap | full free | none | none |
+| Free / recycle | no-op¹³ | N/A | per-bin freelist | warp-cursor wrap | full free | none | none |
 | Language-integrated | ✓ (ALLOCATE) | ✓ (declared arrays) | ✗ (library) | ✗ (library) | ✗ | ✗ | ✗ |
-| Bounds-checked at allocate | ✓ (abort on overflow) | ✓ (spec)¹¹ | ✗ | ✗ (fallback path) | yes (NULL return) | no | no |
+| Bounds-checked at allocate | ✓ (abort on overflow) | ✓ (spec)¹⁴ | ✗ | ✗ (fallback path) | yes (NULL return) | no | no |
 
-⁷ Ergo CPU bit-identical-across-rebuilds: design contract,
+¹⁰ Ergo CPU bit-identical-across-rebuilds: design contract,
 **validated**. Documented in
 [Spec/x86_Determinism_Audit.md](../Spec/x86_Determinism_Audit.md);
 the stage-1/2/3 work (commits 802e939…1093c77) builds with explicit
 flag pinning and was tested across rebuilds.
 
-⁷ᵃ Ergo GPU bit-identical-across-rebuilds: design contract, **not
+¹⁰ᵃ Ergo GPU bit-identical-across-rebuilds: design contract, **not
 empirically validated in this work**. The SPIRV emission contract
 in `mcl/backends/spirv.py` is deterministic by construction (no
 hash-set iteration, no random ordering); but a back-to-back rebuild
 of the same Ergo program has not been diffed at the SPIRV level
 within this audit. Flagged for follow-up.
 
-⁸ V22 bit-identical determinism documented in
+¹¹ V22 bit-identical determinism documented in
 [V22/COMPILER_DETERMINISM.md](V22/COMPILER_DETERMINISM.md). Requires
 `-O3 -march=native -ffp-contract=fast`. Breaks under `-ffast-math`.
 
-⁹ V8 bit-identical SASS within a toolchain version (same nvcc + same
+¹² V8 bit-identical SASS within a toolchain version (same nvcc + same
 source = same SASS, verified via empty diff in
 [V8/COMPILER_DETERMINISM.md](V8/COMPILER_DETERMINISM.md)). Across
 toolchain versions: ~9% throughput drift observed between prior
 nvcc and nvcc 13.1; SASS differs across major nvcc releases by
 design.
 
-¹⁰ Ergo's DEALLOCATE is a documented no-op under the arena lowering:
+¹³ Ergo's DEALLOCATE is a documented no-op under the arena lowering:
 the bump arena is one-shot for program lifetime; freeing a single
 allocation would leave a hole, and Ergo's design assumes the next
 ALLOCATE doesn't need that hole back. See
@@ -189,22 +245,25 @@ ALLOCATE doesn't need that hole back. See
 Design contract, **validated** by codegen inspection (no `free(` or
 `malloc(` in emitted C; `_ergo_arena_offset` advances monotonically).
 
-¹¹ Ergo GPU bounds-check-at-allocate: design contract, **not
+¹⁴ Ergo GPU bounds-check-at-allocate: design contract, **not
 empirically validated**. The Vulkan host code in
 `mcl/runtime/vk_host.c` checks `vkAllocateMemory` return codes and
 exits on failure, but Ergo's error-handling path has not been
 exercised in an out-of-VRAM test within this audit. The CPU
-bounds-check (footnote 6) is empirically validated; the GPU path
+bounds-check (footnote 5) is empirically validated; the GPU path
 relies on the Vulkan API contract.
 
 ## What's still TBD
 
-- **Pass 2** (Ergo CPU instrumentation): measure Ergo's arena bump
-  on `tests/allocate_bench.ergo` under the post-x86-determinism flag
-  regime. Fills the **Ergo CPU arena** row in Sub-table 1 and the
-  **Ergo CPU arena init** row in Sub-table 2. Predicted result: both
-  rows match the CPU bump floor exactly (bump emit *is* the
-  operation).
+- **Pass 2** (Ergo CPU instrumentation): ✅ **Complete.** Ergo CPU
+  arena measured at 0.77 ns/alloc (1.5× of CPU bump floor) via the
+  `nostore` variant of [baseline_arena.c](baseline_arena.c). Sub-table
+  1's Ergo CPU arena row and Sub-table 2's three-row cost
+  decomposition (sub-floor / first-touch / wrap-revisit) are filled in.
+  Methodology surprise documented: a naive end-to-end bench timed at
+  12.9 ns/alloc — 25× higher — and required the four-variant
+  diagnostic to separate allocator cost from DRAM write-for-ownership
+  cost.
 
 - **Pass 3** (Ergo GPU instrumentation): measure Ergo's
   `vkAllocateMemory` cost per buffer on this hardware, and inspect
