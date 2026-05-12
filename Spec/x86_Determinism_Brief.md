@@ -1,5 +1,36 @@
 # x86 Determinism Fix — Implementation Brief
 
+## Status (as of stage 3 landing)
+
+- **Stage 1: landed** (commit 1093c77). DETERMINISTIC_FLAGS at four
+  GCC call sites. Galaxy hash `372e6c0230b53b92` stable.
+- **Stage 2: landed** (commit dccc79e). `--fast-math` split into
+  `--cpu-fast-math` / `--gpu-fast-math` with one-release deprecation
+  alias. 5-row validation matrix passed.
+- **Stage 3: landed** (commits 802e939, 699f7c0, 71fb024, a67ef6c).
+  Spec errata pass (8 stale flag references renamed) + Part 9.9
+  implementation-status paragraph + Determinism Contract (x86)
+  section in Part 7 + audit/brief Part 6→7 correction.
+
+- **Stage 4: deferred.** Configurable flag surface (`--cpu-opt`,
+  `--cpu-march`, `--cpu-fp-contract`). **Trigger:** ARM or RISC-V
+  port begins. Until then, the hardcoded x86-64-v3 defaults are
+  correct and the abstraction would be over-engineering. The
+  deprecation-alias precedent from stage 2 is the template for the
+  CLI surface change when this is activated.
+
+- **Stage 5: deferred.** OpenMP reduction pragmas above
+  SUM/DOT_PRODUCT/NORM2 loops. **Trigger:** profiling shows reduction
+  loops are a bottleneck. Stage 1's `-O3 -march=x86-64-v3
+  -ffp-contract=fast` already delivers SIMD on non-reduction loops;
+  reductions are the specifically-blocked case under strict IEEE.
+  Cost when activated: requires `-fopenmp`, makes determinism
+  per-thread-count rather than universal.
+
+No brief should be written for stages 4-5 until their triggers fire.
+Speculative briefs age poorly; the audit + this brief's existing
+stage 4/5 stubs are enough scaffolding when a concrete need surfaces.
+
 ## Corrections vs original brief
 
 Three gaps were caught during stage 1 implementation. Documented here so
