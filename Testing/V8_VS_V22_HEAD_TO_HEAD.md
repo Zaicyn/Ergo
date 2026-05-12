@@ -210,22 +210,22 @@ If you ship anything serious from this codebase:
 ```bash
 cd Testing
 
-# V8 micro-benchmark
-nvcc -arch=sm_75 -O3 -I. /tmp/v8_micro.cu -o /tmp/v8_micro
-/tmp/v8_micro          # prints 5 reps with fresh pool each time
+# V8 micro-benchmark (steady-state throughput, 5 reps with fresh pool)
+nvcc -arch=sm_75 -O3 -IV8 V8/v8_micro.cu -o /tmp/v8_micro
+/tmp/v8_micro
 
 # V22 single-threaded
 gcc -O3 -march=native -std=c11 -ffp-contract=fast V22/v22_compare.c -o /tmp/v22_bench -lm
 /tmp/v22_bench 20000000
 
 # V22 multi-threaded (OpenMP)
-gcc -O3 -march=native -fopenmp -std=c11 -IV22 /tmp/v22_parallel.c -o /tmp/v22_parallel -lm
+gcc -O3 -march=native -fopenmp -std=c11 -IV22 V22/v22_parallel.c -o /tmp/v22_parallel -lm
 for N in 1 2 4 6 12; do /tmp/v22_parallel 50000000 $N; done
 ```
 
-Source files for the micro-benchmarks live in `/tmp/` and can be
-regenerated from the descriptions in this conversation. The source
-under `V8/` and `V22/` is the canonical allocator code being measured.
+All micro-benchmark sources are tracked in-tree under `V8/` and `V22/`.
+The source under `V8/` and `V22/` is the canonical allocator code being
+measured; the micro-benches are thin timing harnesses around that code.
 
 ---
 
