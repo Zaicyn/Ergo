@@ -16,6 +16,23 @@ from .ir_gpu import (extract_kernels, promote_locals,
 from .errors import MCLError
 
 
+# Default GCC flags applied to every generated-C compile. Per V22's
+# COMPILER_DETERMINISM audit, this combination is performance-positive and
+# determinism-neutral: -O3 enables full optimization; -march=x86-64-v3
+# guarantees FMA + AVX2 + BMI2 baseline (Haswell/Zen2 or newer);
+# -ffp-contract=fast permits FMA fusion within an expression (deterministic
+# *if* the source is compiled identically each time); -fno-math-errno
+# elides errno writes from libm calls (deterministic, faster). -std=c11
+# matches the documented determinism contract in Spec/MCL_Design_COMPLETE.md.
+DETERMINISTIC_FLAGS = [
+    "-O3",
+    "-march=x86-64-v3",
+    "-ffp-contract=fast",
+    "-fno-math-errno",
+    "-std=c11",
+]
+
+
 def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
                    skip_check: bool = False, fast_math: bool = False,
                    source_path: str = None, use_ir: bool = True,
@@ -87,8 +104,8 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
 
     try:
         runtime_dir = os.path.join(os.path.dirname(__file__), "runtime")
-        gcc_flags = ["gcc", "-o", output, c_path, "-lm", "-std=c99",
-                     f"-I{runtime_dir}"]
+        gcc_flags = (["gcc", "-o", output, c_path] + DETERMINISTIC_FLAGS +
+                     ["-lm", f"-I{runtime_dir}"])
         if render:
             # Link against Vulkan runtime for rendering
             vk_host_c = os.path.join(runtime_dir, "vk_host.c")
@@ -172,11 +189,12 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
                 f.write(c_code)
                 c_path = f.name
             try:
-                gcc_flags = [
+                gcc_flags = ([
                     "gcc", "-o", output, c_path, vk_host_c,
-                    "-lm", "-lvulkan", "-lglfw", "-std=c99",
+                ] + DETERMINISTIC_FLAGS + [
+                    "-lm", "-lvulkan", "-lglfw",
                     f"-I{runtime_dir}",
-                ]
+                ])
                 if fast_math:
                     gcc_flags.append("-ffast-math")
                 result = subprocess.run(gcc_flags, capture_output=True, text=True)
@@ -231,12 +249,13 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
         c_path = f.name
 
     try:
-        gcc_flags = [
+        gcc_flags = ([
             "gcc", "-o", output, c_path,
             vk_host_c,
-            "-lm", "-lvulkan", "-std=c99",
+        ] + DETERMINISTIC_FLAGS + [
+            "-lm", "-lvulkan",
             f"-I{runtime_dir}",
-        ]
+        ])
         if render:
             gcc_flags.append("-lglfw")
         else:

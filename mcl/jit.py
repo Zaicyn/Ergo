@@ -35,6 +35,7 @@ from .ir_builder import IRBuilder
 from .ir_codegen import IRCodeGen
 from .ir import get_real_precision
 from .errors import MCLError
+from .driver import DETERMINISTIC_FLAGS
 
 
 class JitLibrary:
@@ -165,13 +166,14 @@ def jit(source: str, precision: int = 64, fast_math: bool = False,
                            f"ergo_jit_{source_hash}.so")
 
     runtime_dir = os.path.join(os.path.dirname(__file__), "runtime")
-    gcc_flags = [
-        "gcc", "-shared", "-fPIC", "-O2",
+    gcc_flags = ([
+        "gcc", "-shared", "-fPIC",
         "-o", so_path,
         "-x", "c", "-",  # read from stdin
-        "-lm", "-std=c99",
+    ] + DETERMINISTIC_FLAGS + [
+        "-lm",
         f"-I{runtime_dir}",
-    ]
+    ])
     if fast_math:
         gcc_flags.append("-ffast-math")
 
