@@ -120,18 +120,24 @@ class JitLibrary:
 _jit_cache = {}
 
 
-def jit(source: str, precision: int = 64, fast_math: bool = False,
+def jit(source: str, precision: int = 64,
+        cpu_fast_math: bool = False,
+        gpu_fast_math: bool = False,
         cache: bool = True) -> JitLibrary:
     """JIT-compile Ergo source code to a callable library.
 
     Args:
         source: Ergo source code as a string
-        fast_math: enable -ffast-math (breaks determinism)
+        cpu_fast_math: pass -ffast-math to GCC (breaks IEEE determinism)
+        gpu_fast_math: accepted for signature parity with compile_file;
+                       no effect on the JIT path (no GPU codegen here)
         cache: if True, reuse compiled library for identical source
 
     Returns:
         JitLibrary with callable functions
     """
+    # gpu_fast_math accepted but unused — JIT path is CPU-only.
+    del gpu_fast_math
     # Hash source for caching
     source_hash = hashlib.sha256(source.encode()).hexdigest()[:16]
 
@@ -174,7 +180,7 @@ def jit(source: str, precision: int = 64, fast_math: bool = False,
         "-lm",
         f"-I{runtime_dir}",
     ])
-    if fast_math:
+    if cpu_fast_math:
         gcc_flags.append("-ffast-math")
 
     result = subprocess.run(

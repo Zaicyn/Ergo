@@ -42,7 +42,7 @@ NVVM_MATH = {
     Op.TANH:  "@llvm.nvvm.tanh.approx.d",
 }
 
-# Fast-math variants (used with --fast-math)
+# Fast-math variants (used with --gpu-fast-math)
 NVVM_MATH_FAST = {
     Op.SIN:   "@llvm.nvvm.sin.approx.d",
     Op.COS:   "@llvm.nvvm.cos.approx.d",
@@ -78,8 +78,9 @@ class NVVMBackend(KernelBackend):
     name = "nvvm"
     device_ext = ".ll"
 
-    def __init__(self, module: IRModule, plan: GPUPlan, fast_math: bool = False):
-        super().__init__(module, plan, fast_math)
+    def __init__(self, module: IRModule, plan: GPUPlan,
+                 gpu_fast_math: bool = False):
+        super().__init__(module, plan, gpu_fast_math)
         self._lines: list[str] = []
         self._ssa_counter = 0
 
@@ -368,7 +369,7 @@ class NVVMBackend(KernelBackend):
         if op in NVVM_MATH:
             a = self._resolve_operand(inst.args[0], param_names, ssa_map)
             result = self._fresh_ssa()
-            if self.fast_math and op in NVVM_MATH_FAST:
+            if self.gpu_fast_math and op in NVVM_MATH_FAST:
                 intrinsic = NVVM_MATH_FAST[op]
             else:
                 intrinsic = NVVM_MATH[op]
@@ -587,7 +588,7 @@ class NVVMBackend(KernelBackend):
             if isinstance(item, IRBlock):
                 for inst in item.insts:
                     if inst.op in NVVM_MATH:
-                        if self.fast_math and inst.op in NVVM_MATH_FAST:
+                        if self.gpu_fast_math and inst.op in NVVM_MATH_FAST:
                             declared.add(NVVM_MATH_FAST[inst.op])
                         else:
                             declared.add(NVVM_MATH[inst.op])
