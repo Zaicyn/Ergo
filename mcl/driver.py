@@ -22,7 +22,8 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
                    target: str = None, no_split: bool = False,
                    render: bool = False,
                    promote_locals_flag: bool = False,
-                   param_overrides: dict = None) -> str:
+                   param_overrides: dict = None,
+                   arena_size: int = None) -> str:
     """Compile MCL source to an executable (or just emit C if requested).
 
     target: if set, extract GPU kernels and emit device code via the
@@ -65,7 +66,7 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
                 for d in promo_diags:
                     print(d, file=sys.stderr)
             return _compile_target(ir_module, target, output, emit_c,
-                                   fast_math, no_split, render)
+                                   fast_math, no_split, render, arena_size)
 
         if render:
             from .ir_inline import inline_subroutines
@@ -96,6 +97,8 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
             gcc_flags.extend(["-lvulkan", "-lglfw"])
         if fast_math:
             gcc_flags.append("-ffast-math")
+        if arena_size is not None:
+            gcc_flags.append(f"-DERGO_ARENA_BYTES=((size_t){arena_size})")
         result = subprocess.run(
             gcc_flags,
             capture_output=True, text=True,
@@ -115,7 +118,8 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
 
 def _compile_target(ir_module, target: str, output: str, emit_c: bool,
                     fast_math: bool, no_split: bool = False,
-                    render: bool = False) -> str:
+                    render: bool = False,
+                    arena_size: int = None) -> str:
     """Kernel extraction + vendor backend compilation path."""
     # Load the requested backend (vendor-specific, loaded on demand)
     from .backends import get_backend
@@ -179,6 +183,9 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
                 ]
                 if fast_math:
                     gcc_flags.append("-ffast-math")
+                if arena_size is not None:
+                    gcc_flags.append(
+                        f"-DERGO_ARENA_BYTES=((size_t){arena_size})")
                 result = subprocess.run(gcc_flags, capture_output=True, text=True)
                 if result.returncode != 0:
                     print("=== Generated C ===", file=sys.stderr)
@@ -243,6 +250,8 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
             gcc_flags.append("-DERGO_VK_HEADLESS_ONLY")
         if fast_math:
             gcc_flags.append("-ffast-math")
+        if arena_size is not None:
+            gcc_flags.append(f"-DERGO_ARENA_BYTES=((size_t){arena_size})")
         result = subprocess.run(gcc_flags, capture_output=True, text=True)
         if result.returncode != 0:
             print("=== Generated C ===", file=sys.stderr)
@@ -277,7 +286,8 @@ def compile_file(path: str, output: str = None, emit_c: bool = False,
                  target: str = None, no_split: bool = False,
                  render: bool = False,
                  promote_locals: bool = False,
-                 param_overrides: dict = None) -> str:
+                 param_overrides: dict = None,
+                 arena_size: int = None) -> str:
     """Compile an MCL source file."""
     with open(path, "r", encoding="utf-8") as f:
         source = f.read()
@@ -291,4 +301,5 @@ def compile_file(path: str, output: str = None, emit_c: bool = False,
                           use_ir=use_ir, target=target,
                           no_split=no_split, render=render,
                           promote_locals_flag=promote_locals,
-                          param_overrides=param_overrides)
+                          param_overrides=param_overrides,
+                          arena_size=arena_size)

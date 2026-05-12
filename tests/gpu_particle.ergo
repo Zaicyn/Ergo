@@ -1,0 +1,25 @@
+! gpu_particle.mcl - Minimal GPU kernel extraction test
+! A single DO loop over arrays — should extract to one GPU kernel.
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: N = 1024
+REAL, PARAMETER :: DT = 0.001
+
+REAL :: px(N), vx(N)
+INTEGER :: i
+
+! Initialize
+DO i = 1, N, 1
+  px(i) := 0.0
+  vx(i) := 1.0
+ENDDO
+
+! This loop is the kernel candidate:
+!   - writes only at index i
+!   - no I/O, no ALLOCATE, no cross-iteration dependency
+!   - all arrays have known shape
+DO i = 1, N, 1
+  px(i) := px(i) + vx(i) * DT
+ENDDO
+
+PRINT px(1)

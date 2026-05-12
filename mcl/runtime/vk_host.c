@@ -20,6 +20,107 @@
 
 #include <math.h>
 
+/*
+ * ERGO_BENCH_VK_ALLOC — opt-in instrumentation for Pass 3 of the
+ * allocator comparison. When defined at compile time, ergo_vk_create_buffer
+ * records per-call wall-clock for each of {vkCreateBuffer, vkAllocateMemory,
+ * vkBindBufferMemory} and prints a summary at program exit (registered via
+ * atexit). Off by default; the production build path pays zero overhead.
+ *
+ * Build with: -DERGO_BENCH_VK_ALLOC
+ * See Testing/COMPARISON_TABLE.md Sub-table 2 for the measured numbers.
+ */
+#ifdef ERGO_BENCH_VK_ALLOC
+/* Note: requires -D_POSIX_C_SOURCE=199309L on the gcc command line so
+ * <time.h> exposes clock_gettime under -std=c99. Defining the macro
+ * here is too late — <stdio.h> at the top of the file has already
+ * been preprocessed without it. */
+#include <time.h>
+#define ERGO_BENCH_MAX_CALLS 4096
+typedef struct {
+    double create_ns;
+    double alloc_ns;
+    double bind_ns;
+    size_t bytes;
+} ergo_bench_record;
+static ergo_bench_record _ergo_bench_calls[ERGO_BENCH_MAX_CALLS];
+static int _ergo_bench_count = 0;
+static int _ergo_bench_atexit_registered = 0;
+
+static double _ergo_bench_now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1e9 + (double)t.tv_nsec;
+}
+
+static void _ergo_bench_report(void) {
+    if (_ergo_bench_count == 0) return;
+    fprintf(stderr, "\n=== ERGO_BENCH_VK_ALLOC: %d buffer creations ===\n",
+            _ergo_bench_count);
+    fprintf(stderr, "%-5s %12s %12s %12s %12s %10s\n",
+            "call#", "create(µs)", "alloc(µs)", "bind(µs)", "total(µs)", "bytes");
+    double sum_c = 0, sum_a = 0, sum_b = 0, sum_t = 0;
+    /* Print first 3 (cold) + last 3 (warm) + summary for everything in between. */
+    int print_first = _ergo_bench_count < 6 ? _ergo_bench_count : 3;
+    for (int i = 0; i < print_first; i++) {
+        double t = _ergo_bench_calls[i].create_ns
+                 + _ergo_bench_calls[i].alloc_ns
+                 + _ergo_bench_calls[i].bind_ns;
+        fprintf(stderr, "%-5d %12.2f %12.2f %12.2f %12.2f %10zu\n",
+                i,
+                _ergo_bench_calls[i].create_ns / 1000.0,
+                _ergo_bench_calls[i].alloc_ns / 1000.0,
+                _ergo_bench_calls[i].bind_ns / 1000.0,
+                t / 1000.0,
+                _ergo_bench_calls[i].bytes);
+    }
+    if (_ergo_bench_count > 6) {
+        fprintf(stderr, "  ...  (calls %d through %d omitted)\n",
+                print_first, _ergo_bench_count - 4);
+        for (int i = _ergo_bench_count - 3; i < _ergo_bench_count; i++) {
+            double t = _ergo_bench_calls[i].create_ns
+                     + _ergo_bench_calls[i].alloc_ns
+                     + _ergo_bench_calls[i].bind_ns;
+            fprintf(stderr, "%-5d %12.2f %12.2f %12.2f %12.2f %10zu\n",
+                    i,
+                    _ergo_bench_calls[i].create_ns / 1000.0,
+                    _ergo_bench_calls[i].alloc_ns / 1000.0,
+                    _ergo_bench_calls[i].bind_ns / 1000.0,
+                    t / 1000.0,
+                    _ergo_bench_calls[i].bytes);
+        }
+    }
+    /* Cold vs warm splits */
+    double cold_create = _ergo_bench_calls[0].create_ns;
+    double cold_alloc  = _ergo_bench_calls[0].alloc_ns;
+    double cold_bind   = _ergo_bench_calls[0].bind_ns;
+    for (int i = 0; i < _ergo_bench_count; i++) {
+        sum_c += _ergo_bench_calls[i].create_ns;
+        sum_a += _ergo_bench_calls[i].alloc_ns;
+        sum_b += _ergo_bench_calls[i].bind_ns;
+    }
+    sum_t = sum_c + sum_a + sum_b;
+    if (_ergo_bench_count > 1) {
+        double warm_c = (sum_c - cold_create) / (_ergo_bench_count - 1);
+        double warm_a = (sum_a - cold_alloc)  / (_ergo_bench_count - 1);
+        double warm_b = (sum_b - cold_bind)   / (_ergo_bench_count - 1);
+        fprintf(stderr,
+                "cold (call 0)         : create=%.2fµs alloc=%.2fµs bind=%.2fµs total=%.2fµs\n",
+                cold_create / 1000.0, cold_alloc / 1000.0, cold_bind / 1000.0,
+                (cold_create + cold_alloc + cold_bind) / 1000.0);
+        fprintf(stderr,
+                "warm (mean of %d post): create=%.2fµs alloc=%.2fµs bind=%.2fµs total=%.2fµs\n",
+                _ergo_bench_count - 1,
+                warm_c / 1000.0, warm_a / 1000.0, warm_b / 1000.0,
+                (warm_c + warm_a + warm_b) / 1000.0);
+    } else {
+        fprintf(stderr, "(only 1 allocation — cold-only; no warm cohort)\n");
+    }
+    fprintf(stderr, "aggregate sum         : %.2f µs across %d calls\n",
+            sum_t / 1000.0, _ergo_bench_count);
+}
+#endif
+
 #ifdef ERGO_VK_ANDROID
 #include <vulkan/vulkan_android.h>
 #include <android/native_window.h>
@@ -897,7 +998,17 @@ ErgoVkBuf ergo_vk_create_buffer(size_t size) {
                  | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     buf_ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
+#ifdef ERGO_BENCH_VK_ALLOC
+    if (!_ergo_bench_atexit_registered) {
+        atexit(_ergo_bench_report);
+        _ergo_bench_atexit_registered = 1;
+    }
+    double _bench_t0 = _ergo_bench_now_ns();
+#endif
     VK_CHECK(vkCreateBuffer(g.device, &buf_ci, NULL, &b->buffer));
+#ifdef ERGO_BENCH_VK_ALLOC
+    double _bench_t1 = _ergo_bench_now_ns();
+#endif
 
     VkMemoryRequirements mem_req;
     vkGetBufferMemoryRequirements(g.device, b->buffer, &mem_req);
@@ -905,12 +1016,52 @@ ErgoVkBuf ergo_vk_create_buffer(size_t size) {
     VkMemoryAllocateInfo mem_ai = {0};
     mem_ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mem_ai.allocationSize = mem_req.size;
+#ifdef ERGO_BENCH_VK_ALLOC
+    /* Allow bench to select HOST_VISIBLE via ERGO_BENCH_HOST_VISIBLE=1
+     * for the Pass 3 DEVICE_LOCAL vs HOST_VISIBLE diagnostic. Print
+     * the selected memory type index on first call so we can verify
+     * the test actually picked the different type. */
+    static int _bench_mem_type_logged = 0;
+    if (getenv("ERGO_BENCH_HOST_VISIBLE")) {
+        mem_ai.memoryTypeIndex = find_memory_type(
+            mem_req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    } else {
+        mem_ai.memoryTypeIndex = find_memory_type(
+            mem_req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
+    if (!_bench_mem_type_logged) {
+        fprintf(stderr, "[bench] selected memoryTypeIndex=%u  bits=0x%08x  mode=%s\n",
+                mem_ai.memoryTypeIndex, mem_req.memoryTypeBits,
+                getenv("ERGO_BENCH_HOST_VISIBLE") ? "HOST_VISIBLE" : "DEVICE_LOCAL");
+        _bench_mem_type_logged = 1;
+    }
+#else
     mem_ai.memoryTypeIndex = find_memory_type(
         mem_req.memoryTypeBits,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+#endif
 
+#ifdef ERGO_BENCH_VK_ALLOC
+    double _bench_t2 = _ergo_bench_now_ns();
+#endif
     VK_CHECK(vkAllocateMemory(g.device, &mem_ai, NULL, &b->memory));
+#ifdef ERGO_BENCH_VK_ALLOC
+    double _bench_t3 = _ergo_bench_now_ns();
+#endif
     VK_CHECK(vkBindBufferMemory(g.device, b->buffer, b->memory, 0));
+#ifdef ERGO_BENCH_VK_ALLOC
+    double _bench_t4 = _ergo_bench_now_ns();
+    if (_ergo_bench_count < ERGO_BENCH_MAX_CALLS) {
+        _ergo_bench_calls[_ergo_bench_count].create_ns = _bench_t1 - _bench_t0;
+        _ergo_bench_calls[_ergo_bench_count].alloc_ns  = _bench_t3 - _bench_t2;
+        _ergo_bench_calls[_ergo_bench_count].bind_ns   = _bench_t4 - _bench_t3;
+        _ergo_bench_calls[_ergo_bench_count].bytes     = size;
+        _ergo_bench_count++;
+    }
+#endif
 
     b->size = size;
     b->in_use = 1;

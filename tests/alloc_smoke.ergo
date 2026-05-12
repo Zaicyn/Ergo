@@ -1,0 +1,29 @@
+! Minimal ALLOCATE smoke test for arena lowering.
+! Exists to provide a one-shot regression-fix verification target:
+!   - emit C and confirm no `malloc(` calls in generated source
+!   - confirm program runs and produces correct output
+!
+! Not a benchmark; the comparison brief's tests/allocate_bench.ergo
+! will provide that when it lands.
+
+IMPLICIT NONE
+
+INTEGER :: N, I
+REAL, ALLOCATABLE :: A(:)
+REAL :: SUM_A
+
+N := 100
+ALLOCATE(A(N))
+
+DO I = 1, N
+  A(I) := REAL(I) * 0.5
+ENDDO
+
+SUM_A := 0.0
+DO I = 1, N
+  SUM_A := SUM_A + A(I)
+ENDDO
+
+PRINT SUM_A
+
+DEALLOCATE(A)

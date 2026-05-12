@@ -34,7 +34,15 @@ This document confirms that **all language design decisions are locked**. The co
 
 ✅ **ALLOCATE/DEALLOCATE are statements:** `ALLOCATE(C(m, p))` is a statement, not an expression.
 
+✅ **Arena-backed allocation:** ALLOCATABLE arrays are bump-allocated from a file-scope STATIC arena in the generated C. No libc, no syscalls — the arena lives in BSS, is zero-filled by the loader, and is 64-byte aligned.
+
+✅ **DEALLOCATE is a no-op:** The arena is bump-only (LIFO would require a freelist; not in scope). A user writing `ALLOCATE; DEALLOCATE; ALLOCATE` in a loop will not recycle memory. Matches the "allocate once at startup, never free" pattern that ALLOCATABLE is for.
+
+✅ **Arena size:** Default is 1 GiB. Override with `--arena-size <N>` (accepts K/M/G suffix). On exhaustion, the program aborts with a stderr message naming the requested and available bytes.
+
 **Model name:** F77+Allocatable (strict, no hidden allocation)
+
+**Implementation reference:** [Spec/Arena_Lowering_Brief.md](Arena_Lowering_Brief.md).
 
 ---
 

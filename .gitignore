@@ -13,6 +13,40 @@
 !README.md
 !NEXT_SESSION.md
 
+# Testing/ — sources only, not build products.
+# Whitelist directories first so git considers them, then whitelist
+# source extensions by directory. asm/ and asm/keep_*/ stay ignored
+# because they're not in this whitelist — that's intentional, they
+# are regenerable from `make`.
+!Testing/
+!Testing/**/
+!Testing/*.md
+!Testing/**/*.md
+!Testing/Makefile
+!Testing/**/Makefile
+!Testing/*.c
+!Testing/*.cu
+!Testing/V8/*.cu
+!Testing/V8/*.cuh
+!Testing/V8/*.h
+!Testing/V8_bounded/*.cu
+!Testing/V22/*.c
+!Testing/V22/*.h
+!Testing/V9/*.cu
+!Testing/V9/*.cuh
+!Testing/V16/*.cu
+!Testing/V16/*.cuh
+!Testing/GEO/*.cu
+!Testing/GEO/*.cuh
+
+# tests/ — Ergo programs and C harnesses. Same pattern as Testing/:
+# track sources, leave build products and stale regenerable dumps
+# (compiled binaries, .spvasm snapshots) ignored.
+!tests/
+!tests/*.ergo
+!tests/*.c
+!tests/*.h
+
 # Always ignore build artifacts
 __pycache__/
 *.pyc
