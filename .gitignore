@@ -39,6 +39,14 @@
 !Testing/GEO/*.cu
 !Testing/GEO/*.cuh
 
+# tests/ — Ergo programs and C harnesses. Same pattern as Testing/:
+# track sources, leave build products and stale regenerable dumps
+# (compiled binaries, .spvasm snapshots) ignored.
+!tests/
+!tests/*.ergo
+!tests/*.c
+!tests/*.h
+
 # Always ignore build artifacts
 __pycache__/
 *.pyc
