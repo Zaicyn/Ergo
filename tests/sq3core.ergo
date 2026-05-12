@@ -34,7 +34,7 @@ DATA BINGEO / 228, 104, 0, 104, 228, 104, 0, 104 /
 ! Direct static addressing. No pointer chasing. No indirection.
 ! Access to STATIC storage compiles to direct address computation.
 
-STATIC REAL :: TINVAR(32, 8, 2)
+STATIC INTEGER :: TINVAR(32, 8, 2)
 STATIC INTEGER :: TOCC(32, 8, 2)
 STATIC INTEGER :: TFROZ(32, 8, 2)
 STATIC INTEGER :: TWHEAD(8, 2)
@@ -65,7 +65,7 @@ SUBROUTINE SQ3FAL(ID, IERR)
   INTEGER :: BIN, GEN, SHELL, POS
   INTEGER :: IGEO, IBIN, ISHEL
   INTEGER :: TBITS
-  REAL :: RINV
+  INTEGER :: RINV
 
   IERR := 0
   SHELL := 1
@@ -98,8 +98,8 @@ SUBROUTINE SQ3FAL(ID, IERR)
   ! no dependence on optimizer recognizing the power-of-two fold.
   TBITS := IAND(ISHFT(GEN - 1, 1), 31)
 
-  RINV := REAL(ISHFT(IGEO, 24) + ISHFT(IBIN, 16) + ISHFT(TBITS, 9) + &
-               ISHFT(ISHEL, 8) + (GEN - 1))
+  RINV := ISHFT(IGEO, 24) + ISHFT(IBIN, 16) + ISHFT(TBITS, 9) + &
+          ISHFT(ISHEL, 8) + (GEN - 1)
 
   TINVAR(GEN, BIN, SHELL) := RINV
 
@@ -132,7 +132,7 @@ SUBROUTINE SQ3TIN
       DO I = 1, 32
         TOCC(I, J, K) := 0
         TFROZ(I, J, K) := 0
-        TINVAR(I, J, K) := 0.0
+        TINVAR(I, J, K) := 0
       ENDDO
     ENDDO
   ENDDO
@@ -159,11 +159,72 @@ INTEGER FUNCTION SQ3ZON(NOCC)
   RETURN SQ3ZON
 END
 
+! ── SQ3VAL: Validate TINVAR contents ───────────────────────
+! Walks every (GEN, BIN, SHELL) slot. For occupied slots
+! (TOCC == 1), recomputes the expected bit-pack and compares
+! against the stored TINVAR entry. Returns count of mismatches
+! (zero = all entries valid). For unoccupied slots, expects
+! TINVAR == 0 (the SQ3TIN init value).
+!
+! This routine exists to make v3's "RINV is exactly recoverable
+! bit-for-bit" claim falsifiable. Without it, the bit-pack
+! discipline is asserted but never verified. With it, any
+! corruption of the encoding (wrong shift, wrong mask, drift)
+! produces a non-zero mismatch count.
+!
+! TODO (future implementer): when Invariant_Language_Feature
+! Version 1 lands, the per-entry check below becomes the body
+! of an INVARIANT GEO_PACKING declaration, and SQ3VAL becomes
+! the compiler-generated verifier rather than hand-written.
+! Other invariants worth adding at that time (per Grok's sketch):
+!   - INVARIANT TORUS_CONSERVATION:
+!       TTOTAL = SUM(TALLOC) OVER BINS,SHELLS = SUM(TOCC)
+!   - INVARIANT RING_INTEGRITY:
+!       FOR EACH BIN,SHELL: TLEN = COUNT(TOCC == 1)
+!   - INVARIANT PERIOD4_FREEZE:
+!       TFROZ == 1 IFF MOD(TALLOC, 4) == 0 AT ALLOCATION TIME
+!   - INVARIANT HEAD_PROGRESSION:
+!       TWHEAD = 1 + TLEN
+! Keep this comment in sync with the V1 implementation if it lands.
+
+SUBROUTINE SQ3VAL(NMISMATCH)
+  INTEGER :: NMISMATCH
+  INTEGER :: VI, VJ, VK
+  INTEGER :: VBIN, VSHELL, VGEO, VTBITS, EXPECTED, ACTUAL
+
+  NMISMATCH := 0
+  DO VK = 1, 2
+    DO VJ = 1, 8
+      DO VI = 1, 32
+        ACTUAL := TINVAR(VI, VJ, VK)
+        IF TOCC(VI, VJ, VK) = 1 THEN
+          ! Reproduce SQ3FAL's bit-pack from (BIN=VJ, SHELL=VK, GEN=VI).
+          VBIN := VJ - 1
+          VSHELL := VK - 1
+          VGEO := BINGEO(VJ)
+          VTBITS := IAND(ISHFT(VI - 1, 1), 31)
+          EXPECTED := ISHFT(VGEO, 24) + ISHFT(VBIN, 16) + &
+                      ISHFT(VTBITS, 9) + ISHFT(VSHELL, 8) + (VI - 1)
+          IF ACTUAL ≠ EXPECTED THEN
+            NMISMATCH := NMISMATCH + 1
+          ENDIF
+        ELSE
+          IF ACTUAL ≠ 0 THEN
+            NMISMATCH := NMISMATCH + 1
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDDO
+  ENDDO
+  RETURN
+END
+
 ! ── Test harness ─────────────────────────────────────────────
 
 IMPLICIT NONE
 INTEGER :: I, ERR, ZONE
 INTEGER :: HASH, HI, HJ, HK
+INTEGER :: NBAD
 
 CALL SQ3TIN
 
@@ -176,12 +237,18 @@ PRINT TTOTAL
 ZONE := SQ3ZON(TTOTAL)
 PRINT ZONE
 
+! Validate TINVAR encoding. Expected: 0 mismatches.
+CALL SQ3VAL(NBAD)
+PRINT NBAD
+
 ! ── ERGO_HASH_FINAL-style integer state hash ─────────────────
 ! Xorshift mix (13, -19) over TOCC, TFROZ, TWHEAD, TLEN, TALLOC, TTOTAL
 ! in fixed iteration order. Uses only IEOR/ISHFT so the hash itself
 ! is bit-exact under any GCC optimization level. Seeded with FNV-1a
-! 32-bit offset basis. Skips TINVAR (REAL) — FP determinism is
-! validated separately via the GPU hash hook on galaxy_structured.
+! 32-bit offset basis. Skips TINVAR — its contents are verified
+! directly by SQ3VAL (called below), which checks every entry against
+! its derived bit-pack; the hash's role is regression coverage of
+! integer state, not redundant TINVAR validation.
 
 HASH := 166136261
 DO HK = 1, 2
