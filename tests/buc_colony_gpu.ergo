@@ -1,0 +1,411 @@
+! BUC_COLONY_GPU - Colony simulator for Vulkan GPU + render
+! ====================================================================
+! Same simulation as buc_colony.mcl, stripped of ANSI terminal output.
+! Visualization via --render (Vulkan window, fragment shader heat map).
+!
+! Usage:
+!   mcl tests/buc_colony_gpu.mcl --target spirv --render -o colony_gpu
+!   ./colony_gpu
+
+IMPLICIT NONE
+
+! ── Grid parameters ─────────────────────────────────────────
+INTEGER :: GW = 64
+INTEGER :: GH = 32
+INTEGER :: NCELLS = 2048
+INTEGER :: TPF = 50
+INTEGER :: NFRAME = 2000
+
+! ── Per-cell state arrays ───────────────────────────────────
+REAL :: CPSI(2048), CHIN(2048), CKIN(2048)
+REAL :: CATP(2048), CMSH(2048)
+INTEGER :: CALIVE(2048), CGENO(2048), CDIV(2048)
+
+! ── Environment ─────────────────────────────────────────────
+REAL :: HOUT = 1.0E-4
+REAL :: KOUT = 5.0
+
+! ── Membrane parameters ────────────────────────────────────
+REAL :: CM = 0.02
+REAL :: GK0 = 0.008
+REAL :: GH0 = 0.002
+REAL :: PMAX = 0.05
+REAL :: PHALF = 0.3
+REAL :: PCOST = 0.008
+REAL :: PCURR = 2.0
+REAL :: SMAX = 0.08
+REAL :: SHALF = 80.0
+REAL :: SYIELD = 0.005
+REAL :: ADECAY = 0.00005
+REAL :: NERNST = 61.5
+
+! ── Mesh dynamics ───────────────────────────────────────────
+REAL :: MREPAIR = 0.001
+REAL :: MDECAY = 0.00002
+REAL :: MRCOST = 0.0003
+
+! ── Inter-cell diffusion ───────────────────────────────────
+REAL :: DK = 0.02
+REAL :: DH = 0.005
+
+! ── Buffer arrays for GPU/CPU pass communication ──────────
+REAL :: WILEAK_BUF(2048), WIK_BUF(2048), WIH_BUF(2048)
+REAL :: IPUMP_BUF(2048)
+
+! ── Working variables ──────────────────────────────────────
+REAL :: WEK, WEH, WGK, WGH, WIK, WIH, WILEAK
+REAL :: PRATE, IPUMP, DELTAP, SRATE, EXCESS, VPNLTY
+REAL :: ITOTAL, DPSIDT, DAVGM, DFLUX
+REAL :: DMESH, RCOST
+REAL :: GKMOD, SYMOD, MRMOD
+REAL :: NOISE, RND, DIST
+INTEGER :: I, J, K, X, Y, IX, FRAME, T
+INTEGER :: NX, NY, NI
+INTEGER :: ISEED
+INTEGER :: NEMPTY, NKIDX
+INTEGER :: ELIST(8)
+
+! ── Neighbor offsets (8-connected) ─────────────────────────
+INTEGER :: DXN(8)
+INTEGER :: DYN(8)
+DATA DXN / -1, 0, 1, -1, 1, -1, 0, 1 /
+DATA DYN / -1, -1, -1, 0, 0, 1, 1, 1 /
+
+! ── Initialize grid ────────────────────────────────────────
+ISEED := 42
+DO I = 1, 2048
+  CALIVE(I) := 0
+  CPSI(I) := 0.0
+  CHIN(I) := HOUT
+  CKIN(I) := KOUT
+  CATP(I) := 0.0
+  CMSH(I) := 0.0
+  CGENO(I) := 0
+  CDIV(I) := 0
+ENDDO
+
+! ── Seed initial population: center 15x15 block ────────────
+DO Y = 9, 23
+  DO X = 25, 39
+    IX := (Y - 1) * 64 + X
+    IF IX ≥ 1 .AND. IX ≤ 2048 THEN
+      CALIVE(IX) := 1
+      IF X ≤ 32 .AND. Y ≤ 16 THEN
+        CGENO(IX) := 0
+      ELSEIF X > 32 .AND. Y ≤ 16 THEN
+        CGENO(IX) := 1
+      ELSEIF X ≤ 32 .AND. Y > 16 THEN
+        CGENO(IX) := 2
+      ELSE
+        CGENO(IX) := 3
+      ENDIF
+      CPSI(IX) := -220.0
+      CHIN(IX) := 5.0E-4
+      CKIN(IX) := 200.0
+      CATP(IX) := 0.80
+      CMSH(IX) := 1.0
+      CDIV(IX) := 0
+    ENDIF
+  ENDDO
+ENDDO
+
+! ════════════════════════════════════════════════════════════
+! MAIN LOOP
+! ════════════════════════════════════════════════════════════
+DO FRAME = 1, 2000
+
+  ! ── Environmental noise ──────────────────────────────────
+  NOISE := 0.0001 * (1.0 + SIN(REAL(FRAME) / 50.0)) * MIN(REAL(FRAME) / 500.0, 3.0)
+
+  ! ── Tick all cells ───────────────────────────────────────
+  DO T = 1, 50
+
+    ! ── PASS 1: ELECTROCHEMISTRY (GPU) ─────────────────────
+    ! Pure data-parallel. Each cell computes Nernst, leak, pump,
+    ! synthase, ATP decay, mesh decay. Results buffered for Pass 3.
+    DO I = 1, 2048
+      IF CALIVE(I) ≠ 1 THEN
+        WILEAK_BUF(I) := 0.0
+        WIK_BUF(I) := 0.0
+        WIH_BUF(I) := 0.0
+        IPUMP_BUF(I) := 0.0
+        CYCLE
+      ENDIF
+
+      ! Genotype modifiers
+      GKMOD := 1.0
+      SYMOD := 1.0
+      IF CGENO(I) = 2 THEN
+        GKMOD := 2.0
+      ENDIF
+      IF CGENO(I) = 3 THEN
+        SYMOD := 0.5
+      ENDIF
+
+      ! ── Nernst potentials ────────────────────────────
+      IF CKIN(I) > 1.0E-10 THEN
+        WEK := NERNST * LOG10(KOUT / CKIN(I))
+      ELSE
+        WEK := 0.0
+      ENDIF
+      IF CHIN(I) > 1.0E-15 THEN
+        WEH := NERNST * LOG10(HOUT / CHIN(I))
+      ELSE
+        WEH := 0.0
+      ENDIF
+
+      ! ── Leak conductances ────────────────────────────
+      WGK := GK0 * (1.0 - 0.95 * CMSH(I)) * GKMOD
+      WGH := GH0 * (1.0 - 0.95 * CMSH(I)) * GKMOD
+
+      ! ── Passive leak currents ────────────────────────
+      WIK := WGK * (CPSI(I) - WEK)
+      WIH := WGH * (CPSI(I) - WEH)
+      WILEAK := WIK + WIH
+
+      ! ── Active proton pump ───────────────────────────
+      IF CATP(I) > 0.001 THEN
+        PRATE := PMAX * CATP(I) / (CATP(I) + PHALF)
+      ELSE
+        PRATE := 0.0
+      ENDIF
+      IPUMP := PCURR * PRATE
+      CHIN(I) := CHIN(I) - PRATE * 2.0E-5
+      IF CHIN(I) < 1.0E-8 THEN
+        CHIN(I) := 1.0E-8
+      ENDIF
+      CATP(I) := CATP(I) - PCOST * PRATE
+      IF CATP(I) < 0.0 THEN
+        CATP(I) := 0.0
+      ENDIF
+
+      ! ── ATP synthase ─────────────────────────────────
+      IF CHIN(I) > 1.0E-15 .AND. HOUT > 1.0E-15 THEN
+        DELTAP := CPSI(I) - 60.0 * LOG10(CHIN(I) / HOUT)
+      ELSE
+        DELTAP := CPSI(I)
+      ENDIF
+      IF DELTAP < -80.0 .AND. CPSI(I) < -100.0 THEN
+        EXCESS := ABS(DELTAP) - 80.0
+        VPNLTY := MIN(1.0, (ABS(CPSI(I)) - 100.0) / 50.0)
+        SRATE := SMAX * (EXCESS ** 2) / (EXCESS ** 2 + SHALF ** 2) * VPNLTY
+        CATP(I) := CATP(I) + SYIELD * SYMOD * SRATE
+        IF CATP(I) > 1.0 THEN
+          CATP(I) := 1.0
+        ENDIF
+        CHIN(I) := CHIN(I) + 5.0E-7 * SRATE
+      ELSE
+        SRATE := 0.0
+      ENDIF
+
+      ! ── Baseline ATP consumption ─────────────────────
+      CATP(I) := CATP(I) - ADECAY
+      IF CATP(I) < 0.0 THEN
+        CATP(I) := 0.0
+      ENDIF
+
+      ! ── Mesh decay ───────────────────────────────────
+      CMSH(I) := CMSH(I) - MDECAY
+
+      ! ── Store intermediates to buffers ───────────────
+      WILEAK_BUF(I) := WILEAK
+      WIK_BUF(I) := WIK
+      WIH_BUF(I) := WIH
+      IPUMP_BUF(I) := IPUMP
+    ENDDO
+
+    ! ── PASS 2: ENVIRONMENTAL NOISE + MESH REPAIR (CPU) ──
+    ! Sequential: ISEED accumulator, PRNG-dependent mesh damage.
+    DO I = 1, 2048
+      IF CALIVE(I) ≠ 1 THEN
+        CYCLE
+      ENDIF
+
+      ! Genotype modifier for mesh repair
+      MRMOD := 1.0
+      IF CGENO(I) = 1 THEN
+        MRMOD := 0.0
+      ENDIF
+
+      ! ── Environmental mesh damage ────────────────────
+      X := MOD(I - 1, 64) + 1
+      Y := (I - 1) / 64 + 1
+      DIST := SQRT(REAL((X - 32) ** 2 + (Y - 16) ** 2)) / REAL(MAX(64, 32))
+      ISEED := MOD(ISEED * 1103515245 + 12345, 2147483647)
+      RND := REAL(MOD(ISEED / 65536, 32768)) / 32767.0
+      CMSH(I) := CMSH(I) - NOISE * DIST * RND
+
+      ! ── Mesh repair ──────────────────────────────────
+      IF CATP(I) > 0.3 .AND. MRMOD > 0.0 THEN
+        DMESH := MREPAIR * MRMOD * (CATP(I) - 0.3) / 0.7 * (1.0 - CMSH(I))
+        RCOST := MRCOST * DMESH
+        IF RCOST < CATP(I) - 0.2 THEN
+          CMSH(I) := CMSH(I) + DMESH
+          CATP(I) := CATP(I) - RCOST
+        ENDIF
+      ENDIF
+
+      ! ── Clamp mesh ───────────────────────────────────
+      IF CMSH(I) < 0.0 THEN
+        CMSH(I) := 0.0
+      ENDIF
+      IF CMSH(I) > 1.0 THEN
+        CMSH(I) := 1.0
+      ENDIF
+    ENDDO
+
+    ! ── PASS 3: MEMBRANE UPDATE (GPU) ────────────────────
+    ! Reads from buffer arrays. Pure data-parallel.
+    DO I = 1, 2048
+      IF CALIVE(I) ≠ 1 THEN
+        CYCLE
+      ENDIF
+
+      ! ── Membrane potential update ────────────────────
+      ITOTAL := WILEAK_BUF(I) + IPUMP_BUF(I)
+      DPSIDT := -ITOTAL / CM
+      CPSI(I) := CPSI(I) + DPSIDT
+      IF CPSI(I) < -300.0 THEN
+        CPSI(I) := -300.0
+      ENDIF
+      IF CPSI(I) > 50.0 THEN
+        CPSI(I) := 50.0
+      ENDIF
+
+      ! ── Ion update ───────────────────────────────────
+      CKIN(I) := CKIN(I) - WIK_BUF(I) * 0.05
+      CHIN(I) := CHIN(I) - WIH_BUF(I) * 5.0E-5
+      IF CKIN(I) < 0.1 THEN
+        CKIN(I) := 0.1
+      ENDIF
+      IF CKIN(I) > 500.0 THEN
+        CKIN(I) := 500.0
+      ENDIF
+      IF CHIN(I) < 1.0E-8 THEN
+        CHIN(I) := 1.0E-8
+      ENDIF
+      IF CHIN(I) > 1.0E-2 THEN
+        CHIN(I) := 1.0E-2
+      ENDIF
+    ENDDO
+
+    ! ── PASS 4: DEATH + DIVISION (CPU) ───────────────────
+    ! Sequential: NEMPTY accumulator, neighbor search, ISEED PRNG.
+    DO I = 1, 2048
+      IF CALIVE(I) ≠ 1 THEN
+        CYCLE
+      ENDIF
+
+      ! ── Death check ──────────────────────────────────
+      IF CATP(I) < 0.001 .AND. CPSI(I) > -105.0 THEN
+        CALIVE(I) := 0
+        CYCLE
+      ENDIF
+
+      ! ── Division cooldown ────────────────────────────
+      CDIV(I) := CDIV(I) + 1
+
+      ! ── Division check ───────────────────────────────
+      X := MOD(I - 1, 64) + 1
+      Y := (I - 1) / 64 + 1
+      IF CPSI(I) < -130.0 .AND. CATP(I) > 0.4 .AND. CMSH(I) > 0.85 .AND. CDIV(I) > 200 THEN
+        NEMPTY := 0
+        DO J = 1, 8
+          NX := MOD(X - 1 + DXN(J) + 64, 64) + 1
+          NY := MOD(Y - 1 + DYN(J) + 32, 32) + 1
+          NI := (NY - 1) * 64 + NX
+          IF CALIVE(NI) = 0 THEN
+            NEMPTY := NEMPTY + 1
+            ELIST(NEMPTY) := NI
+          ENDIF
+        ENDDO
+
+        IF NEMPTY > 0 THEN
+          ISEED := MOD(ISEED * 1103515245 + 12345, 2147483647)
+          NKIDX := MOD(ABS(ISEED / 65536), NEMPTY) + 1
+          NI := ELIST(NKIDX)
+          CALIVE(NI) := 1
+          CGENO(NI) := CGENO(I)
+          CPSI(NI) := CPSI(I)
+          CHIN(NI) := CHIN(I)
+          CKIN(NI) := CKIN(I)
+          CATP(NI) := CATP(I) * 0.8
+          CMSH(NI) := CMSH(I) * 0.98
+          CDIV(NI) := 0
+          CATP(I) := CATP(I) * 0.8
+          CMSH(I) := CMSH(I) * 0.98
+          CDIV(I) := 0
+        ENDIF
+      ENDIF
+    ENDDO
+
+    ! ── PASS 5: DIFFUSION (CPU) ──────────────────────────
+    ! Cross-cell writes at NI indices; stays on CPU.
+    DO I = 1, 2048
+      IF CALIVE(I) ≠ 1 THEN
+        CYCLE
+      ENDIF
+      X := MOD(I - 1, 64) + 1
+      Y := (I - 1) / 64 + 1
+
+      ! Right neighbor
+      NX := MOD(X, 64) + 1
+      NI := (Y - 1) * 64 + NX
+      IF CALIVE(NI) = 1 THEN
+        DAVGM := 0.5 * (CMSH(I) + CMSH(NI))
+        DFLUX := DK * (1.0 - 0.95 * DAVGM)
+        CKIN(I) := CKIN(I) + DFLUX * (CKIN(NI) - CKIN(I))
+        CKIN(NI) := CKIN(NI) + DFLUX * (CKIN(I) - CKIN(NI))
+        DFLUX := DH * (1.0 - 0.95 * DAVGM)
+        CHIN(I) := CHIN(I) + DFLUX * (CHIN(NI) - CHIN(I))
+        CHIN(NI) := CHIN(NI) + DFLUX * (CHIN(I) - CHIN(NI))
+      ENDIF
+
+      ! Down neighbor
+      IF Y < 32 THEN
+        NI := Y * 64 + X
+        IF CALIVE(NI) = 1 THEN
+          DAVGM := 0.5 * (CMSH(I) + CMSH(NI))
+          DFLUX := DK * (1.0 - 0.95 * DAVGM)
+          CKIN(I) := CKIN(I) + DFLUX * (CKIN(NI) - CKIN(I))
+          CKIN(NI) := CKIN(NI) + DFLUX * (CKIN(I) - CKIN(NI))
+          DFLUX := DH * (1.0 - 0.95 * DAVGM)
+          CHIN(I) := CHIN(I) + DFLUX * (CHIN(NI) - CHIN(I))
+          CHIN(NI) := CHIN(NI) + DFLUX * (CHIN(I) - CHIN(NI))
+        ENDIF
+      ENDIF
+
+      ! Boundary leak to environment
+      DO J = 1, 8
+        NX := MOD(X - 1 + DXN(J) + 64, 64) + 1
+        NY := MOD(Y - 1 + DYN(J) + 32, 32) + 1
+        NI := (NY - 1) * 64 + NX
+        IF CALIVE(NI) ≠ 1 THEN
+          DFLUX := DK * (1.0 - 0.95 * CMSH(I)) * 0.002
+          CKIN(I) := CKIN(I) + DFLUX * (KOUT - CKIN(I))
+          DFLUX := DH * (1.0 - 0.95 * CMSH(I)) * 0.002
+          CHIN(I) := CHIN(I) + DFLUX * (HOUT - CHIN(I))
+        ENDIF
+      ENDDO
+
+      ! Clamp ions after diffusion
+      IF CKIN(I) < 0.1 THEN
+        CKIN(I) := 0.1
+      ENDIF
+      IF CKIN(I) > 500.0 THEN
+        CKIN(I) := 500.0
+      ENDIF
+      IF CHIN(I) < 1.0E-8 THEN
+        CHIN(I) := 1.0E-8
+      ENDIF
+      IF CHIN(I) > 1.0E-2 THEN
+        CHIN(I) := 1.0E-2
+      ENDIF
+
+    ENDDO
+
+  ENDDO
+
+ENDDO
+
+STOP

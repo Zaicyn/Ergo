@@ -1,0 +1,30 @@
+! Benchmark Ergo's arena-backed ALLOCATABLE path.
+!
+! Pattern: N=1000 ALLOCATE/access/DEALLOCATE cycles, with a per-iteration
+! write-read of A(1) plus an accumulator so the compiler can't DCE the
+! loop body. PRINT total at the end serves as both a correctness check
+! and an observable side effect.
+!
+! Expected correctness: total = sum(I for I = 1..1000) = 500500.0
+!
+! Expected perf: ~0.5-0.6 ns/ALLOCATE on Ryzen 5 3600 (essentially at
+! the CPU bump-allocator floor; arena emit is load+round+bounds-check+
+! store-pointer, all integer ops). See Testing/COMPARISON_TABLE.md
+! Sub-table 1 for the floor measurement and the Ergo cell.
+
+IMPLICIT NONE
+
+INTEGER :: I, N
+REAL, ALLOCATABLE :: A(:)
+REAL :: total
+
+N := 1000
+total := 0.0
+DO I = 1, N
+  ALLOCATE(A(64))
+  A(1) := REAL(I)
+  total := total + A(1)
+  DEALLOCATE(A)
+ENDDO
+
+PRINT total

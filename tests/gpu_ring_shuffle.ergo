@@ -1,0 +1,32 @@
+! gpu_ring_shuffle.mcl - Test RING_PREV / RING_NEXT subgroup shuffle intrinsics
+! Each thread reads its neighbor's value via warp shuffle.
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: N = 256
+
+REAL :: OMEGA(N), OMEGA_PREV(N), OMEGA_NEXT(N)
+REAL :: DELTA(N)
+INTEGER :: i
+
+! CPU-side initialization (not a GPU kernel — no array writes in a loop)
+DO i = 1, N, 1
+  OMEGA(i) := REAL(i) * 0.1
+ENDDO
+PRINT OMEGA(1)
+PRINT OMEGA(32)
+
+! Ring shuffle kernel: exchange with neighbors
+! This loop is extracted as a separate GPU kernel because OMEGA
+! is read-only here (writes go to OMEGA_PREV, OMEGA_NEXT, DELTA).
+DO i = 1, N, 1
+  OMEGA_PREV(i) := RING_PREV(OMEGA(i))
+  OMEGA_NEXT(i) := RING_NEXT(OMEGA(i))
+  DELTA(i) := OMEGA_NEXT(i) - OMEGA_PREV(i)
+ENDDO
+
+! Expected for warp-local shuffle (32-lane subgroup):
+! Lane 0: OMEGA=0.1, PREV=lane31's value (3.2), NEXT=lane1's value (0.2)
+! DELTA(1) = 0.2 - 3.2 = -3.0
+PRINT OMEGA_PREV(1)
+PRINT OMEGA_NEXT(1)
+PRINT DELTA(1)

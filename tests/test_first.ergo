@@ -1,0 +1,19 @@
+! test_first.mcl - First compilation target
+IMPLICIT NONE
+
+REAL :: x, y, z
+INTEGER :: i
+
+x := 5.0
+y := 3.0
+z := x + y * 2.0
+PRINT z
+
+DO i = 1, 10, 1
+  x := x + 1.0
+ENDDO
+PRINT x
+
+IF 0.0 < z ≤ 20.0 THEN
+  PRINT z
+ENDIF

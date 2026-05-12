@@ -1,0 +1,117 @@
+! GPU_INDEX_PATTERNS — Test IR classification for various write patterns
+! =====================================================================
+! Tests the FLOW-rooted dependence taxonomy:
+!   INJECTIVE — affine index, compiler-proven unique writes
+!   FLOW      — data-dependent index, asserted non-colliding
+!   SHIFT(k)  — same-array read/write at constant offset
+!   REDUCTION — scalar accumulator
+!   SCATTER   — known or possible write collisions
+!
+! Run: python -m mcl tests/gpu_index_patterns.mcl --target spirv --emit-c
+! (Will report which loops extracted and which rejected)
+
+PARAMETER INTEGER :: N = 1024
+PARAMETER INTEGER :: NX = 32
+PARAMETER INTEGER :: NY = 32
+
+STATIC REAL :: A(N), B(N), C(N)
+STATIC REAL :: D(2048)
+STATIC REAL :: GRID(NX, NY)
+STATIC INTEGER :: IDX(N)
+STATIC INTEGER :: PERM(N)
+STATIC REAL :: total
+
+IMPLICIT NONE
+INTEGER :: I, J
+
+! ── Pattern 1: Trivial INJECTIVE — A(I) := B(I) + C(I) ──────
+! Expected: INJECTIVE (extractable). g(I) = I, stride = 1.
+DO I = 1, N
+  A(I) := B(I) + C(I)
+ENDDO
+
+! ── Pattern 2: Strided INJECTIVE — D(2*I) := A(I) ───────────
+! Expected: INJECTIVE (extractable). g(I) = 2*I, stride = 2.
+DO I = 1, N
+  D(2 * I) := A(I)
+ENDDO
+
+! ── Pattern 3: Reverse INJECTIVE — A(N - I + 1) := B(I) ─────
+! Expected: INJECTIVE (extractable). g(I) = -I + N + 1, stride = -1.
+DO I = 1, N
+  A(N - I + 1) := B(I)
+ENDDO
+
+! ── Pattern 4: Offset INJECTIVE — A(I + 10) := B(I) ─────────
+! Expected: INJECTIVE (extractable). g(I) = I + 10, stride = 1.
+DO I = 1, 1000
+  A(I + 10) := B(I)
+ENDDO
+
+! ── Pattern 5: SCATTER — accumulation at data-dependent index ─
+! Expected: SCATTER (rejected). Read-modify-write at IDX(I).
+DO I = 1, N
+  A(IDX(I)) := A(IDX(I)) + 1.0
+ENDDO
+
+! ── Pattern 6: Dual INJECTIVE — two writes at loop var ───────
+! Expected: INJECTIVE (extractable). Both writes at I.
+DO I = 1, N
+  A(I) := B(I) * 2.0
+  C(I) := B(I) + 1.0
+ENDDO
+
+! ── Pattern 7: Nested loop — 2D grid ─────────────────────────
+! Expected: REJECTED (nested loop). Future: linearized MAP.
+DO J = 1, NY
+  DO I = 1, NX
+    GRID(I, J) := REAL(I + NX * (J - 1))
+  ENDDO
+ENDDO
+
+! ── Pattern 8: Division — non-injective affine ───────────────
+! Expected: SCATTER (rejected). g(I) = I/2 — floor division
+! collapses pairs (1,2 -> 0), (3,4 -> 1), etc. Not injective.
+DO I = 1, N
+  A(I / 2) := B(I)
+ENDDO
+
+! ── Pattern 9: SHIFT — stencil dependency ────────────────────
+! Expected: SHIFT(k=1) (rejected). Reads A(I-1), writes A(I).
+! Cross-iteration dependency: iteration I depends on I-1.
+DO I = 2, N
+  A(I) := A(I - 1) + B(I)
+ENDDO
+
+! ── Pattern 10: FLOW — permutation mapping ───────────────────
+! Expected: FLOW (extractable). P is a permutation array.
+! Index is data-dependent but no read-modify-write of target.
+DO I = 1, N
+  A(PERM(I)) := B(I)
+ENDDO
+
+! ── Pattern 11: REDUCTION — scalar accumulator ───────────────
+! Expected: REDUCTION (rejected). total is read-before-write.
+total := 0.0
+DO I = 1, N
+  total := total + A(I)
+ENDDO
+
+! ── Pattern 12: Self-map — A(I) := A(I) + B(I) ──────────────
+! Expected: INJECTIVE (extractable). Same-array read and write
+! at identical index (shift k=0). Each iteration is independent.
+DO I = 1, N
+  A(I) := A(I) + B(I)
+ENDDO
+
+! ── Pattern 13: Out-of-bounds — D(2*I) with N=1024, SIZE(D)=2048 ──
+! Expected: INJECTIVE (extractable) with bounds WARNING.
+! 2*1024 = 2048, which equals array size — OK actually.
+! But D(3*I) with N=1024 would be 3072 > 2048.
+DO I = 1, N
+  D(3 * I) := A(I)
+ENDDO
+
+PRINT A(1)
+PRINT D(2)
+PRINT total
