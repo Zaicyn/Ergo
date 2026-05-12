@@ -2139,6 +2139,54 @@ class _EmitContext:
         return (item.insts[0].op == Op.COPY and
                 item.insts[0].meta.get("kind") == "cycle")
 
+    # Ops safe to predicate. Anything not in this set disqualifies a body
+    # from the Flatten hint — keeps the classifier strict; loosen later if
+    # a profile flags a missed opportunity.
+    _FLATTEN_SAFE_OPS = frozenset({
+        Op.ADD, Op.SUB, Op.MUL, Op.DIV, Op.POW, Op.MOD, Op.NEG,
+        Op.LT, Op.GT, Op.EQ, Op.NE, Op.LE, Op.GE,
+        Op.AND, Op.OR, Op.NOT,
+        Op.ISHFT, Op.IEOR, Op.IAND, Op.IOR, Op.BITNOT,
+        Op.TO_REAL, Op.TO_INT, Op.TO_CHAR,
+        Op.SIN, Op.COS, Op.TAN, Op.ASIN, Op.ACOS, Op.ATAN,
+        Op.EXP, Op.LOG, Op.SQRT, Op.ABS,
+        Op.SINH, Op.COSH, Op.TANH,
+        Op.MAX, Op.MIN, Op.CLAMP,
+        Op.LOAD, Op.STORE, Op.COPY,
+    })
+
+    _FLATTEN_BODY_LIMIT = 8
+
+    def _should_flatten(self, node: IRIf) -> bool:
+        """Classifier for SPIR-V SelectionMerge Flatten hint.
+
+        Returns True when the IF body is small, pure-compute, and direct-RW —
+        safe for the driver to predicate rather than branch. Conservative:
+        rejects nested control flow, calls, warp/ring collectives, and
+        scatter-pattern stores (read-modify-write on the same array, which
+        the SPIRV emitter promotes to atomics).
+        """
+        insts: list[IRInst] = []
+        for body in (node.then_body, node.else_body or []):
+            for item in body:
+                if not isinstance(item, IRBlock):
+                    return False  # nested control flow disqualifies
+                insts.extend(item.insts)
+        if len(insts) > self._FLATTEN_BODY_LIMIT:
+            return False
+        loaded_arrays: set[str] = set()
+        for inst in insts:
+            if inst.op not in self._FLATTEN_SAFE_OPS:
+                return False
+            if inst.op == Op.LOAD:
+                loaded_arrays.add(inst.meta.get("array", ""))
+            elif inst.op == Op.STORE:
+                # Read-modify-write on the same array = scatter, becomes
+                # atomic in the emitter; never predicate.
+                if inst.meta.get("array", "") in loaded_arrays:
+                    return False
+        return True
+
     def _emit_if(self, node: IRIf, buf_vars: dict[str, int],
                  pc_member_ids: dict[str, tuple[int, int]],
                  ssa_map: dict[str, int], idx_0: int):
@@ -2180,8 +2228,9 @@ class _EmitContext:
         # Remember the block we branched from (for OpPhi fallthrough)
         pre_if_block = self._current_block
 
+        merge_hint = "Flatten" if self._should_flatten(node) else "None"
         self._function.append(
-            f"               OpSelectionMerge {self._id(merge_label)} None")
+            f"               OpSelectionMerge {self._id(merge_label)} {merge_hint}")
         self._function.append(
             f"               OpBranchConditional {self._id(cond)} "
             f"{self._id(then_label)} {self._id(else_label)}")
