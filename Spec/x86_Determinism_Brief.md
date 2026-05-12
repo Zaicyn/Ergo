@@ -327,7 +327,7 @@ audit; spec/code gap is currently flagged in a comment, not fixed).
 
 ## Stage 3 — Document the determinism contract in the spec
 
-**Goal:** [Spec/MCL_Design_COMPLETE.md](MCL_Design_COMPLETE.md) Part 6
+**Goal:** [Spec/MCL_Design_COMPLETE.md](MCL_Design_COMPLETE.md) Part 7
 states the determinism guarantees Ergo provides, with explicit reference
 to the build flags and the V8/V22 empirical work.
 
@@ -339,7 +339,10 @@ just in the implementer's head.
 
 **Change in [Spec/MCL_Design_COMPLETE.md](MCL_Design_COMPLETE.md):**
 
-Add a subsection to Part 6, after "Expression Evaluation Order (Locked)":
+Add a subsection to Part 7, after "IEEE Semantics for Math Intrinsics"
+(the brief originally said "Part 6, after Expression Evaluation Order";
+both were wrong — Part 6 is a 4-bullet checklist with no subsections,
+and "Expression Evaluation Order (Locked)" lives in Part 7):
 
 ```markdown
 ### Determinism Contract (x86)
@@ -390,7 +393,11 @@ Verify by:
    don't ship a contract you don't enforce.
 
 **Out of scope:** any change to existing spec sections beyond adding the
-new subsection. Don't reorganize Part 6 to accommodate it; just append.
+new subsection. Don't reorganize Part 7 to accommodate it; just append.
+(Stage 3 landed an errata-only flag-name rename across 8 stale
+`--fast-math` references and one implementation-status paragraph in
+Part 9.9 — those are factual corrections to keep the spec consistent
+with stages 1-2, not reorganization.)
 
 ## Stage 4 — Add configurable flag surface (deferred)
 
@@ -473,7 +480,7 @@ hours when picked up.
   yourself wanting to modify generated C to "help" the compiler, stop
   — that's a separate project with a separate brief.
 - **Don't optimize the spec wording in stage 3.** Add the new subsection.
-  Don't reorganize Part 6 around it. Spec churn produces review burden
+  Don't reorganize Part 7 around it. Spec churn produces review burden
   out of proportion to the value.
 - **Don't expand `-march=x86-64-v3` to `-march=native`.** Native means
   "fast on the build machine, undefined on others." For an Ergo program
