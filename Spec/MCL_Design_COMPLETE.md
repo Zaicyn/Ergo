@@ -729,6 +729,13 @@ REDUCTION uses deterministic staged reduction.
 accumulation order. Only allowed if the operation is associative or the user
 accepts numerical variation.
 
+**Implementation status:** as of this writing, the SPIRV backend emits atomics
+unconditionally for any SCATTER kernel with read-modify-write at a runtime
+index. The `--gpu-fast-math` gate described above is plumbed through the
+backend constructor but not consulted at the atomic-emission site. Resolution
+(wire the gate to match this spec, vs. update this section to match the
+unconditional code) is open.
+
 ---
 
 ## APPENDIX: Design Rationale (TL;DR)
