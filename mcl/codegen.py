@@ -357,7 +357,9 @@ class CodeGen:
         elif isinstance(node, ast.AllocateStmt):
             self._emit_allocate(node)
         elif isinstance(node, ast.DeallocateStmt):
-            self._put(f"free({node.name}); {node.name} = NULL;")
+            # DEALLOCATE is a no-op: the arena is bump-only. See
+            # Spec/Arena_Lowering_Brief.md "DEALLOCATE semantics".
+            self._put(f"/* DEALLOCATE({node.name}) — no-op (arena is bump-only) */")
         elif isinstance(node, ast.SelectCaseStmt):
             self._emit_select_case(node)
         elif isinstance(node, ast.WriteStmt):
@@ -563,7 +565,25 @@ class CodeGen:
     def _emit_allocate(self, node: ast.AllocateStmt):
         size = " * ".join(self._expr(d) for d in node.shape)
         c_type = self._c_type(self.var_types.get(node.name, "REAL"))
-        self._put(f"{node.name} = ({c_type} *)malloc(({size}) * sizeof({c_type}));")
+        # Bump from the file-scope arena (see _emit_arena_decl). 64-byte
+        # alignment, bounds-checked, abort on exhaustion.
+        self._put("{")
+        self.indent += 1
+        self._put(f"size_t _sz = ({size}) * sizeof({c_type});")
+        self._put("size_t _aligned = (_sz + 63) & ~(size_t)63;")
+        self._put("if (_ergo_arena_offset + _aligned > ERGO_ARENA_BYTES) {")
+        self.indent += 1
+        self._put('fprintf(stderr, "ergo: arena exhausted (need %zu, '
+                  'have %zu)\\n",')
+        self._put("        _aligned, ERGO_ARENA_BYTES - _ergo_arena_offset);")
+        self._put("abort();")
+        self.indent -= 1
+        self._put("}")
+        self._put(f"{node.name} = ({c_type} *)(_ergo_arena + "
+                  f"_ergo_arena_offset);")
+        self._put("_ergo_arena_offset += _aligned;")
+        self.indent -= 1
+        self._put("}")
 
     # ── call argument handling ───────────────────────────────
 

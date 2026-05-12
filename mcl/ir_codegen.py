@@ -1419,17 +1419,37 @@ class IRCodeGen:
             self._put(f"{array_name}[{indices}] = {val};")
             return
 
-        # ALLOC
+        # ALLOC — bump from file-scope arena (see _emit_arena_decl).
+        # 64-byte aligned, bounds-checked, abort on exhaustion.
         if op == Op.ALLOC:
             ct = self._c_type(inst.type)
             size = " * ".join(self._operand(a) for a in args)
-            self._put(f"{result} = ({ct} *)malloc(({size}) * sizeof({ct}));")
+            self._put("{")
+            self.indent += 1
+            self._put(f"size_t _sz = ({size}) * sizeof({ct});")
+            self._put("size_t _aligned = (_sz + 63) & ~(size_t)63;")
+            self._put("if (_ergo_arena_offset + _aligned > "
+                      "ERGO_ARENA_BYTES) {")
+            self.indent += 1
+            self._put('fprintf(stderr, "ergo: arena exhausted (need %zu, '
+                      'have %zu)\\n",')
+            self._put("        _aligned, ERGO_ARENA_BYTES - "
+                      "_ergo_arena_offset);")
+            self._put("abort();")
+            self.indent -= 1
+            self._put("}")
+            self._put(f"{result} = ({ct} *)(_ergo_arena + "
+                      f"_ergo_arena_offset);")
+            self._put("_ergo_arena_offset += _aligned;")
+            self.indent -= 1
+            self._put("}")
             return
 
-        # FREE
+        # FREE — DEALLOCATE is a no-op: the arena is bump-only.
+        # See Spec/Arena_Lowering_Brief.md "DEALLOCATE semantics".
         if op == Op.FREE:
             name = self._operand(args[0])
-            self._put(f"free({name}); {name} = NULL;")
+            self._put(f"/* DEALLOCATE({name}) — no-op (arena is bump-only) */")
             return
 
         # ZERO — zero entire array via memset (or GPU fill in batched frame)
