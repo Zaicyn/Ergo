@@ -135,11 +135,13 @@ in steady state.
 | **malloc (libc, glibc)** | ~30 ns⁶ | N/A | Single libc call; backed by sbrk/mmap |
 | **V22 SQ2FAL** | ~30 ns | Yes (per-thread) | Scatter LUT + bin advance |
 | **V8 viviani_slab_alloc** | ~50 ns | Yes (per-warp) | First range claim adds 100 SASS instr; amortized over warp lifetime |
-| **vkAllocateMemory (Vulkan)** | TBD (Pass 3) | No | Vulkan driver call per buffer; expected to dominate Ergo GPU init |
+| **vkAllocateMemory (DEVICE_LOCAL, fixed floor)** | ~162 µs¹⁵ | No | NVIDIA Linux Vulkan per-call overhead, size-independent below ~1 MB |
+| **vkAllocateMemory (DEVICE_LOCAL, per-byte slope)** | +19 ns/byte¹⁶ | No | Asymptotic at ≥16 MB; crossover with floor at ~8 MB |
+| **vkAllocateMemory (HOST_VISIBLE, per-byte slope)** | +290 ns/byte¹⁷ | No | 15× the DEVICE_LOCAL slope; falsified hypothesis, see footnote |
 | **Ergo arena emit (cold, no memory store)** | ~0 ns⁷ | Yes (program lifetime) | Bump + bounds check; overlaps with surrounding work in the loop |
 | **+ first-touch (cold cacheline)** | +7.0 ns⁸ | One-time per cacheline | DRAM read-for-ownership when writing fresh memory |
 | **+ wrap-revisit (evicted cacheline)** | +5.1 ns⁹ | Avoidable via free/recycle | Revisiting cachelines evicted from L3 after wrap |
-| **Ergo GPU init (per array)** | TBD (Pass 3) | Yes (program lifetime) | One vkCreateBuffer + vkAllocateMemory + vkBindBufferMemory per declared array |
+| **Ergo GPU init (galaxy_structured @ N=18M)** | ~27.6 ms total¹⁸ | Yes (program lifetime) | 37 buffers, ~300 MB total VRAM committed |
 
 ⁶ malloc init cost approximated; not measured in this work.
 
@@ -181,6 +183,47 @@ programs that exceed the arena and wrap, the cost is real and
 unavoidable in a bump-only design — V8's warp-cursor recycling
 specifically targets this regime.
 
+¹⁵ `vkAllocateMemory` fixed floor: 162 µs/call on NVIDIA RTX 2060
+under Linux Vulkan, measured warm-cohort mean across 49 successive
+allocations following one cold call. Holds size-independent from
+4 KB through ~1 MB, where the per-byte slope (footnote 16) begins
+to dominate. The 162 µs is per-call driver overhead — IOCTLs into
+the kernel driver, memory-type lookups, internal allocator
+bookkeeping — not memory-bandwidth-related. See
+[VK_ALLOC_COST_MODEL.md](VK_ALLOC_COST_MODEL.md) for the full
+characterization.
+
+¹⁶ DEVICE_LOCAL per-byte slope: ~19 ns/byte (~20 µs/MB) for
+allocations ≥ 16 MB. The slope corresponds to ~50 MB/s effective
+allocation throughput — far below the 2060's ~300 GB/s VRAM
+bandwidth, so this isn't bandwidth-limited; it's per-byte driver
+work (page-table setup, internal bookkeeping). Sample model
+validation: galaxy_structured's 149 MB buffers predicted at
+3134 µs (162 + 19×149e6 ns), measured at 2867 µs — within 9%.
+
+¹⁷ HOST_VISIBLE per-byte slope: ~290 ns/byte, 15× higher than
+DEVICE_LOCAL. This row exists because the Pass 3 diagnostic plan
+predicted HOST_VISIBLE would be *faster* than DEVICE_LOCAL (the
+hypothesis was "DEVICE_LOCAL pays a VRAM zero-fill cost that
+HOST_VISIBLE escapes"). The hypothesis was **falsified**:
+HOST_VISIBLE is dramatically slower at large sizes (4970 µs vs
+515 µs at 16 MB). The cost is likely PCIe-bus-bound zeroing of
+pinned system memory. Implication: for Ergo's STATIC array storage,
+DEVICE_LOCAL is unambiguously the right memory type — HOST_VISIBLE
+saves nothing on allocation time and adds host-mapping overhead
+on every access.
+
+¹⁸ Ergo GPU init wall-clock total for galaxy_structured at
+N=18M particles: 27.6 ms across 37 buffer creations. Two largest
+buffers are 149 MB each (the position and velocity arrays at
+double precision) and contribute ~5.7 ms total. The remaining
+~22 ms is spread across the other 35 smaller buffers, dominated
+by the 162 µs fixed floor since most are well under 8 MB. For a
+program running at 60-74 FPS over millions of frames, the 27.6 ms
+one-time startup cost is invisible. See
+[VK_ALLOC_COST_MODEL.md](VK_ALLOC_COST_MODEL.md) for the per-call
+breakdown and the cold/warm analysis.
+
 ### Why init cost matters specifically for Ergo
 
 Ergo programs don't allocate at steady state. `galaxy_structured.ergo`
@@ -192,12 +235,22 @@ N/A for Ergo GPU and matches the CPU bump floor for Ergo CPU; the
 it should be compared against per-allocation runtime allocators that
 amortize their setup over many calls.
 
-Once Pass 3 measures `vkAllocateMemory`'s per-buffer cost on this
-hardware, the table will let a reader see the trade Ergo makes
-concretely: it pays N × init-cost at program start in exchange for
-0 ns/alloc at every subsequent timestep. V8 and V22 pay the inverse:
-small per-call cost amortized across many calls, but every call has
-that cost.
+Pass 3's `vkAllocateMemory` characterization makes the Ergo trade
+concrete: galaxy_structured at N=18M particles pays 27.6 ms of
+one-time startup cost in exchange for 0 ns/alloc at every
+subsequent timestep. V8 and V22 pay the inverse: small per-call
+cost amortized across many calls, but every call has that cost.
+For a simulation running millions of frames at 60-74 FPS, Ergo's
+trade is unambiguously the right one — the 27.6 ms startup
+overhead is invisible against the total simulation runtime, and
+the savings of 0 ns/alloc per frame compound across hundreds of
+thousands of frames.
+
+The per-byte slope (~19 ns/byte for DEVICE_LOCAL VRAM commit) is
+the part that scales with Ergo's total array footprint. A program
+with 4 GB of arrays (near the RTX 2060 ceiling) would pay
+~76 ms of one-time allocation cost. Still amortizable; still
+invisible against a multi-minute simulation runtime.
 
 ## Sub-table 3: Features and determinism
 
@@ -265,15 +318,19 @@ relies on the Vulkan API contract.
   diagnostic to separate allocator cost from DRAM write-for-ownership
   cost.
 
-- **Pass 3** (Ergo GPU instrumentation): measure Ergo's
-  `vkAllocateMemory` cost per buffer on this hardware, and inspect
-  Ergo's SPIRV buffer-access pattern post-peephole for the GPU
-  instruction-count comparison. Fills the **vkAllocateMemory** and
-  **Ergo GPU init** rows in Sub-table 2 and produces the GPU
-  instruction-count table called for in
-  [Spec/Allocator_Comparison_Brief.md](../Spec/Allocator_Comparison_Brief.md).
-  No Ergo cell to fill in Sub-table 1 — Ergo has no runtime GPU
-  allocator and the cell is correctly N/A.
+- **Pass 3 (Ergo GPU instrumentation, allocation cost)**: ✅
+  **Complete.** `vkAllocateMemory` characterized on NVIDIA Linux
+  Vulkan as a two-component cost: 162 µs floor + 19 ns/byte slope
+  (DEVICE_LOCAL). Sub-table 2 rows filled in.
+  [VK_ALLOC_COST_MODEL.md](VK_ALLOC_COST_MODEL.md) documents the
+  full characterization with falsified-hypothesis trail and four
+  per-size diagnostic measurements.
+
+- **Pass 3 (GPU instruction-count comparison)**: still TBD. SPIRV
+  buffer-access pattern (Ergo) vs SASS hot path (V8) at the
+  instruction-count level. The cross-API abstraction-level mismatch
+  (Ergo emits SPIRV; V8 emits SASS) means this is structurally
+  limited but still informative per the brief's guidance. Next.
 
 - **Cross-machine determinism for Ergo GPU**: Sub-table 3 has TBD
   for Ergo GPU bit-identical-across-machines. Determined by whether
