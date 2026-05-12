@@ -200,6 +200,11 @@ class IRCodeGen:
         if statics:
             self._put_raw("")
 
+        # Emit arena BSS if any ALLOC/FREE op is reachable from main or a
+        # function body. BSS is zero-filled by the loader; no libc.
+        if self._uses_allocate(mod):
+            self._emit_arena_decl()
+
         # Embed SPIR-V binaries as byte arrays (if GPU)
         if has_gpu:
             self._emit_spirv_embeds()
@@ -2122,6 +2127,50 @@ class IRCodeGen:
         self._put("printf(\"ERGO_FINAL_HASH=%016llx\\n\", _h);")
         self.indent -= 1
         self._put("}")
+
+    # ── arena lowering for ALLOCATABLE ────────────────────────
+    # ALLOC bumps an offset into a file-scope BSS arena. FREE is a
+    # no-op (the arena is bump-only; see Spec/Arena_Lowering_Brief.md).
+
+    def _uses_allocate(self, mod: IRModule) -> bool:
+        """Return True if any ALLOC or FREE instruction is reachable."""
+        def walk_items(items) -> bool:
+            for item in items:
+                if isinstance(item, IRBlock):
+                    for inst in item.insts:
+                        if inst.op in (Op.ALLOC, Op.FREE):
+                            return True
+                elif isinstance(item, IRLoop):
+                    if walk_items(item.body):
+                        return True
+                elif isinstance(item, IRWhileLoop):
+                    if walk_items(item.body):
+                        return True
+                elif isinstance(item, IRIf):
+                    if walk_items(item.then_body):
+                        return True
+                    if item.else_body and walk_items(item.else_body):
+                        return True
+            return False
+        if walk_items(mod.main_body):
+            return True
+        for fn in mod.functions:
+            if walk_items(fn.body):
+                return True
+        return False
+
+    def _emit_arena_decl(self) -> None:
+        self._put_raw("/* Ergo arena: STATIC-backed bump allocator for "
+                      "ALLOCATABLE arrays.")
+        self._put_raw("   No libc, no syscalls — file-scope BSS only. "
+                      "DEALLOCATE is a no-op. */")
+        self._put_raw("#ifndef ERGO_ARENA_BYTES")
+        self._put_raw("#define ERGO_ARENA_BYTES ((size_t)1 << 30)")
+        self._put_raw("#endif")
+        self._put_raw("static char _ergo_arena[ERGO_ARENA_BYTES] "
+                      "__attribute__((aligned(64)));")
+        self._put_raw("static size_t _ergo_arena_offset = 0;")
+        self._put_raw("")
 
     def _gpu_arrays(self) -> list[str]:
         """Arrays that need GPU buffers — only those used by frame-loop kernels.

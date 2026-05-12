@@ -104,6 +104,11 @@ class CodeGen:
         if statics:
             self._put("")
 
+        # Emit arena BSS if any ALLOCATE/DEALLOCATE statement is reachable.
+        # BSS is zero-filled by the loader; no libc, no syscalls.
+        if self._uses_allocate(functions, main_stmts):
+            self._emit_arena_decl()
+
         # Emit functions
         for fn in functions:
             self._emit_function(fn)
@@ -512,6 +517,48 @@ class CodeGen:
                 self._put(f"return {self._expr(val)};")
         else:
             self._put("return;")
+
+    # ── arena lowering for ALLOCATABLE ────────────────────────
+    # ALLOCATE bumps an offset into a file-scope BSS arena. DEALLOCATE
+    # is a no-op (the arena is bump-only; see Spec/Arena_Lowering_Brief.md).
+
+    def _uses_allocate(self, functions, main_stmts) -> bool:
+        """Return True if any ALLOCATE/DEALLOCATE statement is reachable."""
+        def walk(node) -> bool:
+            if isinstance(node, (ast.AllocateStmt, ast.DeallocateStmt)):
+                return True
+            for attr in ("body", "then_body", "else_body", "statements",
+                         "units", "stmts", "true_block", "false_block"):
+                if hasattr(node, attr):
+                    val = getattr(node, attr)
+                    if isinstance(val, list):
+                        for child in val:
+                            if walk(child):
+                                return True
+                    elif val is not None:
+                        if walk(val):
+                            return True
+            return False
+        for fn in functions:
+            if walk(fn):
+                return True
+        for s in main_stmts:
+            if walk(s):
+                return True
+        return False
+
+    def _emit_arena_decl(self) -> None:
+        self._put("/* Ergo arena: STATIC-backed bump allocator for "
+                  "ALLOCATABLE arrays.")
+        self._put("   No libc, no syscalls — file-scope BSS only. "
+                  "DEALLOCATE is a no-op. */")
+        self._put("#ifndef ERGO_ARENA_BYTES")
+        self._put("#define ERGO_ARENA_BYTES ((size_t)1 << 30)")
+        self._put("#endif")
+        self._put("static char _ergo_arena[ERGO_ARENA_BYTES] "
+                  "__attribute__((aligned(64)));")
+        self._put("static size_t _ergo_arena_offset = 0;")
+        self._put("")
 
     def _emit_allocate(self, node: ast.AllocateStmt):
         size = " * ".join(self._expr(d) for d in node.shape)
