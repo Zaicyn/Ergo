@@ -1553,6 +1553,34 @@ class _EmitContext:
 
         # MOD
         if op == Op.MOD:
+            # Power-of-two fold: MOD(x, k) -> x & (k-1) when x is provably
+            # non-negative and k is a positive literal power-of-two. Only
+            # case 1 from the brief (dividend is the loop variable itself);
+            # GPU loop vars are gid+1 ≥ 1 > 0 so the check is unconditional
+            # once the operand matches. Deferred: dividend = loop_var - 1
+            # / loop_var + nonneg_const (needs known-non-negative SSA
+            # tracking); dividend = PARAMETER-resolved constant (needs
+            # PARAMETER value folding upstream of the emitter).
+            a_arg = inst.args[0]
+            b_arg = inst.args[1]
+            if (isinstance(a_arg, IRRef)
+                    and a_arg.name == self.kernel.loop_var
+                    and isinstance(b_arg, IRConst)
+                    and b_arg.type == IRType.INTEGER
+                    and isinstance(b_arg.value, int)
+                    and b_arg.value > 0
+                    and (b_arg.value & (b_arg.value - 1)) == 0):
+                a = self._resolve(a_arg, pc_member_ids, ssa_map)
+                mask = self._get_const(IRType.INTEGER, b_arg.value - 1)
+                result = self._alloc()
+                self._function.append(
+                    f"         {self._id(result)} = OpBitwiseAnd "
+                    f"{self._id(self.id_i32)} {self._id(a)} {self._id(mask)}")
+                self._set_ssa_type(result, self.id_i32)
+                if inst.result:
+                    ssa_map[inst.result] = result
+                return False
+
             a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
             b = self._resolve(inst.args[1], pc_member_ids, ssa_map)
             is_fp = self._is_real_id(a) or self._is_real_id(b)
@@ -2139,6 +2167,54 @@ class _EmitContext:
         return (item.insts[0].op == Op.COPY and
                 item.insts[0].meta.get("kind") == "cycle")
 
+    # Ops safe to predicate. Anything not in this set disqualifies a body
+    # from the Flatten hint — keeps the classifier strict; loosen later if
+    # a profile flags a missed opportunity.
+    _FLATTEN_SAFE_OPS = frozenset({
+        Op.ADD, Op.SUB, Op.MUL, Op.DIV, Op.POW, Op.MOD, Op.NEG,
+        Op.LT, Op.GT, Op.EQ, Op.NE, Op.LE, Op.GE,
+        Op.AND, Op.OR, Op.NOT,
+        Op.ISHFT, Op.IEOR, Op.IAND, Op.IOR, Op.BITNOT,
+        Op.TO_REAL, Op.TO_INT, Op.TO_CHAR,
+        Op.SIN, Op.COS, Op.TAN, Op.ASIN, Op.ACOS, Op.ATAN,
+        Op.EXP, Op.LOG, Op.SQRT, Op.ABS,
+        Op.SINH, Op.COSH, Op.TANH,
+        Op.MAX, Op.MIN, Op.CLAMP,
+        Op.LOAD, Op.STORE, Op.COPY,
+    })
+
+    _FLATTEN_BODY_LIMIT = 8
+
+    def _should_flatten(self, node: IRIf) -> bool:
+        """Classifier for SPIR-V SelectionMerge Flatten hint.
+
+        Returns True when the IF body is small, pure-compute, and direct-RW —
+        safe for the driver to predicate rather than branch. Conservative:
+        rejects nested control flow, calls, warp/ring collectives, and
+        scatter-pattern stores (read-modify-write on the same array, which
+        the SPIRV emitter promotes to atomics).
+        """
+        insts: list[IRInst] = []
+        for body in (node.then_body, node.else_body or []):
+            for item in body:
+                if not isinstance(item, IRBlock):
+                    return False  # nested control flow disqualifies
+                insts.extend(item.insts)
+        if len(insts) > self._FLATTEN_BODY_LIMIT:
+            return False
+        loaded_arrays: set[str] = set()
+        for inst in insts:
+            if inst.op not in self._FLATTEN_SAFE_OPS:
+                return False
+            if inst.op == Op.LOAD:
+                loaded_arrays.add(inst.meta.get("array", ""))
+            elif inst.op == Op.STORE:
+                # Read-modify-write on the same array = scatter, becomes
+                # atomic in the emitter; never predicate.
+                if inst.meta.get("array", "") in loaded_arrays:
+                    return False
+        return True
+
     def _emit_if(self, node: IRIf, buf_vars: dict[str, int],
                  pc_member_ids: dict[str, tuple[int, int]],
                  ssa_map: dict[str, int], idx_0: int):
@@ -2180,8 +2256,9 @@ class _EmitContext:
         # Remember the block we branched from (for OpPhi fallthrough)
         pre_if_block = self._current_block
 
+        merge_hint = "Flatten" if self._should_flatten(node) else "None"
         self._function.append(
-            f"               OpSelectionMerge {self._id(merge_label)} None")
+            f"               OpSelectionMerge {self._id(merge_label)} {merge_hint}")
         self._function.append(
             f"               OpBranchConditional {self._id(cond)} "
             f"{self._id(then_label)} {self._id(else_label)}")
@@ -2336,17 +2413,22 @@ class _EmitContext:
         shape = self.array_shapes.get(arr, ())
         ndims = len(index_args)
 
-        # Resolve all indices
-        indices = []
-        for arg in index_args:
-            idx = self._resolve(arg, pc_member_ids, ssa_map)
-            indices.append(idx)
-
-        # Convert each index from 1-based to 0-based (ensure i32)
+        # Convert each index from 1-based to 0-based (ensure i32).
+        # IR convention (ir.py:10, ir_builder.py:308/406): operands named
+        # _idx_* are already 0-based (produced as sub(expr, 1) by the IR
+        # builder). Resolving them gives the already-converted SSA — emitting
+        # another OpISub here is a duplicate that the brief identified as
+        # the orphan-OpISub pattern. Skip the subtraction for those; emit it
+        # for any other operand shape.
         const_1 = self._get_const(IRType.INTEGER, 1)
         zero_based = []
-        for idx in indices:
-            # Ensure index is i32 (may be f64 from FClamp)
+        for arg in index_args:
+            is_pre_converted = (isinstance(arg, IRRef)
+                                and arg.name.startswith("_idx"))
+            idx = self._resolve(arg, pc_member_ids, ssa_map)
+            if is_pre_converted:
+                zero_based.append(idx)
+                continue
             idx = self._ensure_i32(idx)
             zb = self._alloc()
             self._function.append(

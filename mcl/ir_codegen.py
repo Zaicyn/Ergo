@@ -157,6 +157,19 @@ class IRCodeGen:
             self._put_raw("#include \"ergo_net.h\"")
         self._put_raw("")
 
+        # FNV-1a hash helper for ERGO_HASH_FINAL=1 state-hash diagnostic.
+        # Only emitted when GPU state needs to be hashable on exit.
+        if has_gpu:
+            self._put_raw("/* FNV-1a 64-bit, byte-wise. Used by ERGO_HASH_FINAL=1. */")
+            self._put_raw("static unsigned long long _ergo_fnv1a_update("
+                          "unsigned long long h, const void *data, size_t n) {")
+            self._put_raw("    const unsigned char *p = (const unsigned char*)data;")
+            self._put_raw("    for (size_t i = 0; i < n; i++) {"
+                          " h ^= p[i]; h *= 1099511628211ULL; }")
+            self._put_raw("    return h;")
+            self._put_raw("}")
+            self._put_raw("")
+
         # Collect metadata
         self._collect_metadata()
 
@@ -230,6 +243,10 @@ class IRCodeGen:
 
         # Emit main body
         self._emit_body(mod.main_body)
+
+        # Final-state hash hook (ERGO_HASH_FINAL=1)
+        if has_gpu:
+            self._emit_final_hash_hook()
 
         # GPU shutdown
         if has_gpu or self.render:
@@ -1540,6 +1557,7 @@ class IRCodeGen:
         # STOP
         if op == Op.STOP:
             if self.gpu_plan and self.gpu_plan.kernels:
+                self._emit_final_hash_hook()
                 self._put("ergo_vk_shutdown();")
             self._put("return 0;")
             return
@@ -2075,6 +2093,35 @@ class IRCodeGen:
                 self._collect_kernel_ids(item.then_body, ids)
                 if item.else_body:
                     self._collect_kernel_ids(item.else_body, ids)
+
+    def _emit_final_hash_hook(self) -> None:
+        """Emit ERGO_HASH_FINAL=1 state-hash diagnostic.
+
+        Downloads particle position/velocity/omega arrays from GPU and hashes
+        NPART elements with FNV-1a. Prints one greppable line to stdout:
+        ERGO_FINAL_HASH=<16-hex-digits>. No-op when the env var is unset.
+        """
+        gpu = set(self._gpu_arrays())
+        # Order matters — hashes mix in this fixed sequence for stability.
+        hash_arrays = [a for a in
+                       ("POS_X", "POS_Y", "POS_Z",
+                        "VEL_X", "VEL_Y", "VEL_Z", "OMEGA_NAT")
+                       if a in gpu]
+        if not hash_arrays:
+            return
+        self._put("if (getenv(\"ERGO_HASH_FINAL\")) {")
+        self.indent += 1
+        self._put("ergo_vk_frame_wait();")
+        for arr in hash_arrays:
+            self._put(f"ergo_vk_download(d_{arr}, {arr}, "
+                      f"NPART * sizeof(float));")
+        self._put("unsigned long long _h = 14695981039346656037ULL;")
+        for arr in hash_arrays:
+            self._put(f"_h = _ergo_fnv1a_update(_h, {arr}, "
+                      f"NPART * sizeof(float));")
+        self._put("printf(\"ERGO_FINAL_HASH=%016llx\\n\", _h);")
+        self.indent -= 1
+        self._put("}")
 
     def _gpu_arrays(self) -> list[str]:
         """Arrays that need GPU buffers — only those used by frame-loop kernels.
