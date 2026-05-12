@@ -2336,17 +2336,22 @@ class _EmitContext:
         shape = self.array_shapes.get(arr, ())
         ndims = len(index_args)
 
-        # Resolve all indices
-        indices = []
-        for arg in index_args:
-            idx = self._resolve(arg, pc_member_ids, ssa_map)
-            indices.append(idx)
-
-        # Convert each index from 1-based to 0-based (ensure i32)
+        # Convert each index from 1-based to 0-based (ensure i32).
+        # IR convention (ir.py:10, ir_builder.py:308/406): operands named
+        # _idx_* are already 0-based (produced as sub(expr, 1) by the IR
+        # builder). Resolving them gives the already-converted SSA — emitting
+        # another OpISub here is a duplicate that the brief identified as
+        # the orphan-OpISub pattern. Skip the subtraction for those; emit it
+        # for any other operand shape.
         const_1 = self._get_const(IRType.INTEGER, 1)
         zero_based = []
-        for idx in indices:
-            # Ensure index is i32 (may be f64 from FClamp)
+        for arg in index_args:
+            is_pre_converted = (isinstance(arg, IRRef)
+                                and arg.name.startswith("_idx"))
+            idx = self._resolve(arg, pc_member_ids, ssa_map)
+            if is_pre_converted:
+                zero_based.append(idx)
+                continue
             idx = self._ensure_i32(idx)
             zb = self._alloc()
             self._function.append(
