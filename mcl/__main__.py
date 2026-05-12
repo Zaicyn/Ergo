@@ -72,6 +72,15 @@ def main():
         help="Floating-point precision for REAL type (default: f64)",
     )
 
+    # Arena (for ALLOCATABLE arrays — bump allocator, see
+    # Spec/Arena_Lowering_Brief.md)
+    parser.add_argument(
+        "--arena-size", type=str, default=None,
+        help="Override the default 1 GiB ALLOCATABLE arena size. "
+             "Accepts plain bytes (16777216), or with K/M/G suffix "
+             "(16M, 2G). No effect on programs that don't use ALLOCATABLE.",
+    )
+
     args = parser.parse_args()
 
     # Set global precision before any IR is built
@@ -159,12 +168,38 @@ def main():
         if args.M is not None:
             param_overrides["MAXPART"] = args.M
 
+        # Parse --arena-size with optional K/M/G suffix.
+        arena_size = None
+        if args.arena_size is not None:
+            s = args.arena_size.strip().upper()
+            mult = 1
+            if s.endswith("K"):
+                mult = 1 << 10
+                s = s[:-1]
+            elif s.endswith("M"):
+                mult = 1 << 20
+                s = s[:-1]
+            elif s.endswith("G"):
+                mult = 1 << 30
+                s = s[:-1]
+            try:
+                arena_size = int(s) * mult
+            except ValueError:
+                print(f"Error: invalid --arena-size '{args.arena_size}'",
+                      file=sys.stderr)
+                sys.exit(1)
+            if arena_size <= 0:
+                print(f"Error: --arena-size must be positive",
+                      file=sys.stderr)
+                sys.exit(1)
+
         c_code = compile_file(args.source, output=args.output, emit_c=args.emit_c,
                               fast_math=args.fast_math, target=args.target,
                               no_split=args.no_split,
                               render=args.render,
                               promote_locals=args.promote_locals,
-                              param_overrides=param_overrides)
+                              param_overrides=param_overrides,
+                              arena_size=arena_size)
         if args.emit_c:
             print(c_code)
         else:
