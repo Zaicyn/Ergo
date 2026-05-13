@@ -19,16 +19,16 @@ layout(set = 0, binding = 1) buffer BufY { float py[]; };
 layout(set = 0, binding = 2) buffer BufZ { float pz[]; };
 layout(set = 0, binding = 3) buffer BufC { float cv[]; };
 
-layout(set = 0, binding = 5) uniform RenderParams {
+layout(push_constant) uniform PC {
     mat4  viewProj;
-    float cam_x;
-    float cam_y;
-    float cam_z;
-    float cull_mode;   // 0 = off, 1 = hemisphere cull
+    float point_size;
     float val_min;
     float val_max;
     float world_scale;
-    float pad;
+    float cam_x;
+    float cam_y;
+    float cam_z;
+    float cull_mode;
 } pc;
 
 void main() {
@@ -66,7 +66,7 @@ void main() {
     float raw_val = cv[particle];
     float t = clamp((raw_val - pc.val_min) / (pc.val_max - pc.val_min + 1e-10), 0.0, 1.0);
 
-    float radius = 0.008 * (0.5 + t);  /* fixed splat size in clip space */
+    float radius = pc.point_size * (0.5 + t);
 
     gl_Position = clip_center;
     gl_Position.xy += offset * radius * clip_center.w;

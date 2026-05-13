@@ -2862,19 +2862,27 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     Mat4 view = mat4_look_at(ex, ey, ez, 0, 0, 0, 0, 1, 0);
     Mat4 viewProj = mat4_mul(proj, view);
 
-    /* Push constants */
+    /* Push constants — must match render_points.vert PC layout (96 bytes) */
     struct {
         float viewProj[16];
         float point_size;
         float val_min;
         float val_max;
         float world_scale;
+        float cam_x;
+        float cam_y;
+        float cam_z;
+        float cull_mode;
     } pc;
     memcpy(pc.viewProj, viewProj.m, 64);
     pc.point_size = point_size;
     pc.val_min = val_min;
     pc.val_max = val_max;
     pc.world_scale = world_scale;
+    pc.cam_x = ex;
+    pc.cam_y = ey;
+    pc.cam_z = ez;
+    pc.cull_mode = g_culling_enabled ? 1.0f : 0.0f;
 
     /* Record command buffer */
     VkCommandBufferBeginInfo begin_info = {0};
@@ -3002,18 +3010,27 @@ void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     Mat4 view = mat4_look_at(ex, ey, ez, 0, 0, 0, 0, 1, 0);
     Mat4 viewProj = mat4_mul(proj, view);
 
+    /* Push constants — must match render_gauss.vert PC layout (96 bytes) */
     struct {
         float viewProj[16];
         float point_size;
         float val_min;
         float val_max;
         float world_scale;
+        float cam_x;
+        float cam_y;
+        float cam_z;
+        float cull_mode;
     } pc;
     memcpy(pc.viewProj, viewProj.m, 64);
     pc.point_size = point_size;
     pc.val_min = val_min;
     pc.val_max = val_max;
     pc.world_scale = world_scale;
+    pc.cam_x = ex;
+    pc.cam_y = ey;
+    pc.cam_z = ez;
+    pc.cull_mode = g_culling_enabled ? 1.0f : 0.0f;
 
     VkCommandBufferBeginInfo begin_info = {0};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
