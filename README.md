@@ -232,12 +232,14 @@ See `Spec/Ergo_NodeGraph_Design.md` for the full specification including Nuklear
 |---------|-------|---------------|
 | `test_first.ergo` | 19 | Arithmetic, loops, comparison chaining |
 | `sq2core.ergo` | 160 | Squaragon V2 allocator (1.8ns/alloc, biology-inspired torus) |
+| `sq3core.ergo` | 290 | Squaragon V3 refinement: integer-only fast path, bit-twiddle seam, SQ3VAL verifier |
 | `buc_membrane_unit.ergo` | 203 | Nernst-Planck membrane physics, 5 experiments, CSV output |
 | `buc_colony.ergo` | 443 | 64x32 cell grid: diffusion, division, death, ANSI visualization |
 
 ### Validation Results
 
 - **sq2core**: 192 allocations, zone 1. Assembly verified: all `%rip`-relative, zero `->`, zero `malloc`.
+- **sq3core**: same allocation result (192/zone 1), 0 SQ3VAL mismatches across all TINVAR entries. No FP ops in fast path; bit-pack exactly recoverable.
 - **membrane unit**: Run 1 steady state PSI = -246.44 mV, ATP = 0.8777. Matches F77 to 4 decimal places.
 - **colony**: Frame 10: 343 cells (WT:97, KO_msh:86, KO_mem:85, KO_tra:75). Exact match with F77 output.
 
@@ -260,6 +262,7 @@ Ergo/
   tests/                  Ergo test programs
     test_first.ergo          Basic arithmetic and control flow
     sq2core.ergo             Squaragon V2 torus allocator
+    sq3core.ergo             Squaragon V3 — integer-only fast path + SQ3VAL verifier
     buc_membrane_unit.ergo   Single-cell membrane physics
     buc_colony.ergo          Colony simulator with ANSI display
   Spec/                   Language specification (locked)
