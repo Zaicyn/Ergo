@@ -1,0 +1,40 @@
+! ════════════════════════════════════════════════════════════════
+! MAIN_DIAG — In-loop diagnostic variant of main.ergo
+! ════════════════════════════════════════════════════════════════
+!
+! Single physics loop with DIAG_REPORT called at frames {10, 100, 1000}.
+! In-loop DIAG_REPORT causes per-frame download stalls (the GPU has to
+! drain and re-upload each iteration), but with only 4 calls over 1000
+! frames the cost is acceptable for diagnostics.
+!
+! NOTE: cannot split into separate DO loops with CALL SIM_PHYSICS_STEP
+! in each — the compiler fuses physics kernels but only initializes the
+! DT push-constant from the last CALL site, so earlier chunks dispatch
+! with DT=0.
+
+IMPLICIT NONE
+
+INTEGER :: FRAME
+
+CALL SIM_INIT(DEFAULT_N, MAXPART, 42)
+CALL SIM_SEED_SHELL()
+SPAWN_COUNTER(1) := NPART
+
+CALL DIAG_REPORT(0)
+
+DO FRAME = 1, 1000
+  CALL CLEAR_GRID()
+  CALL SCATTER_GRID()
+  CALL STENCIL_GRID()
+  CALL SIM_PHYSICS_STEP(DEFAULT_DT)
+
+  IF FRAME = 10 THEN
+    CALL DIAG_REPORT(10)
+  ENDIF
+  IF FRAME = 100 THEN
+    CALL DIAG_REPORT(100)
+  ENDIF
+  IF FRAME = 1000 THEN
+    CALL DIAG_REPORT(1000)
+  ENDIF
+ENDDO

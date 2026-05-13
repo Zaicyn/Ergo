@@ -1,0 +1,116 @@
+! ════════════════════════════════════════════════════════════════
+! DIAG — Energy/momentum trajectory diagnostic (CPU-only)
+! ════════════════════════════════════════════════════════════════
+!
+! Runs between simulation chunks. Reads particle state directly,
+! prints one row of scalars per snapshot. Output format (one PRINT per line):
+!
+!   FRAME, COUNT, MEAN_R, MEAN_VSQ, MEAN_KE, MEAN_PE, MEAN_E,
+!   L_MAG, MEAN_VR, FRAC_INFALL, MEAN_ABS_Y_OVER_R, MEAN_VY_SQ
+!
+! KE = 0.5 * v²
+! PE = -BH_MASS / max(r, 1)   (matching the physics clamp)
+! L  = sum(r × v)             magnitude of total angular momentum
+! VR = (v · r̂)                 radial velocity (negative = infalling)
+
+SUBROUTINE DIAG_REPORT(FRAME)
+  INTEGER :: FRAME
+  INTEGER :: I, N_ACTIVE, N_INFALL
+  REAL :: PX, PY, PZ, VX, VY, VZ
+  REAL :: R, R_SAFE, INV_R, VSQ, VR
+  REAL :: SUM_R, SUM_VSQ, SUM_KE, SUM_PE, SUM_VR
+  REAL :: SUM_ABS_Y_OVER_R, SUM_VY_SQ
+  REAL :: LX, LY, LZ, SUM_LX, SUM_LY, SUM_LZ, L_MAG
+  REAL :: INV_N
+  REAL :: MEAN_R, MEAN_VSQ, MEAN_KE, MEAN_PE, MEAN_E
+  REAL :: MEAN_VR, FRAC_INFALL, MEAN_ABS_Y_OVER_R, MEAN_VY_SQ
+
+  N_ACTIVE := 0
+  N_INFALL := 0
+  SUM_R := 0.0
+  SUM_VSQ := 0.0
+  SUM_KE := 0.0
+  SUM_PE := 0.0
+  SUM_VR := 0.0
+  SUM_ABS_Y_OVER_R := 0.0
+  SUM_VY_SQ := 0.0
+  SUM_LX := 0.0
+  SUM_LY := 0.0
+  SUM_LZ := 0.0
+
+  DO I = 1, NPART
+    IF IAND(FLAGS(I), PFLAG_ACTIVE) = 0 THEN
+      CYCLE
+    ENDIF
+
+    PX := POS_X(I)
+    PY := POS_Y(I)
+    PZ := POS_Z(I)
+    VX := VEL_X(I)
+    VY := VEL_Y(I)
+    VZ := VEL_Z(I)
+
+    R := SQRT(PX*PX + PY*PY + PZ*PZ + 1.0E-8)
+    R_SAFE := MAX(R, 1.0)
+    INV_R := 1.0 / R
+    VSQ := VX*VX + VY*VY + VZ*VZ
+    VR := (VX*PX + VY*PY + VZ*PZ) * INV_R
+
+    LX := PY*VZ - PZ*VY
+    LY := PZ*VX - PX*VZ
+    LZ := PX*VY - PY*VX
+
+    N_ACTIVE := N_ACTIVE + 1
+    IF VR < 0.0 THEN
+      N_INFALL := N_INFALL + 1
+    ENDIF
+    SUM_R := SUM_R + R
+    SUM_VSQ := SUM_VSQ + VSQ
+    SUM_KE := SUM_KE + 0.5 * VSQ
+    SUM_PE := SUM_PE - BH_MASS / R_SAFE
+    SUM_VR := SUM_VR + VR
+    SUM_ABS_Y_OVER_R := SUM_ABS_Y_OVER_R + ABS(PY) * INV_R
+    SUM_VY_SQ := SUM_VY_SQ + VY*VY
+    SUM_LX := SUM_LX + LX
+    SUM_LY := SUM_LY + LY
+    SUM_LZ := SUM_LZ + LZ
+  ENDDO
+
+  IF N_ACTIVE > 0 THEN
+    INV_N := 1.0 / REAL(N_ACTIVE)
+  ELSE
+    INV_N := 0.0
+  ENDIF
+
+  MEAN_R := SUM_R * INV_N
+  MEAN_VSQ := SUM_VSQ * INV_N
+  MEAN_KE := SUM_KE * INV_N
+  MEAN_PE := SUM_PE * INV_N
+  MEAN_E := MEAN_KE + MEAN_PE
+  MEAN_VR := SUM_VR * INV_N
+  IF N_ACTIVE > 0 THEN
+    FRAC_INFALL := REAL(N_INFALL) * INV_N
+  ELSE
+    FRAC_INFALL := 0.0
+  ENDIF
+  MEAN_ABS_Y_OVER_R := SUM_ABS_Y_OVER_R * INV_N
+  MEAN_VY_SQ := SUM_VY_SQ * INV_N
+  L_MAG := SQRT(SUM_LX*SUM_LX + SUM_LY*SUM_LY + SUM_LZ*SUM_LZ)
+
+  ! Tag row so the Python parser can find it
+  PRINT 99999
+  PRINT FRAME
+  PRINT N_ACTIVE
+  PRINT MEAN_R
+  PRINT MEAN_VSQ
+  PRINT MEAN_KE
+  PRINT MEAN_PE
+  PRINT MEAN_E
+  PRINT L_MAG
+  PRINT MEAN_VR
+  PRINT FRAC_INFALL
+  PRINT MEAN_ABS_Y_OVER_R
+  PRINT MEAN_VY_SQ
+
+  RETURN
+END
