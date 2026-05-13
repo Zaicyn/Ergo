@@ -26,6 +26,7 @@ from .errors import MCLError
 # matches the documented determinism contract in Spec/MCL_Design_COMPLETE.md.
 DETERMINISTIC_FLAGS = [
     "-O3",
+    "-fwrapv",
     "-march=x86-64-v3",
     "-ffp-contract=fast",
     "-fno-math-errno",
