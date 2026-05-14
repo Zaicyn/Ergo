@@ -1,0 +1,54 @@
+! ════════════════════════════════════════════════════════════════
+! PROBE — Single-particle trajectory probe (CPU-only)
+! ════════════════════════════════════════════════════════════════
+!
+! Logs one particle's state each call. Cheap discriminator for
+! trajectory-centric vs identity-centric topology: does this particle's
+! GEN change over time as it orbits?
+!
+! Output format (one PRINT per line, tagged 88888 for parser pickup):
+!
+!   88888, FRAME, I, PX, PY, PZ, VX, VY, VZ,
+!   R, VMAG, OMEGA, FLAGS_INT, GEN, PH
+!
+! GEN is extracted from FLAGS bits 8-12 (Ergo's current encoding).
+! When/if THETA(MAXPART) is added per V22 spec section 9.5, this probe
+! should be extended to also print THETA and re-derive GEN from THETA.
+
+SUBROUTINE PROBE_REPORT(I, FRAME)
+  INTEGER :: I, FRAME
+  INTEGER :: GEN, PH
+  REAL :: PX, PY, PZ, VX, VY, VZ, R, VMAG, OMEGA
+
+  PX := POS_X(I)
+  PY := POS_Y(I)
+  PZ := POS_Z(I)
+  VX := VEL_X(I)
+  VY := VEL_Y(I)
+  VZ := VEL_Z(I)
+  OMEGA := OMEGA_NAT(I)
+
+  R := SQRT(PX*PX + PY*PY + PZ*PZ + 1.0E-8)
+  VMAG := SQRT(VX*VX + VY*VY + VZ*VZ + 1.0E-8)
+
+  GEN := IAND(ISHFT(FLAGS(I), -GEN_SHIFT), GEN_MASK)
+  PH  := IAND(ISHFT(FLAGS(I), -PHASE_SHIFT), PHASE_MASK)
+
+  PRINT 88888
+  PRINT FRAME
+  PRINT I
+  PRINT PX
+  PRINT PY
+  PRINT PZ
+  PRINT VX
+  PRINT VY
+  PRINT VZ
+  PRINT R
+  PRINT VMAG
+  PRINT OMEGA
+  PRINT FLAGS(I)
+  PRINT GEN
+  PRINT PH
+
+  RETURN
+END

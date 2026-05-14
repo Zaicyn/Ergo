@@ -1,0 +1,48 @@
+! ════════════════════════════════════════════════════════════════
+! MAIN_PROBE — Trajectory-centric topology discriminator
+! ════════════════════════════════════════════════════════════════
+!
+! Runs physics on a small population, probes a single particle every
+! PROBE_EVERY frames. Output goes to stdout, tagged 88888 for picking
+! up via parser.
+!
+! The discriminator question: does the probed particle's GEN change
+! over time as it orbits?
+!   YES → trajectory-centric topology is wired (V22-style).
+!   NO  → identity-centric (Ergo's current state pre-port).
+!
+! At r=50 with BH_MASS=100, orbital period is ~13,300 frames. A 15K
+! frame run with PROBE_EVERY=100 gives ~150 samples per orbit, plenty
+! of resolution for GEN-transition detection.
+
+IMPLICIT NONE
+
+INTEGER :: FRAME
+INTEGER :: PROBE_I, PROBE_EVERY, MAX_FRAMES
+
+! Probe particle 1 (first cuboctahedron shell vertex, r=50)
+PROBE_I := 1
+PROBE_EVERY := 100
+MAX_FRAMES := 15000
+
+CALL SIM_INIT(DEFAULT_N, MAXPART, 42)
+CALL SIM_SEED_SHELL()
+SPAWN_COUNTER(1) := NPART
+
+! Frame 0 baseline
+CALL PROBE_REPORT(PROBE_I, 0)
+
+DO FRAME = 1, MAX_FRAMES
+  CALL CLEAR_GRID()
+  CALL SCATTER_GRID()
+  CALL STENCIL_GRID()
+  CALL SIM_PHYSICS_STEP(DEFAULT_DT)
+
+  ! Probe at PROBE_EVERY intervals.
+  ! Compiler doesn't hoist downloads into the IF, so this triggers a
+  ! per-frame stall regardless. Use small MAXPART (e.g. -M 1000) to
+  ! keep download size manageable.
+  IF MOD(FRAME, PROBE_EVERY) = 0 THEN
+    CALL PROBE_REPORT(PROBE_I, FRAME)
+  ENDIF
+ENDDO
