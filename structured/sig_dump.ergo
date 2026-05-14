@@ -1,0 +1,45 @@
+! ════════════════════════════════════════════════════════════════
+! SIG_DUMP — Crystal lane signature dump (CPU-only, end-of-run)
+! ════════════════════════════════════════════════════════════════
+!
+! Prints all collected crystal-lane signatures as space-separated rows.
+! Each row is tagged 77777 for parser pickup. Format:
+!
+!   77777
+!   <count>
+!   ⟨for slot k = 1..count:⟩
+!     <SIG_OMEGA[k]>
+!     <SIG_RHO[k]>
+!     <SIG_FMODE[k]>
+!     <SIG_VMAG[k]>
+!     <SIG_RNORM[k]>
+!     <SIG_MGATE[k]>
+!     <SIG_ZC[k]>
+!     <SIG_FW[k]>
+!
+! Python clustering tool reads this and runs k-means / DBSCAN over the
+! 7D space (ω, ρ, fmode, vmag, r, mgate, zc, fw → 8 dimensions actually).
+
+SUBROUTINE SIG_DUMP()
+  INTEGER :: K, N
+
+  N := SIG_COUNT(1)
+
+  PRINT 77777
+  PRINT N
+
+  IF N > 0 THEN
+    DO K = 1, N
+      PRINT SIG_OMEGA(K)
+      PRINT SIG_RHO(K)
+      PRINT SIG_FMODE(K)
+      PRINT SIG_VMAG(K)
+      PRINT SIG_RNORM(K)
+      PRINT SIG_MGATE(K)
+      PRINT SIG_ZC(K)
+      PRINT SIG_FW(K)
+    ENDDO
+  ENDIF
+
+  RETURN
+END

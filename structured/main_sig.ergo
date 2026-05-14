@@ -1,0 +1,32 @@
+! ════════════════════════════════════════════════════════════════
+! MAIN_SIG — Run long enough to collect crystal signatures, then dump
+! ════════════════════════════════════════════════════════════════
+!
+! No in-loop downloads. Just runs physics for MAX_FRAMES, then dumps
+! the SIG_* arrays once at end. Goal: collect a population of
+! crystallized particles, classify them by clustering signatures.
+!
+! Crystal trigger: ω < OMEGA_CRYSTAL_THRESH (0.008) AND v² < 0.01.
+! At pre-port Ergo state (GEN frozen, particles stuck in their seed
+! mode), crystallizations may be rare or zero. That itself is a
+! useful baseline — confirms no emergent classes form without
+! trajectory-centric topology.
+
+IMPLICIT NONE
+
+INTEGER :: FRAME, MAX_FRAMES
+
+MAX_FRAMES := 200000
+
+CALL SIM_INIT(DEFAULT_N, MAXPART, 42)
+CALL SIM_SEED_SHELL()
+SPAWN_COUNTER(1) := NPART
+
+DO FRAME = 1, MAX_FRAMES
+  CALL CLEAR_GRID()
+  CALL SCATTER_GRID()
+  CALL STENCIL_GRID()
+  CALL SIM_PHYSICS_STEP(DEFAULT_DT)
+ENDDO
+
+CALL SIG_DUMP()
