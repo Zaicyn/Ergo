@@ -244,3 +244,114 @@ cycle through θ-space and can crystallize at different phases.
 Post-port "Test of multi-GEN crystallization" = simple histogram of
 SIG_GEN across crystals. Pre-port = single bin (1). Post-port = many
 bins if trajectory-centric is working.
+
+## Update: prograde-mode crystals ALSO show SIG_GEN = 1 (2026-05-14)
+
+After three external AI analyses raised competing interpretations of
+the GEN=1 monopoly (substrate chirality, ISCO analog, eigenmode
+filtering vs architectural bias), ran the discriminator experiment
+GPT proposed: re-cluster in **prograde mode** at threshold 0.048,
+N=1M, with the 12-field signatures.
+
+Result: **all 37 prograde crystals also have GEN=1.**
+
+This is decisive against the "TANGENT[1] direction creates plunge
+geometry" theory. In prograde mode the velocity direction is
+`(-z, 0, x)/r_xz`, completely independent of TANGENT[GEN]. Yet the
+GEN=1 monopoly persists.
+
+### The actual mechanism: GEN is frozen at seed, GEN derives from seed position
+
+GEN is computed once at SIM_INIT or SIM_SEED_SHELL from:
+
+  θ_seed = atan2(Z, X) + SEAM_STEP
+  PH     = int(θ_seed · PHASE_MASK / 2π) & PHASE_MASK
+  GEN    = (PH >> 10) & GEN_MASK + 1
+
+For positions near the +X axis (Z ≈ 0, X > 0), `atan2(Z,X) ≈ 0`,
+`θ_seed ≈ SEAM_STEP = 0.196`, `PH ≈ 1024`, `GEN = 1`.
+
+So GEN=1 = the angular wedge near the +X axis (approximately
+`[0°, 22.5°]` in the XZ plane from +X).
+
+Once GEN is set, identity-centric topology keeps it frozen. The
+particle's GEN never updates regardless of where it moves. So when
+the particle eventually crystallizes — wherever, however — its
+recorded GEN is the GEN of its **seed-time angular position**, not
+its current angular position.
+
+The "GEN=1 monopoly" finding reduces to: **the particles that
+crystallize all came from the same seed-time angular wedge.**
+
+### Why specifically GEN=1 and not other bins
+
+Particles seeded in different wedges:
+
+- Tangent mode: TANGENT[k] velocity direction varies with k. Most
+  TANGENT entries have y components that produce velocities not
+  aligned with orbital tangent → orbits decay quickly. TANGENT[1]
+  and TANGENT[17] have zero y component → these orbits stay in the
+  XZ plane longest before crystallizing. TANGENT[1] = (-1, 0, 0)
+  produces a clean radial plunge from the +X axis → reaches v²<0.01
+  at periapsis. TANGENT[17] = (+1, 0, 0) produces a clean radial
+  flight outward from the -X axis (since GEN=17 ≈ -X wedge) → but
+  particles never come back to GEN=17 territory at low speed.
+
+- Prograde mode: velocity always perpendicular to position in XZ
+  plane. Particles in GEN=1 wedge get velocity in +Z direction →
+  they orbit, return to GEN=1 wedge at slightly larger r each cycle,
+  eventually reach apoapsis where v²<0.01. GEN=17 particles (at -X
+  axis with velocity in -Z direction) also orbit, but their orbits
+  apoapsis lands... actually this is unclear, would need direct
+  measurement of why GEN=17 doesn't produce crystals too.
+
+Either way, the mechanism is **seed-position bias** + **frozen GEN**,
+not substrate-native phase selection.
+
+### Implication: this changes the V22 port test design
+
+The SIG_GEN distribution is NOT a clean discriminator for
+trajectory-centric vs identity-centric topology by itself. Post-V22-port,
+crystals could still come from a narrow GEN range if the seed
+position bias persists.
+
+**Better discriminator**: compare the GEN at crystallization to the
+GEN at seed time. Pre-port = identical for every particle (frozen GEN).
+Post-port = should differ for any particle that orbited more than a few
+GEN bins worth before dying.
+
+Requires a new field: `SIG_GEN_SEED` — the GEN at seed time, separate
+from `SIG_GEN` (current GEN at death). Trivial to add: store on the
+FLAGS bits 8-12 = the seed GEN that's already there in the current
+implementation. Post-port, the current-GEN comes from `theta[i]`
+recomputed each frame.
+
+### Recommendation: GPT's LUT permutation test is still worth doing
+
+Even though we've ruled out "TANGENT[1] direction" as the cause, we
+haven't fully isolated the role of LUT contents vs the role of bin
+index. Permuting the LUT (cycle FLOW_MODE, TANGENT, Z_COUPLING,
+FLOW_W by an offset of e.g. +7) should shift the crystal population
+to whatever bin now holds the original (COAST + zc=1 + fw=0) entries.
+If the crystal population moves with the LUT contents → role-based
+selection (substrate-native). If it stays at index 1 → there's
+something index-specific in the implementation (likely SPAWN_COUNTER
+modulo or initial RNG sequence ordering).
+
+This test costs about 30 minutes of work: write a `permute_constants.py`
+that generates a rotated version of `constants.ergo` from a CLI offset,
+run both, compare clusters. Deferred for now.
+
+### What this means for the AIs' interpretations
+
+- **GPT** had the correct framing: cannot distinguish substrate-native
+  selection from architectural bias without permutation test.
+- **Deepseek's** "substrate chirality" reading of GEN=1 is not
+  supported by data; prograde-mode result shows GEN=1 is geometric,
+  not dynamical.
+- **Gemini's** rotation test would also reveal this, but tests a
+  different axis (position-axis chirality vs LUT-vs-index).
+
+All three AIs jumped to "this is substrate physics" too quickly. The
+right epistemic move was GPT's: name the alternative hypotheses, do
+the cheapest test that distinguishes them.
