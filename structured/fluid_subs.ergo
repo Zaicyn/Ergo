@@ -107,10 +107,20 @@ SUBROUTINE SIM_INIT(N, CAP, SEED)
 
     R_XZ := SQRT(X * X + Z * Z)
     V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
-    INV_RXZ := 1.0 / MAX(R_XZ, 1.0E-4)
-    VEL_X(I) := -Z * INV_RXZ * V_CIRC
-    VEL_Y(I) := 0.0
-    VEL_Z(I) :=  X * INV_RXZ * V_CIRC
+    IF SEED_DIR_MODE = SEED_DIR_TANGENT THEN
+      ! Legacy: Viviani-curve tangent as velocity direction.
+      ! Correct speed, wrong direction → eccentric plunges that
+      ! produce v² < 0.01 transiently → crystallization possible.
+      VEL_X(I) := TANGENT(1, GEN) * V_CIRC
+      VEL_Y(I) := TANGENT(2, GEN) * V_CIRC
+      VEL_Z(I) := TANGENT(3, GEN) * V_CIRC
+    ELSE
+      ! Prograde: clean bound orbits, v · r̂ = 0.
+      INV_RXZ := 1.0 / MAX(R_XZ, 1.0E-4)
+      VEL_X(I) := -Z * INV_RXZ * V_CIRC
+      VEL_Y(I) := 0.0
+      VEL_Z(I) :=  X * INV_RXZ * V_CIRC
+    ENDIF
 
     R_CLAMP := MAX(R_XZ, 1.0)
     OMEGA_NAT(I) := 0.1 * (50.0 / R_CLAMP) ** 1.5
@@ -151,10 +161,18 @@ SUBROUTINE SIM_SEED_SHELL()
 
     R_XZ := SQRT(PX * PX + PZ * PZ)
     V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
-    INV_RXZ := 1.0 / MAX(R_XZ, 1.0E-4)
-    VEL_X(I) := -PZ * INV_RXZ * V_CIRC
-    VEL_Y(I) := 0.0
-    VEL_Z(I) :=  PX * INV_RXZ * V_CIRC
+    IF SEED_DIR_MODE = SEED_DIR_TANGENT THEN
+      ! Legacy: Viviani-curve tangent as velocity direction.
+      VEL_X(I) := TANGENT(1, GEN) * V_CIRC
+      VEL_Y(I) := TANGENT(2, GEN) * V_CIRC
+      VEL_Z(I) := TANGENT(3, GEN) * V_CIRC
+    ELSE
+      ! Prograde: clean bound orbits, v · r̂ = 0.
+      INV_RXZ := 1.0 / MAX(R_XZ, 1.0E-4)
+      VEL_X(I) := -PZ * INV_RXZ * V_CIRC
+      VEL_Y(I) := 0.0
+      VEL_Z(I) :=  PX * INV_RXZ * V_CIRC
+    ENDIF
 
     OMEGA_NAT(I) := 0.1
     FLAGS(I) := IOR(IOR(PFLAG_ACTIVE, ISHFT(IAND(GEN - 1, GEN_MASK), &

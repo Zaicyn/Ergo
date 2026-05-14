@@ -99,5 +99,81 @@ is enough.
 
 ## Files
 
-- `N500K_F200K_thresh048.log` — 19 signatures at N=500K
-- `N1M_F200K_thresh048.log` — 37 signatures at N=1M
+- `N500K_F200K_thresh048.log` — 19 signatures at N=500K, **PROGRADE** seed mode
+- `N1M_F200K_thresh048.log` — 37 signatures at N=1M, **PROGRADE** seed mode
+- `N100K_F200K_thresh048_TANGENT.log` — 954 signatures at N=100K, **TANGENT** seed mode
+
+## Late finding: seed direction is the load-bearing knob
+
+Per V22 assistant's session 2026-05-14 (after their seed-fix was applied in
+V22, they noticed the same "crystals stopped forming" symptom in V22's
+test results that we saw here). V22 added a runtime toggle between
+prograde and tangent-direction seeding. We did the same as a PARAMETER
+toggle in `constants.ergo`:
+
+```
+PARAMETER INTEGER :: SEED_DIR_PROGRADE = 0
+PARAMETER INTEGER :: SEED_DIR_TANGENT  = 1
+PARAMETER INTEGER :: SEED_DIR_MODE = 0   ! 0 = prograde, 1 = tangent
+```
+
+### Re-test in TANGENT mode
+
+Setting `SEED_DIR_MODE = 1` (Viviani-curve tangent direction as velocity,
+the pre-`06cbcc8` Ergo behavior), threshold 0.048, N=100K, 200K frames:
+
+**954 crystallizations** — 25× the prograde rate at 1M / 10× the count
+in 1/10 the particle count → **~250× more crystal-productive per
+particle**. Matches V22 assistant's cb9a5ba observation of "exponentially
+accelerating" crystal counts in tangent mode.
+
+K-means k=4 reveals **4 distinct classes**:
+
+| Class | n | r | ρ | mgate | Interpretation |
+|---|---|---|---|---|---|
+| MAIN_DISK   | 886 | 736 | 1.0 | 0.36 | bulk stellar death |
+| DENSE_INNER | 19  | 57  | 99  | 0.36 | inner density spike |
+| CORE_REMNANT | 2 | 11  | 109 | 0.36 | innermost remnant |
+| HALO_DUST   | 47  | 1077 | 0.0 | 0.20 | outer halo |
+
+K-means k=6 further resolves MAIN_DISK into MID_DISK (r≈546) and
+OUTER_DISK (r≈1080). Inertia continues dropping smoothly, suggesting
+the structure is genuinely multi-class, not just 2.
+
+### Implication
+
+The original April 30 measurement was implicitly done in tangent-mode
+(pre-`06cbcc8`). The "2 material classes" finding there underrepresents
+the substrate's actual class diversity — at N=100K (much smaller than
+April 30's 5M) we already see 4 classes in tangent mode. April 30's
+2-class result was probably limited by:
+- The clustering tool used then may have been less sensitive to small
+  high-density clusters (DBSCAN here also only finds 2).
+- The threshold and density distributions were different.
+
+The **prograde "loose decay = flat" finding from earlier in this
+README is still correct for prograde mode**, but it's not a substrate
+property — it's a consequence of the seeding choice. The substrate IS
+capable of diverse material production; it just needs particles that
+can reach the v² < 0.01 state, and prograde orbits never do.
+
+### Open question for the V22 port
+
+What happens to class diversity once trajectory-centric topology is
+wired (V22 sections 1 + 9.5)? Two hypotheses:
+
+1. **Prograde + trajectory-centric** produces 4+ classes because
+   ω-driven mode cycling lets particles enter ACTIVE/FLOW regimes,
+   accumulate ω, then drift back into COAST and decelerate — creating
+   the same v²-low conditions tangent mode produces via eccentric
+   plunges, but through phase dynamics instead of geometric ones.
+
+2. **Prograde + trajectory-centric** still doesn't produce v²-low
+   conditions because the prograde orbits are still energetically
+   conserved — ω cycling alone doesn't decelerate particles. In this
+   case, the death pathway genuinely needs the tangent-direction
+   seeding OR one of the Option A/B/C death-criterion improvements
+   from Material_Future_Directions.md.
+
+The post-V22-port re-run (both seed modes × both trajectory regimes)
+will discriminate.

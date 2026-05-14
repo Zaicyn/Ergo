@@ -30,6 +30,21 @@ PARAMETER REAL :: SCALE_RATIO = 1.6875
 PARAMETER REAL :: STEER_RATE = 0.03
 PARAMETER REAL :: DENSITY_FORCE_SCALE = 0.01
 
+! ── Seed-direction mode (research instrument, compile-time) ───
+! 0 = PROGRADE: v = (-z, 0, x)/r_xz · v_circ. Clean bound orbits,
+!   v · r̂ = 0, kinetic energy conserved. Crystal v²-gate
+!   unreachable at populated radii — no death pathway. Default.
+! 1 = TANGENT: v = TANGENT(GEN) · v_circ (legacy Viviani-curve
+!   tangent used as velocity direction). Correct speed, wrong
+!   direction → degenerate plunges. v² transiently crosses 0.01
+!   at periapsis. The only seed mode in which crystallization
+!   fires regularly. Matches V22 cb9a5ba behavior.
+! See Spec/V22_Correction_And_Seed_Fix.md + V22 assistant's note
+! on the crystal-history finding (2026-05-14).
+PARAMETER INTEGER :: SEED_DIR_PROGRADE = 0
+PARAMETER INTEGER :: SEED_DIR_TANGENT  = 1
+PARAMETER INTEGER :: SEED_DIR_MODE = 0
+
 ! ── Metabolic thresholds (positive = gain, negative = decay)
 PARAMETER REAL :: OMEGA_BASE = 0.08
 PARAMETER REAL :: OMEGA_GAIN = 2.0
