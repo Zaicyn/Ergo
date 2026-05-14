@@ -99,9 +99,10 @@ is enough.
 
 ## Files
 
-- `N500K_F200K_thresh048.log` — 19 signatures at N=500K, **PROGRADE** seed mode
-- `N1M_F200K_thresh048.log` — 37 signatures at N=1M, **PROGRADE** seed mode
-- `N100K_F200K_thresh048_TANGENT.log` — 954 signatures at N=100K, **TANGENT** seed mode
+- `N500K_F200K_thresh048.log` — 19 sigs at N=500K, **PROGRADE**, 8-field format
+- `N1M_F200K_thresh048.log` — 37 sigs at N=1M, **PROGRADE**, 8-field format
+- `N100K_F200K_thresh048_TANGENT.log` — 954 sigs at N=100K, **TANGENT**, 8-field format
+- `N100K_F200K_thresh048_TANGENT_12field.log` — same 954 sigs, **12-field extended format** (adds gen, energy, ang_mom, bin_presence)
 
 ## Late finding: seed direction is the load-bearing knob
 
@@ -177,3 +178,69 @@ wired (V22 sections 1 + 9.5)? Two hypotheses:
 
 The post-V22-port re-run (both seed modes × both trajectory regimes)
 will discriminate.
+
+## Extended fields (2026-05-14, post-12-field upgrade)
+
+Added 4 fields to SIG_* collection to recover information lost in the
+original 8-field format:
+
+  SIG_GEN          — raw GEN bin (1..32). Recovers identity collapsed
+                     by `|zc|` and `|fw|` (which both have ties across
+                     multiple GEN bins).
+  SIG_ENERGY       — specific orbital energy ½v² − GM/r at death.
+                     Distinguishes deeply-bound from marginally-bound
+                     populations.
+  SIG_ANG_MOM      — |r × v| at death. Distinguishes near-circular
+                     orbits (high L) from plunge orbits (low L).
+  SIG_BIN_PRESENCE — bitmask of GEN bins represented in dying cell.
+                     bitcount → ring coverage at death location.
+
+Re-clustering the same 954-crystal tangent-mode run with the extended
+fields produces the same 4 classes but with sharper discrimination:
+
+  Class             n    rnorm  rho    energy   ang_mom  bin_pres
+  HALO_DUST        47   0.90   0.0    −0.09     91        0
+  MAIN_DISK       886   0.61   1.0    −0.18     54        1
+  CORE_REMNANT     2   0.01   109    −10.3      0.5       1
+  DENSE_INNER      19   0.05   99     −2.1      4.3       1
+
+### Three new findings from the extended fields
+
+1. **`SIG_GEN = 1` for all 954 crystals.** Not a sampling artifact —
+   every single crystal in tangent-mode at this scale came from GEN
+   bin 1 specifically. The substrate's crystallization population is
+   not just COAST-biased; it's selectively GEN=1-biased among the 10
+   available COAST bins. Suggests the (TANGENT[1] = (−1, 0, 0),
+   Z_COUPLING[1] = 1.0, FLOW_W[1] = 0.0) combination creates a
+   uniquely favorable plunge geometry. GEN=17 has the same
+   (zc=1, fw=0) but TANGENT[17] = (+1, 0, 0), and never produces a
+   crystal in this run.
+
+2. **Angular momentum is the clean class separator.** 200× spread
+   between CORE_REMNANT (L≈0.5, near-radial plunge) and HALO_DUST
+   (L≈91, near-circular outer orbit). Confirms V22 assistant's theory
+   that tangent-mode produces low-L plunges; the four classes
+   correspond to different L survival rates.
+
+3. **`bin_presence = 0` cleanly separates HALO_DUST.** Particles
+   crystallizing in cells with zero ring-bin coverage = the substrate
+   has no topological structure at the death location. All other
+   classes have bin_presence = 1 (single bin, partial structure).
+   DBSCAN at default eps actually picks up subclusters within
+   bin_presence=0 by separating mid-r-norm from outer-r-norm halo
+   particles.
+
+### Implication: gen=1 invariance is a substrate constraint, not noise
+
+The fact that crystallization is locked to a single GEN bin reveals
+that the current substrate has **no genuine GEN-mixing in the
+crystallization population**. Every crystal arrived via the same
+phase trajectory through θ-space. This is itself a strong indictment
+of identity-centric topology — and a clear prediction for the V22
+port: if trajectory-centric topology works as intended, post-port
+re-runs should show crystals from multiple GEN bins, since particles
+cycle through θ-space and can crystallize at different phases.
+
+Post-port "Test of multi-GEN crystallization" = simple histogram of
+SIG_GEN across crystals. Pre-port = single bin (1). Post-port = many
+bins if trajectory-centric is working.

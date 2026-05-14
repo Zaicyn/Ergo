@@ -59,6 +59,14 @@ STATIC REAL :: SIG_RNORM(SIG_MAX)
 STATIC REAL :: SIG_MGATE(SIG_MAX)
 STATIC REAL :: SIG_ZC(SIG_MAX)
 STATIC REAL :: SIG_FW(SIG_MAX)
+! Extended signature fields (added 2026-05-14) — recover lost
+! information about WHERE in θ-space the death occurred (SIG_GEN),
+! the particle's orbital state at death (SIG_ENERGY, SIG_ANG_MOM),
+! and the cell's ring-completeness (SIG_BIN_PRESENCE).
+STATIC INTEGER :: SIG_GEN(SIG_MAX)
+STATIC REAL :: SIG_ENERGY(SIG_MAX)
+STATIC REAL :: SIG_ANG_MOM(SIG_MAX)
+STATIC INTEGER :: SIG_BIN_PRESENCE(SIG_MAX)
 
 ! ════════════════════════════════════════════════════════════════
 ! PRNG (deterministic, reproducible)

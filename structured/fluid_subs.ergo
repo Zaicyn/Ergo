@@ -246,14 +246,42 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
             CJ := CLAMP(INT(POS_Y(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
             CK := CLAMP(INT(POS_Z(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
 
+            ! Load particle state into locals for derived quantities.
+            ! Reuses physics-step locals (PX/PY/PZ/VX/VY/VZ etc.) declared
+            ! at top of subroutine; we're in dead time for crystal warps.
+            PX := POS_X(I)
+            PY := POS_Y(I)
+            PZ := POS_Z(I)
+            VX := VEL_X(I)
+            VY := VEL_Y(I)
+            VZ := VEL_Z(I)
+
             SIG_OMEGA(SIG_SLOT) := OMEGA_NAT(I)
             SIG_RHO(SIG_SLOT) := REAL(GRID_DENSITY(CI, CJ, CK)) / 32.0
             SIG_FMODE(SIG_SLOT) := REAL(FLOW_MODE(GEN))
-            SIG_VMAG(SIG_SLOT) := SQRT(VEL_X(I)*VEL_X(I) + VEL_Y(I)*VEL_Y(I) + VEL_Z(I)*VEL_Z(I))
-            SIG_RNORM(SIG_SLOT) := SQRT(POS_X(I)*POS_X(I) + POS_Y(I)*POS_Y(I) + POS_Z(I)*POS_Z(I)) / DISK_OUTER_R
+            SIG_VMAG(SIG_SLOT) := SQRT(VX*VX + VY*VY + VZ*VZ)
+            SIG_RNORM(SIG_SLOT) := SQRT(PX*PX + PY*PY + PZ*PZ) / DISK_OUTER_R
             SIG_MGATE(SIG_SLOT) := GRID_MET_GATE(CI, CJ, CK)
             SIG_ZC(SIG_SLOT) := ABS(Z_COUPLING(GEN))
             SIG_FW(SIG_SLOT) := ABS(FLOW_W(GEN))
+
+            ! Extended fields (2026-05-14):
+            !   GEN          — raw GEN bin (1..32), recovers identity lost
+            !                  when only |zc| and |fw| are stored.
+            !   ENERGY       — specific orbital energy ½v² − GM/r.
+            !                  Negative = bound; magnitude = depth in well.
+            !   ANG_MOM      — |r × v|. Distinguishes near-circular orbits
+            !                  (high L) from plunge orbits (low L).
+            !   BIN_PRESENCE — bitmask of GEN bins represented in this cell.
+            !                  bitcount → ring coverage (8 = full, 1 = sparse).
+            SIG_GEN(SIG_SLOT) := GEN
+            SIG_ENERGY(SIG_SLOT) := 0.5 * (VX*VX + VY*VY + VZ*VZ) &
+              - BH_MASS / MAX(SQRT(PX*PX + PY*PY + PZ*PZ), 1.0)
+            SIG_ANG_MOM(SIG_SLOT) := SQRT( &
+              (PY*VZ - PZ*VY) * (PY*VZ - PZ*VY) + &
+              (PZ*VX - PX*VZ) * (PZ*VX - PX*VZ) + &
+              (PX*VY - PY*VX) * (PX*VY - PY*VX))
+            SIG_BIN_PRESENCE(SIG_SLOT) := BIN_PRESENCE(CI, CJ, CK)
 
             FLAGS(I) := IOR(FLAGS(I), PFLAG_SIGNED)
           ENDIF

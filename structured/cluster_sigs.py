@@ -24,11 +24,29 @@ import numpy as np
 from sklearn.cluster import KMeans, DBSCAN
 from sklearn.preprocessing import StandardScaler
 
-DIMS = ["omega", "rho", "fmode", "vmag", "rnorm", "mgate", "zc", "fw"]
+DIMS = [
+    "omega",
+    "rho",
+    "fmode",
+    "vmag",
+    "rnorm",
+    "mgate",
+    "zc",
+    "fw",
+    "gen",
+    "energy",
+    "ang_mom",
+    "bin_pres",
+]
 
 
 def parse_dump(text):
-    """Find the 77777 block in the input text, return (N, array[N, 8])."""
+    """Find the 77777 block in the input text, return (N, array[N, len(DIMS)]).
+
+    Supports both the 8-field legacy format (archived logs from before
+    2026-05-14) and the 12-field extended format. Detects which by
+    counting values after the count line.
+    """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     try:
         idx = lines.index("77777")
@@ -38,10 +56,27 @@ def parse_dump(text):
     n = int(lines[idx + 1])
     if n == 0:
         return 0, np.empty((0, len(DIMS)))
-    flat = lines[idx + 2 : idx + 2 + n * len(DIMS)]
-    if len(flat) < n * len(DIMS):
+
+    # Try 12-field first (current); fall back to 8-field (legacy)
+    flat_full = lines[idx + 2 : idx + 2 + n * len(DIMS)]
+    if len(flat_full) == n * len(DIMS):
+        flat = flat_full
+        legacy_8 = False
+    else:
+        # Maybe an 8-field legacy log
+        flat_legacy = lines[idx + 2 : idx + 2 + n * 8]
+        if len(flat_legacy) == n * 8:
+            print(
+                f"NOTE: detected 8-field legacy log; padding 4 extended fields with NaN.",
+                file=sys.stderr,
+            )
+            # Reshape to 8, then pad to len(DIMS)
+            arr8 = np.array([float(x) for x in flat_legacy]).reshape(n, 8)
+            pad = np.full((n, len(DIMS) - 8), np.nan)
+            return n, np.concatenate([arr8, pad], axis=1)
         print(
-            f"ERROR: expected {n * len(DIMS)} signature values, got {len(flat)}.",
+            f"ERROR: expected {n * len(DIMS)} values (12-field) or "
+            f"{n * 8} values (8-field legacy); got {len(flat_full)}.",
             file=sys.stderr,
         )
         sys.exit(1)

@@ -16,9 +16,16 @@
 !     <SIG_MGATE[k]>
 !     <SIG_ZC[k]>
 !     <SIG_FW[k]>
+!     <SIG_GEN[k]>           (extended, 2026-05-14)
+!     <SIG_ENERGY[k]>
+!     <SIG_ANG_MOM[k]>
+!     <SIG_BIN_PRESENCE[k]>
 !
-! Python clustering tool reads this and runs k-means / DBSCAN over the
-! 7D space (ω, ρ, fmode, vmag, r, mgate, zc, fw → 8 dimensions actually).
+! Total: 12 values per signature row.
+!
+! Python clustering tool (cluster_sigs.py) reads this and runs
+! k-means / DBSCAN over the 12D space. The extended fields recover
+! information that was previously collapsed by the 8-field format.
 
 SUBROUTINE SIG_DUMP()
   INTEGER :: K, N
@@ -38,6 +45,10 @@ SUBROUTINE SIG_DUMP()
       PRINT SIG_MGATE(K)
       PRINT SIG_ZC(K)
       PRINT SIG_FW(K)
+      PRINT SIG_GEN(K)
+      PRINT SIG_ENERGY(K)
+      PRINT SIG_ANG_MOM(K)
+      PRINT SIG_BIN_PRESENCE(K)
     ENDDO
   ENDIF
 
