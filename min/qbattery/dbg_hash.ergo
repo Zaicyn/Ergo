@@ -1,0 +1,50 @@
+! HASHCHK — replicate rotor_traj's exact hash chain and measure the
+! channel-selection variate x conditioned on a jump firing.
+! R_TOT = 0.7 (state n=1: loss 0.5, pump 0.2), threshold x > 5/7 = pump.
+! Stream 1 (NOISE): jump/no-jump. Stream 2 (H2): channel selection,
+! seeded differently so conditioning on stream 1 cannot bias it.
+IMPLICIT NONE
+
+STATIC INTEGER :: ST, H, H2, NFIRE, NPUMP, NPUMP2
+STATIC REAL :: NOISE, X, X2, R_TOT, SUMX, SUMX2, ALLX2
+
+R_TOT := 0.7
+NFIRE := 0
+NPUMP := 0
+NPUMP2 := 0
+SUMX := 0.0
+SUMX2 := 0.0
+ALLX2 := 0.0
+DO ST = 1, 12000
+  H := IEOR(ST * 2654435761, IEOR(1 * 40503, 1 * 7919))
+  H := IEOR(H, ISHFT(H, -30))
+  H := H * 6364136223846793005
+  H := IEOR(H, ISHFT(H, -27))
+  H := H * 6364136223846793005
+  H := IEOR(H, ISHFT(H, -31))
+  NOISE := (REAL(IAND(H, 65535)) + 0.5) / 65536.0
+  H2 := IEOR(ST * 2246822519, IEOR(1 * 40503, IEOR(1 * 7919, 123456789)))
+  H2 := IEOR(H2, ISHFT(H2, -30))
+  H2 := H2 * 6364136223846793005
+  H2 := IEOR(H2, ISHFT(H2, -27))
+  H2 := H2 * 6364136223846793005
+  H2 := IEOR(H2, ISHFT(H2, -31))
+  X2 := (REAL(IAND(H2, 65535)) + 0.5) / 65536.0
+  ALLX2 := ALLX2 + X2
+  IF R_TOT * 0.01 > NOISE THEN
+    NFIRE := NFIRE + 1
+    H := IEOR(H, ISHFT(H, -17))
+    X := (REAL(IAND(H, 65535)) + 0.5) / 65536.0
+    SUMX := SUMX + X
+    SUMX2 := SUMX2 + X2
+    IF X > 0.7142857 THEN
+      NPUMP := NPUMP + 1
+    ENDIF
+    IF X2 > 0.7142857 THEN
+      NPUMP2 := NPUMP2 + 1
+    ENDIF
+  ENDIF
+ENDDO
+WRITE(*, "fires %d old-pump %d old-meanx %f") NFIRE, NPUMP, SUMX / REAL(NFIRE)
+WRITE(*, "new-pump %d new-meanx %f uncond-meanx2 %f") NPUMP2, SUMX2 / REAL(NFIRE), ALLX2 / 12000.0
+STOP

@@ -1,0 +1,134 @@
+! ════════════════════════════════════════════════════════════════════
+! DENDRITE_STAGE2 — dynamic alignment: do current ribbons reorient
+! toward the low-field wedge? (dendrite_stage2_check.md)
+! NSEG=5 ribbon segments (L=40) pinned at junction (128,128), diverging
+! ramped DC, mechanically free to rotate about the junction.
+! ROTATIONAL DYNAMICS MODEL (documented — the sim has no segment
+! inertia, so we define it):
+!   torque per segment about the junction from the magnetic force:
+!     tau_s = sum_cells r x (J x B) = -HZ * (rx*jx + ry*jy) per cell
+!   (self-field vanishes on the segment axis — measured in weber_check;
+!    the measured HZ at a segment's own cells is the OTHER segments'
+!    field, so tau is a clean cross-segment torque)
+!   OVERDAMPED dynamics: omega_s = tau_s / GAMMAR, capped at |omega| <=
+!   OMAX (keeps rotation quasi-static vs the field solve; GAMMAR=2000,
+!   OMAX=5e-4 rad/frame — documented parameters, no inertia term: the
+!   relaxation is first-order, the simplest documented model).
+!   E-field/accumulated-charge torque is NOT included in the dynamics
+!   (documented): the comparison "alignment rate vs charge buildup" is
+!   reported from the trajectories vs the known charge ramp (I*t).
+! Initial angles (documented seed — fixed list): 20, 80, 150, 210, 320
+! degrees. Segments cross each other freely (superposition, no sterics).
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 256, NY = 256
+INTEGER, PARAMETER :: NSTEPS = 3000, NSEG = 5, L = 40
+REAL, PARAMETER :: S = 0.5
+REAL, PARAMETER :: I_AMP = 0.05
+REAL, PARAMETER :: GAMMAR = 2000.0, OMAX = 0.0005
+INTEGER, PARAMETER :: NSP = 20, JC = 128, YC = 128
+
+STATIC REAL :: HZ(NX, NY), EX(NX, NY), EY(NX, NY)
+STATIC REAL :: ABSORB(NX, NY)
+STATIC REAL :: TH(NSEG), OM(NSEG), TAU(NSEG), CTH(NSEG), STH(NSEG)
+
+REAL :: SV, RAMPV, JXS, JYS
+INTEGER :: I, J, T, K, X, Y
+
+TH(1) := 0.349066
+TH(2) := 1.396263
+TH(3) := 2.617994
+TH(4) := 3.665191
+TH(5) := 5.585054
+DO K = 1, NSEG
+  OM(K) := 0.0
+ENDDO
+
+DO J = 1, NY
+  DO I = 1, NX
+    HZ(I, J) := 0.0
+    EX(I, J) := 0.0
+    EY(I, J) := 0.0
+    ABSORB(I, J) := 1.0
+  ENDDO
+ENDDO
+DO I = 1, NSP
+  SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - I) / REAL(NSP + 1)))
+  DO J = 1, NY
+    ABSORB(I, J) := ABSORB(I, J) * SV
+    ABSORB(NX - I + 1, J) := ABSORB(NX - I + 1, J) * SV
+  ENDDO
+ENDDO
+DO J = 1, NSP
+  SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - J) / REAL(NSP + 1)))
+  DO I = 1, NX
+    ABSORB(I, J) := ABSORB(I, J) * SV
+    ABSORB(I, NY - J + 1) := ABSORB(I, NY - J + 1) * SV
+  ENDDO
+ENDDO
+
+DO T = 1, NSTEPS
+  DO J = 2, NY - 1
+    DO I = 2, NX - 1
+      EX(I, J) := (EX(I, J) + S * (HZ(I, J) - HZ(I, J - 1))) * ABSORB(I, J)
+      EY(I, J) := (EY(I, J) - S * (HZ(I, J) - HZ(I - 1, J))) * ABSORB(I, J)
+    ENDDO
+  ENDDO
+  RAMPV := 1.0
+  IF (T <= 200) THEN
+    RAMPV := 0.5 * (1.0 - COS(3.14159265358979 * REAL(T) / 200.0))
+  ENDIF
+  DO K = 1, NSEG
+    CTH(K) := COS(TH(K))
+    STH(K) := SIN(TH(K))
+  ENDDO
+  ! junction: common source feeding all branches
+  JXS := 0.0
+  JYS := 0.0
+  DO K = 1, NSEG
+    JXS := JXS + I_AMP * CTH(K)
+    JYS := JYS + I_AMP * STH(K)
+  ENDDO
+  EX(JC, YC) := EX(JC, YC) - S * JXS * RAMPV
+  EY(JC, YC) := EY(JC, YC) - S * JYS * RAMPV
+  DO K = 1, NSEG
+    DO I = 1, L
+      X := JC + INT(REAL(I) * CTH(K) + 8000.5) - 8000
+      Y := YC + INT(REAL(I) * STH(K) + 8000.5) - 8000
+      EX(X, Y) := EX(X, Y) - S * I_AMP * CTH(K) * RAMPV
+      EY(X, Y) := EY(X, Y) - S * I_AMP * STH(K) * RAMPV
+    ENDDO
+  ENDDO
+  DO J = 1, NY - 1
+    DO I = 1, NX - 1
+      HZ(I, J) := (HZ(I, J) - S * (EY(I + 1, J) - EY(I, J) - EX(I, J + 1) + EX(I, J))) * ABSORB(I, J)
+    ENDDO
+  ENDDO
+  ! torque + overdamped angle update (after the current ramp)
+  IF T > 200 THEN
+    DO K = 1, NSEG
+      TAU(K) := 0.0
+      DO I = 1, L
+        X := JC + INT(REAL(I) * CTH(K) + 8000.5) - 8000
+        Y := YC + INT(REAL(I) * STH(K) + 8000.5) - 8000
+        TAU(K) := TAU(K) - HZ(X, Y) * (REAL(X - JC) * I_AMP * CTH(K) + REAL(Y - YC) * I_AMP * STH(K))
+      ENDDO
+      OM(K) := TAU(K) / GAMMAR
+      IF OM(K) > OMAX THEN
+        OM(K) := OMAX
+      ENDIF
+      IF OM(K) < 0.0 - OMAX THEN
+        OM(K) := 0.0 - OMAX
+      ENDIF
+      TH(K) := TH(K) + OM(K)
+    ENDDO
+  ENDIF
+  IF MOD(T, 50) = 0 THEN
+    WRITE(*, "ANG %d %.2f %.2f %.2f %.2f %.2f %.4f %.4f %.4f %.4f %.4f") T, &
+      TH(1) * 57.29578, TH(2) * 57.29578, TH(3) * 57.29578, TH(4) * 57.29578, TH(5) * 57.29578, &
+      TAU(1), TAU(2), TAU(3), TAU(4), TAU(5)
+  ENDIF
+ENDDO
+WRITE(*, "# DONE")
+STOP

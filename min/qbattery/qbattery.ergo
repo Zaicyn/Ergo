@@ -1,0 +1,104 @@
+! ════════════════════════════════════════════════════════════════════
+! QBATTERY — open-system rate model of the Hymas et al. 2026 quantum
+! battery claim (papers/sapphire.txt): N CuPc molecules (S1 ~2 eV,
+! T1 ~1.2 eV) in a resonant microcavity, incoherent pump, charge
+! extraction via transport/blocking layers. Claim: steady-state
+! discharge power scales SUPER-LINEARLY with N (P ~ N^2, cavity/control
+! ratio linear in N) while no-cavity controls scale linearly.
+!
+! Model (documented choice — polariton-branch rate equations, the
+! classical-channel alternative hypothesis; NO non-classical
+! correlations anywhere):
+!   B = bright collective polariton occupancy (one mode; superradiant
+!       absorption W*N*fB*(1-B), fB = LP oscillator-strength fraction
+!       = 0.5 by the sum rule; two-level saturation (1-B))
+!   D = dark-mode singlet population (N-1 uncoupled molecular modes,
+!       independent absorption W each, decay gamma + k_ISC)
+!   T = triplet reservoir (metastable, k_rec small), extraction k_ext
+!   I = k_ext * T (photocurrent), P = I * Vth
+!   Vth(cavity) = E_T1 + COUP (dressed-state voltage, the paper's own
+!       mechanism: Voc ~ sqrt(N); Vth(control) = E_T1)
+! Cavity case: COUP = G * sqrt(N); control: G = 0 AND no bright channel.
+! Parameters (documented, ns^-1 unless noted): k_ISC = 1 (CuPc ISC fast),
+! gamma = 0.1 (radiative S1 decay), kappa swept, k_ext = 1, k_rec = 0.01
+! (triplet metastable per paper), G = 0.05 eV (Omega = G*sqrt(N) reaches
+! ~0.5 eV at N=100, matching the UP/LP separation in the reflectance
+! spectra), E_T1 = 1.2 eV.
+! Steady state: Euler integration to convergence (graphene_transfer idiom).
+! Sweep: N in {1,2,5,10,20,50,100,200}, W in {0.001, 0.1, 1.0} (pump
+! crossover: unsaturated -> bright-mode saturation), KAPPA in {0.1,0.5,2}.
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+
+PARAMETER REAL :: KISC = 1.0
+PARAMETER REAL :: GAMMA_R = 0.1
+PARAMETER REAL :: KEXT = 1.0
+PARAMETER REAL :: KREC = 0.01
+PARAMETER REAL :: G = 0.05
+PARAMETER REAL :: E_T1 = 1.2
+PARAMETER REAL :: FB = 0.5
+PARAMETER REAL :: DT_INT = 0.01
+PARAMETER INTEGER :: NSTEPS = 40000
+
+STATIC REAL :: NTAB(8), WTAB(3), KATAB(3)
+DATA NTAB / 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0 /
+DATA WTAB / 0.001, 0.1, 1.0 /
+DATA KATAB / 0.1, 0.5, 2.0 /
+
+STATIC REAL :: B, D, T, N, W, KAPPA, COUP, VTH
+STATIC REAL :: DB, DD, DT_R, I_CUR, P_MAX
+INTEGER :: IN, IW, IK, IC
+
+WRITE(*, "# QBATTERY cols: case N W kappa B D T I Vth P")
+DO IC = 1, 2
+  DO IK = 1, 3
+    KAPPA := KATAB(IK)
+    DO IW = 1, 3
+      W := WTAB(IW)
+      DO IN = 1, 8
+        N := NTAB(IN)
+        IF IC = 1 THEN
+          COUP := G * SQRT(N)
+        ELSE
+          COUP := 0.0
+        ENDIF
+        B := 0.0
+        D := 0.0
+        T := 0.0
+        CALL STEADY(IC)
+        VTH := E_T1 + COUP
+        IF IC = 2 THEN
+          VTH := E_T1
+        ENDIF
+        I_CUR := KEXT * T
+        P_MAX := I_CUR * VTH
+        IF IC = 1 THEN
+          WRITE(*, "cavity  %6.0f %.3f %.1f %.4f %.2f %.3f %.4f %.3f %.4f") &
+            N, W, KAPPA, B, D, T, I_CUR, VTH, P_MAX
+        ELSE
+          WRITE(*, "control %6.0f %.3f %.1f %.4f %.2f %.3f %.4f %.3f %.4f") &
+            N, W, KAPPA, B, D, T, I_CUR, VTH, P_MAX
+        ENDIF
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+WRITE(*, "# DONE")
+STOP
+
+SUBROUTINE STEADY(IC)
+  INTEGER :: IC, ST
+  DO ST = 1, NSTEPS
+    IF IC = 1 THEN
+      DB := W * N * FB * (1.0 - B) - (KAPPA + KISC) * B
+      DD := W * ((N - 1.0) - D) - (GAMMA_R + KISC) * D
+    ELSE
+      DB := 0.0
+      DD := W * (N - D) - (GAMMA_R + KISC) * D
+    ENDIF
+    DT_R := KISC * B + KISC * D - (KEXT + KREC) * T
+    B := B + DT_INT * DB
+    D := D + DT_INT * DD
+    T := T + DT_INT * DT_R
+  ENDDO
+END

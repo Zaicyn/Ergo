@@ -1,0 +1,35 @@
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 640, NY = 512
+INTEGER, PARAMETER :: NPTS = 327680
+REAL, PARAMETER :: C2 = 0.25, AMP = 1.0
+INTEGER, PARAMETER :: IX_SRC = 40, NEND = NPTS - NX - 1
+REAL, PARAMETER :: OMEGA = 0.19634954084936207
+STATIC REAL :: U(NPTS), UN(NPTS), ABSORB(NPTS), PASS(NPTS), BOUND(NPTS)
+REAL :: ENV, SV
+INTEGER :: K, T
+DO DMY = 1, 1
+  DO K = 1, NPTS
+    U(K) := 0.0
+    UN(K) := 0.0
+    ABSORB(K) := 1.0
+    PASS(K) := 1.0
+    BOUND(K) := 1.0
+  ENDDO
+ENDDO
+DO T = 1, 200, 2
+  DO K = NX + 2, NEND
+    UN(K) := ((2.0 * U(K) - UN(K) &
+      + C2 * (U(K + 1) + U(K - 1) + U(K + NX) + U(K - NX) - 4.0 * U(K))) &
+      * ABSORB(K) * PASS(K) * BOUND(K)) + UN(K) * (1.0 - BOUND(K))
+  ENDDO
+  SV := AMP * SIN(OMEGA * REAL(T)) * EXP(0.0 - ((REAL(T) - 200.0) / 60.0) ** 2)
+  UN(IX_SRC + (256 - 1) * NX) := UN(IX_SRC + (256 - 1) * NX) + SV
+  DO K = NX + 2, NEND
+    U(K) := ((2.0 * UN(K) - U(K) &
+      + C2 * (UN(K + 1) + UN(K - 1) + UN(K + NX) + UN(K - NX) - 4.0 * UN(K))) &
+      * ABSORB(K) * PASS(K) * BOUND(K)) + U(K) * (1.0 - BOUND(K))
+  ENDDO
+  SV := AMP * SIN(OMEGA * REAL(T + 1)) * EXP(0.0 - ((REAL(T + 1) - 200.0) / 60.0) ** 2)
+  U(IX_SRC + (256 - 1) * NX) := U(IX_SRC + (256 - 1) * NX) + SV
+ENDDO
+WRITE(*, "Usrc=%.6f U50=%.6f UN50=%.6f") U(163240), U(163290), UN(163290)

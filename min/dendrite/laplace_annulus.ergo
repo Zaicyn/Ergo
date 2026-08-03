@@ -1,0 +1,177 @@
+! laplace_annulus.ergo — Stage 1: Laplace solver validation (DBM thread)
+!
+! Solves Laplace phi=0 in a radial annulus: frozen inner disk r<=R0 (phi=0),
+! outer circle r>=R1 (phi=1), by in-place SOR with mask-multiplied update
+! (branch-free idiom from min/fdtd/stencil_test.ergo).
+!
+! Oracle (analytic): phi(r) = ln(r/R0)/ln(R1/R0). Interior band
+! R0+4 < r < R1-4 must show O(h^2) error: run -N 129 and -N 257, band
+! Linf should drop ~4x.
+!
+! Grid size knob is DEFAULT_N so the compiler's -N flag overrides it.
+!
+!   python -m core min/dendrite/laplace_annulus.ergo -o laplace_annulus
+!   ./laplace_annulus                       (129 grid)
+!   python -m core min/dendrite/laplace_annulus.ergo -N 257 -o laplace_annulus_257
+!   ./laplace_annulus_257                   (257 grid)
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: DEFAULT_N = 129
+INTEGER, PARAMETER :: NX = DEFAULT_N, NY = DEFAULT_N
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+REAL, PARAMETER :: TOL = 1.0E-9
+INTEGER, PARAMETER :: SWMAX = 500000
+STATIC REAL :: PHI(NPTS), MASK(NPTS)
+STATIC REAL :: SHSUM(NX), SHMIN(NX), SHMAX(NX)
+STATIC INTEGER :: SHCNT(NX)
+REAL :: CX, CY, R, R0, R1, DX, DY
+REAL :: DN, MAXD, OMEGA, PI
+REAL :: E, LINF, L2, LR, RN, AA, BB
+REAL :: SLR, SLR2, SP, SPLR, AZI
+INTEGER :: I, J, K, S, SW, CONV, SWUSED, CNT
+
+PI := ACOS(0.0 - 1.0)
+CX := 0.5 * REAL(NX + 1)
+CY := 0.5 * REAL(NY + 1)
+R1 := 0.5 * REAL(NX) - 4.5
+R0 := R1 / 6.0
+OMEGA := 2.0 / (1.0 + SIN(PI / REAL(NX)))
+
+! Geometry: inner disk fixed 0, outer circle fixed 1, annulus solves.
+DO J = 1, NY
+  DO I = 1, NX
+    K := I + (J - 1) * NX
+    DX := REAL(I) - CX
+    DY := REAL(J) - CY
+    R := SQRT(DX * DX + DY * DY)
+    MASK(K) := 0.0
+    PHI(K) := 1.0
+    IF (R <= R0) THEN
+      PHI(K) := 0.0
+    ENDIF
+    IF (R > R0) THEN
+      IF (R < R1) THEN
+        MASK(K) := 1.0
+        PHI(K) := 0.5
+      ENDIF
+    ENDIF
+  ENDDO
+ENDDO
+
+! SOR with convergence flag (fixed-count loop, idempotent once converged).
+CONV := 0
+SWUSED := SWMAX
+DO SW = 1, SWMAX
+  IF (CONV == 0) THEN
+    MAXD := 0.0
+    DO K = NX + 2, NEND
+      DN := MASK(K) * OMEGA * (0.25 * (PHI(K - 1) + PHI(K + 1) &
+        + PHI(K - NX) + PHI(K + NX)) - PHI(K))
+      PHI(K) := PHI(K) + DN
+      MAXD := MAX(MAXD, ABS(DN))
+    ENDDO
+    IF (MAXD < TOL) THEN
+      CONV := 1
+      SWUSED := SW
+    ENDIF
+  ENDIF
+ENDDO
+
+! Error vs analytic phi(r) = ln(r/R0)/ln(R1/R0).
+! Oracle: the discrete solution must be radial, harmonic, and log-shaped.
+! Staircase boundaries shift the *effective* radii by O(h), so comparing
+! against ln(r/R0)/ln(R1/R0) with the nominal R0,R1 only converges O(h).
+! Instead least-squares fit phi = A*ln(r) + B over the band (clearance
+! 15% of R1 on both sides, scaling WITH the grid) and measure the
+! residual: a correct 5-point Laplacian gives O(h^2) there (4x drop per
+! grid doubling). Also report max azimuthal variation within shells
+! (radial symmetry) and fitted A vs analytic 1/ln(R1/R0).
+SLR := 0.0
+SLR2 := 0.0
+SP := 0.0
+SPLR := 0.0
+CNT := 0
+DO J = 1, NY
+  DO I = 1, NX
+    K := I + (J - 1) * NX
+    IF (MASK(K) > 0.5) THEN
+      DX := REAL(I) - CX
+      DY := REAL(J) - CY
+      R := SQRT(DX * DX + DY * DY)
+      IF (R > R0 + 0.15 * R1) THEN
+        IF (R < R1 - 0.15 * R1) THEN
+          LR := LOG(R)
+          SLR := SLR + LR
+          SLR2 := SLR2 + LR * LR
+          SP := SP + PHI(K)
+          SPLR := SPLR + PHI(K) * LR
+          CNT := CNT + 1
+        ENDIF
+      ENDIF
+    ENDIF
+  ENDDO
+ENDDO
+RN := REAL(CNT)
+AA := (RN * SPLR - SP * SLR) / (RN * SLR2 - SLR * SLR)
+BB := (SP - AA * SLR) / RN
+
+LINF := 0.0
+L2 := 0.0
+DO J = 1, NY
+  DO I = 1, NX
+    K := I + (J - 1) * NX
+    IF (MASK(K) > 0.5) THEN
+      DX := REAL(I) - CX
+      DY := REAL(J) - CY
+      R := SQRT(DX * DX + DY * DY)
+      IF (R > R0 + 0.15 * R1) THEN
+        IF (R < R1 - 0.15 * R1) THEN
+          E := ABS(PHI(K) - AA * LOG(R) - BB)
+          LINF := MAX(LINF, E)
+          L2 := L2 + E * E
+        ENDIF
+      ENDIF
+    ENDIF
+  ENDDO
+ENDDO
+L2 := SQRT(L2 / RN)
+
+! Azimuthal variation: per-shell (integer r) max-min of phi, worst shell.
+DO S = 1, NX
+  SHSUM(S) := 0.0
+  SHMIN(S) := 1.0E30
+  SHMAX(S) := 0.0 - 1.0E30
+  SHCNT(S) := 0
+ENDDO
+DO J = 1, NY
+  DO I = 1, NX
+    K := I + (J - 1) * NX
+    IF (MASK(K) > 0.5) THEN
+      DX := REAL(I) - CX
+      DY := REAL(J) - CY
+      R := SQRT(DX * DX + DY * DY)
+      IF (R > R0 + 0.15 * R1) THEN
+        IF (R < R1 - 0.15 * R1) THEN
+          S := INT(R)
+          SHSUM(S) := SHSUM(S) + PHI(K)
+          SHMIN(S) := MIN(SHMIN(S), PHI(K))
+          SHMAX(S) := MAX(SHMAX(S), PHI(K))
+          SHCNT(S) := SHCNT(S) + 1
+        ENDIF
+      ENDIF
+    ENDIF
+  ENDDO
+ENDDO
+AZI := 0.0
+DO S = 1, NX
+  IF (SHCNT(S) > 3) THEN
+    AZI := MAX(AZI, SHMAX(S) - SHMIN(S))
+  ENDIF
+ENDDO
+
+WRITE(*, "grid %d x %d  R0 %.1f  R1 %.1f  omega %.5f") NX, NY, R0, R1, OMEGA
+WRITE(*, "sweeps %d  final maxdelta %.3e") SWUSED, MAXD
+WRITE(*, "logfit A %.6f  (analytic 1/ln(R1/R0) %.6f)") AA, 1.0 / LOG(R1 / R0)
+WRITE(*, "fit residual Linf %.6e  L2 %.6e  (n=%d)") LINF, L2, CNT
+WRITE(*, "max shell deviation %.6e") AZI

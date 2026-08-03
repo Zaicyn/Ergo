@@ -1,0 +1,26 @@
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 640, NY = 512
+INTEGER, PARAMETER :: NPTS = 327680
+REAL, PARAMETER :: C2 = 0.25
+STATIC REAL :: U(NPTS), UN(NPTS), ABSORB(NPTS), PASS(NPTS), BOUND(NPTS)
+INTEGER :: K, T, NEND
+DO K = 1, NPTS
+  U(K) := 0.001 * MOD(K, 97)
+  UN(K) := 0.0
+  ABSORB(K) := 1.0
+  PASS(K) := 1.0
+  BOUND(K) := 1.0
+ENDDO
+DO T = 1, 5
+  NEND := NPTS - NX - 1
+DO K = NX + 2, NEND
+    UN(K) := ((2.0 * U(K) - UN(K) &
+      + C2 * (U(K + 1) + U(K - 1) + U(K + NX) + U(K - NX) - 4.0 * U(K))) &
+      * ABSORB(K) * PASS(K) * BOUND(K)) + UN(K) * (1.0 - BOUND(K))
+  ENDDO
+  NEND := NPTS - NX - 1
+DO K = NX + 2, NEND
+    U(K) := UN(K)
+  ENDDO
+ENDDO
+PRINT UN(164000)

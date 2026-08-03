@@ -1,0 +1,113 @@
+! ════════════════════════════════════════════════════════════════════
+! FDTD_SLIT_DB — double-buffered double-slit FDTD (zero rotate copies)
+! Physics identical to fdtd_slit.ergo: C2=0.25, pulse source, barrier
+! ix=300 (slits [219,230],[283,294]), screen ix=560, PROF 900..1800.
+! Copy-free double buffering:
+!   step A (computes V_t):    UN := 2*U - UN + C2*lap(U)    [U=V_{t-1}, UN=V_{t-2}]
+!   step B (computes V_{t+1}): U := 2*UN - U + C2*lap(UN)   [UN=V_t, U=V_{t-1}]
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 640, NY = 512
+INTEGER, PARAMETER :: NSTEPS = 2000
+INTEGER, PARAMETER :: NSP = 40
+REAL, PARAMETER :: C2 = 0.25
+REAL, PARAMETER :: AMP = 1.0
+INTEGER, PARAMETER :: IX_SRC = 40, IX_BAR = 300, IX_SCR = 560
+
+STATIC REAL :: U(NX, NY), UN(NX, NY)
+STATIC REAL :: ABSORB(NX, NY), PASS(NX, NY), PROF(NY)
+STATIC REAL :: LTAB(3)
+DATA LTAB / 12.0, 16.0, 20.0 /
+
+REAL :: OMEGA, ENV, SV
+INTEGER :: I, J, T, SC
+
+DO SC = 1, 3
+  DO DMY = 1, 1
+    DO J = 1, NY
+      DO I = 1, NX
+        U(I, J) := 0.0
+        UN(I, J) := 0.0
+        ABSORB(I, J) := 1.0
+        PASS(I, J) := 1.0
+      ENDDO
+    ENDDO
+  ENDDO
+  DO I = 1, NSP
+    SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - I) / REAL(NSP + 1)))
+    DO J = 1, NY
+      ABSORB(I, J) := ABSORB(I, J) * SV
+      ABSORB(NX - I + 1, J) := ABSORB(NX - I + 1, J) * SV
+    ENDDO
+  ENDDO
+  DO J = 1, NSP
+    SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - J) / REAL(NSP + 1)))
+    DO I = 1, NX
+      ABSORB(I, J) := ABSORB(I, J) * SV
+      ABSORB(I, NY - J + 1) := ABSORB(I, NY - J + 1) * SV
+    ENDDO
+  ENDDO
+  DO J = 1, NY
+    PASS(IX_BAR, J) := 0.0
+  ENDDO
+  DO J = 219, 230
+    PASS(IX_BAR, J) := 1.0
+  ENDDO
+  DO J = 283, 294
+    PASS(IX_BAR, J) := 1.0
+  ENDDO
+  DO J = 1, NY
+    PROF(J) := 0.0
+  ENDDO
+  OMEGA := 3.14159265358979 / LTAB(SC)
+
+  DO T = 1, NSTEPS, 2
+    ! ===== step A: V_t from U=V_{t-1}, UN=V_{t-2} =====
+    DO J = 2, NY - 1
+      DO I = 2, NX - 1
+        UN(I, J) := (2.0 * U(I, J) - UN(I, J) &
+          + C2 * (U(I + 1, J) + U(I - 1, J) + U(I, J + 1) + U(I, J - 1) &
+          - 4.0 * U(I, J))) * ABSORB(I, J) * PASS(I, J)
+      ENDDO
+    ENDDO
+    ENV := EXP(0.0 - ((REAL(T) - 200.0) / 60.0) ** 2)
+    SV := AMP * SIN(OMEGA * REAL(T)) * ENV
+    DO J = 1, NY
+      UN(IX_SRC, J) := UN(IX_SRC, J) + SV
+    ENDDO
+    IF (T >= 900) THEN
+      IF (T <= 1800) THEN
+        DO J = 1, NY
+          PROF(J) := PROF(J) + UN(IX_SCR, J) * UN(IX_SCR, J)
+        ENDDO
+      ENDIF
+    ENDIF
+    ! ===== step B: V_{t+1} from UN=V_t, U=V_{t-1} =====
+    DO J = 2, NY - 1
+      DO I = 2, NX - 1
+        U(I, J) := (2.0 * UN(I, J) - U(I, J) &
+          + C2 * (UN(I + 1, J) + UN(I - 1, J) + UN(I, J + 1) + UN(I, J - 1) &
+          - 4.0 * UN(I, J))) * ABSORB(I, J) * PASS(I, J)
+      ENDDO
+    ENDDO
+    ENV := EXP(0.0 - ((REAL(T + 1) - 200.0) / 60.0) ** 2)
+    SV := AMP * SIN(OMEGA * REAL(T + 1)) * ENV
+    DO J = 1, NY
+      U(IX_SRC, J) := U(IX_SRC, J) + SV
+    ENDDO
+    IF (T + 1 >= 900) THEN
+      IF (T + 1 <= 1800) THEN
+        DO J = 1, NY
+          PROF(J) := PROF(J) + U(IX_SCR, J) * U(IX_SCR, J)
+        ENDDO
+      ENDIF
+    ENDIF
+  ENDDO
+
+  DO J = 1, NY
+    WRITE(*, "%d %d %.6f") SC, J, PROF(J)
+  ENDDO
+ENDDO
+
+WRITE(*, "# DONE")

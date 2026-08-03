@@ -1,0 +1,100 @@
+! ════════════════════════════════════════════════════════════════════
+! FDTD_TM — 2D TM Maxwell solver (Ez, Hx, Hy, Yee grid), parallel-wire
+! oracle for the Weber-vs-Maxwell comparison (weber_check.md).
+! Two line currents Jz at (XC,Y1) and (XC,Y2), R = Y2-Y1 = 60 cells.
+! Wire 1 driven (ramped DC, soft source); wire 2 OFF so the probe reads
+! wire 1's external field only (the force J2 x B1 uses this field).
+! Analytic oracle: H = I/(2 pi R) (normalized units eps0=mu0=1, c=1).
+! Update (Yee, s = dt/dx = 0.5 <= 1/sqrt(2) CFL):
+!   Hx(i,j) ~ (i, j+1/2):  Hx -= s (Ez(i,j+1) - Ez(i,j))
+!   Hy(i,j) ~ (i+1/2, j):  Hy += s (Ez(i+1,j) - Ez(i,j))
+!   Ez(i,j):               Ez += s (Hy(i,j)-Hy(i-1,j) - Hx(i,j)+Hx(i,j-1))
+! Jz point sources have zero in-plane divergence -> no charge
+! accumulation (clean DC line currents, exactly the oracle geometry).
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 256, NY = 256
+INTEGER, PARAMETER :: NSTEPS = 3000
+REAL, PARAMETER :: S = 0.5
+REAL, PARAMETER :: I_AMP = 0.05
+INTEGER, PARAMETER :: XC = 128, Y1 = 98, Y2 = 158, NSP = 20
+
+STATIC REAL :: EZ(NX, NY), HX(NX, NY), HY(NX, NY)
+STATIC REAL :: ABSORB(NX, NY)
+STATIC REAL :: HXPR(31), HYPR(31)
+
+REAL :: SV, RAMPV
+INTEGER :: I, J, T, K
+
+DO J = 1, NY
+  DO I = 1, NX
+    EZ(I, J) := 0.0
+    HX(I, J) := 0.0
+    HY(I, J) := 0.0
+    ABSORB(I, J) := 1.0
+  ENDDO
+ENDDO
+DO I = 1, NSP
+  SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - I) / REAL(NSP + 1)))
+  DO J = 1, NY
+    ABSORB(I, J) := ABSORB(I, J) * SV
+    ABSORB(NX - I + 1, J) := ABSORB(NX - I + 1, J) * SV
+  ENDDO
+ENDDO
+DO J = 1, NSP
+  SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - J) / REAL(NSP + 1)))
+  DO I = 1, NX
+    ABSORB(I, J) := ABSORB(I, J) * SV
+    ABSORB(I, NY - J + 1) := ABSORB(I, NY - J + 1) * SV
+  ENDDO
+ENDDO
+
+DO T = 1, NSTEPS
+  ! --- H update (Ez^n) ---
+  DO J = 1, NY - 1
+    DO I = 1, NX - 1
+      HX(I, J) := (HX(I, J) - S * (EZ(I, J + 1) - EZ(I, J))) * ABSORB(I, J)
+      HY(I, J) := (HY(I, J) + S * (EZ(I + 1, J) - EZ(I, J))) * ABSORB(I, J)
+    ENDDO
+  ENDDO
+  ! --- E update (H^{n+1/2}) ---
+  DO J = 2, NY - 1
+    DO I = 2, NX - 1
+      EZ(I, J) := (EZ(I, J) + S * (HY(I, J) - HY(I - 1, J) - HX(I, J) + HX(I, J - 1))) * ABSORB(I, J)
+    ENDDO
+  ENDDO
+  ! --- soft current source: ramped DC line current at wire 1 ---
+  RAMPV := 1.0
+  IF (T <= 200) THEN
+    RAMPV := 0.5 * (1.0 - COS(3.14159265358979 * REAL(T) / 200.0))
+  ENDIF
+  EZ(XC, Y1) := EZ(XC, Y1) - S * I_AMP * RAMPV
+  IF MOD(T, 100) = 0 THEN
+    K := T / 100
+    HXPR(K) := HX(XC, Y2)
+    HYPR(K) := HY(XC, Y2)
+    WRITE(*, "PROBE %d %.6f %.6f %.6f %.6f %.6f %.6f") T, &
+      HX(XC, 128), HX(XC, Y2), HX(XC, 188), HX(XC, 38), HX(XC, 68), HX(XC, 98)
+  ENDIF
+ENDDO
+
+! discrete Ampere circulation around wire 1 (square contour, half-width 8):
+! Hx(i, j+1/2) lives on horizontal edges, Hy(i+1/2, j) on vertical edges
+SV := 0.0
+DO I = XC - 8, XC + 7
+  SV := SV + HX(I, Y1 - 9)
+ENDDO
+DO I = XC - 8, XC + 7
+  SV := SV - HX(I, Y1 + 8)
+ENDDO
+DO J = Y1 - 8, Y1 + 7
+  SV := SV - HY(XC - 9, J)
+ENDDO
+DO J = Y1 - 8, Y1 + 7
+  SV := SV + HY(XC + 8, J)
+ENDDO
+WRITE(*, "CIRC %.6f I_AMP %.6f") SV, I_AMP
+WRITE(*, "ANALYTIC_H %.6f") I_AMP / (2.0 * 3.14159265358979 * 60.0)
+WRITE(*, "# DONE")
+STOP

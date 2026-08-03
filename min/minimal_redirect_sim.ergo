@@ -1,0 +1,372 @@
+! ════════════════════════════════════════════════════════════════════
+! MINIMAL REDIRECT TOPOLOGY TEST SIM — Ergo Language
+! ════════════════════════════════════════════════════════════════════
+!
+! Purpose: Test whether forbidden transitions redirect into w-component
+! Structure: 12-node ring (cuboctahedral)
+! Dynamics: Phase-coupled oscillators with occupancy tracking
+! Output: Event log of state transitions + orthogonal (w) accumulation
+!
+! Ported to Ergo: flat top-level structure, STATIC file-scope state,
+! subroutines access STATIC directly (no aliasing), WRITE(*, "fmt")
+! to stdout — redirect stdout to redirect_transitions.log.
+!
+! ════════════════════════════════════════════════════════════════════
+
+! ── CONSTANTS ──────────────────────────────────────────────────────
+
+! Ring geometry
+PARAMETER INTEGER :: NUM_NODES = 12
+PARAMETER INTEGER :: MAX_PARTICLES = 100000
+PARAMETER INTEGER :: MAX_TRANSITIONS = 100000
+PARAMETER REAL :: TWO_PI = 6.28318530717958648
+PARAMETER REAL :: PI = 3.14159265358979324
+
+! Simulation parameters
+PARAMETER INTEGER :: MAX_FRAMES = 200
+PARAMETER REAL :: DT = 0.01
+PARAMETER REAL :: K_PHASE = 0.5          ! Phase coupling strength
+PARAMETER REAL :: K_DRIFT = 0.1          ! Harmonic drift
+PARAMETER REAL :: OMEGA_BASE = 1.0       ! Base rotation rate
+PARAMETER REAL :: OMEGA_3RD = 3.0        ! 3rd harmonic
+
+! Thresholds for state classification
+PARAMETER REAL :: PHASE_LOCK_THRESH = 0.1   ! Tight phase lock
+PARAMETER REAL :: PHASE_MIXED_UPPER = 1.57  ! π/2, loose lock boundary
+
+! Transition detection
+PARAMETER REAL :: OCCUPANCY_EPSILON = 0.5  ! Threshold to call it a "change"
+
+! Flags for particle status
+PARAMETER INTEGER :: FLAG_ACTIVE = 1
+PARAMETER INTEGER :: FLAG_LOCKED = 2
+PARAMETER INTEGER :: FLAG_FORBIDDEN = 4
+
+! ── PARTICLE STATE ─────────────────────────────────────────────────
+
+STATIC REAL :: POS_X(MAX_PARTICLES)
+STATIC REAL :: POS_Y(MAX_PARTICLES)
+STATIC REAL :: POS_Z(MAX_PARTICLES)
+STATIC REAL :: VEL_X(MAX_PARTICLES)
+STATIC REAL :: VEL_Y(MAX_PARTICLES)
+STATIC REAL :: VEL_Z(MAX_PARTICLES)
+STATIC REAL :: PHASE(MAX_PARTICLES)
+STATIC REAL :: OMEGA_NAT(MAX_PARTICLES)
+STATIC INTEGER :: NODE_ID(MAX_PARTICLES)   ! Which node (1-12) particle belongs to
+STATIC INTEGER :: FLAGS(MAX_PARTICLES)
+
+! ── NODE-LEVEL STATE ──────────────────────────────────────────────
+
+STATIC REAL :: NODE_OCCUPANCY(NUM_NODES)       ! Current occupancy count (fractional)
+STATIC REAL :: NODE_PHASE_AVG(NUM_NODES)       ! Average phase at node
+STATIC REAL :: NODE_PHASE_SPREAD(NUM_NODES)    ! Phase coherence (std dev)
+STATIC REAL :: NODE_OMEGA(NUM_NODES)           ! Angular velocity
+STATIC REAL :: NODE_W_COMPONENT(NUM_NODES)     ! Orthogonal (forbidden) component
+
+! Previous frame for transition detection
+STATIC REAL :: NODE_OCCUPANCY_PREV(NUM_NODES)
+STATIC INTEGER :: NODE_STATE_PREV(NUM_NODES)   ! Classified state (empty/single/double/triple)
+
+! ── TRANSITION LOG ────────────────────────────────────────────────
+
+STATIC INTEGER :: TRANSITION_COUNT = 0
+STATIC INTEGER :: TRANS_FRAME(MAX_TRANSITIONS)
+STATIC INTEGER :: TRANS_FROM_NODE(MAX_TRANSITIONS)
+STATIC INTEGER :: TRANS_FROM_STATE(MAX_TRANSITIONS)
+STATIC INTEGER :: TRANS_TO_STATE(MAX_TRANSITIONS)
+STATIC REAL :: TRANS_PHASE_SPREAD(MAX_TRANSITIONS)
+STATIC REAL :: TRANS_W_RISE(MAX_TRANSITIONS)
+STATIC INTEGER :: TRANS_TYPE(MAX_TRANSITIONS)  ! 1=internal, 2=charge_add, 3=charge_remove
+
+! ── CONTROL VARIABLES ─────────────────────────────────────────────
+
+STATIC INTEGER :: NPART = 1000
+
+! Main-program locals
+INTEGER :: FRAME
+REAL :: TIME
+
+! ════════════════════════════════════════════════════════════════════
+! MAIN EXECUTION
+! ════════════════════════════════════════════════════════════════════
+
+TRANSITION_COUNT := 0
+
+! Initialize particles in ring
+CALL INIT_PARTICLES(NPART)
+
+! Frame loop
+DO FRAME = 1, MAX_FRAMES
+  TIME := REAL(FRAME) * DT
+
+  ! Classify current state (before dynamics)
+  CALL CLASSIFY_NODE_STATE(FRAME)
+
+  ! Detect transitions
+  CALL DETECT_TRANSITIONS(FRAME)
+
+  ! Update particle dynamics
+  CALL UPDATE_PARTICLES(DT, FRAME)
+
+  ! Progress report
+  IF MOD(FRAME, 50) == 0 THEN
+    WRITE(*, "Frame %d | Transitions: %d") FRAME, TRANSITION_COUNT
+  ENDIF
+ENDDO
+
+! Print summary
+WRITE(*, "============================================")
+WRITE(*, "REDIRECT TEST COMPLETE")
+WRITE(*, "Total transitions detected: %d") TRANSITION_COUNT
+WRITE(*, "Log file: redirect_transitions.log")
+WRITE(*, "============================================")
+
+STOP
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: Initialize particles on ring
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE INIT_PARTICLES(N)
+  INTEGER :: N
+  INTEGER :: I, NODE
+  REAL :: ANGLE, R, PHI
+
+  ! Place particles on 12-node ring
+  DO I = 1, N
+    NODE := MOD(I, NUM_NODES) + 1
+    NODE_ID(I) := NODE
+
+    ! Node position on unit sphere (simple: around equator)
+    ANGLE := REAL(NODE - 1) * (TWO_PI / REAL(NUM_NODES))
+    R := 1.0
+    PHI := PI / 2.0  ! Equatorial band
+
+    POS_X(I) := R * COS(ANGLE) * COS(PHI)
+    POS_Y(I) := R * SIN(ANGLE) * COS(PHI)
+    POS_Z(I) := R * SIN(PHI)
+
+    ! Small random perturbation
+    POS_X(I) := POS_X(I) + (MOD(REAL(I), 1.0) - 0.5) * 0.1
+    POS_Y(I) := POS_Y(I) + (MOD(REAL(I) * 2.0, 1.0) - 0.5) * 0.1
+
+    ! Velocity zero initially
+    VEL_X(I) := 0.0
+    VEL_Y(I) := 0.0
+    VEL_Z(I) := 0.0
+
+    ! Phase: random
+    PHASE(I) := MOD(REAL(I) * 0.67, TWO_PI)
+
+    ! Natural frequency: base + small random spread
+    OMEGA_NAT(I) := OMEGA_BASE + (MOD(REAL(I) * 0.13, 1.0) - 0.5) * 0.2
+
+    ! Flags
+    FLAGS(I) := FLAG_ACTIVE
+
+  ENDDO
+
+  ! Initialize node-level tracking
+  DO NODE = 1, NUM_NODES
+    NODE_OCCUPANCY(NODE) := 0.0
+    NODE_OCCUPANCY_PREV(NODE) := 0.0
+    NODE_PHASE_AVG(NODE) := 0.0
+    NODE_PHASE_SPREAD(NODE) := 0.0
+    NODE_OMEGA(NODE) := OMEGA_BASE
+    NODE_W_COMPONENT(NODE) := 0.0
+    NODE_STATE_PREV(NODE) := 0  ! Empty
+  ENDDO
+
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: Classify node state (occupancy + phase + w-component)
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE CLASSIFY_NODE_STATE(FRM)
+  INTEGER :: FRM
+  INTEGER :: I, NODE, COUNT
+  REAL :: PHASE_SQ_SUM
+  REAL :: W_MAG
+
+  ! Zero accumulators
+  DO NODE = 1, NUM_NODES
+    NODE_OCCUPANCY(NODE) := 0.0
+    NODE_PHASE_AVG(NODE) := 0.0
+    NODE_PHASE_SPREAD(NODE) := 0.0
+    NODE_W_COMPONENT(NODE) := 0.0
+  ENDDO
+
+  ! Single pass: bin particles by node
+  DO I = 1, NPART
+    IF IAND(FLAGS(I), FLAG_ACTIVE) == 0 THEN
+      CYCLE
+    ENDIF
+
+    NODE := NODE_ID(I)
+    NODE_OCCUPANCY(NODE) := NODE_OCCUPANCY(NODE) + 1.0
+    NODE_PHASE_AVG(NODE) := NODE_PHASE_AVG(NODE) + PHASE(I)
+  ENDDO
+
+  ! Normalize phase and compute spread
+  DO NODE = 1, NUM_NODES
+    COUNT := INT(NODE_OCCUPANCY(NODE))
+
+    IF COUNT > 0 THEN
+      NODE_PHASE_AVG(NODE) := NODE_PHASE_AVG(NODE) / NODE_OCCUPANCY(NODE)
+
+      ! Phase spread: compute standard deviation
+      PHASE_SQ_SUM := 0.0
+      DO I = 1, NPART
+        IF IAND(FLAGS(I), FLAG_ACTIVE) == 0 THEN
+          CYCLE
+        ENDIF
+        IF NODE_ID(I) /= NODE THEN
+          CYCLE
+        ENDIF
+
+        PHASE_SQ_SUM := PHASE_SQ_SUM + &
+          (PHASE(I) - NODE_PHASE_AVG(NODE)) ** 2
+      ENDDO
+
+      NODE_PHASE_SPREAD(NODE) := SQRT(PHASE_SQ_SUM / NODE_OCCUPANCY(NODE))
+
+      ! Forbidden-state detection: particles at "wrong" phase
+      ! Example: if node is locked to phase 0, but particle is at phase ≈ π, it's "forbidden"
+      W_MAG := 0.0
+      DO I = 1, NPART
+        IF IAND(FLAGS(I), FLAG_ACTIVE) == 0 THEN
+          CYCLE
+        ENDIF
+        IF NODE_ID(I) /= NODE THEN
+          CYCLE
+        ENDIF
+
+        ! Simple criterion: if phase diff from node average > π/2, it's "forbidden"
+        IF ABS(PHASE(I) - NODE_PHASE_AVG(NODE)) > PI / 2.0 THEN
+          W_MAG := W_MAG + 1.0
+          FLAGS(I) := IOR(FLAGS(I), FLAG_FORBIDDEN)
+        ELSE
+          FLAGS(I) := IAND(FLAGS(I), NOT(FLAG_FORBIDDEN))
+        ENDIF
+      ENDDO
+
+      NODE_W_COMPONENT(NODE) := W_MAG / NODE_OCCUPANCY(NODE)
+
+    ELSE
+      NODE_PHASE_AVG(NODE) := 0.0
+      NODE_PHASE_SPREAD(NODE) := 0.0
+      NODE_W_COMPONENT(NODE) := 0.0
+    ENDIF
+  ENDDO
+
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: Detect and record state transitions
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE DETECT_TRANSITIONS(FRM)
+  INTEGER :: FRM
+  INTEGER :: NODE, STATE_CUR, STATE_PREV, TRANS_TYPE_VAL
+  REAL :: OCCUPANCY_CHANGE, W_RISE
+
+  DO NODE = 1, NUM_NODES
+
+    ! Classify occupancy into state: 0=empty, 1=single, 2=double, 3+=triple
+    STATE_CUR := INT(NODE_OCCUPANCY(NODE))
+    IF STATE_CUR > 3 THEN
+      STATE_CUR := 3
+    ENDIF
+
+    STATE_PREV := NODE_STATE_PREV(NODE)
+
+    ! Did occupancy change?
+    OCCUPANCY_CHANGE := ABS(NODE_OCCUPANCY(NODE) - NODE_OCCUPANCY_PREV(NODE))
+
+    IF OCCUPANCY_CHANGE > OCCUPANCY_EPSILON THEN
+
+      ! Determine transition type
+      IF STATE_CUR > STATE_PREV THEN
+        TRANS_TYPE_VAL := 2  ! Charge added
+      ELSEIF STATE_CUR < STATE_PREV THEN
+        TRANS_TYPE_VAL := 3  ! Charge removed
+      ELSE
+        TRANS_TYPE_VAL := 1  ! Internal rearrangement (shouldn't happen here, but flag it)
+      ENDIF
+
+      ! W-rise: increase in forbidden-state magnitude
+      W_RISE := NODE_W_COMPONENT(NODE) - 0.0  ! (prev w not tracked; use current as rise)
+
+      ! Record transition
+      TRANSITION_COUNT := TRANSITION_COUNT + 1
+
+      IF TRANSITION_COUNT <= MAX_TRANSITIONS THEN
+        TRANS_FRAME(TRANSITION_COUNT) := FRM
+        TRANS_FROM_NODE(TRANSITION_COUNT) := NODE
+        TRANS_FROM_STATE(TRANSITION_COUNT) := STATE_PREV
+        TRANS_TO_STATE(TRANSITION_COUNT) := STATE_CUR
+        TRANS_PHASE_SPREAD(TRANSITION_COUNT) := NODE_PHASE_SPREAD(NODE)
+        TRANS_W_RISE(TRANSITION_COUNT) := W_RISE
+        TRANS_TYPE(TRANSITION_COUNT) := TRANS_TYPE_VAL
+
+        ! Write to log immediately (stdout → redirect to redirect_transitions.log)
+        WRITE(*, "%d %d %d %d %.4f %.4f %d") &
+          FRM, NODE, STATE_PREV, STATE_CUR, &
+          NODE_PHASE_SPREAD(NODE), W_RISE, TRANS_TYPE_VAL
+      ENDIF
+
+    ENDIF
+
+    ! Update previous state
+    NODE_OCCUPANCY_PREV(NODE) := NODE_OCCUPANCY(NODE)
+    NODE_STATE_PREV(NODE) := STATE_CUR
+
+  ENDDO
+
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: Update particle dynamics (phase coupling + harmonic)
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE UPDATE_PARTICLES(STEP, FRM)
+  REAL :: STEP
+  INTEGER :: FRM
+  INTEGER :: I
+  REAL :: PHASE_COUPLING, HARMONIC_TERM, DPHASE
+
+  DO I = 1, NPART
+    IF IAND(FLAGS(I), FLAG_ACTIVE) == 0 THEN
+      CYCLE
+    ENDIF
+
+    ! Phase coupling: push toward node average
+    PHASE_COUPLING := K_PHASE * (NODE_PHASE_AVG(NODE_ID(I)) - PHASE(I))
+
+    ! Harmonic drift: add 3rd harmonic to break symmetry
+    HARMONIC_TERM := K_DRIFT * SIN(3.0 * PHASE(I))
+
+    ! Total phase velocity
+    DPHASE := OMEGA_NAT(I) + PHASE_COUPLING + HARMONIC_TERM
+
+    ! Update phase
+    PHASE(I) := PHASE(I) + DPHASE * STEP
+
+    ! Wrap to [0, 2π]
+    IF PHASE(I) < 0.0 THEN
+      PHASE(I) := PHASE(I) + TWO_PI
+    ELSEIF PHASE(I) >= TWO_PI THEN
+      PHASE(I) := PHASE(I) - TWO_PI
+    ENDIF
+
+    ! Stochastic node jumping (low probability each frame)
+    ! Introduces occupancy changes so transitions actually fire
+    ! (per README_MINIMAL_SIM.md troubleshooting).
+    IF MOD(I, 100) == 0 THEN
+      NODE_ID(I) := MOD(NODE_ID(I), NUM_NODES) + 1
+    ENDIF
+
+  ENDDO
+
+END

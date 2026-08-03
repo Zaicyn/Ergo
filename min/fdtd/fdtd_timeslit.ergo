@@ -1,0 +1,94 @@
+! ════════════════════════════════════════════════════════════════════
+! FDTD_TIMESLIT — time-domain double-slit (Tirole et al., Nature 2023)
+! No spatial barrier: a line source emits TWO Gaussian-envelope pulses
+! separated by DT sim steps ("slits in time"). A probe at ix=400 records
+! U(t); the spectrum |U(omega)| shows fringes with period 2*pi/DT.
+! Sweep: DT in {64,96,128} x rise time TW in {60 (soft), 20 (sharp)}.
+! Sharper pulses -> broader spectra -> more visible fringes.
+! Flattened 1D arrays, masked stencil (same structure as fdtd_slit_1d).
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 640, NY = 512
+INTEGER, PARAMETER :: NPTS = 327680
+INTEGER, PARAMETER :: NSTEPS = 2000
+INTEGER, PARAMETER :: NSP = 40
+REAL, PARAMETER :: C2 = 0.25
+REAL, PARAMETER :: AMP = 1.0
+INTEGER, PARAMETER :: IX_SRC = 40, IX_PR = 400
+INTEGER, PARAMETER :: IPROBE = 163240  ! IX_PR + (256-1)*NX
+
+STATIC REAL :: U(NPTS), UN(NPTS)
+STATIC REAL :: ABSORB(NPTS), PASS(NPTS), BOUND(NPTS)
+STATIC REAL :: DTAB(12), TWAB(12)
+DATA DTAB / 64.0, 96.0, 128.0, 64.0, 96.0, 128.0, 64.0, 96.0, 128.0, 64.0, 96.0, 128.0 /
+DATA TWAB / 80.0, 80.0, 80.0, 40.0, 40.0, 40.0, 20.0, 20.0, 20.0, 10.0, 10.0, 10.0 /
+
+REAL :: OMEGA, SV, SVX, SVY, TT1, TT2, TW, DT
+INTEGER :: I, J, T, SC, K, NEND
+
+OMEGA := 3.14159265358979 / 16.0
+
+DO SC = 1, 12
+  DT := DTAB(SC)
+  TW := TWAB(SC)
+  TT1 := 200.0
+  TT2 := 200.0 + DT
+  DO DMY = 1, 1
+    DO K = 1, NPTS
+      U(K) := 0.0
+      UN(K) := 0.0
+      ABSORB(K) := 1.0
+      PASS(K) := 1.0
+      BOUND(K) := 0.0
+    ENDDO
+  ENDDO
+  DO J = 2, NY - 1
+    DO I = 2, NX - 1
+      BOUND(I + (J - 1) * NX) := 1.0
+    ENDDO
+  ENDDO
+  DO I = 1, NSP
+    SVX := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - I) / REAL(NSP + 1)))
+    DO J = 1, NY
+      ABSORB(I + (J - 1) * NX) := ABSORB(I + (J - 1) * NX) * SVX
+      ABSORB(NX - I + 1 + (J - 1) * NX) := ABSORB(NX - I + 1 + (J - 1) * NX) * SVX
+    ENDDO
+  ENDDO
+  DO J = 1, NSP
+    SVY := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - J) / REAL(NSP + 1)))
+    DO I = 1, NX
+      ABSORB(I + (J - 1) * NX) := ABSORB(I + (J - 1) * NX) * SVY
+      ABSORB(I + (NY - J + 1 - 1) * NX) := ABSORB(I + (NY - J + 1 - 1) * NX) * SVY
+    ENDDO
+  ENDDO
+  NEND := NPTS - NX - 1
+  DO T = 1, NSTEPS, 2
+    ! ===== step A =====
+    DO K = NX + 2, NEND
+      UN(K) := ((2.0 * U(K) - UN(K) &
+        + C2 * (U(K + 1) + U(K - 1) + U(K + NX) + U(K - NX) - 4.0 * U(K))) &
+        * ABSORB(K) * PASS(K) * BOUND(K)) + UN(K) * (1.0 - BOUND(K))
+    ENDDO
+    SV := AMP * SIN(OMEGA * (REAL(T) - TT1)) * EXP(0.0 - ((REAL(T) - TT1) / TW) ** 2) &
+        + AMP * SIN(OMEGA * (REAL(T) - TT2)) * EXP(0.0 - ((REAL(T) - TT2) / TW) ** 2)
+    DO J = 1, NY
+      UN(IX_SRC + (J - 1) * NX) := UN(IX_SRC + (J - 1) * NX) + SV
+    ENDDO
+    WRITE(*, "%d %d %.8f") SC, T, UN(IPROBE)
+    ! ===== step B =====
+    DO K = NX + 2, NEND
+      U(K) := ((2.0 * UN(K) - U(K) &
+        + C2 * (UN(K + 1) + UN(K - 1) + UN(K + NX) + UN(K - NX) - 4.0 * UN(K))) &
+        * ABSORB(K) * PASS(K) * BOUND(K)) + U(K) * (1.0 - BOUND(K))
+    ENDDO
+    SV := AMP * SIN(OMEGA * (REAL(T + 1) - TT1)) * EXP(0.0 - ((REAL(T + 1) - TT1) / TW) ** 2) &
+        + AMP * SIN(OMEGA * (REAL(T + 1) - TT2)) * EXP(0.0 - ((REAL(T + 1) - TT2) / TW) ** 2)
+    DO J = 1, NY
+      U(IX_SRC + (J - 1) * NX) := U(IX_SRC + (J - 1) * NX) + SV
+    ENDDO
+    WRITE(*, "%d %d %.8f") SC, T + 1, U(IPROBE)
+  ENDDO
+ENDDO
+
+WRITE(*, "# DONE")

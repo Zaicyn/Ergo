@@ -1,0 +1,15 @@
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 640, NPTS = 327680
+STATIC REAL :: A(NPTS)
+INTEGER :: K, IK, JK, M
+REAL :: F
+DO DMY = 1, 1
+  DO K = 1, NPTS
+    IK := MOD(K - 1, NX) + 1
+    JK := INT(REAL(K - 1) / REAL(NX)) + 1
+    M := MIN(1, MAX(0, MIN(IK - 1, NX - IK)))
+    F := 0.5 + 0.25 * (1.0 + COS(3.14159265358979 * REAL(MAX(0, 40 - JK)) / 41.0))
+    A(K) := REAL(M) * F + REAL(ABS(IK - 300))
+  ENDDO
+ENDDO
+WRITE(*, "A1=%.6f A2=%.6f A300=%.6f") A(1), A(2), A(300)

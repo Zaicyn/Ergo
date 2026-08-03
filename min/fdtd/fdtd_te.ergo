@@ -1,0 +1,90 @@
+! ════════════════════════════════════════════════════════════════════
+! FDTD_TE — 2D TE Maxwell solver (Hz, Ex, Ey, Yee grid), the COLLINEAR
+! discriminating case for Weber vs Maxwell (weber_check.md).
+! Two collinear current elements on the x-axis (row YC): segment 1
+! x in [X1,X2], segment 2 x in [X3,X4], both driven +x (ramped DC).
+! Continuity: div J /= 0 at the ends -> charge accumulates there
+! (Hertzian-dipole-with-DC-ramp), supplying the longitudinal E field.
+! Biot-Savart along the axis: Bz ~ 0 -> JxB force ~ 0; any longitudinal
+! force must be electric (the Maxwell answer).
+! Update (Yee, s = dt/dx = 0.5):
+!   Hz(i,j) ~ (i+1/2,j+1/2): Hz -= s (Ey(i+1,j)-Ey(i,j) - Ex(i,j+1)+Ex(i,j))
+!   Ex(i,j) ~ (i+1/2,j):     Ex += s (Hz(i,j)-Hz(i,j-1)) - s Jx
+!   Ey(i,j) ~ (i,j+1/2):     Ey -= s (Hz(i,j)-Hz(i-1,j)) - s Jy
+! Probes: Ex/Hz at seg2 midpoint (168,YC) over time (charge-ramp check),
+! Ex profile along the seg2 row at the end (for J2*integral(E)dl force).
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 256, NY = 256
+INTEGER, PARAMETER :: NSTEPS = 1500
+REAL, PARAMETER :: S = 0.5
+REAL, PARAMETER :: I_AMP = 0.05
+INTEGER, PARAMETER :: YC = 128, X1 = 68, X2 = 108, X3 = 148, X4 = 188, NSP = 20
+
+STATIC REAL :: HZ(NX, NY), EX(NX, NY), EY(NX, NY)
+STATIC REAL :: ABSORB(NX, NY)
+
+REAL :: SV, RAMPV
+INTEGER :: I, J, T, X
+
+DO J = 1, NY
+  DO I = 1, NX
+    HZ(I, J) := 0.0
+    EX(I, J) := 0.0
+    EY(I, J) := 0.0
+    ABSORB(I, J) := 1.0
+  ENDDO
+ENDDO
+DO I = 1, NSP
+  SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - I) / REAL(NSP + 1)))
+  DO J = 1, NY
+    ABSORB(I, J) := ABSORB(I, J) * SV
+    ABSORB(NX - I + 1, J) := ABSORB(NX - I + 1, J) * SV
+  ENDDO
+ENDDO
+DO J = 1, NSP
+  SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - J) / REAL(NSP + 1)))
+  DO I = 1, NX
+    ABSORB(I, J) := ABSORB(I, J) * SV
+    ABSORB(I, NY - J + 1) := ABSORB(I, NY - J + 1) * SV
+  ENDDO
+ENDDO
+
+DO T = 1, NSTEPS
+  ! --- E update (Hz^n) ---
+  DO J = 2, NY - 1
+    DO I = 2, NX - 1
+      EX(I, J) := (EX(I, J) + S * (HZ(I, J) - HZ(I, J - 1))) * ABSORB(I, J)
+      EY(I, J) := (EY(I, J) - S * (HZ(I, J) - HZ(I - 1, J))) * ABSORB(I, J)
+    ENDDO
+  ENDDO
+  ! --- soft current: ramped DC on both segments ---
+  RAMPV := 1.0
+  IF (T <= 200) THEN
+    RAMPV := 0.5 * (1.0 - COS(3.14159265358979 * REAL(T) / 200.0))
+  ENDIF
+  DO X = X1, X2
+    EX(X, YC) := EX(X, YC) - S * I_AMP * RAMPV
+  ENDDO
+  DO X = X3, X4
+    EX(X, YC) := EX(X, YC) - S * I_AMP * RAMPV
+  ENDDO
+  ! --- H update (E^{n+1/2}) ---
+  DO J = 1, NY - 1
+    DO I = 1, NX - 1
+      HZ(I, J) := (HZ(I, J) - S * (EY(I + 1, J) - EY(I, J) - EX(I, J + 1) + EX(I, J))) * ABSORB(I, J)
+    ENDDO
+  ENDDO
+  IF MOD(T, 100) = 0 THEN
+    WRITE(*, "PROBE %d %.6f %.6f %.6f %.6f %.6f") T, &
+      EX(168, YC), HZ(168, YC), HZ(168, YC - 1), EX(X2 + 10, YC), EY(168, YC)
+  ENDIF
+ENDDO
+
+! Ex profile along the seg2 row (for the longitudinal force integral)
+DO X = X3, X4
+  WRITE(*, "EXPROF %d %.6f %.6f") X, EX(X, YC), HZ(X, YC)
+ENDDO
+WRITE(*, "# DONE")
+STOP

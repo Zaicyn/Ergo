@@ -1,0 +1,23 @@
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 100
+STATIC REAL :: A(N), W(N), P2(N)
+STATIC REAL :: S(2)
+STATIC INTEGER :: BLKOF(N)
+INTEGER :: I, KB
+DO I = 1, N
+  A(I) := REAL(I)
+  BLKOF(I) := MOD(I - 1, 2) + 1
+ENDDO
+DO I = 1, N
+  W(I) := A(I) * 2.0
+ENDDO
+DO I = 1, N
+  P2(I) := W(I) * W(I)
+ENDDO
+S(1) := 0.0
+S(2) := 0.0
+DO I = 1, N
+  S(BLKOF(I)) := S(BLKOF(I)) + P2(I)
+ENDDO
+PRINT S(1)
+PRINT S(2)

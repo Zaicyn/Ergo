@@ -1,0 +1,16 @@
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 100
+STATIC REAL :: A(N), B(N)
+STATIC REAL :: S
+INTEGER :: I
+DO I = 1, N
+  A(I) := REAL(I)
+ENDDO
+DO I = 1, N
+  B(I) := A(I) * 2.0
+ENDDO
+S := 0.0
+DO I = 1, N
+  S := S + B(I)
+ENDDO
+PRINT S

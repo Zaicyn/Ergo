@@ -1,0 +1,112 @@
+! ════════════════════════════════════════════════════════════════════
+! FDTD_SW — 2D scalar wave equation, standing wave in a cavity
+! Line source at ix=40, mirror (PASS=0) at ix=600 (kept out of the sponge
+! to avoid barrier-in-sponge overlap; sponge occupies edges 1-20, 621-640).
+! lambda = 16 cells -> node spacing lambda/2 = 8 cells.
+! Output |U| profile along x at row 256 after 3000 steps.
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 640, NY = 512
+INTEGER, PARAMETER :: NSTEPS = 3500
+REAL, PARAMETER :: C2 = 0.25
+REAL, PARAMETER :: AMP = 1.0
+INTEGER, PARAMETER :: IX_SRC = 40, IX_MIR = 580, NSP = 40
+REAL, PARAMETER :: LAM = 16.0
+
+STATIC REAL :: U(NX, NY), U_OLD(NX, NY), UN(NX, NY)
+STATIC REAL :: ABSORB(NX, NY), PASS(NX, NY), PROF(NX)
+
+REAL :: OMEGA, RAMPV, SV
+INTEGER :: JY
+INTEGER :: I, J, T, DMY
+
+DO DMY = 1, 1
+  DO J = 1, NY
+    DO I = 1, NX
+      U(I, J) := 0.0
+      U_OLD(I, J) := 0.0
+      UN(I, J) := 0.0
+      ABSORB(I, J) := 1.0
+      PASS(I, J) := 1.0
+    ENDDO
+  ENDDO
+ENDDO
+DO I = 1, NSP
+  SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - I) / REAL(NSP + 1)))
+  DO J = 1, NY
+    ABSORB(I, J) := ABSORB(I, J) * SV
+    ABSORB(NX - I + 1, J) := ABSORB(NX - I + 1, J) * SV
+  ENDDO
+ENDDO
+DO J = 1, NSP
+  SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - J) / REAL(NSP + 1)))
+  DO I = 1, NX
+    ABSORB(I, J) := ABSORB(I, J) * SV
+    ABSORB(I, NY - J + 1) := ABSORB(I, NY - J + 1) * SV
+  ENDDO
+ENDDO
+DO J = 1, NY
+  PASS(IX_MIR, J) := 0.0
+ENDDO
+OMEGA := 3.14159265358979 / LAM
+JY := 256
+
+DO T = 1, NSTEPS
+  DO J = 2, NY - 1
+    DO I = 2, NX - 1
+      UN(I, J) := (2.0 * U(I, J) - U_OLD(I, J) &
+        + C2 * (U(I + 1, J) + U(I - 1, J) + U(I, J + 1) + U(I, J - 1) &
+        - 4.0 * U(I, J))) * ABSORB(I, J) * PASS(I, J)
+    ENDDO
+  ENDDO
+  RAMPV := 1.0
+  IF (T <= 200) THEN
+    RAMPV := 0.5 * (1.0 - COS(3.14159265358979 * REAL(T) / 200.0))
+  ENDIF
+  SV := AMP * SIN(OMEGA * REAL(T)) * RAMPV
+  DO J = 1, NY
+    UN(IX_SRC, J) := UN(IX_SRC, J) + SV
+  ENDDO
+  DO J = 1, NY
+    DO I = 1, NX
+      U_OLD(I, J) := U(I, J)
+      U(I, J) := UN(I, J)
+    ENDDO
+  ENDDO
+ENDDO
+
+DO I = 1, NX
+  PROF(I) := 0.0
+ENDDO
+DO T = NSTEPS - 500, NSTEPS - 1
+  DO J = 2, NY - 1
+    DO I = 2, NX - 1
+      UN(I, J) := (2.0 * U(I, J) - U_OLD(I, J) &
+        + C2 * (U(I + 1, J) + U(I - 1, J) + U(I, J + 1) + U(I, J - 1) &
+        - 4.0 * U(I, J))) * ABSORB(I, J) * PASS(I, J)
+    ENDDO
+  ENDDO
+  RAMPV := 1.0
+  IF (T <= 200) THEN
+    RAMPV := 0.5 * (1.0 - COS(3.14159265358979 * REAL(T) / 200.0))
+  ENDIF
+  SV := AMP * SIN(OMEGA * REAL(T)) * RAMPV
+  DO J = 1, NY
+    UN(IX_SRC, J) := UN(IX_SRC, J) + SV
+  ENDDO
+  DO I = 1, NX
+    PROF(I) := PROF(I) + UN(I, JY) * UN(I, JY)
+  ENDDO
+  DO J = 1, NY
+    DO I = 1, NX
+      U_OLD(I, J) := U(I, J)
+      U(I, J) := UN(I, J)
+    ENDDO
+  ENDDO
+ENDDO
+DO I = 1, NX
+  WRITE(*, "%d %.6f") I, SQRT(PROF(I) / 500.0)
+ENDDO
+
+WRITE(*, "# DONE")

@@ -1,0 +1,433 @@
+! ════════════════════════════════════════════════════════════════════
+! TRIMER PME — Li/Pokorný three-impurity Anderson model in Ergo
+! ════════════════════════════════════════════════════════════════════
+!
+! Replication of the model in "Non-equilibrium correlated electron
+! dynamics in triangular molecular assemblies" (Li, Pokorný, Hapala
+! et al., Nat. Commun. 2026):
+!
+!   - 3 sites, one correlated level each, EPS0 = -90 meV
+!   - U prohibits double occupancy of a site (built in: 1 level/site)
+!   - Inter-site capacitive coupling W = 50 meV
+!   - No direct inter-site hopping (transitions via reservoirs only)
+!   - 2^3 = 8 many-body states, Pauli master equation, sequential
+!     tunneling: rates from Fermi functions, kT = 0.22 meV
+!   - Tip: coupling GT_i = GT0 * exp(-(d3_i - TIP_Z)/GDECAY) with the
+!     tip hovering TIP_Z = 0.6 nm above the plane; electrostatics per
+!     the paper's theory section: charged sphere + image-charge
+!     screening plane at Z_S = -0.09 nm, shift
+!     DEPS_i = VS * (L_UNIFORM + L_LOCAL * g(d_i)/g(0)).
+!     Lever arm calibrated so the molecular discharge ring sits at
+!     their measured 520 mV; center discharge and NDC onset are then
+!     predictions (theirs: ~590 mV / ~760 mV).
+!
+! Outputs sections to stdout:
+!   # POSITION_SCAN — tip scan at Vs = 790 mV (their Fig. 3 setup)
+!   # BIAS_SWEEP    — Vs sweep at trimer center, G_HOP = 0 (baseline)
+!   # POROSITY      — Vs sweep at center for each G_HOP (ablation)
+! Columns: pos_or_vs  I_tip  Q_total  w_singlet  w_doublet  w_other
+! where w_singlet = occupation of |100>,|010>,|001> (the kinetically
+! trapped manifold = the "w component" in redirect language).
+!
+! POROSITY ABLATION: G_HOP adds a weak direct inter-site channel
+! (electron moves site a -> b, rate G_HOP * f(-DE), detailed-balance
+! preserving). The paper's model has G_HOP ~ 0; sweeping it tests
+! whether the trapped population drains and the NDC washes out when
+! the "forbidden" transitions become porous.
+!
+! ════════════════════════════════════════════════════════════════════
+
+! ── MODEL CONSTANTS (from the paper) ──────────────────────────────
+
+PARAMETER REAL :: EPS0 = -90.0        ! On-site energy (meV)
+PARAMETER REAL :: W_COUL = 50.0       ! Inter-site capacitive coupling (meV)
+PARAMETER REAL :: GS = 1.0            ! Substrate coupling (rate unit)
+PARAMETER REAL :: MU_S = 0.0          ! Substrate chemical potential (meV)
+
+! ── TIP MODEL (our choice — SI unavailable, see header) ───────────
+
+PARAMETER REAL :: GT0 = 0.1           ! Tip coupling at molecular contact (Gt < Gs)
+PARAMETER REAL :: GDECAY = 0.5        ! Tip coupling decay length (nm)
+
+! Tip electrostatics, per the paper's theory section (via Deepseek's
+! reading of the SI): tip = charged sphere hovering TIP_Z above the
+! molecular plane, image-charge screening plane at Z_S. Field shift:
+!   DEPS_i = VS * (L_UNIFORM + L_LOCAL * g(d_i)/g(0))
+! where g(d) is the sphere + image-charge profile (see GPROFILE).
+! L_UNIFORM + L_LOCAL is calibrated so the molecular discharge ring
+! (electron removal energy eps+W crossing mu_s) sits at their
+! measured 520 mV; the center discharge and NDC onset then come out
+! as predictions to compare against their ~590 / ~760 mV.
+PARAMETER REAL :: TIP_Z = 0.6         ! Tip height above plane (nm)
+PARAMETER REAL :: Z_S = -0.09         ! Screening (image) plane (nm)
+PARAMETER REAL :: L_UNIFORM = 0.03    ! Uniform lever arm (counter-electrode)
+PARAMETER REAL :: L_LOCAL = 0.0469    ! Local lever arm at contact (meV/mV)
+
+! ── SCAN PARAMETERS ───────────────────────────────────────────────
+
+PARAMETER REAL :: VS_SCAN = 790.0     ! Fixed Vs for position scan (mV)
+PARAMETER REAL :: X_MIN = -1.0        ! Scan line start (nm from site 1)
+PARAMETER REAL :: X_MAX = 1.5         ! Scan line end
+PARAMETER INTEGER :: NX_STEPS = 50    ! -> 51 points, 0.05 nm spacing
+PARAMETER REAL :: VS_MIN = 400.0      ! Bias sweep range (mV)
+PARAMETER REAL :: VS_MAX = 1000.0
+PARAMETER INTEGER :: NV_STEPS = 24    ! -> 25 points, 25 mV spacing
+
+! Master equation integration
+PARAMETER REAL :: DT_INT = 0.05       ! Euler step (1/rate units)
+PARAMETER INTEGER :: NSTEPS = 100000  ! -> t = 5000, ~50 tau of GS
+
+! Porosity ablation: G_HOP = POROSITY_BASE * 10^IG for IG = 0..NP_STEPS
+PARAMETER REAL :: POROSITY_BASE = 0.0001
+PARAMETER INTEGER :: NP_STEPS = 4     ! -> 1e-4 .. 1.0 (=GS), plus G_HOP=0 baseline
+                                      ! (cap at GS keeps the Euler integrator stable)
+
+! Temperature sweep: KT = KT_BASE * 2^IT for IT = 0..NKT_STEPS
+PARAMETER REAL :: KT_BASE = 0.22      ! k_B * T_exp (meV) — their 2.6 K
+PARAMETER INTEGER :: NKT_STEPS = 7    ! -> 0.22 .. 28.2 meV (melting regime)
+
+! ── STATE ─────────────────────────────────────────────────────────
+
+STATIC REAL :: P(8), PNEW(8)          ! State occupations
+STATIC REAL :: ENERGY(8)              ! Many-body state energies
+STATIC REAL :: RS(8, 8)               ! Rates via substrate: RS(from, to)
+STATIC REAL :: RT(8, 8)               ! Rates via tip
+STATIC REAL :: RH(8, 8)               ! Rates via direct inter-site hop
+STATIC REAL :: EPS_I(3)               ! Site energies incl. tip shift
+STATIC REAL :: DIST(3)                ! Tip distance per site (nm)
+STATIC REAL :: SITE_X(3), SITE_Y(3)   ! Trimer geometry (nm)
+STATIC REAL :: TIP_X, TIP_Y, VS       ! Tip position / sample voltage
+STATIC REAL :: MU_T                   ! Tip chemical potential = -Vs
+STATIC REAL :: G_HOP                  ! Porosity: direct hop rate
+STATIC REAL :: KT = 0.22              ! Thermal energy (meV); swept in section 4
+
+! Measurement results
+STATIC REAL :: I_TIP, Q_TOT, W_SING, W_DOUBLE, W_OTHER, HOLE_NEAR
+
+! Main locals
+INTEGER :: IX, IV, IG, IT
+REAL :: X
+
+! ════════════════════════════════════════════════════════════════════
+! MAIN EXECUTION
+! ════════════════════════════════════════════════════════════════════
+
+CALL INIT_GEOMETRY()
+
+! ── Section 1: tip position scan at fixed Vs (their Fig. 3) ──────
+
+G_HOP := 0.0
+WRITE(*, "# POSITION_SCAN VS=790  cols: x I_tip Q w_singlet w_doublet w_other")
+VS := VS_SCAN
+DO IX = 0, NX_STEPS
+  X := X_MIN + REAL(IX) * (X_MAX - X_MIN) / REAL(NX_STEPS)
+  ! Scan line: through site 1 (0,0) and the midpoint of sites 2-3,
+  ! direction (cos 30, sin 30) = (0.8660254, 0.5)
+  TIP_X := X * 0.8660254
+  TIP_Y := X * 0.5
+  CALL COMPUTE_ENERGIES()
+  CALL COMPUTE_RATES()
+  CALL SOLVE_STEADY()
+  CALL MEASURE()
+  WRITE(*, "%.3f %.6f %.4f %.4f %.4f %.4f") &
+    X, I_TIP, Q_TOT, W_SING, W_DOUBLE, W_OTHER
+ENDDO
+
+! ── Section 2: bias sweep at trimer center, baseline G_HOP = 0 ───
+
+WRITE(*, "# BIAS_SWEEP G_HOP=0  cols: vs I_tip Q w_singlet w_doublet w_other")
+TIP_X := 0.5
+TIP_Y := 0.2886751
+DO IV = 0, NV_STEPS
+  VS := VS_MIN + REAL(IV) * (VS_MAX - VS_MIN) / REAL(NV_STEPS)
+  CALL COMPUTE_ENERGIES()
+  CALL COMPUTE_RATES()
+  CALL SOLVE_STEADY()
+  CALL MEASURE()
+  WRITE(*, "%.1f %.6f %.4f %.4f %.4f %.4f") &
+    VS, I_TIP, Q_TOT, W_SING, W_DOUBLE, W_OTHER
+ENDDO
+
+! ── Section 3: porosity ablation — position scan per G_HOP ───────
+! (A center bias sweep is useless here: at the symmetric center the
+! hops connect degenerate states, so porosity has no effect. The
+! trapping lives in asymmetric tip positions — "occupation wasted in
+! states where the empty site is far from the tip".)
+
+DO IG = 0, NP_STEPS
+  G_HOP := POROSITY_BASE * (10.0 ** IG)
+  WRITE(*, "# POROSITY G_HOP=%.1E  cols: x I_tip Q w_singlet w_doublet w_other hole_near") &
+    G_HOP
+  VS := VS_SCAN
+  DO IX = 0, NX_STEPS
+    X := X_MIN + REAL(IX) * (X_MAX - X_MIN) / REAL(NX_STEPS)
+    TIP_X := X * 0.8660254
+    TIP_Y := X * 0.5
+    CALL COMPUTE_ENERGIES()
+    CALL COMPUTE_RATES()
+    CALL SOLVE_STEADY()
+    CALL MEASURE()
+    WRITE(*, "%.3f %.6f %.4f %.4f %.4f %.4f %.4f") &
+      X, I_TIP, Q_TOT, W_SING, W_DOUBLE, W_OTHER, HOLE_NEAR
+  ENDDO
+ENDDO
+
+! ── Section 4: temperature sweep — how solid are the walls? ──────
+! Per KT: center bias sweep (NDC depth) + position scan (trapped w).
+! Walls are exponentials in DE/KT — watch them melt on schedule.
+
+G_HOP := 0.0
+DO IT = 0, NKT_STEPS
+  KT := KT_BASE * (2.0 ** IT)
+
+  WRITE(*, "# TEMP_SWEEP KT=%.4f  cols: vs I_tip Q w_singlet w_doublet w_other") &
+    KT
+  TIP_X := 0.5
+  TIP_Y := 0.2886751
+  DO IV = 0, NV_STEPS
+    VS := VS_MIN + REAL(IV) * (VS_MAX - VS_MIN) / REAL(NV_STEPS)
+    CALL COMPUTE_ENERGIES()
+    CALL COMPUTE_RATES()
+    CALL SOLVE_STEADY()
+    CALL MEASURE()
+    WRITE(*, "%.1f %.6f %.4f %.4f %.4f %.4f") &
+      VS, I_TIP, Q_TOT, W_SING, W_DOUBLE, W_OTHER
+  ENDDO
+
+  WRITE(*, "# TEMP_SCAN KT=%.4f  cols: x I_tip Q w_singlet w_doublet w_other") KT
+  VS := VS_SCAN
+  DO IX = 0, NX_STEPS
+    X := X_MIN + REAL(IX) * (X_MAX - X_MIN) / REAL(NX_STEPS)
+    TIP_X := X * 0.8660254
+    TIP_Y := X * 0.5
+    CALL COMPUTE_ENERGIES()
+    CALL COMPUTE_RATES()
+    CALL SOLVE_STEADY()
+    CALL MEASURE()
+    WRITE(*, "%.3f %.6f %.4f %.4f %.4f %.4f") &
+      X, I_TIP, Q_TOT, W_SING, W_DOUBLE, W_OTHER
+  ENDDO
+ENDDO
+
+WRITE(*, "# DONE")
+
+STOP
+
+! ════════════════════════════════════════════════════════════════════
+! Fermi function with overflow clamp (kT = 0.22 meV)
+! ════════════════════════════════════════════════════════════════════
+
+REAL FUNCTION FERMI(X)
+  REAL :: X, XKT
+  XKT := X / KT
+  IF XKT > 50.0 THEN
+    FERMI := 0.0
+  ELSEIF XKT < -50.0 THEN
+    FERMI := 1.0
+  ELSE
+    FERMI := 1.0 / (1.0 + EXP(XKT))
+  ENDIF
+END
+
+! ════════════════════════════════════════════════════════════════════
+! Image-charge field profile: charged sphere at height TIP_Z above a
+! screening plane at Z_S, normalized to 1 at lateral distance zero.
+!   g(d) = 1/sqrt(d^2 + z_tip^2) - 1/sqrt(d^2 + (z_tip - 2*z_S)^2)
+! ════════════════════════════════════════════════════════════════════
+
+REAL FUNCTION GPROFILE(D)
+  REAL :: D, ZIMG, G0, GD
+  ZIMG := TIP_Z - 2.0 * Z_S
+  GD := 1.0 / SQRT(D ** 2 + TIP_Z ** 2) &
+      - 1.0 / SQRT(D ** 2 + ZIMG ** 2)
+  G0 := 1.0 / TIP_Z - 1.0 / ZIMG
+  GPROFILE := GD / G0
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: trimer geometry (equilateral, 1 nm sides)
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE INIT_GEOMETRY()
+  SITE_X(1) := 0.0
+  SITE_Y(1) := 0.0
+  SITE_X(2) := 1.0
+  SITE_Y(2) := 0.0
+  SITE_X(3) := 0.5
+  SITE_Y(3) := 0.8660254
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: many-body energies E = sum eps_i n_i + W sum n_i n_j
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE COMPUTE_ENERGIES()
+  INTEGER :: I, S, S0, N1, N2, N3
+  REAL :: DLAT, D3
+
+  ! Site energies with tip electrostatic shift.
+  ! DIST(I) holds the 3D tip-site distance (tip hovers at TIP_Z);
+  ! the field profile uses the lateral distance via GPROFILE.
+  DO I = 1, 3
+    DLAT := SQRT((SITE_X(I) - TIP_X) ** 2 + (SITE_Y(I) - TIP_Y) ** 2)
+    D3 := SQRT(DLAT ** 2 + TIP_Z ** 2)
+    DIST(I) := D3
+    EPS_I(I) := EPS0 + VS * (L_UNIFORM + L_LOCAL * GPROFILE(DLAT))
+  ENDDO
+
+  ! 8 configurations, state index S-1, bit i = occupancy of site i+1
+  DO S = 1, 8
+    S0 := S - 1
+    N1 := IAND(S0, 1)
+    N2 := IAND(ISHFT(S0, -1), 1)
+    N3 := IAND(ISHFT(S0, -2), 1)
+    ENERGY(S) := EPS_I(1) * REAL(N1) + EPS_I(2) * REAL(N2) &
+      + EPS_I(3) * REAL(N3) &
+      + W_COUL * REAL(N1 * N2 + N1 * N3 + N2 * N3)
+  ENDDO
+
+  ! Tip chemical potential (Vs in mV <-> meV for one electron)
+  MU_T := 0.0 - VS
+
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: golden-rule rates, sequential tunneling
+!   add e:    R = G * f(DE - mu)
+!   remove e: R = G * (1 - f(-DE - mu))     DE = E(to) - E(from)
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE COMPUTE_RATES()
+  INTEGER :: S, SP, SITE, SA, SB, S0
+  REAL :: DE, GT
+
+  DO S = 1, 8
+    DO SP = 1, 8
+      RS(S, SP) := 0.0
+      RT(S, SP) := 0.0
+      RH(S, SP) := 0.0
+    ENDDO
+  ENDDO
+
+  DO S = 1, 8
+    S0 := S - 1
+    DO SITE = 1, 3
+      SP := IEOR(S0, ISHFT(1, SITE - 1)) + 1
+      DE := ENERGY(SP) - ENERGY(S)
+      ! GT0 is the coupling at molecular contact (3D distance = TIP_Z)
+      GT := GT0 * EXP(0.0 - (DIST(SITE) - TIP_Z) / GDECAY)
+
+      IF IAND(S0, ISHFT(1, SITE - 1)) == 0 THEN
+        ! Add electron to SITE: S -> SP
+        RS(S, SP) := RS(S, SP) + GS * FERMI(DE - MU_S)
+        RT(S, SP) := RT(S, SP) + GT * FERMI(DE - MU_T)
+      ELSE
+        ! Remove electron from SITE: S -> SP
+        RS(S, SP) := RS(S, SP) + GS * (1.0 - FERMI(0.0 - DE - MU_S))
+        RT(S, SP) := RT(S, SP) + GT * (1.0 - FERMI(0.0 - DE - MU_T))
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Direct inter-site hops (porosity): electron moves SA -> SB.
+  ! Rate G_HOP * f(-DE) preserves detailed balance with the bath.
+  DO S = 1, 8
+    S0 := S - 1
+    DO SA = 1, 3
+      DO SB = 1, 3
+        IF SA /= SB THEN
+          IF IAND(S0, ISHFT(1, SA - 1)) /= 0 THEN
+            IF IAND(S0, ISHFT(1, SB - 1)) == 0 THEN
+              SP := IEOR(IEOR(S0, ISHFT(1, SA - 1)), &
+                         ISHFT(1, SB - 1)) + 1
+              DE := ENERGY(SP) - ENERGY(S)
+              RH(S, SP) := RH(S, SP) + G_HOP * FERMI(0.0 - DE)
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDDO
+  ENDDO
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: integrate master equation to steady state (Euler)
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE SOLVE_STEADY()
+  INTEGER :: S, SP, T
+  REAL :: FLOW
+
+  ! Uniform initial distribution
+  DO S = 1, 8
+    P(S) := 0.125
+  ENDDO
+
+  DO T = 1, NSTEPS
+    DO S = 1, 8
+      FLOW := 0.0
+      DO SP = 1, 8
+        FLOW := FLOW + P(SP) * (RS(SP, S) + RT(SP, S) + RH(SP, S)) &
+                     - P(S) * (RS(S, SP) + RT(S, SP) + RH(S, SP))
+      ENDDO
+      PNEW(S) := P(S) + DT_INT * FLOW
+    ENDDO
+    DO S = 1, 8
+      P(S) := PNEW(S)
+    ENDDO
+  ENDDO
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: current, total charge, manifold occupations
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE MEASURE()
+  INTEGER :: S, SP, SITE, S0, NE, I, INEAR
+
+  ! Net electron current tip -> cluster
+  I_TIP := 0.0
+  DO S = 1, 8
+    S0 := S - 1
+    DO SITE = 1, 3
+      SP := IEOR(S0, ISHFT(1, SITE - 1)) + 1
+      IF IAND(S0, ISHFT(1, SITE - 1)) == 0 THEN
+        I_TIP := I_TIP + P(S) * RT(S, SP)
+      ELSE
+        I_TIP := I_TIP - P(S) * RT(S, SP)
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Total charge and manifold weights
+  Q_TOT := 0.0
+  DO S = 1, 8
+    S0 := S - 1
+    NE := IAND(S0, 1) + IAND(ISHFT(S0, -1), 1) + IAND(ISHFT(S0, -2), 1)
+    Q_TOT := Q_TOT + P(S) * REAL(NE)
+  ENDDO
+
+  ! Singly occupied: states 1,2,4 -> indices 2,3,5
+  W_SING := P(2) + P(3) + P(5)
+  ! Doubly occupied: states 3,5,6 -> indices 4,6,7
+  W_DOUBLE := P(4) + P(6) + P(7)
+  ! Empty + triple
+  W_OTHER := P(1) + P(8)
+
+  ! Hole tracking: probability that the site NEAREST the tip is empty.
+  ! Trapped regime: singlets evenly populated -> 2/3.
+  ! Quasi-equilibrium (porous): electron avoids the tip -> -> 1.0.
+  INEAR := 1
+  DO I = 2, 3
+    IF DIST(I) < DIST(INEAR) THEN
+      INEAR := I
+    ENDIF
+  ENDDO
+  HOLE_NEAR := 0.0
+  DO S = 1, 8
+    S0 := S - 1
+    IF IAND(S0, ISHFT(1, INEAR - 1)) == 0 THEN
+      HOLE_NEAR := HOLE_NEAR + P(S)
+    ENDIF
+  ENDDO
+END

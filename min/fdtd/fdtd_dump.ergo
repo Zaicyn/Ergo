@@ -1,0 +1,113 @@
+! ════════════════════════════════════════════════════════════════════
+! FDTD_SLIT — 2D scalar wave equation, double-slit diffraction, 3 lambdas
+! u_tt = c^2 laplacian(u), leapfrog, C2 = (c dt/dx)^2 = 0.25 (c = 0.5)
+! Grid 640 (x) x 512 (y). Sponge edges (20 cells), barrier at ix=300 with
+! two slits (sep d=64, width a=12) centered y=256, screen at ix=560.
+! lambda = 16 -> fringe spacing dy = lambda*L/d = 16*260/64 = 65 cells.
+! Scenes: lambda in {12, 16, 20} (ratios 12:16:20).
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 640, NY = 512
+INTEGER, PARAMETER :: NSTEPS = 6000
+REAL, PARAMETER :: C2 = 0.25
+REAL, PARAMETER :: AMP = 1.0
+INTEGER, PARAMETER :: IX_SRC = 40, IX_BAR = 300, IX_SCR = 560
+
+STATIC REAL :: U(NX, NY), U_OLD(NX, NY), UN(NX, NY)
+STATIC REAL :: ABSORB(NX, NY), PASS(NX, NY), PROF(NY)
+STATIC REAL :: LTAB(3)
+DATA LTAB / 12.0, 16.0, 20.0 /
+
+REAL :: OMEGA, RAMPV, SV
+INTEGER :: I, J, T, SC, IXC
+
+DO SC = 1, 3
+  ! ---- init fields, sponge, barrier ----
+  DO J = 1, NY
+    DO I = 1, NX
+      U(I, J) := 0.0
+      U_OLD(I, J) := 0.0
+      UN(I, J) := 0.0
+      ABSORB(I, J) := 1.0
+      PASS(I, J) := 1.0
+    ENDDO
+  ENDDO
+  ! sponge: cosine ramp 0.7 -> 1.0 over outer 20 cells per edge
+  DO I = 1, 20
+    SV := 0.7 + 0.3 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(21 - I) / 21.0))
+    DO J = 1, NY
+      ABSORB(I, J) := ABSORB(I, J) * SV
+      ABSORB(NX - I + 1, J) := ABSORB(NX - I + 1, J) * SV
+    ENDDO
+  ENDDO
+  DO J = 1, 20
+    SV := 0.7 + 0.3 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(21 - J) / 21.0))
+    DO I = 1, NX
+      ABSORB(I, J) := ABSORB(I, J) * SV
+      ABSORB(I, NY - J + 1) := ABSORB(I, NY - J + 1) * SV
+    ENDDO
+  ENDDO
+  ! barrier with two slits: wall at ix=300 except windows
+  ! slit centers y=224 and y=288 (sep 64), width 12: [219,230], [283,294]
+  DO J = 1, NY
+    PASS(IX_BAR, J) := 0.0
+  ENDDO
+  DO J = 219, 230
+    PASS(IX_BAR, J) := 1.0
+  ENDDO
+  DO J = 283, 294
+    PASS(IX_BAR, J) := 1.0
+  ENDDO
+  DO J = 1, NY
+    PROF(J) := 0.0
+  ENDDO
+  OMEGA := 3.14159265358979 / LTAB(SC)
+
+  ! ---- time loop ----
+  DO T = 1, NSTEPS
+    ! leapfrog stencil + sponge + barrier in one pass
+    DO J = 2, NY - 1
+      DO I = 2, NX - 1
+        UN(I, J) := (2.0 * U(I, J) - U_OLD(I, J) &
+          + C2 * (U(I + 1, J) + U(I - 1, J) + U(I, J + 1) + U(I, J - 1) &
+          - 4.0 * U(I, J))) * ABSORB(I, J) * PASS(I, J)
+      ENDDO
+    ENDDO
+    ! plane-wave source with smooth ramp (first 200 steps)
+    RAMPV := 1.0
+    IF (T <= 200) THEN
+      RAMPV := 0.5 * (1.0 - COS(3.14159265358979 * REAL(T) / 200.0))
+    ENDIF
+    SV := AMP * SIN(OMEGA * REAL(T)) * RAMPV
+    DO J = 1, NY
+      UN(IX_SRC, J) := UN(IX_SRC, J) + SV
+    ENDDO
+    ! screen accumulation, last 1000 steps only
+    IF (T > NSTEPS - 2000) THEN
+      DO J = 1, NY
+        PROF(J) := PROF(J) + UN(IX_SCR, J) * UN(IX_SCR, J)
+      ENDDO
+    ENDIF
+    ! rotate
+    DO J = 1, NY
+      DO I = 1, NX
+        U_OLD(I, J) := U(I, J)
+        U(I, J) := UN(I, J)
+      ENDDO
+    ENDDO
+  ENDDO
+
+  DO J = 1, NY
+    WRITE(*, "%d %d %.6f") SC, J, PROF(J)
+  ENDDO
+  IF (SC == 2) THEN
+    DO J = 1, NY, 8
+      DO I = 1, NX, 8
+        WRITE(*, "F %d %d %.4f") I, J, U(I, J)
+      ENDDO
+    ENDDO
+  ENDIF
+ENDDO
+
+WRITE(*, "# DONE")

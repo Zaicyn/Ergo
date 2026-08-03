@@ -1,0 +1,216 @@
+! dbm_strip.ergo — DBM electrodeposition in battery geometry
+!
+! Bottom row = seed electrode (cluster, phi=0), top row = counter
+! electrode (phi=PHIB), side walls Neumann (mirrored via precomputed
+! LIDX/RIDX index arrays — keeps the stencil branch-free). One deposit
+! per step, counter-based RAND(SEED + G). Deterministic.
+!
+! Growth law (candidate = empty site 4-adjacent to cluster):
+!     w = max(phi, 0)**ETA
+!   D0 : capillary length — Gibbs-Thomson in the BOUNDARY CONDITION: a
+!        site deposited with m cluster neighbors is held at
+!        phi_s = D0*(2-m), quenched at attachment (tip +D0, flat 0,
+!        notch -D0). Raised tip potentials divert flux to flatter
+!        interface (Mullins-Sekerka). The growth-LAW threshold form was
+!        tried and anti-stabilizes — see DENDRITE_FINDINGS.md.
+!   CAP: reservoir capacity in deposited mass units. CAP>0 drains
+!        PHIB = max(1-mass/CAP, 0) and freezes growth at exhaustion.
+!        Uniform drain changes the clock, not the morphology; with D0>0
+!        it gives self-limiting growth. CAP=0 -> infinite reservoir.
+! D0=0, CAP=0 reproduce the pre-surface-tension physics bitwise
+! (regression oracle: diff SNAP blocks against dbm_strip.out).
+!
+! Battery signature: screening instability. eta=0 (Eden) advances a
+! compact layer (tip ~ mean height); eta>=1 tips screen the valleys and
+! outrun the mean — tracked as tip height, mean height, and per-column
+! height roughness. Surface tension should re-stabilize the interface
+! (Mullins-Sekerka cutoff); depletion should self-limit tip growth.
+!
+!   python -m core min/dendrite/dbm_strip.ergo -o dbm_strip
+!   ./dbm_strip > dbm_strip.out
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: DEFAULT_N = 257
+INTEGER, PARAMETER :: NX = DEFAULT_N, NY = DEFAULT_N
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NSTEPS = 8000
+INTEGER, PARAMETER :: SEED = 12345
+REAL, PARAMETER :: ETA = 1.0
+REAL, PARAMETER :: D0 = 0.0
+REAL, PARAMETER :: CAP = 0.0
+REAL, PARAMETER :: TOLG = 1.0E-6
+INTEGER, PARAMETER :: SWMAX = 1200
+STATIC REAL :: PHI(NPTS), MASK(NPTS), CLUS(NPTS), W(NPTS), BND(NPTS)
+STATIC INTEGER :: LIDX(NPTS), RIDX(NPTS), HCOL(NX)
+REAL :: DN, MAXD, NSUM, TOTW, U, TARGET, CUM, OMEGA, PI, PHIB, T
+REAL :: HMEAN, HSTD, HTIP
+INTEGER :: I, J, K, G, SW, CONV, KSEL, DONE, SWUSED, NCAND, MASS
+INTEGER :: ICOL, JROW, JSTOP
+
+PI := ACOS(0.0 - 1.0)
+OMEGA := 2.0 / (1.0 + SIN(PI / REAL(NY)))
+JSTOP := INT(0.85 * REAL(NY))
+PHIB := 1.0
+
+! Geometry: rows 1 and NY fixed; interior solves with linear start.
+! LIDX/RIDX mirror the side walls (Neumann): I=1 sees I=2 as left
+! neighbor, I=NX sees I=NX-1 as right neighbor.
+DO J = 1, NY
+  DO I = 1, NX
+    K := I + (J - 1) * NX
+    CLUS(K) := 0.0
+    LIDX(K) := K - 1
+    RIDX(K) := K + 1
+    IF (I == 1) THEN
+      LIDX(K) := K + 1
+    ENDIF
+    IF (I == NX) THEN
+      RIDX(K) := K - 1
+    ENDIF
+    BND(K) := 0.0
+    MASK(K) := 1.0
+    PHI(K) := REAL(J - 1) / REAL(NY - 1)
+    IF (J == 1) THEN
+      MASK(K) := 0.0
+      PHI(K) := 0.0
+      CLUS(K) := 1.0
+    ENDIF
+    IF (J == NY) THEN
+      MASK(K) := 0.0
+      PHI(K) := 1.0
+      BND(K) := 1.0
+    ENDIF
+  ENDDO
+ENDDO
+DO I = 1, NX
+  HCOL(I) := 1
+ENDDO
+
+WRITE(*, "dbm_strip  grid %d x %d  eta %.2f  d0 %.4f  cap %.0f  seed %d  nsteps %d") &
+  NX, NY, ETA, D0, CAP, SEED, NSTEPS
+
+MASS := NX
+T := 0.0
+DONE := 0
+DO G = 1, NSTEPS
+  IF (DONE == 0) THEN
+
+    ! 1. Warm-started SOR re-solve (rows 2..NY-1, all columns).
+    ! Clamp phi >= 0: SOR overshoot can drive phi negative at the steep
+    ! deposit surface; physical field is non-negative (max principle).
+    CONV := 0
+    SWUSED := SWMAX
+    DO SW = 1, SWMAX
+      IF (CONV == 0) THEN
+        MAXD := 0.0
+        DO K = NX + 1, NPTS - NX
+          DN := MASK(K) * OMEGA * (0.25 * (PHI(LIDX(K)) + PHI(RIDX(K)) &
+            + PHI(K - NX) + PHI(K + NX)) - PHI(K))
+          PHI(K) := MAX(PHI(K) + DN, 0.0)
+          MAXD := MAX(MAXD, ABS(DN))
+        ENDDO
+        IF (MAXD < TOLG) THEN
+          CONV := 1
+          SWUSED := SW
+        ENDIF
+      ENDIF
+    ENDDO
+
+    ! 2. Candidate weights (GT lives in the cluster BC, not here).
+    TOTW := 0.0
+    NCAND := 0
+    DO K = NX + 1, NPTS - NX
+      NSUM := CLUS(LIDX(K)) + CLUS(RIDX(K)) + CLUS(K - NX) + CLUS(K + NX)
+      W(K) := (1.0 - CLUS(K)) * MASK(K) * MIN(1.0, NSUM) &
+        * MAX(PHI(K), 0.0) ** ETA
+      TOTW := TOTW + W(K)
+      NCAND := NCAND + INT((1.0 - CLUS(K)) * MASK(K) * MIN(1.0, NSUM))
+    ENDDO
+
+    ! 3. Roulette pick.
+    KSEL := 0
+    IF (TOTW > 0.0) THEN
+      U := RAND(SEED + G)
+      TARGET := U * TOTW
+      CUM := 0.0
+      DO K = NX + 1, NPTS - NX
+        IF (KSEL == 0) THEN
+          CUM := CUM + W(K)
+          IF (CUM >= TARGET) THEN
+            IF (W(K) > 0.0) THEN
+              KSEL := K
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDIF
+
+    ! 4. Deposit; quenched Gibbs-Thomson BC phi_s = D0*(2-m); column
+    !    heights; physical time advances by 1/flux; stop flags.
+    IF (KSEL > 0) THEN
+      NSUM := CLUS(LIDX(KSEL)) + CLUS(RIDX(KSEL)) + CLUS(KSEL - NX) &
+        + CLUS(KSEL + NX)
+      CLUS(KSEL) := 1.0
+      MASK(KSEL) := 0.0
+      PHI(KSEL) := D0 * (2.0 - NSUM)
+      MASS := MASS + 1
+      T := T + 1.0 / TOTW
+      ICOL := MOD(KSEL - 1, NX) + 1
+      JROW := (KSEL - 1) / NX + 1
+      HCOL(ICOL) := MAX(HCOL(ICOL), JROW)
+      IF (JROW >= JSTOP) THEN
+        DONE := 1
+      ENDIF
+      IF (CAP > 0.0) THEN
+        PHIB := MAX(1.0 - REAL(MASS) / CAP, 0.0)
+        DO K = 1, NPTS
+          IF (BND(K) > 0.5) THEN
+            PHI(K) := PHIB
+          ENDIF
+        ENDDO
+        IF (PHIB <= 0.0) THEN
+          WRITE(*, "reservoir exhausted at step %d  mass %d  time %.3e") &
+            G, MASS, T
+          DONE := 1
+        ENDIF
+      ENDIF
+    ENDIF
+    IF (TOTW <= 0.0) THEN
+      WRITE(*, "frozen at step %d  mass %d  phib %.4f  (totw=0)") &
+        G, MASS, PHIB
+      DONE := 1
+    ENDIF
+
+    ! 5. Morphology series: tip height, mean column height, roughness.
+    IF (MOD(G, 100) == 0) THEN
+      HMEAN := 0.0
+      HTIP := 0.0
+      DO I = 1, NX
+        HMEAN := HMEAN + REAL(HCOL(I))
+        HTIP := MAX(HTIP, REAL(HCOL(I)))
+      ENDDO
+      HMEAN := HMEAN / REAL(NX)
+      HSTD := 0.0
+      DO I = 1, NX
+        HSTD := HSTD + (REAL(HCOL(I)) - HMEAN) ** 2
+      ENDDO
+      HSTD := SQRT(HSTD / REAL(NX))
+      WRITE(*, "step %d  mass %d  tip %.1f  hmean %.2f  rough %.2f  ncand %d  sor %d  phib %.4f  time %.3e") &
+        G, MASS, HTIP, HMEAN, HSTD, NCAND, SWUSED, PHIB, T
+    ENDIF
+    IF (DONE == 1) THEN
+      IF (JROW >= JSTOP) THEN
+        WRITE(*, "tip reached row %d at step %d") JSTOP, G
+      ENDIF
+    ENDIF
+  ENDIF
+ENDDO
+
+WRITE(*, "SNAP %d") NSTEPS
+DO K = 1, NPTS
+  IF (CLUS(K) > 0.5) THEN
+    WRITE(*, "%d %d") MOD(K - 1, NX) + 1, (K - 1) / NX + 1
+  ENDIF
+ENDDO
+WRITE(*, "ENDSNAP")
+WRITE(*, "done  mass %d  phib %.4f") MASS, PHIB

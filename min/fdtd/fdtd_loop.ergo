@@ -1,0 +1,94 @@
+! ════════════════════════════════════════════════════════════════════
+! FDTD_LOOP — 2D TE Maxwell solver, CLOSED rectangular current loop
+! (the Maxwell ≡ Ampère ≡ Weber agreement test, weber_check.md).
+! Loop: bottom Jx(78..177, 100) +x, right Jy(178, 100..167) +y,
+!       top Jx(78..177, 168) -x, left Jy(78, 100..167) -y.
+! Drive ranges chosen so EVERY path cell is divergence-free (checked
+! per-cell against the staggered flux bookkeeping) -> no charge ramp,
+! static E, static B. Test element site: collinear extension of the
+! bottom side, row y=100, x in [XT1,XT2], un-driven (field probe).
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 320, NY = 256
+INTEGER, PARAMETER :: NSTEPS = 3000
+REAL, PARAMETER :: S = 0.5
+REAL, PARAMETER :: I_AMP = 0.05
+INTEGER, PARAMETER :: NSP = 20
+
+STATIC REAL :: HZ(NX, NY), EX(NX, NY), EY(NX, NY)
+STATIC REAL :: ABSORB(NX, NY)
+
+REAL :: SV, RAMPV
+INTEGER :: I, J, T, X
+
+DO J = 1, NY
+  DO I = 1, NX
+    HZ(I, J) := 0.0
+    EX(I, J) := 0.0
+    EY(I, J) := 0.0
+    ABSORB(I, J) := 1.0
+  ENDDO
+ENDDO
+DO I = 1, NSP
+  SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - I) / REAL(NSP + 1)))
+  DO J = 1, NY
+    ABSORB(I, J) := ABSORB(I, J) * SV
+    ABSORB(NX - I + 1, J) := ABSORB(NX - I + 1, J) * SV
+  ENDDO
+ENDDO
+DO J = 1, NSP
+  SV := 0.5 + 0.5 * 0.5 * (1.0 + COS(3.14159265358979 * REAL(NSP + 1 - J) / REAL(NSP + 1)))
+  DO I = 1, NX
+    ABSORB(I, J) := ABSORB(I, J) * SV
+    ABSORB(I, NY - J + 1) := ABSORB(I, NY - J + 1) * SV
+  ENDDO
+ENDDO
+
+DO T = 1, NSTEPS
+  DO J = 2, NY - 1
+    DO I = 2, NX - 1
+      EX(I, J) := (EX(I, J) + S * (HZ(I, J) - HZ(I, J - 1))) * ABSORB(I, J)
+      EY(I, J) := (EY(I, J) - S * (HZ(I, J) - HZ(I - 1, J))) * ABSORB(I, J)
+    ENDDO
+  ENDDO
+  RAMPV := 1.0
+  IF (T <= 200) THEN
+    RAMPV := 0.5 * (1.0 - COS(3.14159265358979 * REAL(T) / 200.0))
+  ENDIF
+  DO X = 78, 177
+    EX(X, 100) := EX(X, 100) - S * I_AMP * RAMPV
+    EX(X, 168) := EX(X, 168) + S * I_AMP * RAMPV
+  ENDDO
+  DO J = 100, 167
+    EY(178, J) := EY(178, J) - S * I_AMP * RAMPV
+    EY(78, J) := EY(78, J) + S * I_AMP * RAMPV
+  ENDDO
+  DO J = 1, NY - 1
+    DO I = 1, NX - 1
+      HZ(I, J) := (HZ(I, J) - S * (EY(I + 1, J) - EY(I, J) - EX(I, J + 1) + EX(I, J))) * ABSORB(I, J)
+    ENDDO
+  ENDDO
+  IF MOD(T, 100) = 0 THEN
+    WRITE(*, "PROBE %d %.6f %.6f %.6f %.6f %.6f %.6f") T, &
+      HZ(218, 100), HZ(128, 134), HZ(128, 120), EX(218, 100), EX(178, 100), EY(218, 100)
+  ENDIF
+ENDDO
+
+DO X = 198, 238
+  WRITE(*, "TPROF %d %.6f %.6f %.6f") X, HZ(X, 100), EX(X, 100), EY(X, 100)
+ENDDO
+! near-field of the bottom wire (line current check) + circulation around it
+WRITE(*, "NEAR %.6f %.6f %.6f") HZ(128, 103), HZ(128, 96), HZ(128, 90)
+! circulation around the bottom side (contour x 68..188, y 90..110):
+! bottom edge y=89.5 (Hx array j=89), top y=110.5 (j=110), left x=68.5, right x=188.5
+SV := 0.0
+DO I = 68, 187
+  SV := SV + HZ(I, 89)
+ENDDO
+DO I = 68, 187
+  SV := SV - HZ(I, 110)
+ENDDO
+WRITE(*, "CIRC_BOT %.6f") SV
+WRITE(*, "# DONE")
+STOP

@@ -1,0 +1,227 @@
+! ════════════════════════════════════════════════════════════════════
+! TRIMER MAP — 2D charging-ring map (Li/Pokorný Fig. 2 / Fig. 3)
+! ════════════════════════════════════════════════════════════════════
+!
+! Same 8-state Pauli master equation as trimer_pme.ergo (validated:
+! Q 2->1, NDC threshold 788 mV vs their ~760, singlet trapping,
+! far-site suppression). Here: 2D tip scan over a square grid covering
+! the trimer, per grid point the full PME steady state.
+!
+! Grid: X in [-0.8, 1.8], Y in [-0.4, 1.3] nm, 60x60 points.
+! Vs series (their Fig. 2 evolution + dI/dV pair at 790 +/- 20):
+!   540, 620, 690, 770, 790, 810, 870 mV (one pass per Vs).
+! Output columns: X Y VS I_TIP Q_TOT W_SING
+!
+! Budget: 7 * 3600 = 25200 steady-state solves.
+
+PARAMETER REAL :: EPS0 = -90.0
+PARAMETER REAL :: W_COUL = 50.0
+PARAMETER REAL :: GS = 1.0
+PARAMETER REAL :: MU_S = 0.0
+PARAMETER REAL :: GT0 = 0.1
+PARAMETER REAL :: GDECAY = 0.5
+PARAMETER REAL :: TIP_Z = 0.6
+PARAMETER REAL :: Z_S = -0.09
+PARAMETER REAL :: L_UNIFORM = 0.03
+PARAMETER REAL :: L_LOCAL = 0.0469
+
+PARAMETER INTEGER :: NGX = 60
+PARAMETER INTEGER :: NGY = 60
+PARAMETER REAL :: X_MIN = -0.8
+PARAMETER REAL :: X_MAX = 1.8
+PARAMETER REAL :: Y_MIN = -0.4
+PARAMETER REAL :: Y_MAX = 1.3
+
+PARAMETER INTEGER :: NVS = 7
+STATIC REAL :: VSTAB(NVS)
+DATA VSTAB / 540.0, 620.0, 690.0, 770.0, 790.0, 810.0, 870.0 /
+
+PARAMETER REAL :: DT_INT = 0.05
+PARAMETER INTEGER :: NSTEPS = 100000
+
+STATIC REAL :: P(8), PNEW(8)
+STATIC REAL :: ENERGY(8)
+STATIC REAL :: RS(8, 8), RT(8, 8), RH(8, 8)
+STATIC REAL :: EPS_I(3), DIST(3)
+STATIC REAL :: SITE_X(3), SITE_Y(3)
+STATIC REAL :: TIP_X, TIP_Y, VS, MU_T
+STATIC REAL :: G_HOP = 0.0
+STATIC REAL :: KT = 0.22
+STATIC REAL :: I_TIP, Q_TOT, W_SING, W_DOUBLE, W_OTHER, HOLE_NEAR
+
+INTEGER :: IX, IY, IVS
+
+CALL INIT_GEOMETRY()
+
+DO IVS = 1, NVS
+  VS := VSTAB(IVS)
+  DO IY = 0, NGY - 1
+    TIP_Y := Y_MIN + REAL(IY) * (Y_MAX - Y_MIN) / REAL(NGY - 1)
+    DO IX = 0, NGX - 1
+      TIP_X := X_MIN + REAL(IX) * (X_MAX - X_MIN) / REAL(NGX - 1)
+      CALL COMPUTE_ENERGIES()
+      CALL COMPUTE_RATES()
+      CALL SOLVE_STEADY()
+      CALL MEASURE()
+      WRITE(*, "%.3f %.3f %.1f %.6f %.4f %.4f") &
+        TIP_X, TIP_Y, VS, I_TIP, Q_TOT, W_SING
+    ENDDO
+  ENDDO
+ENDDO
+
+WRITE(*, "# DONE")
+STOP
+
+REAL FUNCTION FERMI(X)
+  REAL :: X, XKT
+  XKT := X / KT
+  IF XKT > 50.0 THEN
+    FERMI := 0.0
+  ELSEIF XKT < -50.0 THEN
+    FERMI := 1.0
+  ELSE
+    FERMI := 1.0 / (1.0 + EXP(XKT))
+  ENDIF
+END
+
+REAL FUNCTION GPROFILE(D)
+  REAL :: D, ZIMG, G0, GD
+  ZIMG := TIP_Z - 2.0 * Z_S
+  GD := 1.0 / SQRT(D ** 2 + TIP_Z ** 2) &
+      - 1.0 / SQRT(D ** 2 + ZIMG ** 2)
+  G0 := 1.0 / TIP_Z - 1.0 / ZIMG
+  GPROFILE := GD / G0
+END
+
+SUBROUTINE INIT_GEOMETRY()
+  SITE_X(1) := 0.0
+  SITE_Y(1) := 0.0
+  SITE_X(2) := 1.0
+  SITE_Y(2) := 0.0
+  SITE_X(3) := 0.5
+  SITE_Y(3) := 0.8660254
+END
+
+SUBROUTINE COMPUTE_ENERGIES()
+  INTEGER :: I, S, S0, N1, N2, N3
+  REAL :: DLAT, D3
+  DO I = 1, 3
+    DLAT := SQRT((SITE_X(I) - TIP_X) ** 2 + (SITE_Y(I) - TIP_Y) ** 2)
+    D3 := SQRT(DLAT ** 2 + TIP_Z ** 2)
+    DIST(I) := D3
+    EPS_I(I) := EPS0 + VS * (L_UNIFORM + L_LOCAL * GPROFILE(DLAT))
+  ENDDO
+  DO S = 1, 8
+    S0 := S - 1
+    N1 := IAND(S0, 1)
+    N2 := IAND(ISHFT(S0, -1), 1)
+    N3 := IAND(ISHFT(S0, -2), 1)
+    ENERGY(S) := EPS_I(1) * REAL(N1) + EPS_I(2) * REAL(N2) &
+      + EPS_I(3) * REAL(N3) &
+      + W_COUL * REAL(N1 * N2 + N1 * N3 + N2 * N3)
+  ENDDO
+  MU_T := 0.0 - VS
+END
+
+SUBROUTINE COMPUTE_RATES()
+  INTEGER :: S, SP, SITE, SA, SB, S0
+  REAL :: DE, GT
+  DO S = 1, 8
+    DO SP = 1, 8
+      RS(S, SP) := 0.0
+      RT(S, SP) := 0.0
+      RH(S, SP) := 0.0
+    ENDDO
+  ENDDO
+  DO S = 1, 8
+    S0 := S - 1
+    DO SITE = 1, 3
+      SP := IEOR(S0, ISHFT(1, SITE - 1)) + 1
+      DE := ENERGY(SP) - ENERGY(S)
+      GT := GT0 * EXP(0.0 - (DIST(SITE) - TIP_Z) / GDECAY)
+      IF IAND(S0, ISHFT(1, SITE - 1)) == 0 THEN
+        RS(S, SP) := RS(S, SP) + GS * FERMI(DE - MU_S)
+        RT(S, SP) := RT(S, SP) + GT * FERMI(DE - MU_T)
+      ELSE
+        RS(S, SP) := RS(S, SP) + GS * (1.0 - FERMI(0.0 - DE - MU_S))
+        RT(S, SP) := RT(S, SP) + GT * (1.0 - FERMI(0.0 - DE - MU_T))
+      ENDIF
+    ENDDO
+  ENDDO
+  DO S = 1, 8
+    S0 := S - 1
+    DO SA = 1, 3
+      DO SB = 1, 3
+        IF SA /= SB THEN
+          IF IAND(S0, ISHFT(1, SA - 1)) /= 0 THEN
+            IF IAND(S0, ISHFT(1, SB - 1)) == 0 THEN
+              SP := IEOR(IEOR(S0, ISHFT(1, SA - 1)), &
+                         ISHFT(1, SB - 1)) + 1
+              DE := ENERGY(SP) - ENERGY(S)
+              RH(S, SP) := RH(S, SP) + G_HOP * FERMI(0.0 - DE)
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDDO
+  ENDDO
+END
+
+SUBROUTINE SOLVE_STEADY()
+  INTEGER :: S, SP, T
+  REAL :: FLOW
+  DO S = 1, 8
+    P(S) := 0.125
+  ENDDO
+  DO T = 1, NSTEPS
+    DO S = 1, 8
+      FLOW := 0.0
+      DO SP = 1, 8
+        FLOW := FLOW + P(SP) * (RS(SP, S) + RT(SP, S) + RH(SP, S)) &
+                     - P(S) * (RS(S, SP) + RT(S, SP) + RH(S, SP))
+      ENDDO
+      PNEW(S) := P(S) + DT_INT * FLOW
+    ENDDO
+    DO S = 1, 8
+      P(S) := PNEW(S)
+    ENDDO
+  ENDDO
+END
+
+SUBROUTINE MEASURE()
+  INTEGER :: S, SP, SITE, S0, NE, I, INEAR
+  I_TIP := 0.0
+  DO S = 1, 8
+    S0 := S - 1
+    DO SITE = 1, 3
+      SP := IEOR(S0, ISHFT(1, SITE - 1)) + 1
+      IF IAND(S0, ISHFT(1, SITE - 1)) == 0 THEN
+        I_TIP := I_TIP + P(S) * RT(S, SP)
+      ELSE
+        I_TIP := I_TIP - P(S) * RT(S, SP)
+      ENDIF
+    ENDDO
+  ENDDO
+  Q_TOT := 0.0
+  DO S = 1, 8
+    S0 := S - 1
+    NE := IAND(S0, 1) + IAND(ISHFT(S0, -1), 1) + IAND(ISHFT(S0, -2), 1)
+    Q_TOT := Q_TOT + P(S) * REAL(NE)
+  ENDDO
+  W_SING := P(2) + P(3) + P(5)
+  W_DOUBLE := P(4) + P(6) + P(7)
+  W_OTHER := P(1) + P(8)
+  INEAR := 1
+  DO I = 2, 3
+    IF DIST(I) < DIST(INEAR) THEN
+      INEAR := I
+    ENDIF
+  ENDDO
+  HOLE_NEAR := 0.0
+  DO S = 1, 8
+    S0 := S - 1
+    IF IAND(S0, ISHFT(1, INEAR - 1)) == 0 THEN
+      HOLE_NEAR := HOLE_NEAR + P(S)
+    ENDIF
+  ENDDO
+END

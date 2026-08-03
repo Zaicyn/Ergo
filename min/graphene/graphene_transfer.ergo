@@ -1,0 +1,467 @@
+! ════════════════════════════════════════════════════════════════════
+! GRAPHENE_TRANSFER — 5-state Pauli master equation for photon-generated
+! carrier transfer graphene -> GaAs -> SSL -> InAs QD (+LOST), testing
+! rate-model consistency of Wang et al., npj 2D Mater. 4:27 (2020).
+!
+! States: G=1 (graphene), A=2 (GaAs), S=3 (SSL), Q=4 (InAs QD),
+! LOST=5 (absorbing: non-radiative + contact loss; tracked via fluxes).
+! Photon source injects into G (rate SRCG) and/or A (SRCA).
+! Forward layer steps are barrier-limited:
+!   k_fwd(i) = K0 * exp(-DE_i/KT)  (+ barrier-insensitive leak KLEAK on G->A)
+! backward steps suppressed by the driving force DG_i (detailed balance):
+!   k_back(i) = k_fwd(i) * exp(-DG_i/KT)
+! Sinks: radiative KR in Q (the PL channel), non-radiative KNR(i) per layer.
+!
+! MEASURED INPUTS (paper):
+!   KT = 0.026 eV (room temp)
+!   DEC: conduction band offset 0.61 eV (non-irradiated) / 0.51 eV (FLI)
+!   graphene bandgap 0 -> 0.31 eV after FLI (motivates absorption mult)
+!   photocurrent enhancement ~20x; PL(L) peaks at L=3; I_sat < 1/3;
+!   QD radiative lifetime ~1 ns -> KR = 1.0 /ns
+!
+! FREE PARAMETERS (documented, NOT fitted — consistency testing):
+!   K0     attempt rate, ref 1e3 /ns (ps-scale phonon-mediated), swept
+!   DAS, DSQ barriers A->S, S->Q = 0.05 eV (SSL miniband + phonon capture)
+!   DG1,DG2,DG3 driving forces 0.2/0.1/0.15 eV (energy cascade)
+!   KNR    non-radiative per layer: G swept (ref 1.0), A 0.1, S 0.1, Q 0.01
+!   AMULT  absorption multiplier for irradiated sample = 2.0 (states below
+!          the opened 0.31 eV gap now participate; choice swept implicitly
+!          since it is a pure multiplier on the ratio)
+!   KLEAK  barrier-insensitive G->A leak (defect/pinhole channel), tested
+!          as the mechanism that could cap the ratio below the naive 47x
+!   DSQ_BOT phonon-bottleneck barrier for the QD-only SA case = 0.3 eV,
+!          swept 0.15..0.35 (paper: TestQD capture is bottleneck-suppressed)
+!
+! SOLVER NOTE: rates span ~10 decades (K0*exp(-0.61/0.026) ~ 6e-8 /ns vs
+! KR = 1 /ns) — explicit Euler cannot reach steady state in feasible
+! steps. Steady state of a LINEAR master equation depends only on rate
+! ratios, so production numbers use an exact 4x4 direct solve (Gaussian
+! elimination); the trimer-style Euler integrator (SOLVE_EULER, STATIC
+! arrays, DT_INT/NSTEPS) is cross-validated on a mild (low-barrier)
+! config in section EULER_CHECK.
+!
+! Output sections:
+!   # EXP1_REF    two configs (non-irr / irr), steady-state fluxes
+!   # EXP1_SCAN   regime map: R_ETA over K0 x KNRG (transfer- vs
+!                 recombination-limited)
+!   # EXP1_LEAK   leak-floor scan: what caps the ratio below 47x
+!   # EXP2_ALG    algebraic PL(L) = A(L)*g^(L-1), per-g peak layer
+!   # EXP2_PME    PL(L) through the full PME for the winning g
+!   # EXP3        SA saturation: eta per case, I_sat ratio vs bottleneck
+!   # EXP3_CURVE  normalized absorption saturation curves
+!   # EULER_CHECK Euler vs direct solve on a mild config
+! ════════════════════════════════════════════════════════════════════
+
+! ── measured constants ─────────────────────────────────────────────
+PARAMETER REAL :: KT = 0.026          ! kT (eV), room temperature
+PARAMETER REAL :: DEC_NI = 0.61       ! dE_C non-irradiated (eV)
+PARAMETER REAL :: DEC_IR = 0.51       ! dE_C FLI-irradiated (eV)
+PARAMETER REAL :: KR = 1.0            ! QD radiative rate (/ns, ~1 ns)
+
+! ── free parameters (see header) ───────────────────────────────────
+PARAMETER REAL :: DAS = 0.05          ! A->S barrier (eV)
+PARAMETER REAL :: DSQ = 0.05          ! S->Q barrier (eV, SSL-assisted)
+PARAMETER REAL :: DG1 = 0.2           ! driving forces (eV)
+PARAMETER REAL :: DG2 = 0.1
+PARAMETER REAL :: DG3 = 0.15
+PARAMETER REAL :: AMULT = 2.0         ! irradiated absorption multiplier
+
+! ── integration (Euler cross-check only) ───────────────────────────
+PARAMETER REAL :: DT_INT = 0.001      ! Euler step (ns)
+PARAMETER INTEGER :: NSTEPS = 3000000 ! -> t = 3000 ns
+
+! ── state ──────────────────────────────────────────────────────────
+STATIC REAL :: K0 = 1000.0            ! attempt rate (/ns) — swept
+STATIC REAL :: KNRG = 1.0             ! graphene non-radiative — swept
+STATIC REAL :: KLEAK = 0.0            ! barrier-insensitive G->A leak
+STATIC REAL :: DEC = 0.61             ! active conduction-band offset
+STATIC REAL :: DSQ_ACT = 0.05         ! active S->Q barrier
+STATIC REAL :: SRCG = 0.0             ! source into G
+STATIC REAL :: SRCA = 0.0             ! source into A
+
+STATIC REAL :: RFWD(3), RBACK(3), KNR(4), SRC(4)
+STATIC REAL :: AMAT(4, 4), RHS(4), AUG(4, 5), P(4), PEUL(4), PNEW(4)
+STATIC REAL :: JGA, JQD, JPL, JNR, SRCT, ETA
+
+INTEGER :: I, J, L, IG, IK, IQ, IL, II
+REAL :: X, Y, GG, AA, TT, PLL, PLMAX, PLALGMAX, R_ETA, R_TOT
+REAL :: ETA_A, ETA_B, ISATR, DSQ_BOT
+INTEGER :: PEAKL
+
+! ════════════════════════════════════════════════════════════════════
+! MAIN
+! ════════════════════════════════════════════════════════════════════
+
+KNR(2) := 0.1
+KNR(3) := 0.1
+KNR(4) := 0.01
+
+! ── EXP1 reference: the two measured configurations ────────────────
+WRITE(*, "# EXP1_REF  cols: config SRC J_GA J_QD J_PL J_NR ETA_GA")
+K0 := 1000.0
+KNRG := 1.0
+KLEAK := 0.0
+DSQ_ACT := DSQ
+KNR(1) := KNRG
+
+DEC := DEC_NI
+SRCG := 1.0
+SRCA := 0.0
+CALL BUILD_RATES()
+CALL SOLVE_STEADY()
+CALL MEASURE()
+WRITE(*, "nonirr %.4f %.6E %.6E %.6E %.6E %.6E") &
+  SRCT, JGA, JQD, JPL, JNR, ETA
+
+DEC := DEC_IR
+SRCG := AMULT
+CALL BUILD_RATES()
+CALL SOLVE_STEADY()
+CALL MEASURE()
+WRITE(*, "irr %.4f %.6E %.6E %.6E %.6E %.6E") &
+  SRCT, JGA, JQD, JPL, JNR, ETA
+WRITE(*, "# EXP1_REF naive prediction: R_ETA = exp(0.10/0.026) = 46.99, R_TOT = AMULT*46.99 = 93.98")
+
+! ── EXP1 regime scan: K0 x KNRG — where does the ratio live? ──────
+WRITE(*, "# EXP1_SCAN  cols: K0 KNRG ETA_non ETA_irr R_ETA R_TOT(AMULT=2)")
+DEC := DEC_NI
+DO IK = 0, 5
+  K0 := 10.0 ** (IK + 1)
+  DO IG = 0, 4
+    KNRG := 0.01 * (10.0 ** IG)
+    KNR(1) := KNRG
+    SRCG := 1.0
+    CALL BUILD_RATES()
+    CALL SOLVE_STEADY()
+    CALL MEASURE()
+    X := ETA                    ! ETA_non
+    DEC := DEC_IR
+    CALL BUILD_RATES()
+    CALL SOLVE_STEADY()
+    CALL MEASURE()
+    Y := ETA                    ! ETA_irr
+    R_ETA := Y / X
+    R_TOT := AMULT * R_ETA
+    WRITE(*, "%.0E %.2E %.6E %.6E %.4f %.4f") &
+      K0, KNRG, X, Y, R_ETA, R_TOT
+    DEC := DEC_NI
+  ENDDO
+ENDDO
+WRITE(*, "# EXP1_SCAN note: R_ETA -> 46.99 when both transfer-limited, -> 1 when both recombination-limited; paper needs R_TOT ~ 20")
+
+! ── EXP1 leak scan: barrier-insensitive channel caps the ratio ────
+WRITE(*, "# EXP1_LEAK  cols: KLEAK JGA_non JGA_irr R_ETA R_TOT(AMULT=2)  (K0=1e3, KNRG=1)")
+K0 := 1000.0
+KNRG := 1.0
+KNR(1) := KNRG
+DO IL = 0, 7
+  IF IL == 0 THEN
+    KLEAK := 0.0
+  ELSE
+    KLEAK := 10.0 ** (REAL(IL) - 9.0)   ! 1e-8 .. 1e-2
+  ENDIF
+  DEC := DEC_NI
+  SRCG := 1.0
+  CALL BUILD_RATES()
+  CALL SOLVE_STEADY()
+  CALL MEASURE()
+  X := JGA
+  DEC := DEC_IR
+  CALL BUILD_RATES()
+  CALL SOLVE_STEADY()
+  CALL MEASURE()
+  Y := JGA
+  R_ETA := Y / X            ! SRC_G = 1.0 both (AMULT excluded)
+  R_TOT := AMULT * R_ETA
+  WRITE(*, "%.1E %.6E %.6E %.4f %.4f") KLEAK, X, Y, R_ETA, R_TOT
+ENDDO
+WRITE(*, "# EXP1_LEAK note: leak raises the non-irr baseline, compressing the ratio; R_TOT ~ 20 near KLEAK ~ 2e-7 /ns")
+
+! ── EXP2 algebraic layer sweep ─────────────────────────────────────
+WRITE(*, "# EXP2_ALG  cols: g L A(L) T(L) PL(L)")
+WRITE(*, "# EXP2_PEAK  cols: g peakL")
+DO IG = 1, 7
+  IF IG == 1 THEN
+    GG := 0.95
+  ELSEIF IG == 2 THEN
+    GG := 0.9
+  ELSEIF IG == 3 THEN
+    GG := 0.85
+  ELSEIF IG == 4 THEN
+    GG := 0.8
+  ELSEIF IG == 5 THEN
+    GG := 0.7
+  ELSEIF IG == 6 THEN
+    GG := 0.6
+  ELSE
+    GG := 0.5
+  ENDIF
+  PLMAX := 0.0
+  PEAKL := 1
+  DO L = 1, 8
+    AA := 1.0 - (0.977 ** L)
+    TT := GG ** (L - 1)
+    PLL := AA * TT
+    IF PLL > PLMAX THEN
+      PLMAX := PLL
+      PEAKL := L
+    ENDIF
+    WRITE(*, "%.2f %d %.6f %.6f %.6f") GG, L, AA, TT, PLL
+  ENDDO
+  WRITE(*, "# EXP2_PEAK %.2f %d") GG, PEAKL
+ENDDO
+
+! ── EXP2 PME check: feed A(L)*T(L) as source multiplier (g=0.7) ───
+WRITE(*, "# EXP2_PME  cols: L SRCMULT J_PL(norm) PL_alg(norm)  (g=0.7, non-irr config)")
+K0 := 1000.0
+KNRG := 1.0
+KNR(1) := KNRG
+KLEAK := 0.0
+DEC := DEC_NI
+SRCA := 0.0
+GG := 0.7
+! first pass: normalization (max over L of both quantities)
+PLMAX := 0.0
+PLALGMAX := 0.0
+DO L = 1, 8
+  AA := 1.0 - (0.977 ** L)
+  TT := GG ** (L - 1)
+  IF AA * TT > PLALGMAX THEN
+    PLALGMAX := AA * TT
+  ENDIF
+  SRCG := AA * TT
+  CALL BUILD_RATES()
+  CALL SOLVE_STEADY()
+  CALL MEASURE()
+  IF JPL > PLMAX THEN
+    PLMAX := JPL
+  ENDIF
+ENDDO
+DO L = 1, 8
+  AA := 1.0 - (0.977 ** L)
+  TT := GG ** (L - 1)
+  SRCG := AA * TT
+  CALL BUILD_RATES()
+  CALL SOLVE_STEADY()
+  CALL MEASURE()
+  PLL := AA * TT / PLALGMAX
+  WRITE(*, "%d %.6f %.6f %.6f") L, SRCG, JPL / PLMAX, PLL
+ENDDO
+WRITE(*, "# EXP2_PME note: linear PME => J_PL exactly proportional to source; shape survives trivially (no density nonlinearity in the model)")
+
+! ── EXP3 SA saturation ─────────────────────────────────────────────
+! Case A (QD-only): source into A, S->Q via phonon bottleneck DSQ_BOT.
+! Case B (graphene-coupled): source AMULT into G + 1 into A, SSL-assisted
+! DSQ = 0.05, irradiated offset. I_sat ∝ KR/eta -> ratio = eta_A/eta_B.
+WRITE(*, "# EXP3  cols: DSQ_BOT eta_QDonly eta_GRcoupled Isat_ratio  (target < 0.333)")
+K0 := 1000.0
+KNRG := 1.0
+KNR(1) := KNRG
+KLEAK := 0.0
+DO IQ = 0, 4
+  DSQ_BOT := 0.15 + 0.05 * REAL(IQ)
+  ! case A
+  DSQ_ACT := DSQ_BOT
+  SRCG := 0.0
+  SRCA := 1.0
+  CALL BUILD_RATES()
+  CALL SOLVE_STEADY()
+  CALL MEASURE()
+  ETA_A := ETA
+  ! case B
+  DSQ_ACT := DSQ
+  DEC := DEC_IR
+  SRCG := AMULT
+  SRCA := 1.0
+  CALL BUILD_RATES()
+  CALL SOLVE_STEADY()
+  CALL MEASURE()
+  ETA_B := ETA
+  ISATR := ETA_A / ETA_B
+  WRITE(*, "%.2f %.6f %.6f %.4f") DSQ_BOT, ETA_A, ETA_B, ISATR
+  DEC := DEC_NI
+  SRCG := 0.0
+ENDDO
+
+! saturation curves at DSQ_BOT = 0.3 (I in units of I_sat of case A)
+DSQ_BOT := 0.3
+DSQ_ACT := DSQ_BOT
+SRCG := 0.0
+SRCA := 1.0
+CALL BUILD_RATES()
+CALL SOLVE_STEADY()
+CALL MEASURE()
+ETA_A := ETA
+DSQ_ACT := DSQ
+DEC := DEC_IR
+SRCG := AMULT
+SRCA := 1.0
+CALL BUILD_RATES()
+CALL SOLVE_STEADY()
+CALL MEASURE()
+ETA_B := ETA
+WRITE(*, "# EXP3_CURVE  cols: I alpha_QDonly alpha_GRcoupled  (I in units of Isat_A; ratio=%.4f)") &
+  ETA_A / ETA_B
+DO II = 0, 24
+  X := 10.0 ** (0.0 - 3.0 + 0.25 * REAL(II))
+  WRITE(*, "%.4E %.6f %.6f") X, 1.0 / (1.0 + X), &
+    1.0 / (1.0 + X * ETA_B / ETA_A)
+ENDDO
+
+! ── EULER cross-check on a mild config (DEC=0.15 eV) ───────────────
+WRITE(*, "# EULER_CHECK  mild config DEC=0.15, K0=1e3, KNRG=1, SRCG=1")
+K0 := 1000.0
+KNRG := 1.0
+KNR(1) := KNRG
+KLEAK := 0.0
+DEC := 0.15
+DSQ_ACT := DSQ
+SRCG := 1.0
+SRCA := 0.0
+CALL BUILD_RATES()
+CALL SOLVE_STEADY()
+CALL MEASURE()
+WRITE(*, "# direct: P= %.6E %.6E %.6E %.6E  JPL=%.6E") &
+  P(1), P(2), P(3), P(4), JPL
+CALL SOLVE_EULER()
+X := 0.0
+DO I = 1, 4
+  Y := PEUL(I) - P(I)
+  IF Y < 0.0 THEN
+    Y := 0.0 - Y
+  ENDIF
+  IF Y > X THEN
+    X := Y
+  ENDIF
+ENDDO
+WRITE(*, "# euler:  P= %.6E %.6E %.6E %.6E") PEUL(1), PEUL(2), PEUL(3), PEUL(4)
+WRITE(*, "# euler vs direct: max|dP| = %.3E (t=%.0f ns, %d steps)") &
+  X, DT_INT * NSTEPS, NSTEPS
+
+WRITE(*, "# DONE")
+STOP
+
+! ════════════════════════════════════════════════════════════════════
+! BUILD_RATES: forward/backward layer rates, sinks, source vector
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE BUILD_RATES()
+  RFWD(1) := K0 * EXP(0.0 - DEC / KT) + KLEAK
+  RFWD(2) := K0 * EXP(0.0 - DAS / KT)
+  RFWD(3) := K0 * EXP(0.0 - DSQ_ACT / KT)
+  RBACK(1) := RFWD(1) * EXP(0.0 - DG1 / KT)
+  RBACK(2) := RFWD(2) * EXP(0.0 - DG2 / KT)
+  RBACK(3) := RFWD(3) * EXP(0.0 - DG3 / KT)
+  KNR(1) := KNRG
+  SRC(1) := SRCG
+  SRC(2) := SRCA
+  SRC(3) := 0.0
+  SRC(4) := 0.0
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SOLVE_STEADY: exact steady state of M p = -SRC via Gaussian
+! elimination with partial pivoting (4x4). M(i,j) = rate j->i (i/=j),
+! M(i,i) = -(out rate of i incl. sinks).
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE SOLVE_STEADY()
+  INTEGER :: R, C, COL, IPV
+  REAL :: F, TMP
+
+  DO R = 1, 4
+    DO C = 1, 4
+      AMAT(R, C) := 0.0
+    ENDDO
+  ENDDO
+  AMAT(2, 1) := RFWD(1)
+  AMAT(1, 2) := RBACK(1)
+  AMAT(3, 2) := RFWD(2)
+  AMAT(2, 3) := RBACK(2)
+  AMAT(4, 3) := RFWD(3)
+  AMAT(3, 4) := RBACK(3)
+  AMAT(1, 1) := 0.0 - (RFWD(1) + KNR(1))
+  AMAT(2, 2) := 0.0 - (RFWD(2) + RBACK(1) + KNR(2))
+  AMAT(3, 3) := 0.0 - (RFWD(3) + RBACK(2) + KNR(3))
+  AMAT(4, 4) := 0.0 - (RBACK(3) + KNR(4) + KR)
+
+  DO R = 1, 4
+    DO C = 1, 4
+      AUG(R, C) := AMAT(R, C)
+    ENDDO
+    AUG(R, 5) := 0.0 - SRC(R)
+  ENDDO
+
+  DO COL = 1, 4
+    IPV := COL
+    DO R = COL + 1, 4
+      IF ABS(AUG(R, COL)) > ABS(AUG(IPV, COL)) THEN
+        IPV := R
+      ENDIF
+    ENDDO
+    IF IPV /= COL THEN
+      DO C = COL, 5
+        TMP := AUG(COL, C)
+        AUG(COL, C) := AUG(IPV, C)
+        AUG(IPV, C) := TMP
+      ENDDO
+    ENDIF
+    DO R = COL + 1, 4
+      F := AUG(R, COL) / AUG(COL, COL)
+      DO C = COL, 5
+        AUG(R, C) := AUG(R, C) - F * AUG(COL, C)
+      ENDDO
+    ENDDO
+  ENDDO
+
+  DO R = 4, 1, -1
+    TMP := AUG(R, 5)
+    DO C = R + 1, 4
+      TMP := TMP - AUG(R, C) * P(C)
+    ENDDO
+    P(R) := TMP / AUG(R, R)
+  ENDDO
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SOLVE_EULER: trimer-style explicit Euler to steady state (only
+! feasible for non-stiff configs — see header note)
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE SOLVE_EULER()
+  INTEGER :: T, R, C
+  REAL :: FLOW
+  DO R = 1, 4
+    PEUL(R) := 0.0
+  ENDDO
+  DO T = 1, NSTEPS
+    DO R = 1, 4
+      FLOW := SRC(R)
+      DO C = 1, 4
+        FLOW := FLOW + PEUL(C) * AMAT(R, C)
+      ENDDO
+      PNEW(R) := PEUL(R) + DT_INT * FLOW
+    ENDDO
+    DO R = 1, 4
+      PEUL(R) := PNEW(R)
+    ENDDO
+  ENDDO
+END
+
+! ════════════════════════════════════════════════════════════════════
+! MEASURE: steady-state fluxes
+!   JGA  net G->A transfer current (photocurrent analog)
+!   JQD  net flux captured into QDs
+!   JPL  radiative flux (PL channel)
+!   JNR  total non-radiative loss
+!   ETA  J_QD / SRC_TOT (capture/coupling efficiency)
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE MEASURE()
+  JGA := RFWD(1) * P(1) - RBACK(1) * P(2)
+  JQD := RFWD(3) * P(3) - RBACK(3) * P(4)
+  JPL := KR * P(4)
+  JNR := KNR(1) * P(1) + KNR(2) * P(2) + KNR(3) * P(3) + KNR(4) * P(4)
+  SRCT := SRC(1) + SRC(2)
+  ETA := JQD / SRCT
+END

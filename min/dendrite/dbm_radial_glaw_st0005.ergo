@@ -1,0 +1,199 @@
+! dbm_radial.ergo — dielectric breakdown model, radial geometry
+!
+! Laplacian growth from a central seed: cluster sites fixed phi=0, outer
+! circle phi=1 (or phi=PHIB when depleted), field relaxed by warm-started
+! SOR each growth step. One site deposited per step via counter-based
+! roulette draw RAND(SEED + G). Fully deterministic given SEED.
+!
+! Growth law (candidate = empty site 4-adjacent to cluster, m = number of
+! cluster neighbors):
+!     w = max(phi - D0*(2-m), 0)**ETA
+!   ETA  : field exponent (NPW eta; also Butler-Volmer transfer order)
+!   D0   : capillary length — Gibbs-Thomson surface-tension term in the
+!          growth law (kinetic GT: solver BC stays phi=0). Curvature
+!          proxy kappa = 2-m: convex tip m=1 -> +1 barrier, flat m=2 -> 0,
+!          concave notch m=3 -> -1 bonus. D0=0 -> no surface tension.
+!   CAP  : reservoir capacity (deposited mass units). CAP>0 drains the
+!          outer boundary PHIB = max(1-mass/CAP, 0) as metal deposits;
+!          growth self-limits when the bulk is exhausted. CAP=0 ->
+!          infinite reservoir (phi_B = 1 fixed).
+!
+! D0=0 and CAP=0 reproduce the pre-surface-tension physics bitwise
+! (regression oracle: diff SNAP blocks against dbm_radial.out).
+!
+!   python -m core min/dendrite/dbm_radial.ergo -o dbm_radial
+!   ./dbm_radial > dbm_radial.out
+!
+! Output: header, per-step progress lines (every 100 steps), occupancy
+! snapshots ("SNAP <step>" followed by "I J" cluster-site lines) at the
+! midpoint and end. Determinism oracle: run twice, diff the .out files.
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: DEFAULT_N = 257
+INTEGER, PARAMETER :: NX = DEFAULT_N, NY = DEFAULT_N
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 4000
+INTEGER, PARAMETER :: SEED = 12345
+REAL, PARAMETER :: ETA = 1.0
+REAL, PARAMETER :: D0 = 0.005
+REAL, PARAMETER :: CAP = 0.0
+REAL, PARAMETER :: TOLG = 1.0E-6
+INTEGER, PARAMETER :: SWMAX = 1200
+STATIC REAL :: PHI(NPTS), MASK(NPTS), CLUS(NPTS), W(NPTS), BND(NPTS)
+REAL :: CX, CY, R, R1, DX, DY, PI, OMEGA
+REAL :: DN, MAXD, NSUM, KAP, TOTW, U, TARGET, CUM, RMAX, RD, PHIB
+INTEGER :: I, J, K, G, SW, CONV, KSEL, DONE, SWUSED, NCAND, MASS
+
+PI := ACOS(0.0 - 1.0)
+CX := 0.5 * REAL(NX + 1)
+CY := 0.5 * REAL(NY + 1)
+R1 := 0.5 * REAL(NX) - 2.0
+OMEGA := 2.0 / (1.0 + SIN(PI / REAL(NX)))
+PHIB := 1.0
+
+! Geometry: outer circle fixed phi=PHIB; interior solves; center seed.
+DO J = 1, NY
+  DO I = 1, NX
+    K := I + (J - 1) * NX
+    DX := REAL(I) - CX
+    DY := REAL(J) - CY
+    R := SQRT(DX * DX + DY * DY)
+    MASK(K) := 0.0
+    PHI(K) := 1.0
+    CLUS(K) := 0.0
+    BND(K) := 0.0
+    IF (R < R1) THEN
+      MASK(K) := 1.0
+      PHI(K) := LOG(MAX(R, 0.5)) / LOG(R1)
+    ENDIF
+    IF (R >= R1) THEN
+      BND(K) := 1.0
+    ENDIF
+  ENDDO
+ENDDO
+K := INT(CX) + (INT(CY) - 1) * NX
+CLUS(K) := 1.0
+MASK(K) := 0.0
+PHI(K) := 0.0
+
+WRITE(*, "dbm_radial  grid %d x %d  R1 %.1f  eta %.2f  d0 %.4f  cap %.0f  seed %d  nsteps %d") &
+  NX, NY, R1, ETA, D0, CAP, SEED, NSTEPS
+
+RMAX := 0.0
+MASS := 1
+DONE := 0
+DO G = 1, NSTEPS
+  IF (DONE == 0) THEN
+
+    ! 1. Warm-started SOR re-solve (fixed-count, idempotent past CONV).
+    ! Clamp phi >= 0: with OMEGA near 2, SOR undershoots below 0 at the
+    ! steep cluster surface; a negative phi fed to phi**ETA is NaN for
+    ! non-integer ETA (and a signed weight for ETA=1/2). The physical
+    ! field is non-negative (maximum principle), so project it back.
+    CONV := 0
+    SWUSED := SWMAX
+    DO SW = 1, SWMAX
+      IF (CONV == 0) THEN
+        MAXD := 0.0
+        DO K = NX + 2, NEND
+          DN := MASK(K) * OMEGA * (0.25 * (PHI(K - 1) + PHI(K + 1) &
+            + PHI(K - NX) + PHI(K + NX)) - PHI(K))
+          PHI(K) := MAX(PHI(K) + DN, 0.0)
+          MAXD := MAX(MAXD, ABS(DN))
+        ENDDO
+        IF (MAXD < TOLG) THEN
+          CONV := 1
+          SWUSED := SW
+        ENDIF
+      ENDIF
+    ENDDO
+
+    ! 2. Candidate weights with Gibbs-Thomson curvature term.
+    TOTW := 0.0
+    NCAND := 0
+    DO K = NX + 2, NEND
+      NSUM := CLUS(K - 1) + CLUS(K + 1) + CLUS(K - NX) + CLUS(K + NX)
+      KAP := 2.0 - NSUM
+      W(K) := (1.0 - CLUS(K)) * MASK(K) * MIN(1.0, NSUM) &
+        * MAX(PHI(K) - D0 * KAP, 0.0) ** ETA
+      TOTW := TOTW + W(K)
+      NCAND := NCAND + INT((1.0 - CLUS(K)) * MASK(K) * MIN(1.0, NSUM))
+    ENDDO
+
+    ! 3. Roulette pick, one counter-based draw per growth step.
+    KSEL := 0
+    IF (TOTW > 0.0) THEN
+      U := RAND(SEED + G)
+      TARGET := U * TOTW
+      CUM := 0.0
+      DO K = NX + 2, NEND
+        IF (KSEL == 0) THEN
+          CUM := CUM + W(K)
+          IF (CUM >= TARGET) THEN
+            IF (W(K) > 0.0) THEN
+              KSEL := K
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDIF
+
+    ! 4. Deposit; track radius; stop flags: boundary, or frozen
+    !    (depleted reservoir / capillary barrier exceeds all fields).
+    IF (KSEL > 0) THEN
+      CLUS(KSEL) := 1.0
+      MASK(KSEL) := 0.0
+      PHI(KSEL) := 0.0
+      MASS := MASS + 1
+      DX := REAL(MOD(KSEL - 1, NX) + 1) - CX
+      DY := REAL((KSEL - 1) / NX + 1) - CY
+      RD := SQRT(DX * DX + DY * DY)
+      RMAX := MAX(RMAX, RD)
+      IF (RMAX > 0.8 * R1) THEN
+        DONE := 1
+      ENDIF
+      IF (CAP > 0.0) THEN
+        PHIB := MAX(1.0 - REAL(MASS) / CAP, 0.0)
+        DO K = 1, NPTS
+          IF (BND(K) > 0.5) THEN
+            PHI(K) := PHIB
+          ENDIF
+        ENDDO
+      ENDIF
+    ENDIF
+    IF (TOTW <= 0.0) THEN
+      WRITE(*, "frozen at step %d  mass %d  phib %.4f  (totw=0)") &
+        G, MASS, PHIB
+      DONE := 1
+    ENDIF
+
+    IF (MOD(G, 100) == 0) THEN
+      WRITE(*, "step %d  mass %d  rmax %.1f  totw %.4e  ncand %d  sor %d  phib %.4f") &
+        G, MASS, RMAX, TOTW, NCAND, SWUSED, PHIB
+    ENDIF
+    IF (G == NSTEPS / 2) THEN
+      WRITE(*, "SNAP %d") G
+      DO K = 1, NPTS
+        IF (CLUS(K) > 0.5) THEN
+          WRITE(*, "%d %d") MOD(K - 1, NX) + 1, (K - 1) / NX + 1
+        ENDIF
+      ENDDO
+      WRITE(*, "ENDSNAP")
+    ENDIF
+    IF (DONE == 1) THEN
+      IF (RMAX > 0.8 * R1) THEN
+        WRITE(*, "boundary reached at step %d  rmax %.1f") G, RMAX
+      ENDIF
+    ENDIF
+  ENDIF
+ENDDO
+
+WRITE(*, "SNAP %d") NSTEPS
+DO K = 1, NPTS
+  IF (CLUS(K) > 0.5) THEN
+    WRITE(*, "%d %d") MOD(K - 1, NX) + 1, (K - 1) / NX + 1
+  ENDIF
+ENDDO
+WRITE(*, "ENDSNAP")
+WRITE(*, "done  mass %d  rmax %.1f  phib %.4f") MASS, RMAX, PHIB

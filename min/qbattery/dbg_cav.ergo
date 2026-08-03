@@ -1,0 +1,392 @@
+! ROTOR_TRAJ — quantum-jump trajectory engine for the open quantum-rotor
+! battery (see gen_rotor_traj.py header for the full model documentation).
+! Exchange term: -J * (L+_i L-_j + L-_i L+_j) (i.e. -J*(LxLx+LyLy)*2 for
+! unit ladders; the rotor-chain convention -J cos(phi_i-phi_j) maps onto
+! this with the documented factor).
+IMPLICIT NONE
+
+PARAMETER INTEGER :: NC = 4, MAXNQ = 8, MAXDIM = 26244
+PARAMETER INTEGER :: NPTS = 1
+PARAMETER INTEGER :: NTHERM = 4000, NSAMPLE = 12000, NBLK = 8
+PARAMETER REAL :: DTQ = 0.01
+PARAMETER REAL :: WC = 1.0, WR = 1.0, G = 0.0
+PARAMETER REAL :: KAPPA = 0.5, GAMMA_S = 1.0, KEXT = 1.0, PUMP = 0.1
+
+STATIC REAL :: PSI_R(MAXDIM), PSI_I(MAXDIM), TMP_R(MAXDIM), TMP_I(MAXDIM)
+STATIC REAL :: RATE_A(MAXDIM)
+STATIC INTEGER :: WT(MAXNQ), MI(MAXNQ)
+STATIC REAL :: MV(MAXNQ), JCOUP, GPHI, LADDER
+STATIC INTEGER :: SD, DIM, S, S2, NN, II, JJ, ST, PT, X, REST, REST2, MODE, NQ
+STATIC INTEGER :: CH, K, H, H2, SEL, BLK, NCH, MI1, NCAV, NPMP
+STATIC REAL :: NPH_A(8)
+STATIC REAL :: E_R, RATE, CURR, COEF, R_TOT, U1, U2, ACC, PR, QI
+STATIC REAL :: I_ACC, COH_ACC, N_ACC, NOISE
+STATIC REAL :: CR, CI, LREAL
+STATIC REAL :: CH_RATE(26)
+
+STATIC INTEGER :: PMODE(32), PNQ(32)
+STATIC REAL :: PJ(32), PG(32)
+DATA PMODE / 1 /
+DATA PNQ / 2 /
+DATA PJ / 0.0 /
+DATA PG / 0.0 /
+
+! ════════════════════════════════════════════════════════════════════
+DO PT = 1, NPTS
+  MODE := PMODE(PT)
+  NQ := PNQ(PT)
+  JCOUP := PJ(PT)
+  GPHI := PG(PT)
+  IF MODE = 1 THEN
+    SD := 3
+    LADDER := 1.41421356
+  ELSE
+    SD := 2
+    LADDER := 1.0
+  ENDIF
+  DIM := NC
+  DO II = 1, NQ
+    DIM := DIM * SD
+  ENDDO
+  ! WT(II) = SD^(NQ-II): rotor index = sum MI(II)*WT(II); state index
+  ! X = photon + NC * rotor_index, so transitions shift by WT(II)*NC.
+  DO II = 1, NQ
+    WT(II) := 1
+    DO JJ = II + 1, NQ
+      WT(II) := WT(II) * SD
+    ENDDO
+  ENDDO
+  DO S = 1, MAXDIM
+    PSI_R(S) := 0.0
+    PSI_I(S) := 0.0
+  ENDDO
+  PSI_R(1) := 1.0
+  NCAV := 0
+  NPMP := 0
+  DO S = 1, 8
+    NPH_A(S) := 0.0
+  ENDDO
+  DO ST = 1, NTHERM
+    CALL TSTEP()
+  ENDDO
+  DO BLK = 1, NBLK
+    I_ACC := 0.0
+    COH_ACC := 0.0
+    N_ACC := 0.0
+    DO S = 1, 8
+      NPH_A(S) := 0.0
+    ENDDO
+    DO ST = 1, NSAMPLE
+      CALL TSTEP()
+      CALL MEASURE()
+    ENDDO
+    LREAL := REAL(NSAMPLE)
+    WRITE(*, "PT %d mode %d NQ %d J %.2f gphi %.2f BLK %d I %.6f coh %.6f nph %.4f") &
+      PT, MODE, NQ, JCOUP, GPHI, BLK, I_ACC / LREAL, COH_ACC / LREAL, N_ACC / LREAL
+    WRITE(*, "# ev ncav %d npmp %d") NCAV, NPMP
+    WRITE(*, "# pi %.6f %.6f %.6f %.6f") &
+      NPH_A(1) / LREAL, NPH_A(2) / LREAL, NPH_A(3) / LREAL, NPH_A(4) / LREAL
+  ENDDO
+ENDDO
+WRITE(*, "# DONE")
+STOP
+
+! ════════════════════════════════════════════════════════════════════
+! TSTEP: one Euler step d|psi>/dt = -i H_eff |psi> + possible jump
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE TSTEP()
+  ! ---- matvec TMP = -i H_eff PSI (H_eff includes -i RATE/2 diagonal) ----
+  DO S = 1, DIM
+    TMP_R(S) := 0.0
+    TMP_I(S) := 0.0
+  ENDDO
+  DO S = 1, DIM
+    X := S - 1
+    NN := MOD(X, NC) + 1
+    REST := INT(REAL(X) / REAL(NC))
+    E_R := WC * REAL(NN - 1)
+    RATE := KAPPA * REAL(NN - 1) + PUMP * REAL(NN)
+    CURR := 0.0
+    REST2 := REST
+    DO II = 1, NQ
+      MI(II) := INT(REAL(REST2) / REAL(WT(II)))
+      REST2 := REST2 - MI(II) * WT(II)
+    ENDDO
+    DO II = 1, NQ
+      IF SD = 3 THEN
+        MV(II) := REAL(MI(II) - 1)
+      ELSE
+        MV(II) := REAL(MI(II)) - 0.5
+      ENDIF
+      E_R := E_R + WR * MV(II)
+      IF MI(II) = SD - 1 THEN
+        RATE := RATE + LADDER * LADDER * GAMMA_S
+      ENDIF
+      IF SD = 3 .AND. MI(II) = 1 THEN
+        RATE := RATE + KEXT
+        CURR := CURR + KEXT
+      ENDIF
+      IF SD = 2 .AND. MI(II) = 1 THEN
+        RATE := RATE + KEXT
+        CURR := CURR + KEXT
+      ENDIF
+      RATE := RATE + GPHI * MV(II) * MV(II)
+      ! a L+_i (photon down, rotor up)
+      IF MI(II) < SD - 1 .AND. NN > 1 THEN
+        S2 := S + WT(II) * NC - 1
+        COEF := G * SQRT(REAL(NN - 1)) * LADDER
+        TMP_R(S2) := TMP_R(S2) + COEF * PSI_I(S)
+        TMP_I(S2) := TMP_I(S2) - COEF * PSI_R(S)
+      ENDIF
+      ! a+ L-_i (photon up, rotor down)
+      IF MI(II) > 0 .AND. NN < NC THEN
+        S2 := S - WT(II) * NC + 1
+        COEF := G * SQRT(REAL(NN)) * LADDER
+        TMP_R(S2) := TMP_R(S2) + COEF * PSI_I(S)
+        TMP_I(S2) := TMP_I(S2) - COEF * PSI_R(S)
+      ENDIF
+    ENDDO
+    ! exchange -J (L+_i L-_j + L-_i L+_j)
+    DO II = 1, NQ - 1
+      DO JJ = II + 1, NQ
+        IF MI(II) < SD - 1 .AND. MI(JJ) > 0 THEN
+          S2 := S + WT(II) * NC - WT(JJ) * NC
+          COEF := 0.0 - JCOUP * LADDER * LADDER
+          TMP_R(S2) := TMP_R(S2) + COEF * PSI_I(S)
+          TMP_I(S2) := TMP_I(S2) - COEF * PSI_R(S)
+        ENDIF
+        IF MI(II) > 0 .AND. MI(JJ) < SD - 1 THEN
+          S2 := S - WT(II) * NC + WT(JJ) * NC
+          COEF := 0.0 - JCOUP * LADDER * LADDER
+          TMP_R(S2) := TMP_R(S2) + COEF * PSI_I(S)
+          TMP_I(S2) := TMP_I(S2) - COEF * PSI_R(S)
+        ENDIF
+      ENDDO
+    ENDDO
+    ! diagonal (E_R real, -RATE/2 imaginary)
+    TMP_R(S) := TMP_R(S) + E_R * PSI_I(S) - 0.5 * RATE * PSI_R(S)
+    TMP_I(S) := TMP_I(S) - E_R * PSI_R(S) - 0.5 * RATE * PSI_I(S)
+    RATE_A(S) := RATE
+  ENDDO
+  ! ---- Euler update ----
+  DO S = 1, DIM
+    PSI_R(S) := PSI_R(S) + DTQ * TMP_R(S)
+    PSI_I(S) := PSI_I(S) + DTQ * TMP_I(S)
+  ENDDO
+  ! ---- renormalize ----
+  ACC := 0.0
+  DO S = 1, DIM
+    ACC := ACC + PSI_R(S) * PSI_R(S) + PSI_I(S) * PSI_I(S)
+  ENDDO
+  ACC := SQRT(ACC)
+  DO S = 1, DIM
+    PSI_R(S) := PSI_R(S) / ACC
+    PSI_I(S) := PSI_I(S) / ACC
+  ENDDO
+  ! ---- channel rates on the post-update state ----
+  NCH := 2 + 3 * NQ
+  DO K = 1, NCH
+    CH_RATE(K) := 0.0
+  ENDDO
+  DO S = 1, DIM
+    X := S - 1
+    NN := MOD(X, NC) + 1
+    REST := INT(REAL(X) / REAL(NC))
+    REST2 := REST
+    DO II = 1, NQ
+      MI(II) := INT(REAL(REST2) / REAL(WT(II)))
+      REST2 := REST2 - MI(II) * WT(II)
+    ENDDO
+    PR := PSI_R(S) * PSI_R(S) + PSI_I(S) * PSI_I(S)
+    CH_RATE(1) := CH_RATE(1) + KAPPA * REAL(NN - 1) * PR
+    CH_RATE(2) := CH_RATE(2) + PUMP * REAL(NN) * PR
+    DO II = 1, NQ
+      IF MI(II) = SD - 1 THEN
+        CH_RATE(2 + II) := CH_RATE(2 + II) + LADDER * LADDER * GAMMA_S * PR
+      ENDIF
+      IF MI(II) = 1 THEN
+        CH_RATE(2 + NQ + II) := CH_RATE(2 + NQ + II) + KEXT * PR
+      ENDIF
+      IF SD = 3 THEN
+        MV(II) := REAL(MI(II) - 1)
+      ELSE
+        MV(II) := REAL(MI(II)) - 0.5
+      ENDIF
+      CH_RATE(2 + 2 * NQ + II) := CH_RATE(2 + 2 * NQ + II) + GPHI * MV(II) * MV(II) * PR
+    ENDDO
+  ENDDO
+  R_TOT := 0.0
+  DO K = 1, NCH
+    R_TOT := R_TOT + CH_RATE(K)
+  ENDDO
+  ! ---- jump decision (splitmix white hash) ----
+  H := IEOR(ST * 2654435761, IEOR(PT * 40503, BLK * 7919))
+  H := IEOR(H, ISHFT(H, -30))
+  H := H * 6364136223846793005
+  H := IEOR(H, ISHFT(H, -27))
+  H := H * 6364136223846793005
+  H := IEOR(H, ISHFT(H, -31))
+  NOISE := (REAL(IAND(H, 65535)) + 0.5) / 65536.0
+  IF R_TOT * DTQ > NOISE THEN
+    H2 := IEOR(ST * 2246822519, IEOR(PT * 40503, IEOR(BLK * 7919, 123456789)))
+    H2 := IEOR(H2, ISHFT(H2, -30))
+    H2 := H2 * 6364136223846793005
+    H2 := IEOR(H2, ISHFT(H2, -27))
+    H2 := H2 * 6364136223846793005
+    H2 := IEOR(H2, ISHFT(H2, -31))
+    U2 := ((REAL(IAND(H2, 65535)) + 0.5) / 65536.0) * R_TOT
+    ACC := 0.0
+    K := 1
+    SEL := 0
+    DO WHILE K <= NCH
+      ACC := ACC + CH_RATE(K)
+      IF ACC >= U2 .AND. SEL = 0 THEN
+        SEL := K
+      ENDIF
+      K := K + 1
+    ENDDO
+    IF SEL = 0 THEN
+      SEL := NCH
+    ENDIF
+    CALL JUMP(SEL)
+    ACC := 0.0
+    DO S = 1, DIM
+      ACC := ACC + PSI_R(S) * PSI_R(S) + PSI_I(S) * PSI_I(S)
+    ENDDO
+    ACC := SQRT(ACC)
+    DO S = 1, DIM
+      PSI_R(S) := PSI_R(S) / ACC
+      PSI_I(S) := PSI_I(S) / ACC
+    ENDDO
+  ENDIF
+END
+
+! ════════════════════════════════════════════════════════════════════
+! JUMP(K): apply channel K to the FULL state (standard unraveling).
+! Channels: 1 = cavity loss, 2 = pump, 2+i = decay rotor i,
+! 2+NQ+i = extraction rotor i, 2+2NQ+i = dephasing rotor i.
+! All jump maps are injective partial shifts, applied in place with the
+! loop direction such that every target is processed before its sources.
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE JUMP(K)
+  INTEGER :: K
+  IF K = 1 THEN
+    ! cavity loss a: photon down, S -> S-1, ascending
+    DO S = 1, DIM
+      NN := MOD(S - 1, NC) + 1
+      IF NN > 1 THEN
+        NCAV := NCAV + 1
+        COEF := SQRT(REAL(NN - 1))
+        PSI_R(S - 1) := PSI_R(S - 1) + PSI_R(S) * COEF
+        PSI_I(S - 1) := PSI_I(S - 1) + PSI_I(S) * COEF
+        PSI_R(S) := 0.0
+        PSI_I(S) := 0.0
+      ENDIF
+    ENDDO
+    RETURN
+  ENDIF
+  IF K = 2 THEN
+    ! pump a+: photon up, S -> S+1, descending via flipped index
+    DO S2 = 1, DIM
+      S := DIM - S2 + 1
+      NN := MOD(S - 1, NC) + 1
+      IF NN < NC THEN
+        NPMP := NPMP + 1
+        COEF := SQRT(REAL(NN))
+        PSI_R(S + 1) := PSI_R(S + 1) + PSI_R(S) * COEF
+        PSI_I(S + 1) := PSI_I(S + 1) + PSI_I(S) * COEF
+        PSI_R(S) := 0.0
+        PSI_I(S) := 0.0
+      ENDIF
+    ENDDO
+    RETURN
+  ENDIF
+  IF K <= 2 + NQ THEN
+    ! decay L-_i on rotor II = K-2: top m -> m-1, amplitude LADDER, ascending
+    II := K - 2
+    DO S = 1, DIM
+      X := S - 1
+      REST := INT(REAL(X) / REAL(NC))
+      MI1 := MOD(INT(REAL(REST) / REAL(WT(II))), SD)
+      IF MI1 = SD - 1 THEN
+        S2 := S - WT(II) * NC
+        PSI_R(S2) := PSI_R(S2) + PSI_R(S) * LADDER
+        PSI_I(S2) := PSI_I(S2) + PSI_I(S) * LADDER
+        PSI_R(S) := 0.0
+        PSI_I(S) := 0.0
+      ENDIF
+    ENDDO
+    RETURN
+  ENDIF
+  IF K <= 2 + 2 * NQ THEN
+    ! extraction X_i on rotor II = K-2-NQ: m=1 -> m=0, amplitude 1, ascending
+    II := K - 2 - NQ
+    DO S = 1, DIM
+      X := S - 1
+      REST := INT(REAL(X) / REAL(NC))
+      MI1 := MOD(INT(REAL(REST) / REAL(WT(II))), SD)
+      IF MI1 = 1 THEN
+        S2 := S - WT(II) * NC
+        PSI_R(S2) := PSI_R(S2) + PSI_R(S)
+        PSI_I(S2) := PSI_I(S2) + PSI_I(S)
+        PSI_R(S) := 0.0
+        PSI_I(S) := 0.0
+      ENDIF
+    ENDDO
+    RETURN
+  ENDIF
+  ! dephasing Lz_i on rotor II = K-2-2*NQ: diagonal, scale by m
+  II := K - 2 - 2 * NQ
+  DO S = 1, DIM
+    X := S - 1
+    REST := INT(REAL(X) / REAL(NC))
+    MI1 := MOD(INT(REAL(REST) / REAL(WT(II))), SD)
+    IF SD = 3 THEN
+      COEF := REAL(MI1 - 1)
+    ELSE
+      COEF := REAL(MI1) - 0.5
+    ENDIF
+    PSI_R(S) := PSI_R(S) * COEF
+    PSI_I(S) := PSI_I(S) * COEF
+  ENDDO
+END
+
+! ════════════════════════════════════════════════════════════════════
+! MEASURE: accumulate current, pair coherence, photon number
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE MEASURE()
+  DO S = 1, DIM
+    X := S - 1
+    NN := MOD(X, NC) + 1
+    N_ACC := N_ACC + REAL(NN - 1) * (PSI_R(S) * PSI_R(S) + PSI_I(S) * PSI_I(S))
+    NPH_A(NN) := NPH_A(NN) + PSI_R(S) * PSI_R(S) + PSI_I(S) * PSI_I(S)
+    REST := INT(REAL(X) / REAL(NC))
+    REST2 := REST
+    DO II = 1, NQ
+      MI(II) := INT(REAL(REST2) / REAL(WT(II)))
+      REST2 := REST2 - MI(II) * WT(II)
+    ENDDO
+    DO II = 1, NQ
+      IF SD = 3 .AND. MI(II) = 1 THEN
+        I_ACC := I_ACC + KEXT * (PSI_R(S) * PSI_R(S) + PSI_I(S) * PSI_I(S))
+      ENDIF
+      IF SD = 2 .AND. MI(II) = 1 THEN
+        I_ACC := I_ACC + KEXT * (PSI_R(S) * PSI_R(S) + PSI_I(S) * PSI_I(S))
+      ENDIF
+    ENDDO
+    ! pair coherence <L+_1 L-_2 + L-_1 L+_2>/2 (rotors 1,2)
+    IF NQ >= 2 THEN
+      IF MI(1) < SD - 1 .AND. MI(2) > 0 THEN
+        S2 := S + WT(1) * NC - WT(2) * NC
+        COH_ACC := COH_ACC + 0.5 * (PSI_R(S2) * PSI_R(S) + PSI_I(S2) * PSI_I(S))
+      ENDIF
+      IF MI(1) > 0 .AND. MI(2) < SD - 1 THEN
+        S2 := S - WT(1) * NC + WT(2) * NC
+        COH_ACC := COH_ACC + 0.5 * (PSI_R(S2) * PSI_R(S) + PSI_I(S2) * PSI_I(S))
+      ENDIF
+    ENDIF
+  ENDDO
+END

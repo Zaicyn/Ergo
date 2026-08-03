@@ -1,0 +1,838 @@
+! AMYLOID__TAG — GNNQQNY sequential assembly (oracle: 1YJP b-axis
+! in-register spacing 4.866 A = 1.9468 model units; screw-mate sheet
+! zipper closest Cα-Cα 6.888 A = 2.756 units). NC=4 chains x 7 res.
+! Guided: inter-chain in-register Go contacts (INTER_K, INTER_R0).
+! Unguided variant: contacts compiled out (hydrophobic only).
+IMPLICIT NONE
+
+PARAMETER INTEGER :: NRES = 7
+PARAMETER INTEGER :: NC = 4
+PARAMETER INTEGER :: NTOT = 28
+PARAMETER INTEGER :: MAXFRAME = 12000
+PARAMETER REAL :: DT = 0.01
+PARAMETER REAL :: FORCE_SCALE = 6.0
+PARAMETER REAL :: BASE_DAMP = 0.9
+PARAMETER REAL :: HEAT_START = 0.001
+PARAMETER REAL :: HEAT_PEAK = 1.0
+PARAMETER REAL :: BACKBONE_R0 = 1.52
+PARAMETER REAL :: BACKBONE_D = 1.4
+PARAMETER REAL :: MORSE_A = 1.0
+PARAMETER REAL :: STERIC_SIG = 1.60
+PARAMETER REAL :: STERIC_EPS = 0.1
+PARAMETER REAL :: STERIC_CUT = 2.5
+PARAMETER REAL :: HYDRO_STRENGTH = 0.0020
+PARAMETER REAL :: HYDRO_R0 = 4.0
+PARAMETER REAL :: HYDRO_CUTOFF = 8.0
+PARAMETER REAL :: HYDRO_ALPHA = 1.0
+PARAMETER REAL :: NATIVE_K = 1.00
+PARAMETER REAL :: INTER_K = 1.00
+PARAMETER REAL :: INTER_R0 = 1.9468
+PARAMETER INTEGER :: NCON = 14
+
+STATIC REAL :: RES_X(28), RES_Y(28), RES_Z(28)
+STATIC REAL :: RES_VX(28), RES_VY(28), RES_VZ(28)
+STATIC REAL :: RES_ANGK(7), RES_ANGT0(7), RES_TORSK(7), RES_TORSP0(7)
+STATIC REAL :: RES_HYDRO(7), VDAMP(NC)
+STATIC INTEGER :: IC_A(NCON), IC_B(NCON)
+STATIC REAL :: IC_R0(NCON)
+PARAMETER INTEGER :: NLAD = 52
+PARAMETER REAL :: LADDER_K = 0.002
+PARAMETER REAL :: LAD_R0 = 1.9520
+PARAMETER REAL :: LAD_ALPHA = 1.0
+STATIC INTEGER :: LAD_A(NLAD), LAD_B(NLAD)
+STATIC REAL :: LAD_W(NLAD)
+STATIC REAL :: CB_OFF_X(7), CB_OFF_Y(7), CB_OFF_Z(7)
+PARAMETER INTEGER :: NZ = 9
+PARAMETER REAL :: ZIP_K = 1.00
+STATIC INTEGER :: ZA(NZ), ZB(NZ)
+STATIC REAL :: ZR0(NZ), DMIN
+STATIC INTEGER :: LA, LB
+
+STATIC REAL :: THERMAL_CURRENT
+
+STATIC INTEGER :: I, J, K, C, FRAME, M, IA, IB, L, SAME
+STATIC REAL :: DX, DY, DZ, D, E, F, FM, CX, CY, CZ, BX, BY, BZ
+STATIC REAL :: UN, VN, CS, UX, UY, UZ, WX, WY, WZ
+STATIC REAL :: B1X, B1Y, B1Z, B2X, B2Y, B2Z, B3X, B3Y, B3Z
+STATIC REAL :: N1X, N1Y, N1Z, N2X, N2Y, N2Z, N1MAG2, N2MAG2, B2MAG, N1MAG, N2MAG, PHI
+STATIC REAL :: DPHI_DR1X, DPHI_DR1Y, DPHI_DR1Z, DPHI_DR4X, DPHI_DR4Y, DPHI_DR4Z
+STATIC REAL :: DPHI_DR2X, DPHI_DR2Y, DPHI_DR2Z, DPHI_DR3X, DPHI_DR3Y, DPHI_DR3Z
+STATIC REAL :: B1DOT, B3DOT, SCALE_B2, SCALE_B1, SCALE_B3
+STATIC REAL :: U1, U2, COSTH, SINTH, PHI2, CANDX, CANDY, CANDZ, DD
+STATIC INTEGER :: ATT, J2, OK
+
+  RES_ANGK(1) := 0.3000
+  RES_ANGK(2) := 0.3000
+  RES_ANGK(3) := 0.3000
+  RES_ANGK(4) := 0.3000
+  RES_ANGK(5) := 0.3000
+  RES_ANGK(6) := 0.3000
+  RES_ANGK(7) := 0.3000
+  RES_ANGT0(1) := 0.000000
+  RES_ANGT0(2) := 1.966495
+  RES_ANGT0(3) := 2.284735
+  RES_ANGT0(4) := 2.064107
+  RES_ANGT0(5) := 2.077749
+  RES_ANGT0(6) := 1.878620
+  RES_ANGT0(7) := 0.000000
+  RES_TORSK(1) := 0.2000
+  RES_TORSK(2) := 0.2000
+  RES_TORSK(3) := 0.2000
+  RES_TORSK(4) := 0.2000
+  RES_TORSK(5) := 0.2000
+  RES_TORSK(6) := 0.2000
+  RES_TORSK(7) := 0.2000
+  RES_TORSP0(1) := 0.000000
+  RES_TORSP0(2) := -2.467023
+  RES_TORSP0(3) := 2.954412
+  RES_TORSP0(4) := 3.128629
+  RES_TORSP0(5) := -2.949773
+  RES_TORSP0(6) := 0.000000
+  RES_TORSP0(7) := 0.000000
+  RES_HYDRO(1) := 0.0
+  RES_HYDRO(2) := 0.0
+  RES_HYDRO(3) := 0.0
+  RES_HYDRO(4) := 0.0
+  RES_HYDRO(5) := 0.0
+  RES_HYDRO(6) := 0.0
+  RES_HYDRO(7) := 1.0
+  VDAMP(1) := 0.9
+  VDAMP(2) := 0.9
+  VDAMP(3) := 0.9
+  VDAMP(4) := 0.9
+
+  CB_OFF_X(1) := 0.000000
+  CB_OFF_Y(1) := 0.000000
+  CB_OFF_Z(1) := 0.000000
+  CB_OFF_X(2) := 0.070413
+  CB_OFF_Y(2) := -0.062812
+  CB_OFF_Z(2) := -0.596110
+  CB_OFF_X(3) := -0.026405
+  CB_OFF_Y(3) := -0.210439
+  CB_OFF_Z(3) := 0.581308
+  CB_OFF_X(4) := 0.108820
+  CB_OFF_Y(4) := 0.104019
+  CB_OFF_Z(4) := -0.595310
+  CB_OFF_X(5) := -0.085616
+  CB_OFF_Y(5) := -0.071213
+  CB_OFF_Z(5) := 0.602912
+  CB_OFF_X(6) := 0.093617
+  CB_OFF_Y(6) := 0.282452
+  CB_OFF_Z(6) := -0.530098
+  CB_OFF_X(7) := -0.039207
+  CB_OFF_Y(7) := -0.431680
+  CB_OFF_Z(7) := 0.428079
+  IC_A(1) := 1
+  IC_B(1) := 8
+  IC_R0(1) := 1.9468
+  IC_A(2) := 2
+  IC_B(2) := 9
+  IC_R0(2) := 1.9468
+  IC_A(3) := 3
+  IC_B(3) := 10
+  IC_R0(3) := 1.9468
+  IC_A(4) := 4
+  IC_B(4) := 11
+  IC_R0(4) := 1.9468
+  IC_A(5) := 5
+  IC_B(5) := 12
+  IC_R0(5) := 1.9468
+  IC_A(6) := 6
+  IC_B(6) := 13
+  IC_R0(6) := 1.9468
+  IC_A(7) := 7
+  IC_B(7) := 14
+  IC_R0(7) := 1.9468
+  IC_A(8) := 15
+  IC_B(8) := 22
+  IC_R0(8) := 1.9468
+  IC_A(9) := 16
+  IC_B(9) := 23
+  IC_R0(9) := 1.9468
+  IC_A(10) := 17
+  IC_B(10) := 24
+  IC_R0(10) := 1.9468
+  IC_A(11) := 18
+  IC_B(11) := 25
+  IC_R0(11) := 1.9468
+  IC_A(12) := 19
+  IC_B(12) := 26
+  IC_R0(12) := 1.9468
+  IC_A(13) := 20
+  IC_B(13) := 27
+  IC_R0(13) := 1.9468
+  IC_A(14) := 21
+  IC_B(14) := 28
+  IC_R0(14) := 1.9468
+  LAD_A(1) := 2
+  LAD_B(1) := 19
+  LAD_W(1) := 0.5000
+  LAD_A(2) := 2
+  LAD_B(2) := 20
+  LAD_W(2) := 1.0000
+  LAD_A(3) := 3
+  LAD_B(3) := 18
+  LAD_W(3) := 0.5000
+  LAD_A(4) := 3
+  LAD_B(4) := 19
+  LAD_W(4) := 1.0000
+  LAD_A(5) := 3
+  LAD_B(5) := 20
+  LAD_W(5) := 0.5000
+  LAD_A(6) := 4
+  LAD_B(6) := 17
+  LAD_W(6) := 0.5000
+  LAD_A(7) := 4
+  LAD_B(7) := 18
+  LAD_W(7) := 1.0000
+  LAD_A(8) := 4
+  LAD_B(8) := 19
+  LAD_W(8) := 0.5000
+  LAD_A(9) := 5
+  LAD_B(9) := 16
+  LAD_W(9) := 0.5000
+  LAD_A(10) := 5
+  LAD_B(10) := 17
+  LAD_W(10) := 1.0000
+  LAD_A(11) := 5
+  LAD_B(11) := 18
+  LAD_W(11) := 0.5000
+  LAD_A(12) := 6
+  LAD_B(12) := 16
+  LAD_W(12) := 1.0000
+  LAD_A(13) := 6
+  LAD_B(13) := 17
+  LAD_W(13) := 0.5000
+  LAD_A(14) := 2
+  LAD_B(14) := 26
+  LAD_W(14) := 0.5000
+  LAD_A(15) := 2
+  LAD_B(15) := 27
+  LAD_W(15) := 1.0000
+  LAD_A(16) := 3
+  LAD_B(16) := 25
+  LAD_W(16) := 0.5000
+  LAD_A(17) := 3
+  LAD_B(17) := 26
+  LAD_W(17) := 1.0000
+  LAD_A(18) := 3
+  LAD_B(18) := 27
+  LAD_W(18) := 0.5000
+  LAD_A(19) := 4
+  LAD_B(19) := 24
+  LAD_W(19) := 0.5000
+  LAD_A(20) := 4
+  LAD_B(20) := 25
+  LAD_W(20) := 1.0000
+  LAD_A(21) := 4
+  LAD_B(21) := 26
+  LAD_W(21) := 0.5000
+  LAD_A(22) := 5
+  LAD_B(22) := 23
+  LAD_W(22) := 0.5000
+  LAD_A(23) := 5
+  LAD_B(23) := 24
+  LAD_W(23) := 1.0000
+  LAD_A(24) := 5
+  LAD_B(24) := 25
+  LAD_W(24) := 0.5000
+  LAD_A(25) := 6
+  LAD_B(25) := 23
+  LAD_W(25) := 1.0000
+  LAD_A(26) := 6
+  LAD_B(26) := 24
+  LAD_W(26) := 0.5000
+  LAD_A(27) := 9
+  LAD_B(27) := 19
+  LAD_W(27) := 0.5000
+  LAD_A(28) := 9
+  LAD_B(28) := 20
+  LAD_W(28) := 1.0000
+  LAD_A(29) := 10
+  LAD_B(29) := 18
+  LAD_W(29) := 0.5000
+  LAD_A(30) := 10
+  LAD_B(30) := 19
+  LAD_W(30) := 1.0000
+  LAD_A(31) := 10
+  LAD_B(31) := 20
+  LAD_W(31) := 0.5000
+  LAD_A(32) := 11
+  LAD_B(32) := 17
+  LAD_W(32) := 0.5000
+  LAD_A(33) := 11
+  LAD_B(33) := 18
+  LAD_W(33) := 1.0000
+  LAD_A(34) := 11
+  LAD_B(34) := 19
+  LAD_W(34) := 0.5000
+  LAD_A(35) := 12
+  LAD_B(35) := 16
+  LAD_W(35) := 0.5000
+  LAD_A(36) := 12
+  LAD_B(36) := 17
+  LAD_W(36) := 1.0000
+  LAD_A(37) := 12
+  LAD_B(37) := 18
+  LAD_W(37) := 0.5000
+  LAD_A(38) := 13
+  LAD_B(38) := 16
+  LAD_W(38) := 1.0000
+  LAD_A(39) := 13
+  LAD_B(39) := 17
+  LAD_W(39) := 0.5000
+  LAD_A(40) := 9
+  LAD_B(40) := 26
+  LAD_W(40) := 0.5000
+  LAD_A(41) := 9
+  LAD_B(41) := 27
+  LAD_W(41) := 1.0000
+  LAD_A(42) := 10
+  LAD_B(42) := 25
+  LAD_W(42) := 0.5000
+  LAD_A(43) := 10
+  LAD_B(43) := 26
+  LAD_W(43) := 1.0000
+  LAD_A(44) := 10
+  LAD_B(44) := 27
+  LAD_W(44) := 0.5000
+  LAD_A(45) := 11
+  LAD_B(45) := 24
+  LAD_W(45) := 0.5000
+  LAD_A(46) := 11
+  LAD_B(46) := 25
+  LAD_W(46) := 1.0000
+  LAD_A(47) := 11
+  LAD_B(47) := 26
+  LAD_W(47) := 0.5000
+  LAD_A(48) := 12
+  LAD_B(48) := 23
+  LAD_W(48) := 0.5000
+  LAD_A(49) := 12
+  LAD_B(49) := 24
+  LAD_W(49) := 1.0000
+  LAD_A(50) := 12
+  LAD_B(50) := 25
+  LAD_W(50) := 0.5000
+  LAD_A(51) := 13
+  LAD_B(51) := 23
+  LAD_W(51) := 1.0000
+  LAD_A(52) := 13
+  LAD_B(52) := 24
+  LAD_W(52) := 0.5000
+  ZA(1) := 2
+  ZB(1) := 20
+  ZR0(1) := 3.0605
+  ZA(2) := 4
+  ZB(2) := 18
+  ZR0(2) := 2.7557
+  ZA(3) := 6
+  ZB(3) := 16
+  ZR0(3) := 2.9905
+  ZA(4) := 8
+  ZB(4) := 27
+  ZR0(4) := 3.0605
+  ZA(5) := 10
+  ZB(5) := 25
+  ZR0(5) := 2.7557
+  ZA(6) := 12
+  ZB(6) := 23
+  ZR0(6) := 2.9905
+  ZA(7) := 8
+  ZB(7) := 20
+  ZR0(7) := 2.9905
+  ZA(8) := 10
+  ZB(8) := 18
+  ZR0(8) := 2.7557
+  ZA(9) := 12
+  ZB(9) := 16
+  ZR0(9) := 3.0605
+
+  ! Chain 1: hash-walk coil (seed offset 0.0)
+  RES_X(1) := 10.0
+  RES_Y(1) := 10.0
+  RES_Z(1) := 10.0
+  DO I = 2, NRES
+    OK := 0
+    ATT := 0
+    DO WHILE ATT < 20
+      ATT := ATT + 1
+      U1 := MOD(ABS(SIN(REAL(I) * 12.9898 + REAL(ATT) * 3.7 + 0.0) * 43758.5453), 1.0)
+      U2 := MOD(ABS(SIN(REAL(I) * 78.2330 + REAL(ATT) * 1.3 + 0.0) * 12543.1230), 1.0)
+      COSTH := 2.0 * U1 - 1.0
+      SINTH := SQRT(1.0 - COSTH * COSTH)
+      PHI2 := 2.0 * 3.14159265 * U2
+      CANDX := RES_X(0 + I - 1) + SINTH * COS(PHI2) * BACKBONE_R0
+      CANDY := RES_Y(0 + I - 1) + SINTH * SIN(PHI2) * BACKBONE_R0
+      CANDZ := RES_Z(0 + I - 1) + COSTH * BACKBONE_R0
+      OK := 1
+      IF I ≥ 5 THEN
+        DO J2 = 1, I - 4
+          DD := SQRT((CANDX - RES_X(0 + J2))**2 + (CANDY - RES_Y(0 + J2))**2 + (CANDZ - RES_Z(0 + J2))**2)
+          IF DD < 1.55 THEN
+            OK := 0
+          ENDIF
+        ENDDO
+      ENDIF
+      IF OK = 1 THEN
+        ATT := 20
+      ENDIF
+    ENDDO
+    RES_X(0 + I) := CANDX
+    RES_Y(0 + I) := CANDY
+    RES_Z(0 + I) := CANDZ
+  ENDDO
+  DO I = 1, NRES
+    RES_VX(0 + I) := 0.0
+    RES_VY(0 + I) := 0.0
+    RES_VZ(0 + I) := 0.0
+  ENDDO
+
+  ! Chain 2: hash-walk coil (seed offset 1.0)
+  RES_X(8) := 20.0
+  RES_Y(8) := 10.0
+  RES_Z(8) := 10.0
+  DO I = 2, NRES
+    OK := 0
+    ATT := 0
+    DO WHILE ATT < 20
+      ATT := ATT + 1
+      U1 := MOD(ABS(SIN(REAL(I) * 12.9898 + REAL(ATT) * 3.7 + 1.0) * 43758.5453), 1.0)
+      U2 := MOD(ABS(SIN(REAL(I) * 78.2330 + REAL(ATT) * 1.3 + 1.0) * 12543.1230), 1.0)
+      COSTH := 2.0 * U1 - 1.0
+      SINTH := SQRT(1.0 - COSTH * COSTH)
+      PHI2 := 2.0 * 3.14159265 * U2
+      CANDX := RES_X(7 + I - 1) + SINTH * COS(PHI2) * BACKBONE_R0
+      CANDY := RES_Y(7 + I - 1) + SINTH * SIN(PHI2) * BACKBONE_R0
+      CANDZ := RES_Z(7 + I - 1) + COSTH * BACKBONE_R0
+      OK := 1
+      IF I ≥ 5 THEN
+        DO J2 = 1, I - 4
+          DD := SQRT((CANDX - RES_X(7 + J2))**2 + (CANDY - RES_Y(7 + J2))**2 + (CANDZ - RES_Z(7 + J2))**2)
+          IF DD < 1.55 THEN
+            OK := 0
+          ENDIF
+        ENDDO
+      ENDIF
+      IF OK = 1 THEN
+        ATT := 20
+      ENDIF
+    ENDDO
+    RES_X(7 + I) := CANDX
+    RES_Y(7 + I) := CANDY
+    RES_Z(7 + I) := CANDZ
+  ENDDO
+  DO I = 1, NRES
+    RES_VX(7 + I) := 0.0
+    RES_VY(7 + I) := 0.0
+    RES_VZ(7 + I) := 0.0
+  ENDDO
+
+  ! Chain 3: hash-walk coil (seed offset 2.0)
+  RES_X(15) := 30.0
+  RES_Y(15) := 10.0
+  RES_Z(15) := 10.0
+  DO I = 2, NRES
+    OK := 0
+    ATT := 0
+    DO WHILE ATT < 20
+      ATT := ATT + 1
+      U1 := MOD(ABS(SIN(REAL(I) * 12.9898 + REAL(ATT) * 3.7 + 2.0) * 43758.5453), 1.0)
+      U2 := MOD(ABS(SIN(REAL(I) * 78.2330 + REAL(ATT) * 1.3 + 2.0) * 12543.1230), 1.0)
+      COSTH := 2.0 * U1 - 1.0
+      SINTH := SQRT(1.0 - COSTH * COSTH)
+      PHI2 := 2.0 * 3.14159265 * U2
+      CANDX := RES_X(14 + I - 1) + SINTH * COS(PHI2) * BACKBONE_R0
+      CANDY := RES_Y(14 + I - 1) + SINTH * SIN(PHI2) * BACKBONE_R0
+      CANDZ := RES_Z(14 + I - 1) + COSTH * BACKBONE_R0
+      OK := 1
+      IF I ≥ 5 THEN
+        DO J2 = 1, I - 4
+          DD := SQRT((CANDX - RES_X(14 + J2))**2 + (CANDY - RES_Y(14 + J2))**2 + (CANDZ - RES_Z(14 + J2))**2)
+          IF DD < 1.55 THEN
+            OK := 0
+          ENDIF
+        ENDDO
+      ENDIF
+      IF OK = 1 THEN
+        ATT := 20
+      ENDIF
+    ENDDO
+    RES_X(14 + I) := CANDX
+    RES_Y(14 + I) := CANDY
+    RES_Z(14 + I) := CANDZ
+  ENDDO
+  DO I = 1, NRES
+    RES_VX(14 + I) := 0.0
+    RES_VY(14 + I) := 0.0
+    RES_VZ(14 + I) := 0.0
+  ENDDO
+
+  ! Chain 4: hash-walk coil (seed offset 3.0)
+  RES_X(22) := 40.0
+  RES_Y(22) := 10.0
+  RES_Z(22) := 10.0
+  DO I = 2, NRES
+    OK := 0
+    ATT := 0
+    DO WHILE ATT < 20
+      ATT := ATT + 1
+      U1 := MOD(ABS(SIN(REAL(I) * 12.9898 + REAL(ATT) * 3.7 + 3.0) * 43758.5453), 1.0)
+      U2 := MOD(ABS(SIN(REAL(I) * 78.2330 + REAL(ATT) * 1.3 + 3.0) * 12543.1230), 1.0)
+      COSTH := 2.0 * U1 - 1.0
+      SINTH := SQRT(1.0 - COSTH * COSTH)
+      PHI2 := 2.0 * 3.14159265 * U2
+      CANDX := RES_X(21 + I - 1) + SINTH * COS(PHI2) * BACKBONE_R0
+      CANDY := RES_Y(21 + I - 1) + SINTH * SIN(PHI2) * BACKBONE_R0
+      CANDZ := RES_Z(21 + I - 1) + COSTH * BACKBONE_R0
+      OK := 1
+      IF I ≥ 5 THEN
+        DO J2 = 1, I - 4
+          DD := SQRT((CANDX - RES_X(21 + J2))**2 + (CANDY - RES_Y(21 + J2))**2 + (CANDZ - RES_Z(21 + J2))**2)
+          IF DD < 1.55 THEN
+            OK := 0
+          ENDIF
+        ENDDO
+      ENDIF
+      IF OK = 1 THEN
+        ATT := 20
+      ENDIF
+    ENDDO
+    RES_X(21 + I) := CANDX
+    RES_Y(21 + I) := CANDY
+    RES_Z(21 + I) := CANDZ
+  ENDDO
+  DO I = 1, NRES
+    RES_VX(21 + I) := 0.0
+    RES_VY(21 + I) := 0.0
+    RES_VZ(21 + I) := 0.0
+  ENDDO
+
+WRITE(*, "# AMYLOID__TAG NC=4 NCON=14 MAXFRAME=12000")
+WRITE(*, "# TRACE frame pair mean_kk_dist (every 200)")
+WRITE(*, "# GEOM pair k dist_kk dist_kk1 (final)")
+WRITE(*, "# COM chain x y z (final)")
+
+DO FRAME = 1, MAXFRAME
+
+  CALL UPDATE_THERMAL(FRAME)
+
+  ! Thermal impulses (velocity kicks)
+  DO I = 1, NTOT
+    RES_VX(I) := RES_VX(I) + THERMAL_CURRENT * SIN((I+1)*7.3 + REAL(FRAME)*0.17)
+    RES_VY(I) := RES_VY(I) + THERMAL_CURRENT * COS((I+1)*5.7 + REAL(FRAME)*0.31)
+    RES_VZ(I) := RES_VZ(I) + THERMAL_CURRENT * SIN((I+1)*3.1 + REAL(FRAME)*0.09)
+  ENDDO
+
+  ! Steric repulsion (same-chain |i-j| >= 4 or any inter-chain pair)
+  DO I = 1, NTOT - 1
+    DO J = I + 1, NTOT
+      SAME := 0
+      IF INT(REAL(I - 1) / REAL(NRES)) = INT(REAL(J - 1) / REAL(NRES)) THEN
+        IF J - I < 4 THEN
+          SAME := 1
+        ENDIF
+      ENDIF
+      IF SAME = 0 THEN
+        DX := RES_X(I) - RES_X(J)
+        DY := RES_Y(I) - RES_Y(J)
+        DZ := RES_Z(I) - RES_Z(J)
+        D := SQRT(DX*DX + DY*DY + DZ*DZ)
+        IF D > 0.0 .AND. D < STERIC_CUT THEN
+          FM := STERIC_EPS * (STERIC_SIG / D) ** 6
+          RES_VX(I) := RES_VX(I) + FM * DX / D * DT * FORCE_SCALE
+          RES_VY(I) := RES_VY(I) + FM * DY / D * DT * FORCE_SCALE
+          RES_VZ(I) := RES_VZ(I) + FM * DZ / D * DT * FORCE_SCALE
+          RES_VX(J) := RES_VX(J) - FM * DX / D * DT * FORCE_SCALE
+          RES_VY(J) := RES_VY(J) - FM * DY / D * DT * FORCE_SCALE
+          RES_VZ(J) := RES_VZ(J) - FM * DZ / D * DT * FORCE_SCALE
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Hydrophobic attraction (GNNQQNY is polar: only Tyr7 has weight)
+  DO I = 1, NTOT - 1
+    DO J = I + 1, NTOT
+      SAME := 0
+      IF INT(REAL(I - 1) / REAL(NRES)) = INT(REAL(J - 1) / REAL(NRES)) THEN
+        IF J - I < 4 THEN
+          SAME := 1
+        ENDIF
+      ENDIF
+      L := MOD(J - 1, NRES) + 1
+      IF SAME = 0 .AND. RES_HYDRO(MOD(I - 1, NRES) + 1) > 0.0 .AND. RES_HYDRO(L) > 0.0 THEN
+        DX := RES_X(I) - RES_X(J)
+        DY := RES_Y(I) - RES_Y(J)
+        DZ := RES_Z(I) - RES_Z(J)
+        D := SQRT(DX*DX + DY*DY + DZ*DZ)
+        IF D > 0.0 .AND. D < HYDRO_CUTOFF THEN
+          FM := -HYDRO_STRENGTH * RES_HYDRO(MOD(I - 1, NRES) + 1) * RES_HYDRO(L) * EXP(-HYDRO_ALPHA * (D - HYDRO_R0))
+          RES_VX(I) := RES_VX(I) + FM * DX / D * DT * FORCE_SCALE
+          RES_VY(I) := RES_VY(I) + FM * DY / D * DT * FORCE_SCALE
+          RES_VZ(I) := RES_VZ(I) + FM * DZ / D * DT * FORCE_SCALE
+          RES_VX(J) := RES_VX(J) - FM * DX / D * DT * FORCE_SCALE
+          RES_VY(J) := RES_VY(J) - FM * DY / D * DT * FORCE_SCALE
+          RES_VZ(J) := RES_VZ(J) - FM * DZ / D * DT * FORCE_SCALE
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+
+
+  ! Inter-chain in-register Go contacts (adjacent chains, k <-> k)
+  DO M = 1, NCON
+    IA := IC_A(M)
+    IB := IC_B(M)
+    DX := RES_X(IA) - RES_X(IB)
+    DY := RES_Y(IA) - RES_Y(IB)
+    DZ := RES_Z(IA) - RES_Z(IB)
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    IF D > 0.0 THEN
+      FM := -2.0 * INTER_K * (D - IC_R0(M))
+      RES_VX(IA) := RES_VX(IA) + FM * DX / D * DT * FORCE_SCALE
+      RES_VY(IA) := RES_VY(IA) + FM * DY / D * DT * FORCE_SCALE
+      RES_VZ(IA) := RES_VZ(IA) + FM * DZ / D * DT * FORCE_SCALE
+      RES_VX(IB) := RES_VX(IB) - FM * DX / D * DT * FORCE_SCALE
+      RES_VY(IB) := RES_VY(IB) - FM * DY / D * DT * FORCE_SCALE
+      RES_VZ(IB) := RES_VZ(IB) - FM * DZ / D * DT * FORCE_SCALE
+    ENDIF
+  ENDDO
+
+  ! Amide ladder: type-filtered (N/Q), register-weighted Cbeta attraction
+  DO M = 1, NLAD
+    IA := LAD_A(M)
+    IB := LAD_B(M)
+    LA := MOD(IA - 1, NRES) + 1
+    LB := MOD(IB - 1, NRES) + 1
+    DX := (RES_X(IA) + CB_OFF_X(LA)) - (RES_X(IB) + CB_OFF_X(LB))
+    DY := (RES_Y(IA) + CB_OFF_Y(LA)) - (RES_Y(IB) + CB_OFF_Y(LB))
+    DZ := (RES_Z(IA) + CB_OFF_Z(LA)) - (RES_Z(IB) + CB_OFF_Z(LB))
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    IF D > 0.0 .AND. D < HYDRO_CUTOFF THEN
+      FM := -LADDER_K * LAD_W(M) * EXP(-LAD_ALPHA * (D - LAD_R0) ** 2)
+      RES_VX(IA) := RES_VX(IA) + FM * DX / D * DT * FORCE_SCALE
+      RES_VY(IA) := RES_VY(IA) + FM * DY / D * DT * FORCE_SCALE
+      RES_VZ(IA) := RES_VZ(IA) + FM * DZ / D * DT * FORCE_SCALE
+      RES_VX(IB) := RES_VX(IB) - FM * DX / D * DT * FORCE_SCALE
+      RES_VY(IB) := RES_VY(IB) - FM * DY / D * DT * FORCE_SCALE
+      RES_VZ(IB) := RES_VZ(IB) - FM * DZ / D * DT * FORCE_SCALE
+    ENDIF
+  ENDDO
+
+
+  ! Backbone + angles + torsions, per chain
+  DO C = 1, NC
+    ! Morse bonds
+    DO I = 1, NRES - 1
+      IA := (C - 1) * NRES + I
+      IB := (C - 1) * NRES + I + 1
+      DX := RES_X(IA) - RES_X(IB)
+      DY := RES_Y(IA) - RES_Y(IB)
+      DZ := RES_Z(IA) - RES_Z(IB)
+      D := SQRT(DX*DX + DY*DY + DZ*DZ)
+      IF D > 0.0 THEN
+        E := EXP(-MORSE_A * (D - BACKBONE_R0))
+        FM := -2.0 * BACKBONE_D * MORSE_A * (1.0 - E) * E * FORCE_SCALE
+        RES_VX(IA) := RES_VX(IA) + FM * DX / D * DT
+        RES_VY(IA) := RES_VY(IA) + FM * DY / D * DT
+        RES_VZ(IA) := RES_VZ(IA) + FM * DZ / D * DT
+        RES_VX(IB) := RES_VX(IB) - FM * DX / D * DT
+        RES_VY(IB) := RES_VY(IB) - FM * DY / D * DT
+        RES_VZ(IB) := RES_VZ(IB) - FM * DZ / D * DT
+      ENDIF
+    ENDDO
+
+    ! Angle bending (shared per-residue targets from real 1YJP chain A)
+    DO I = 2, NRES - 1
+      IA := (C - 1) * NRES + I
+      BX := RES_X(IA - 1) - RES_X(IA)
+      BY := RES_Y(IA - 1) - RES_Y(IA)
+      BZ := RES_Z(IA - 1) - RES_Z(IA)
+      CX := RES_X(IA + 1) - RES_X(IA)
+      CY := RES_Y(IA + 1) - RES_Y(IA)
+      CZ := RES_Z(IA + 1) - RES_Z(IA)
+      UN := SQRT(BX*BX + BY*BY + BZ*BZ)
+      VN := SQRT(CX*CX + CY*CY + CZ*CZ)
+      IF UN > 1.0E-12 .AND. VN > 1.0E-12 THEN
+        CS := MAX(-1.0, MIN(1.0, (BX*CX + BY*CY + BZ*CZ) / (UN * VN)))
+        E := 2.0 * RES_ANGK(I) * (CS - COS(RES_ANGT0(I)))
+        UX := (CX / (UN * VN) - CS * BX / UN / UN)
+        UY := (CY / (UN * VN) - CS * BY / UN / UN)
+        UZ := (CZ / (UN * VN) - CS * BZ / UN / UN)
+        WX := (BX / (UN * VN) - CS * CX / VN / VN)
+        WY := (BY / (UN * VN) - CS * CY / VN / VN)
+        WZ := (BZ / (UN * VN) - CS * CZ / VN / VN)
+        RES_VX(IA - 1) := RES_VX(IA - 1) - E * UX * DT * FORCE_SCALE
+        RES_VY(IA - 1) := RES_VY(IA - 1) - E * UY * DT * FORCE_SCALE
+        RES_VZ(IA - 1) := RES_VZ(IA - 1) - E * UZ * DT * FORCE_SCALE
+        RES_VX(IA + 1) := RES_VX(IA + 1) - E * WX * DT * FORCE_SCALE
+        RES_VY(IA + 1) := RES_VY(IA + 1) - E * WY * DT * FORCE_SCALE
+        RES_VZ(IA + 1) := RES_VZ(IA + 1) - E * WZ * DT * FORCE_SCALE
+        RES_VX(IA) := RES_VX(IA) + (E * UX + E * WX) * DT * FORCE_SCALE
+        RES_VY(IA) := RES_VY(IA) + (E * UY + E * WY) * DT * FORCE_SCALE
+        RES_VZ(IA) := RES_VZ(IA) + (E * UZ + E * WZ) * DT * FORCE_SCALE
+      ENDIF
+    ENDDO
+
+    ! Torsions (shared targets from real 1YJP chain A)
+    DO I = 2, NRES - 2
+      IA := (C - 1) * NRES + I
+      B1X := RES_X(IA) - RES_X(IA - 1)
+      B1Y := RES_Y(IA) - RES_Y(IA - 1)
+      B1Z := RES_Z(IA) - RES_Z(IA - 1)
+      B2X := RES_X(IA + 1) - RES_X(IA)
+      B2Y := RES_Y(IA + 1) - RES_Y(IA)
+      B2Z := RES_Z(IA + 1) - RES_Z(IA)
+      B3X := RES_X(IA + 2) - RES_X(IA + 1)
+      B3Y := RES_Y(IA + 2) - RES_Y(IA + 1)
+      B3Z := RES_Z(IA + 2) - RES_Z(IA + 1)
+      N1X := B1Y*B2Z - B1Z*B2Y
+      N1Y := B1Z*B2X - B1X*B2Z
+      N1Z := B1X*B2Y - B1Y*B2X
+      N2X := B2Y*B3Z - B2Z*B3Y
+      N2Y := B2Z*B3X - B2X*B3Z
+      N2Z := B2X*B3Y - B2Y*B3X
+      N1MAG2 := N1X*N1X + N1Y*N1Y + N1Z*N1Z
+      N2MAG2 := N2X*N2X + N2Y*N2Y + N2Z*N2Z
+      B2MAG := SQRT(B2X*B2X + B2Y*B2Y + B2Z*B2Z)
+      IF N1MAG2 > 1.0E-12 .AND. N2MAG2 > 1.0E-12 .AND. B2MAG > 1.0E-12 THEN
+        N1MAG := SQRT(N1MAG2)
+        N2MAG := SQRT(N2MAG2)
+        PHI := ATAN2(B2MAG*(B1X*N2X + B1Y*N2Y + B1Z*N2Z), N1X*N2X + N1Y*N2Y + N1Z*N2Z)
+        F := -2.0 * RES_TORSK(I) * SIN(PHI - RES_TORSP0(I))
+        DPHI_DR1X := -B2MAG / N1MAG2 * N1X
+        DPHI_DR1Y := -B2MAG / N1MAG2 * N1Y
+        DPHI_DR1Z := -B2MAG / N1MAG2 * N1Z
+        DPHI_DR4X := B2MAG / N2MAG2 * N2X
+        DPHI_DR4Y := B2MAG / N2MAG2 * N2Y
+        DPHI_DR4Z := B2MAG / N2MAG2 * N2Z
+        B1DOT := B1X*B2X + B1Y*B2Y + B1Z*B2Z
+        B3DOT := B3X*B2X + B3Y*B2Y + B3Z*B2Z
+        SCALE_B2 := 1.0 / (B2MAG * B2MAG)
+        SCALE_B1 := B1DOT * SCALE_B2
+        SCALE_B3 := B3DOT * SCALE_B2
+        DPHI_DR2X := -(1.0 + SCALE_B1) * DPHI_DR1X + SCALE_B3 * DPHI_DR4X
+        DPHI_DR2Y := -(1.0 + SCALE_B1) * DPHI_DR1Y + SCALE_B3 * DPHI_DR4Y
+        DPHI_DR2Z := -(1.0 + SCALE_B1) * DPHI_DR1Z + SCALE_B3 * DPHI_DR4Z
+        DPHI_DR3X := -(DPHI_DR1X + DPHI_DR2X + DPHI_DR4X)
+        DPHI_DR3Y := -(DPHI_DR1Y + DPHI_DR2Y + DPHI_DR4Y)
+        DPHI_DR3Z := -(DPHI_DR1Z + DPHI_DR2Z + DPHI_DR4Z)
+        RES_VX(IA - 1) := RES_VX(IA - 1) + F * DPHI_DR1X * DT * FORCE_SCALE
+        RES_VY(IA - 1) := RES_VY(IA - 1) + F * DPHI_DR1Y * DT * FORCE_SCALE
+        RES_VZ(IA - 1) := RES_VZ(IA - 1) + F * DPHI_DR1Z * DT * FORCE_SCALE
+        RES_VX(IA) := RES_VX(IA) + F * DPHI_DR2X * DT * FORCE_SCALE
+        RES_VY(IA) := RES_VY(IA) + F * DPHI_DR2Y * DT * FORCE_SCALE
+        RES_VZ(IA) := RES_VZ(IA) + F * DPHI_DR2Z * DT * FORCE_SCALE
+        RES_VX(IA + 1) := RES_VX(IA + 1) + F * DPHI_DR3X * DT * FORCE_SCALE
+        RES_VY(IA + 1) := RES_VY(IA + 1) + F * DPHI_DR3Y * DT * FORCE_SCALE
+        RES_VZ(IA + 1) := RES_VZ(IA + 1) + F * DPHI_DR3Z * DT * FORCE_SCALE
+        RES_VX(IA + 2) := RES_VX(IA + 2) + F * DPHI_DR4X * DT * FORCE_SCALE
+        RES_VY(IA + 2) := RES_VY(IA + 2) + F * DPHI_DR4Y * DT * FORCE_SCALE
+        RES_VZ(IA + 2) := RES_VZ(IA + 2) + F * DPHI_DR4Z * DT * FORCE_SCALE
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Velocity damping (per-chain VDAMP: template chains strongly damped)
+  DO I = 1, NTOT
+    C := INT(REAL(I - 1) / REAL(NRES)) + 1
+    RES_VX(I) := RES_VX(I) * VDAMP(C)
+    RES_VY(I) := RES_VY(I) * VDAMP(C)
+    RES_VZ(I) := RES_VZ(I) * VDAMP(C)
+  ENDDO
+
+  ! Position update
+  DO I = 1, NTOT
+    RES_X(I) := RES_X(I) + RES_VX(I) * DT
+    RES_Y(I) := RES_Y(I) + RES_VY(I) * DT
+    RES_Z(I) := RES_Z(I) + RES_VZ(I) * DT
+  ENDDO
+
+  ! Trace: mean in-register distance per adjacent chain pair
+  IF MOD(FRAME, 200) = 0 THEN
+    DO C = 1, NC - 1, 2
+      D := 0.0
+      DO K = 1, NRES
+        IA := (C - 1) * NRES + K
+        IB := C * NRES + K
+        D := D + SQRT((RES_X(IA) - RES_X(IB))**2 + (RES_Y(IA) - RES_Y(IB))**2 + (RES_Z(IA) - RES_Z(IB))**2)
+      ENDDO
+      WRITE(*, "TRACE %d %d %.4f") FRAME, C, D / REAL(NRES)
+    ENDDO
+  ENDIF
+
+ENDDO
+
+! Final geometry table
+DO C = 1, NC - 1, 2
+  DO K = 1, NRES
+    IA := (C - 1) * NRES + K
+    IB := C * NRES + K
+    D := SQRT((RES_X(IA) - RES_X(IB))**2 + (RES_Y(IA) - RES_Y(IB))**2 + (RES_Z(IA) - RES_Z(IB))**2)
+    E := 0.0
+    IF K < NRES THEN
+      E := SQRT((RES_X(IA) - RES_X(IB + 1))**2 + (RES_Y(IA) - RES_Y(IB + 1))**2 + (RES_Z(IA) - RES_Z(IB + 1))**2)
+    ENDIF
+    WRITE(*, "GEOM %d %d %.4f %.4f") C, K, D, E
+  ENDDO
+ENDDO
+! Zipper geometry: actual vs target per contact + closest approach
+DO M = 1, NZ
+  IA := ZA(M)
+  IB := ZB(M)
+  D := SQRT((RES_X(IA) - RES_X(IB))**2 + (RES_Y(IA) - RES_Y(IB))**2 + (RES_Z(IA) - RES_Z(IB))**2)
+  WRITE(*, "ZGEOM %d %d %d %.4f %.4f") M, IA, IB, D, ZR0(M)
+ENDDO
+DMIN := 1.0E9
+DO I = 1, 14
+  DO J = 15, 28
+    D := SQRT((RES_X(I) - RES_X(J))**2 + (RES_Y(I) - RES_Y(J))**2 + (RES_Z(I) - RES_Z(J))**2)
+    IF D < DMIN THEN
+      DMIN := D
+    ENDIF
+  ENDDO
+ENDDO
+WRITE(*, "ZMIN %.4f") DMIN
+
+DO C = 1, NC
+  CX := 0.0
+  CY := 0.0
+  CZ := 0.0
+  DO K = 1, NRES
+    CX := CX + RES_X((C - 1) * NRES + K)
+    CY := CY + RES_Y((C - 1) * NRES + K)
+    CZ := CZ + RES_Z((C - 1) * NRES + K)
+  ENDDO
+  WRITE(*, "COM %d %.4f %.4f %.4f") C, CX / REAL(NRES), CY / REAL(NRES), CZ / REAL(NRES)
+ENDDO
+WRITE(*, "# DONE")
+
+STOP
+
+SUBROUTINE UPDATE_THERMAL(FRAME)
+  INTEGER :: FRAME
+  REAL :: FRAC
+  THERMAL_CURRENT := HEAT_START
+  IF FRAME < 300 THEN
+    FRAC := REAL(FRAME) / 300.0
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * FRAC
+  ELSEIF FRAME < 600 THEN
+    FRAC := REAL(FRAME - 300) / 300.0
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * FRAC
+  ELSEIF FRAME < 900 THEN
+    FRAC := REAL(FRAME - 600) / 300.0
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * FRAC
+  ELSEIF FRAME < 1200 THEN
+    FRAC := REAL(FRAME - 900) / 300.0
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * FRAC
+  ELSE
+    THERMAL_CURRENT := HEAT_START
+  ENDIF
+  ! Quench tail: zero thermal noise after frame 9600
+  IF FRAME > 9600 THEN
+    THERMAL_CURRENT := 0.0
+  ENDIF
+  RETURN
+END

@@ -1,0 +1,12 @@
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 327680
+STATIC REAL :: A(N), B(N)
+INTEGER :: K
+DO K = 1, N
+  A(K) := 1.0
+  B(K) := 0.0
+ENDDO
+DO K = 2, N - 1
+  B(K) := A(K)
+ENDDO
+PRINT B(164000)

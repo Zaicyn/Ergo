@@ -1,0 +1,1095 @@
+! AMYLOID__TAG — GNNQQNY sequential assembly (oracle: 1YJP b-axis
+! in-register spacing 4.866 A = 1.9468 model units; screw-mate sheet
+! zipper closest Cα-Cα 6.888 A = 2.756 units). NC=4 chains x 7 res.
+! Guided: inter-chain in-register Go contacts (INTER_K, INTER_R0).
+! Unguided variant: contacts compiled out (hydrophobic only).
+IMPLICIT NONE
+
+PARAMETER INTEGER :: NRES = 7
+PARAMETER INTEGER :: NC = 4
+PARAMETER INTEGER :: NTOT = 28
+PARAMETER INTEGER :: MAXFRAME = 12000
+PARAMETER REAL :: DT = 0.01
+PARAMETER REAL :: FORCE_SCALE = 6.0
+PARAMETER REAL :: BASE_DAMP = 0.9
+PARAMETER REAL :: HEAT_START = 0.001
+PARAMETER REAL :: HEAT_PEAK = 1.0
+PARAMETER REAL :: BACKBONE_R0 = 1.52
+PARAMETER REAL :: BACKBONE_D = 1.4
+PARAMETER REAL :: MORSE_A = 1.0
+PARAMETER REAL :: STERIC_SIG = 1.60
+PARAMETER REAL :: STERIC_EPS = 0.1
+PARAMETER REAL :: STERIC_CUT = 2.5
+PARAMETER REAL :: HYDRO_STRENGTH = 0.0020
+PARAMETER REAL :: HYDRO_R0 = 4.0
+PARAMETER REAL :: HYDRO_CUTOFF = 8.0
+PARAMETER REAL :: HYDRO_ALPHA = 1.0
+PARAMETER REAL :: NATIVE_K = 1.00
+PARAMETER REAL :: INTER_K = 1.00
+PARAMETER REAL :: INTER_R0 = 1.9468
+PARAMETER INTEGER :: NCON = 14
+
+STATIC REAL :: RES_X(28), RES_Y(28), RES_Z(28)
+STATIC REAL :: RES_VX(28), RES_VY(28), RES_VZ(28)
+STATIC REAL :: RES_ANGK(7), RES_ANGT0(7), RES_TORSK(7), RES_TORSP0(7)
+STATIC REAL :: RES_HYDRO(7), VDAMP(NC)
+STATIC INTEGER :: IC_A(NCON), IC_B(NCON)
+STATIC REAL :: IC_R0(NCON)
+! ── Amide beads (hybrid layer) ──────────────────────────────────
+PARAMETER INTEGER :: NB = 40
+PARAMETER INTEGER :: NTETH = 60
+PARAMETER REAL :: HB_D = 0.2
+PARAMETER REAL :: HB_R0 = 1.3410
+PARAMETER REAL :: HB_A = 3.0
+PARAMETER REAL :: HB_RANGE = 1.8
+PARAMETER REAL :: HB_ANGK = 0.3
+STATIC REAL :: BEAD_X(NB), BEAD_Y(NB), BEAD_Z(NB)
+STATIC REAL :: BEAD_VX(NB), BEAD_VY(NB), BEAD_VZ(NB)
+STATIC INTEGER :: BEAD_PARENT(NB)
+STATIC INTEGER :: TETH_A(NTETH), TETH_B(NTETH)
+STATIC REAL :: TETH_R0(NTETH)
+STATIC INTEGER :: HB_PART(20), HB_NUSED(20)
+STATIC INTEGER :: NHB, BEST
+STATIC REAL :: DMIN2
+
+STATIC REAL :: THERMAL_CURRENT
+
+STATIC INTEGER :: I, J, K, C, FRAME, M, IA, IB, L, SAME
+STATIC REAL :: DX, DY, DZ, D, E, F, FM, CX, CY, CZ, BX, BY, BZ
+STATIC REAL :: UN, VN, CS, UX, UY, UZ, WX, WY, WZ
+STATIC REAL :: B1X, B1Y, B1Z, B2X, B2Y, B2Z, B3X, B3Y, B3Z
+STATIC REAL :: N1X, N1Y, N1Z, N2X, N2Y, N2Z, N1MAG2, N2MAG2, B2MAG, N1MAG, N2MAG, PHI
+STATIC REAL :: DPHI_DR1X, DPHI_DR1Y, DPHI_DR1Z, DPHI_DR4X, DPHI_DR4Y, DPHI_DR4Z
+STATIC REAL :: DPHI_DR2X, DPHI_DR2Y, DPHI_DR2Z, DPHI_DR3X, DPHI_DR3Y, DPHI_DR3Z
+STATIC REAL :: B1DOT, B3DOT, SCALE_B2, SCALE_B1, SCALE_B3
+STATIC REAL :: U1, U2, COSTH, SINTH, PHI2, CANDX, CANDY, CANDZ, DD
+STATIC INTEGER :: IA2, IB2
+STATIC REAL :: FX, FY, FZ
+STATIC INTEGER :: ATT, J2, OK
+
+  RES_ANGK(1) := 0.3000
+  RES_ANGK(2) := 0.3000
+  RES_ANGK(3) := 0.3000
+  RES_ANGK(4) := 0.3000
+  RES_ANGK(5) := 0.3000
+  RES_ANGK(6) := 0.3000
+  RES_ANGK(7) := 0.3000
+  RES_ANGT0(1) := 0.000000
+  RES_ANGT0(2) := 1.966495
+  RES_ANGT0(3) := 2.284735
+  RES_ANGT0(4) := 2.064107
+  RES_ANGT0(5) := 2.077749
+  RES_ANGT0(6) := 1.878620
+  RES_ANGT0(7) := 0.000000
+  RES_TORSK(1) := 0.2000
+  RES_TORSK(2) := 0.2000
+  RES_TORSK(3) := 0.2000
+  RES_TORSK(4) := 0.2000
+  RES_TORSK(5) := 0.2000
+  RES_TORSK(6) := 0.2000
+  RES_TORSK(7) := 0.2000
+  RES_TORSP0(1) := 0.000000
+  RES_TORSP0(2) := -2.467023
+  RES_TORSP0(3) := 2.954412
+  RES_TORSP0(4) := 3.128629
+  RES_TORSP0(5) := -2.949773
+  RES_TORSP0(6) := 0.000000
+  RES_TORSP0(7) := 0.000000
+  RES_HYDRO(1) := 0.0
+  RES_HYDRO(2) := 0.0
+  RES_HYDRO(3) := 0.0
+  RES_HYDRO(4) := 0.0
+  RES_HYDRO(5) := 0.0
+  RES_HYDRO(6) := 0.0
+  RES_HYDRO(7) := 1.0
+  VDAMP(1) := 0.9
+  VDAMP(2) := 0.9
+  VDAMP(3) := 0.9
+  VDAMP(4) := 0.9
+
+  IC_A(1) := 1
+  IC_B(1) := 8
+  IC_R0(1) := 1.9468
+  IC_A(2) := 2
+  IC_B(2) := 9
+  IC_R0(2) := 1.9468
+  IC_A(3) := 3
+  IC_B(3) := 10
+  IC_R0(3) := 1.9468
+  IC_A(4) := 4
+  IC_B(4) := 11
+  IC_R0(4) := 1.9468
+  IC_A(5) := 5
+  IC_B(5) := 12
+  IC_R0(5) := 1.9468
+  IC_A(6) := 6
+  IC_B(6) := 13
+  IC_R0(6) := 1.9468
+  IC_A(7) := 7
+  IC_B(7) := 14
+  IC_R0(7) := 1.9468
+  IC_A(8) := 15
+  IC_B(8) := 22
+  IC_R0(8) := 1.9468
+  IC_A(9) := 16
+  IC_B(9) := 23
+  IC_R0(9) := 1.9468
+  IC_A(10) := 17
+  IC_B(10) := 24
+  IC_R0(10) := 1.9468
+  IC_A(11) := 18
+  IC_B(11) := 25
+  IC_R0(11) := 1.9468
+  IC_A(12) := 19
+  IC_B(12) := 26
+  IC_R0(12) := 1.9468
+  IC_A(13) := 20
+  IC_B(13) := 27
+  IC_R0(13) := 1.9468
+  IC_A(14) := 21
+  IC_B(14) := 28
+  IC_R0(14) := 1.9468
+  TETH_A(1) := -2
+  TETH_B(1) := 1
+  TETH_R0(1) := 1.3770
+  TETH_A(2) := -2
+  TETH_B(2) := 2
+  TETH_R0(2) := 1.1890
+  TETH_A(3) := 1
+  TETH_B(3) := 2
+  TETH_R0(3) := 0.9080
+  TETH_A(4) := -3
+  TETH_B(4) := 3
+  TETH_R0(4) := 1.4140
+  TETH_A(5) := -3
+  TETH_B(5) := 4
+  TETH_R0(5) := 1.2290
+  TETH_A(6) := 3
+  TETH_B(6) := 4
+  TETH_R0(6) := 0.9060
+  TETH_A(7) := -4
+  TETH_B(7) := 5
+  TETH_R0(7) := 1.9810
+  TETH_A(8) := -4
+  TETH_B(8) := 6
+  TETH_R0(8) := 1.7420
+  TETH_A(9) := 5
+  TETH_B(9) := 6
+  TETH_R0(9) := 0.9170
+  TETH_A(10) := -5
+  TETH_B(10) := 7
+  TETH_R0(10) := 1.9180
+  TETH_A(11) := -5
+  TETH_B(11) := 8
+  TETH_R0(11) := 1.7260
+  TETH_A(12) := 7
+  TETH_B(12) := 8
+  TETH_R0(12) := 0.9070
+  TETH_A(13) := -6
+  TETH_B(13) := 9
+  TETH_R0(13) := 1.3690
+  TETH_A(14) := -6
+  TETH_B(14) := 10
+  TETH_R0(14) := 1.2150
+  TETH_A(15) := 9
+  TETH_B(15) := 10
+  TETH_R0(15) := 0.8920
+  TETH_A(16) := -9
+  TETH_B(16) := 11
+  TETH_R0(16) := 1.3770
+  TETH_A(17) := -9
+  TETH_B(17) := 12
+  TETH_R0(17) := 1.1890
+  TETH_A(18) := 11
+  TETH_B(18) := 12
+  TETH_R0(18) := 0.9080
+  TETH_A(19) := -10
+  TETH_B(19) := 13
+  TETH_R0(19) := 1.4140
+  TETH_A(20) := -10
+  TETH_B(20) := 14
+  TETH_R0(20) := 1.2290
+  TETH_A(21) := 13
+  TETH_B(21) := 14
+  TETH_R0(21) := 0.9060
+  TETH_A(22) := -11
+  TETH_B(22) := 15
+  TETH_R0(22) := 1.9810
+  TETH_A(23) := -11
+  TETH_B(23) := 16
+  TETH_R0(23) := 1.7420
+  TETH_A(24) := 15
+  TETH_B(24) := 16
+  TETH_R0(24) := 0.9170
+  TETH_A(25) := -12
+  TETH_B(25) := 17
+  TETH_R0(25) := 1.9180
+  TETH_A(26) := -12
+  TETH_B(26) := 18
+  TETH_R0(26) := 1.7260
+  TETH_A(27) := 17
+  TETH_B(27) := 18
+  TETH_R0(27) := 0.9070
+  TETH_A(28) := -13
+  TETH_B(28) := 19
+  TETH_R0(28) := 1.3690
+  TETH_A(29) := -13
+  TETH_B(29) := 20
+  TETH_R0(29) := 1.2150
+  TETH_A(30) := 19
+  TETH_B(30) := 20
+  TETH_R0(30) := 0.8920
+  TETH_A(31) := -16
+  TETH_B(31) := 21
+  TETH_R0(31) := 1.3770
+  TETH_A(32) := -16
+  TETH_B(32) := 22
+  TETH_R0(32) := 1.1890
+  TETH_A(33) := 21
+  TETH_B(33) := 22
+  TETH_R0(33) := 0.9080
+  TETH_A(34) := -17
+  TETH_B(34) := 23
+  TETH_R0(34) := 1.4140
+  TETH_A(35) := -17
+  TETH_B(35) := 24
+  TETH_R0(35) := 1.2290
+  TETH_A(36) := 23
+  TETH_B(36) := 24
+  TETH_R0(36) := 0.9060
+  TETH_A(37) := -18
+  TETH_B(37) := 25
+  TETH_R0(37) := 1.9810
+  TETH_A(38) := -18
+  TETH_B(38) := 26
+  TETH_R0(38) := 1.7420
+  TETH_A(39) := 25
+  TETH_B(39) := 26
+  TETH_R0(39) := 0.9170
+  TETH_A(40) := -19
+  TETH_B(40) := 27
+  TETH_R0(40) := 1.9180
+  TETH_A(41) := -19
+  TETH_B(41) := 28
+  TETH_R0(41) := 1.7260
+  TETH_A(42) := 27
+  TETH_B(42) := 28
+  TETH_R0(42) := 0.9070
+  TETH_A(43) := -20
+  TETH_B(43) := 29
+  TETH_R0(43) := 1.3690
+  TETH_A(44) := -20
+  TETH_B(44) := 30
+  TETH_R0(44) := 1.2150
+  TETH_A(45) := 29
+  TETH_B(45) := 30
+  TETH_R0(45) := 0.8920
+  TETH_A(46) := -23
+  TETH_B(46) := 31
+  TETH_R0(46) := 1.3770
+  TETH_A(47) := -23
+  TETH_B(47) := 32
+  TETH_R0(47) := 1.1890
+  TETH_A(48) := 31
+  TETH_B(48) := 32
+  TETH_R0(48) := 0.9080
+  TETH_A(49) := -24
+  TETH_B(49) := 33
+  TETH_R0(49) := 1.4140
+  TETH_A(50) := -24
+  TETH_B(50) := 34
+  TETH_R0(50) := 1.2290
+  TETH_A(51) := 33
+  TETH_B(51) := 34
+  TETH_R0(51) := 0.9060
+  TETH_A(52) := -25
+  TETH_B(52) := 35
+  TETH_R0(52) := 1.9810
+  TETH_A(53) := -25
+  TETH_B(53) := 36
+  TETH_R0(53) := 1.7420
+  TETH_A(54) := 35
+  TETH_B(54) := 36
+  TETH_R0(54) := 0.9170
+  TETH_A(55) := -26
+  TETH_B(55) := 37
+  TETH_R0(55) := 1.9180
+  TETH_A(56) := -26
+  TETH_B(56) := 38
+  TETH_R0(56) := 1.7260
+  TETH_A(57) := 37
+  TETH_B(57) := 38
+  TETH_R0(57) := 0.9070
+  TETH_A(58) := -27
+  TETH_B(58) := 39
+  TETH_R0(58) := 1.3690
+  TETH_A(59) := -27
+  TETH_B(59) := 40
+  TETH_R0(59) := 1.2150
+  TETH_A(60) := 39
+  TETH_B(60) := 40
+  TETH_R0(60) := 0.8920
+  BEAD_PARENT(1) := 2
+  BEAD_PARENT(2) := 2
+  BEAD_PARENT(3) := 3
+  BEAD_PARENT(4) := 3
+  BEAD_PARENT(5) := 4
+  BEAD_PARENT(6) := 4
+  BEAD_PARENT(7) := 5
+  BEAD_PARENT(8) := 5
+  BEAD_PARENT(9) := 6
+  BEAD_PARENT(10) := 6
+  BEAD_PARENT(11) := 9
+  BEAD_PARENT(12) := 9
+  BEAD_PARENT(13) := 10
+  BEAD_PARENT(14) := 10
+  BEAD_PARENT(15) := 11
+  BEAD_PARENT(16) := 11
+  BEAD_PARENT(17) := 12
+  BEAD_PARENT(18) := 12
+  BEAD_PARENT(19) := 13
+  BEAD_PARENT(20) := 13
+  BEAD_PARENT(21) := 16
+  BEAD_PARENT(22) := 16
+  BEAD_PARENT(23) := 17
+  BEAD_PARENT(24) := 17
+  BEAD_PARENT(25) := 18
+  BEAD_PARENT(26) := 18
+  BEAD_PARENT(27) := 19
+  BEAD_PARENT(28) := 19
+  BEAD_PARENT(29) := 20
+  BEAD_PARENT(30) := 20
+  BEAD_PARENT(31) := 23
+  BEAD_PARENT(32) := 23
+  BEAD_PARENT(33) := 24
+  BEAD_PARENT(34) := 24
+  BEAD_PARENT(35) := 25
+  BEAD_PARENT(36) := 25
+  BEAD_PARENT(37) := 26
+  BEAD_PARENT(38) := 26
+  BEAD_PARENT(39) := 27
+  BEAD_PARENT(40) := 27
+
+  ! Chain 1: hash-walk coil (seed offset 0.0)
+  RES_X(1) := 10.0
+  RES_Y(1) := 10.0
+  RES_Z(1) := 10.0
+  DO I = 2, NRES
+    OK := 0
+    ATT := 0
+    DO WHILE ATT < 20
+      ATT := ATT + 1
+      U1 := MOD(ABS(SIN(REAL(I) * 12.9898 + REAL(ATT) * 3.7 + 0.0) * 43758.5453), 1.0)
+      U2 := MOD(ABS(SIN(REAL(I) * 78.2330 + REAL(ATT) * 1.3 + 0.0) * 12543.1230), 1.0)
+      COSTH := 2.0 * U1 - 1.0
+      SINTH := SQRT(1.0 - COSTH * COSTH)
+      PHI2 := 2.0 * 3.14159265 * U2
+      CANDX := RES_X(0 + I - 1) + SINTH * COS(PHI2) * BACKBONE_R0
+      CANDY := RES_Y(0 + I - 1) + SINTH * SIN(PHI2) * BACKBONE_R0
+      CANDZ := RES_Z(0 + I - 1) + COSTH * BACKBONE_R0
+      OK := 1
+      IF I ≥ 5 THEN
+        DO J2 = 1, I - 4
+          DD := SQRT((CANDX - RES_X(0 + J2))**2 + (CANDY - RES_Y(0 + J2))**2 + (CANDZ - RES_Z(0 + J2))**2)
+          IF DD < 1.55 THEN
+            OK := 0
+          ENDIF
+        ENDDO
+      ENDIF
+      IF OK = 1 THEN
+        ATT := 20
+      ENDIF
+    ENDDO
+    RES_X(0 + I) := CANDX
+    RES_Y(0 + I) := CANDY
+    RES_Z(0 + I) := CANDZ
+  ENDDO
+  DO I = 1, NRES
+    RES_VX(0 + I) := 0.0
+    RES_VY(0 + I) := 0.0
+    RES_VZ(0 + I) := 0.0
+  ENDDO
+
+  ! Chain 2: hash-walk coil (seed offset 1.0)
+  RES_X(8) := 20.0
+  RES_Y(8) := 10.0
+  RES_Z(8) := 10.0
+  DO I = 2, NRES
+    OK := 0
+    ATT := 0
+    DO WHILE ATT < 20
+      ATT := ATT + 1
+      U1 := MOD(ABS(SIN(REAL(I) * 12.9898 + REAL(ATT) * 3.7 + 1.0) * 43758.5453), 1.0)
+      U2 := MOD(ABS(SIN(REAL(I) * 78.2330 + REAL(ATT) * 1.3 + 1.0) * 12543.1230), 1.0)
+      COSTH := 2.0 * U1 - 1.0
+      SINTH := SQRT(1.0 - COSTH * COSTH)
+      PHI2 := 2.0 * 3.14159265 * U2
+      CANDX := RES_X(7 + I - 1) + SINTH * COS(PHI2) * BACKBONE_R0
+      CANDY := RES_Y(7 + I - 1) + SINTH * SIN(PHI2) * BACKBONE_R0
+      CANDZ := RES_Z(7 + I - 1) + COSTH * BACKBONE_R0
+      OK := 1
+      IF I ≥ 5 THEN
+        DO J2 = 1, I - 4
+          DD := SQRT((CANDX - RES_X(7 + J2))**2 + (CANDY - RES_Y(7 + J2))**2 + (CANDZ - RES_Z(7 + J2))**2)
+          IF DD < 1.55 THEN
+            OK := 0
+          ENDIF
+        ENDDO
+      ENDIF
+      IF OK = 1 THEN
+        ATT := 20
+      ENDIF
+    ENDDO
+    RES_X(7 + I) := CANDX
+    RES_Y(7 + I) := CANDY
+    RES_Z(7 + I) := CANDZ
+  ENDDO
+  DO I = 1, NRES
+    RES_VX(7 + I) := 0.0
+    RES_VY(7 + I) := 0.0
+    RES_VZ(7 + I) := 0.0
+  ENDDO
+
+  ! Chain 3: hash-walk coil (seed offset 2.0)
+  RES_X(15) := 30.0
+  RES_Y(15) := 10.0
+  RES_Z(15) := 10.0
+  DO I = 2, NRES
+    OK := 0
+    ATT := 0
+    DO WHILE ATT < 20
+      ATT := ATT + 1
+      U1 := MOD(ABS(SIN(REAL(I) * 12.9898 + REAL(ATT) * 3.7 + 2.0) * 43758.5453), 1.0)
+      U2 := MOD(ABS(SIN(REAL(I) * 78.2330 + REAL(ATT) * 1.3 + 2.0) * 12543.1230), 1.0)
+      COSTH := 2.0 * U1 - 1.0
+      SINTH := SQRT(1.0 - COSTH * COSTH)
+      PHI2 := 2.0 * 3.14159265 * U2
+      CANDX := RES_X(14 + I - 1) + SINTH * COS(PHI2) * BACKBONE_R0
+      CANDY := RES_Y(14 + I - 1) + SINTH * SIN(PHI2) * BACKBONE_R0
+      CANDZ := RES_Z(14 + I - 1) + COSTH * BACKBONE_R0
+      OK := 1
+      IF I ≥ 5 THEN
+        DO J2 = 1, I - 4
+          DD := SQRT((CANDX - RES_X(14 + J2))**2 + (CANDY - RES_Y(14 + J2))**2 + (CANDZ - RES_Z(14 + J2))**2)
+          IF DD < 1.55 THEN
+            OK := 0
+          ENDIF
+        ENDDO
+      ENDIF
+      IF OK = 1 THEN
+        ATT := 20
+      ENDIF
+    ENDDO
+    RES_X(14 + I) := CANDX
+    RES_Y(14 + I) := CANDY
+    RES_Z(14 + I) := CANDZ
+  ENDDO
+  DO I = 1, NRES
+    RES_VX(14 + I) := 0.0
+    RES_VY(14 + I) := 0.0
+    RES_VZ(14 + I) := 0.0
+  ENDDO
+
+  ! Chain 4: hash-walk coil (seed offset 3.0)
+  RES_X(22) := 40.0
+  RES_Y(22) := 10.0
+  RES_Z(22) := 10.0
+  DO I = 2, NRES
+    OK := 0
+    ATT := 0
+    DO WHILE ATT < 20
+      ATT := ATT + 1
+      U1 := MOD(ABS(SIN(REAL(I) * 12.9898 + REAL(ATT) * 3.7 + 3.0) * 43758.5453), 1.0)
+      U2 := MOD(ABS(SIN(REAL(I) * 78.2330 + REAL(ATT) * 1.3 + 3.0) * 12543.1230), 1.0)
+      COSTH := 2.0 * U1 - 1.0
+      SINTH := SQRT(1.0 - COSTH * COSTH)
+      PHI2 := 2.0 * 3.14159265 * U2
+      CANDX := RES_X(21 + I - 1) + SINTH * COS(PHI2) * BACKBONE_R0
+      CANDY := RES_Y(21 + I - 1) + SINTH * SIN(PHI2) * BACKBONE_R0
+      CANDZ := RES_Z(21 + I - 1) + COSTH * BACKBONE_R0
+      OK := 1
+      IF I ≥ 5 THEN
+        DO J2 = 1, I - 4
+          DD := SQRT((CANDX - RES_X(21 + J2))**2 + (CANDY - RES_Y(21 + J2))**2 + (CANDZ - RES_Z(21 + J2))**2)
+          IF DD < 1.55 THEN
+            OK := 0
+          ENDIF
+        ENDDO
+      ENDIF
+      IF OK = 1 THEN
+        ATT := 20
+      ENDIF
+    ENDDO
+    RES_X(21 + I) := CANDX
+    RES_Y(21 + I) := CANDY
+    RES_Z(21 + I) := CANDZ
+  ENDDO
+  DO I = 1, NRES
+    RES_VX(21 + I) := 0.0
+    RES_VY(21 + I) := 0.0
+    RES_VZ(21 + I) := 0.0
+  ENDDO
+  DO I = 1, NB
+    BEAD_VX(I) := 0.0
+    BEAD_VY(I) := 0.0
+    BEAD_VZ(I) := 0.0
+  ENDDO
+  BEAD_X(1) := RES_X(2) + -0.601300
+  BEAD_Y(1) := RES_Y(2) + -0.724500
+  BEAD_Z(1) := RES_Z(2) + -0.726100
+  BEAD_X(2) := RES_X(2) + -0.672900
+  BEAD_Y(2) := RES_Y(2) + 0.046800
+  BEAD_Z(2) := RES_Z(2) + -1.200200
+  BEAD_X(3) := RES_X(3) + 0.596500
+  BEAD_Y(3) := RES_Y(3) + 0.408500
+  BEAD_Z(3) := RES_Z(3) + 0.993400
+  BEAD_X(4) := RES_X(3) + 0.768900
+  BEAD_Y(4) := RES_Y(3) + -0.475700
+  BEAD_Z(4) := RES_Z(3) + 1.087000
+  BEAD_X(5) := RES_X(4) + 0.944200
+  BEAD_Y(5) := RES_Y(4) + 0.552100
+  BEAD_Z(5) := RES_Z(4) + -1.355800
+  BEAD_X(6) := RES_X(4) + 0.946600
+  BEAD_Y(6) := RES_Y(4) + -0.290900
+  BEAD_Z(6) := RES_Z(4) + -1.716300
+  BEAD_X(7) := RES_X(5) + -0.998600
+  BEAD_Y(7) := RES_Y(5) + -0.414500
+  BEAD_Z(7) := RES_Z(5) + 1.345000
+  BEAD_X(8) := RES_X(5) + -0.688500
+  BEAD_Y(8) := RES_Y(5) + 0.330500
+  BEAD_Z(8) := RES_Z(5) + 1.759900
+  BEAD_X(9) := RES_X(6) + -0.413300
+  BEAD_Y(9) := RES_Y(6) + -0.282500
+  BEAD_Z(9) := RES_Z(6) + -1.107000
+  BEAD_X(10) := RES_X(6) + -0.654500
+  BEAD_Y(10) := RES_Y(6) + 0.574900
+  BEAD_Z(10) := RES_Z(6) + -1.055800
+  BEAD_X(11) := RES_X(9) + -0.601300
+  BEAD_Y(11) := RES_Y(9) + -0.724500
+  BEAD_Z(11) := RES_Z(9) + -0.726100
+  BEAD_X(12) := RES_X(9) + -0.672900
+  BEAD_Y(12) := RES_Y(9) + 0.046800
+  BEAD_Z(12) := RES_Z(9) + -1.200200
+  BEAD_X(13) := RES_X(10) + 0.596500
+  BEAD_Y(13) := RES_Y(10) + 0.408500
+  BEAD_Z(13) := RES_Z(10) + 0.993400
+  BEAD_X(14) := RES_X(10) + 0.768900
+  BEAD_Y(14) := RES_Y(10) + -0.475700
+  BEAD_Z(14) := RES_Z(10) + 1.087000
+  BEAD_X(15) := RES_X(11) + 0.944200
+  BEAD_Y(15) := RES_Y(11) + 0.552100
+  BEAD_Z(15) := RES_Z(11) + -1.355800
+  BEAD_X(16) := RES_X(11) + 0.946600
+  BEAD_Y(16) := RES_Y(11) + -0.290900
+  BEAD_Z(16) := RES_Z(11) + -1.716300
+  BEAD_X(17) := RES_X(12) + -0.998600
+  BEAD_Y(17) := RES_Y(12) + -0.414500
+  BEAD_Z(17) := RES_Z(12) + 1.345000
+  BEAD_X(18) := RES_X(12) + -0.688500
+  BEAD_Y(18) := RES_Y(12) + 0.330500
+  BEAD_Z(18) := RES_Z(12) + 1.759900
+  BEAD_X(19) := RES_X(13) + -0.413300
+  BEAD_Y(19) := RES_Y(13) + -0.282500
+  BEAD_Z(19) := RES_Z(13) + -1.107000
+  BEAD_X(20) := RES_X(13) + -0.654500
+  BEAD_Y(20) := RES_Y(13) + 0.574900
+  BEAD_Z(20) := RES_Z(13) + -1.055800
+  BEAD_X(21) := RES_X(16) + -0.601300
+  BEAD_Y(21) := RES_Y(16) + -0.724500
+  BEAD_Z(21) := RES_Z(16) + -0.726100
+  BEAD_X(22) := RES_X(16) + -0.672900
+  BEAD_Y(22) := RES_Y(16) + 0.046800
+  BEAD_Z(22) := RES_Z(16) + -1.200200
+  BEAD_X(23) := RES_X(17) + 0.596500
+  BEAD_Y(23) := RES_Y(17) + 0.408500
+  BEAD_Z(23) := RES_Z(17) + 0.993400
+  BEAD_X(24) := RES_X(17) + 0.768900
+  BEAD_Y(24) := RES_Y(17) + -0.475700
+  BEAD_Z(24) := RES_Z(17) + 1.087000
+  BEAD_X(25) := RES_X(18) + 0.944200
+  BEAD_Y(25) := RES_Y(18) + 0.552100
+  BEAD_Z(25) := RES_Z(18) + -1.355800
+  BEAD_X(26) := RES_X(18) + 0.946600
+  BEAD_Y(26) := RES_Y(18) + -0.290900
+  BEAD_Z(26) := RES_Z(18) + -1.716300
+  BEAD_X(27) := RES_X(19) + -0.998600
+  BEAD_Y(27) := RES_Y(19) + -0.414500
+  BEAD_Z(27) := RES_Z(19) + 1.345000
+  BEAD_X(28) := RES_X(19) + -0.688500
+  BEAD_Y(28) := RES_Y(19) + 0.330500
+  BEAD_Z(28) := RES_Z(19) + 1.759900
+  BEAD_X(29) := RES_X(20) + -0.413300
+  BEAD_Y(29) := RES_Y(20) + -0.282500
+  BEAD_Z(29) := RES_Z(20) + -1.107000
+  BEAD_X(30) := RES_X(20) + -0.654500
+  BEAD_Y(30) := RES_Y(20) + 0.574900
+  BEAD_Z(30) := RES_Z(20) + -1.055800
+  BEAD_X(31) := RES_X(23) + -0.601300
+  BEAD_Y(31) := RES_Y(23) + -0.724500
+  BEAD_Z(31) := RES_Z(23) + -0.726100
+  BEAD_X(32) := RES_X(23) + -0.672900
+  BEAD_Y(32) := RES_Y(23) + 0.046800
+  BEAD_Z(32) := RES_Z(23) + -1.200200
+  BEAD_X(33) := RES_X(24) + 0.596500
+  BEAD_Y(33) := RES_Y(24) + 0.408500
+  BEAD_Z(33) := RES_Z(24) + 0.993400
+  BEAD_X(34) := RES_X(24) + 0.768900
+  BEAD_Y(34) := RES_Y(24) + -0.475700
+  BEAD_Z(34) := RES_Z(24) + 1.087000
+  BEAD_X(35) := RES_X(25) + 0.944200
+  BEAD_Y(35) := RES_Y(25) + 0.552100
+  BEAD_Z(35) := RES_Z(25) + -1.355800
+  BEAD_X(36) := RES_X(25) + 0.946600
+  BEAD_Y(36) := RES_Y(25) + -0.290900
+  BEAD_Z(36) := RES_Z(25) + -1.716300
+  BEAD_X(37) := RES_X(26) + -0.998600
+  BEAD_Y(37) := RES_Y(26) + -0.414500
+  BEAD_Z(37) := RES_Z(26) + 1.345000
+  BEAD_X(38) := RES_X(26) + -0.688500
+  BEAD_Y(38) := RES_Y(26) + 0.330500
+  BEAD_Z(38) := RES_Z(26) + 1.759900
+  BEAD_X(39) := RES_X(27) + -0.413300
+  BEAD_Y(39) := RES_Y(27) + -0.282500
+  BEAD_Z(39) := RES_Z(27) + -1.107000
+  BEAD_X(40) := RES_X(27) + -0.654500
+  BEAD_Y(40) := RES_Y(27) + 0.574900
+  BEAD_Z(40) := RES_Z(27) + -1.055800
+
+WRITE(*, "# AMYLOID__TAG NC=4 NCON=14 MAXFRAME=12000")
+WRITE(*, "# TRACE frame pair mean_kk_dist (every 200)")
+WRITE(*, "# GEOM pair k dist_kk dist_kk1 (final)")
+WRITE(*, "# COM chain x y z (final)")
+
+DO FRAME = 1, MAXFRAME
+
+  CALL UPDATE_THERMAL(FRAME)
+
+  ! Thermal impulses (velocity kicks)
+  DO I = 1, NTOT
+    RES_VX(I) := RES_VX(I) + THERMAL_CURRENT * SIN((I+1)*7.3 + REAL(FRAME)*0.17)
+    RES_VY(I) := RES_VY(I) + THERMAL_CURRENT * COS((I+1)*5.7 + REAL(FRAME)*0.31)
+    RES_VZ(I) := RES_VZ(I) + THERMAL_CURRENT * SIN((I+1)*3.1 + REAL(FRAME)*0.09)
+  ENDDO
+
+  ! Steric repulsion (same-chain |i-j| >= 4 or any inter-chain pair)
+  DO I = 1, NTOT - 1
+    DO J = I + 1, NTOT
+      SAME := 0
+      IF INT(REAL(I - 1) / REAL(NRES)) = INT(REAL(J - 1) / REAL(NRES)) THEN
+        IF J - I < 4 THEN
+          SAME := 1
+        ENDIF
+      ENDIF
+      IF SAME = 0 THEN
+        DX := RES_X(I) - RES_X(J)
+        DY := RES_Y(I) - RES_Y(J)
+        DZ := RES_Z(I) - RES_Z(J)
+        D := SQRT(DX*DX + DY*DY + DZ*DZ)
+        IF D > 0.0 .AND. D < STERIC_CUT THEN
+          FM := STERIC_EPS * (STERIC_SIG / D) ** 6
+          RES_VX(I) := RES_VX(I) + FM * DX / D * DT * FORCE_SCALE
+          RES_VY(I) := RES_VY(I) + FM * DY / D * DT * FORCE_SCALE
+          RES_VZ(I) := RES_VZ(I) + FM * DZ / D * DT * FORCE_SCALE
+          RES_VX(J) := RES_VX(J) - FM * DX / D * DT * FORCE_SCALE
+          RES_VY(J) := RES_VY(J) - FM * DY / D * DT * FORCE_SCALE
+          RES_VZ(J) := RES_VZ(J) - FM * DZ / D * DT * FORCE_SCALE
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Hydrophobic attraction (GNNQQNY is polar: only Tyr7 has weight)
+  DO I = 1, NTOT - 1
+    DO J = I + 1, NTOT
+      SAME := 0
+      IF INT(REAL(I - 1) / REAL(NRES)) = INT(REAL(J - 1) / REAL(NRES)) THEN
+        IF J - I < 4 THEN
+          SAME := 1
+        ENDIF
+      ENDIF
+      L := MOD(J - 1, NRES) + 1
+      IF SAME = 0 .AND. RES_HYDRO(MOD(I - 1, NRES) + 1) > 0.0 .AND. RES_HYDRO(L) > 0.0 THEN
+        DX := RES_X(I) - RES_X(J)
+        DY := RES_Y(I) - RES_Y(J)
+        DZ := RES_Z(I) - RES_Z(J)
+        D := SQRT(DX*DX + DY*DY + DZ*DZ)
+        IF D > 0.0 .AND. D < HYDRO_CUTOFF THEN
+          FM := -HYDRO_STRENGTH * RES_HYDRO(MOD(I - 1, NRES) + 1) * RES_HYDRO(L) * EXP(-HYDRO_ALPHA * (D - HYDRO_R0))
+          RES_VX(I) := RES_VX(I) + FM * DX / D * DT * FORCE_SCALE
+          RES_VY(I) := RES_VY(I) + FM * DY / D * DT * FORCE_SCALE
+          RES_VZ(I) := RES_VZ(I) + FM * DZ / D * DT * FORCE_SCALE
+          RES_VX(J) := RES_VX(J) - FM * DX / D * DT * FORCE_SCALE
+          RES_VY(J) := RES_VY(J) - FM * DY / D * DT * FORCE_SCALE
+          RES_VZ(J) := RES_VZ(J) - FM * DZ / D * DT * FORCE_SCALE
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+
+
+  ! Inter-chain in-register Go contacts (adjacent chains, k <-> k)
+  DO M = 1, NCON
+    IA := IC_A(M)
+    IB := IC_B(M)
+    DX := RES_X(IA) - RES_X(IB)
+    DY := RES_Y(IA) - RES_Y(IB)
+    DZ := RES_Z(IA) - RES_Z(IB)
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    IF D > 0.0 THEN
+      FM := -2.0 * INTER_K * (D - IC_R0(M))
+      RES_VX(IA) := RES_VX(IA) + FM * DX / D * DT * FORCE_SCALE
+      RES_VY(IA) := RES_VY(IA) + FM * DY / D * DT * FORCE_SCALE
+      RES_VZ(IA) := RES_VZ(IA) + FM * DZ / D * DT * FORCE_SCALE
+      RES_VX(IB) := RES_VX(IB) - FM * DX / D * DT * FORCE_SCALE
+      RES_VY(IB) := RES_VY(IB) - FM * DY / D * DT * FORCE_SCALE
+      RES_VZ(IB) := RES_VZ(IB) - FM * DZ / D * DT * FORCE_SCALE
+    ENDIF
+  ENDDO
+
+
+  ! Backbone + angles + torsions, per chain
+  DO C = 1, NC
+    ! Morse bonds
+    DO I = 1, NRES - 1
+      IA := (C - 1) * NRES + I
+      IB := (C - 1) * NRES + I + 1
+      DX := RES_X(IA) - RES_X(IB)
+      DY := RES_Y(IA) - RES_Y(IB)
+      DZ := RES_Z(IA) - RES_Z(IB)
+      D := SQRT(DX*DX + DY*DY + DZ*DZ)
+      IF D > 0.0 THEN
+        E := EXP(-MORSE_A * (D - BACKBONE_R0))
+        FM := -2.0 * BACKBONE_D * MORSE_A * (1.0 - E) * E * FORCE_SCALE
+        RES_VX(IA) := RES_VX(IA) + FM * DX / D * DT
+        RES_VY(IA) := RES_VY(IA) + FM * DY / D * DT
+        RES_VZ(IA) := RES_VZ(IA) + FM * DZ / D * DT
+        RES_VX(IB) := RES_VX(IB) - FM * DX / D * DT
+        RES_VY(IB) := RES_VY(IB) - FM * DY / D * DT
+        RES_VZ(IB) := RES_VZ(IB) - FM * DZ / D * DT
+      ENDIF
+    ENDDO
+
+    ! Angle bending (shared per-residue targets from real 1YJP chain A)
+    DO I = 2, NRES - 1
+      IA := (C - 1) * NRES + I
+      BX := RES_X(IA - 1) - RES_X(IA)
+      BY := RES_Y(IA - 1) - RES_Y(IA)
+      BZ := RES_Z(IA - 1) - RES_Z(IA)
+      CX := RES_X(IA + 1) - RES_X(IA)
+      CY := RES_Y(IA + 1) - RES_Y(IA)
+      CZ := RES_Z(IA + 1) - RES_Z(IA)
+      UN := SQRT(BX*BX + BY*BY + BZ*BZ)
+      VN := SQRT(CX*CX + CY*CY + CZ*CZ)
+      IF UN > 1.0E-12 .AND. VN > 1.0E-12 THEN
+        CS := MAX(-1.0, MIN(1.0, (BX*CX + BY*CY + BZ*CZ) / (UN * VN)))
+        E := 2.0 * RES_ANGK(I) * (CS - COS(RES_ANGT0(I)))
+        UX := (CX / (UN * VN) - CS * BX / UN / UN)
+        UY := (CY / (UN * VN) - CS * BY / UN / UN)
+        UZ := (CZ / (UN * VN) - CS * BZ / UN / UN)
+        WX := (BX / (UN * VN) - CS * CX / VN / VN)
+        WY := (BY / (UN * VN) - CS * CY / VN / VN)
+        WZ := (BZ / (UN * VN) - CS * CZ / VN / VN)
+        RES_VX(IA - 1) := RES_VX(IA - 1) - E * UX * DT * FORCE_SCALE
+        RES_VY(IA - 1) := RES_VY(IA - 1) - E * UY * DT * FORCE_SCALE
+        RES_VZ(IA - 1) := RES_VZ(IA - 1) - E * UZ * DT * FORCE_SCALE
+        RES_VX(IA + 1) := RES_VX(IA + 1) - E * WX * DT * FORCE_SCALE
+        RES_VY(IA + 1) := RES_VY(IA + 1) - E * WY * DT * FORCE_SCALE
+        RES_VZ(IA + 1) := RES_VZ(IA + 1) - E * WZ * DT * FORCE_SCALE
+        RES_VX(IA) := RES_VX(IA) + (E * UX + E * WX) * DT * FORCE_SCALE
+        RES_VY(IA) := RES_VY(IA) + (E * UY + E * WY) * DT * FORCE_SCALE
+        RES_VZ(IA) := RES_VZ(IA) + (E * UZ + E * WZ) * DT * FORCE_SCALE
+      ENDIF
+    ENDDO
+
+    ! Torsions (shared targets from real 1YJP chain A)
+    DO I = 2, NRES - 2
+      IA := (C - 1) * NRES + I
+      B1X := RES_X(IA) - RES_X(IA - 1)
+      B1Y := RES_Y(IA) - RES_Y(IA - 1)
+      B1Z := RES_Z(IA) - RES_Z(IA - 1)
+      B2X := RES_X(IA + 1) - RES_X(IA)
+      B2Y := RES_Y(IA + 1) - RES_Y(IA)
+      B2Z := RES_Z(IA + 1) - RES_Z(IA)
+      B3X := RES_X(IA + 2) - RES_X(IA + 1)
+      B3Y := RES_Y(IA + 2) - RES_Y(IA + 1)
+      B3Z := RES_Z(IA + 2) - RES_Z(IA + 1)
+      N1X := B1Y*B2Z - B1Z*B2Y
+      N1Y := B1Z*B2X - B1X*B2Z
+      N1Z := B1X*B2Y - B1Y*B2X
+      N2X := B2Y*B3Z - B2Z*B3Y
+      N2Y := B2Z*B3X - B2X*B3Z
+      N2Z := B2X*B3Y - B2Y*B3X
+      N1MAG2 := N1X*N1X + N1Y*N1Y + N1Z*N1Z
+      N2MAG2 := N2X*N2X + N2Y*N2Y + N2Z*N2Z
+      B2MAG := SQRT(B2X*B2X + B2Y*B2Y + B2Z*B2Z)
+      IF N1MAG2 > 1.0E-12 .AND. N2MAG2 > 1.0E-12 .AND. B2MAG > 1.0E-12 THEN
+        N1MAG := SQRT(N1MAG2)
+        N2MAG := SQRT(N2MAG2)
+        PHI := ATAN2(B2MAG*(B1X*N2X + B1Y*N2Y + B1Z*N2Z), N1X*N2X + N1Y*N2Y + N1Z*N2Z)
+        F := -2.0 * RES_TORSK(I) * SIN(PHI - RES_TORSP0(I))
+        DPHI_DR1X := -B2MAG / N1MAG2 * N1X
+        DPHI_DR1Y := -B2MAG / N1MAG2 * N1Y
+        DPHI_DR1Z := -B2MAG / N1MAG2 * N1Z
+        DPHI_DR4X := B2MAG / N2MAG2 * N2X
+        DPHI_DR4Y := B2MAG / N2MAG2 * N2Y
+        DPHI_DR4Z := B2MAG / N2MAG2 * N2Z
+        B1DOT := B1X*B2X + B1Y*B2Y + B1Z*B2Z
+        B3DOT := B3X*B2X + B3Y*B2Y + B3Z*B2Z
+        SCALE_B2 := 1.0 / (B2MAG * B2MAG)
+        SCALE_B1 := B1DOT * SCALE_B2
+        SCALE_B3 := B3DOT * SCALE_B2
+        DPHI_DR2X := -(1.0 + SCALE_B1) * DPHI_DR1X + SCALE_B3 * DPHI_DR4X
+        DPHI_DR2Y := -(1.0 + SCALE_B1) * DPHI_DR1Y + SCALE_B3 * DPHI_DR4Y
+        DPHI_DR2Z := -(1.0 + SCALE_B1) * DPHI_DR1Z + SCALE_B3 * DPHI_DR4Z
+        DPHI_DR3X := -(DPHI_DR1X + DPHI_DR2X + DPHI_DR4X)
+        DPHI_DR3Y := -(DPHI_DR1Y + DPHI_DR2Y + DPHI_DR4Y)
+        DPHI_DR3Z := -(DPHI_DR1Z + DPHI_DR2Z + DPHI_DR4Z)
+        RES_VX(IA - 1) := RES_VX(IA - 1) + F * DPHI_DR1X * DT * FORCE_SCALE
+        RES_VY(IA - 1) := RES_VY(IA - 1) + F * DPHI_DR1Y * DT * FORCE_SCALE
+        RES_VZ(IA - 1) := RES_VZ(IA - 1) + F * DPHI_DR1Z * DT * FORCE_SCALE
+        RES_VX(IA) := RES_VX(IA) + F * DPHI_DR2X * DT * FORCE_SCALE
+        RES_VY(IA) := RES_VY(IA) + F * DPHI_DR2Y * DT * FORCE_SCALE
+        RES_VZ(IA) := RES_VZ(IA) + F * DPHI_DR2Z * DT * FORCE_SCALE
+        RES_VX(IA + 1) := RES_VX(IA + 1) + F * DPHI_DR3X * DT * FORCE_SCALE
+        RES_VY(IA + 1) := RES_VY(IA + 1) + F * DPHI_DR3Y * DT * FORCE_SCALE
+        RES_VZ(IA + 1) := RES_VZ(IA + 1) + F * DPHI_DR3Z * DT * FORCE_SCALE
+        RES_VX(IA + 2) := RES_VX(IA + 2) + F * DPHI_DR4X * DT * FORCE_SCALE
+        RES_VY(IA + 2) := RES_VY(IA + 2) + F * DPHI_DR4Y * DT * FORCE_SCALE
+        RES_VZ(IA + 2) := RES_VZ(IA + 2) + F * DPHI_DR4Z * DT * FORCE_SCALE
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! ── bead thermal kicks ──
+  DO K = 1, NB
+    BEAD_VX(K) := BEAD_VX(K) + THERMAL_CURRENT * SIN((K+40)*7.3 + REAL(FRAME)*0.17)
+    BEAD_VY(K) := BEAD_VY(K) + THERMAL_CURRENT * COS((K+40)*5.7 + REAL(FRAME)*0.31)
+    BEAD_VZ(K) := BEAD_VZ(K) + THERMAL_CURRENT * SIN((K+40)*3.1 + REAL(FRAME)*0.09)
+  ENDDO
+
+  ! ── bead tethers (stiff Morse, per-residue crystal r0) ──
+  DO M = 1, NTETH
+    IA := TETH_A(M)
+    IB := TETH_B(M)
+    IF IA < 0 THEN
+      DX := RES_X(0 - IA) - BEAD_X(IB)
+      DY := RES_Y(0 - IA) - BEAD_Y(IB)
+      DZ := RES_Z(0 - IA) - BEAD_Z(IB)
+    ELSE
+      DX := BEAD_X(IA) - BEAD_X(IB)
+      DY := BEAD_Y(IA) - BEAD_Y(IB)
+      DZ := BEAD_Z(IA) - BEAD_Z(IB)
+    ENDIF
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    IF D > 0.0 THEN
+      E := EXP(-2.0 * (D - TETH_R0(M)))
+      FM := -2.0 * 2.0 * 2.0 * (1.0 - E) * E * FORCE_SCALE
+      IF IA < 0 THEN
+        RES_VX(0 - IA) := RES_VX(0 - IA) + FM * DX / D * DT
+        RES_VY(0 - IA) := RES_VY(0 - IA) + FM * DY / D * DT
+        RES_VZ(0 - IA) := RES_VZ(0 - IA) + FM * DZ / D * DT
+      ELSE
+        BEAD_VX(IA) := BEAD_VX(IA) + FM * DX / D * DT
+        BEAD_VY(IA) := BEAD_VY(IA) + FM * DY / D * DT
+        BEAD_VZ(IA) := BEAD_VZ(IA) + FM * DZ / D * DT
+      ENDIF
+      BEAD_VX(IB) := BEAD_VX(IB) - FM * DX / D * DT
+      BEAD_VY(IB) := BEAD_VY(IB) - FM * DY / D * DT
+      BEAD_VZ(IB) := BEAD_VZ(IB) - FM * DZ / D * DT
+    ENDIF
+  ENDDO
+
+  ! ── H-bond formation: greedy valence-1, distance-gated,
+  !    INTER-SHEET only (same-amide and same-sheet pairs excluded —
+  !    intra-sheet binding is provided by the in-register contacts) ──
+  DO K = 1, 20
+    HB_PART(K) := 0
+    HB_NUSED(K) := 0
+  ENDDO
+  DO K = 1, 20
+    DMIN2 := 1.0E9
+    BEST := 0
+    DO M = 1, 20
+      IF HB_NUSED(M) = 0 .AND. INT((K - 1) / 10) /= INT((M - 1) / 10) THEN
+        D := SQRT((BEAD_X(2*K-1) - BEAD_X(2*M))**2 + (BEAD_Y(2*K-1) - BEAD_Y(2*M))**2 + (BEAD_Z(2*K-1) - BEAD_Z(2*M))**2)
+        IF D < HB_RANGE .AND. D < DMIN2 THEN
+          DMIN2 := D
+          BEST := M
+        ENDIF
+      ENDIF
+    ENDDO
+    IF BEST > 0 THEN
+      HB_PART(K) := BEST
+      HB_NUSED(BEST) := 1
+    ENDIF
+  ENDDO
+
+  ! ── H-bond Morse forces (narrow well, typed N..O) ──
+  DO K = 1, 20
+    IF HB_PART(K) > 0 THEN
+      IA := 2 * K - 1
+      IB := 2 * HB_PART(K)
+      DX := BEAD_X(IA) - BEAD_X(IB)
+      DY := BEAD_Y(IA) - BEAD_Y(IB)
+      DZ := BEAD_Z(IA) - BEAD_Z(IB)
+      D := SQRT(DX*DX + DY*DY + DZ*DZ)
+      IF D > 0.0 THEN
+        E := EXP(-HB_A * (D - HB_R0))
+        FM := -2.0 * HB_D * HB_A * (1.0 - E) * E * FORCE_SCALE
+        BEAD_VX(IA) := BEAD_VX(IA) + FM * DX / D * DT
+        BEAD_VY(IA) := BEAD_VY(IA) + FM * DY / D * DT
+        BEAD_VZ(IA) := BEAD_VZ(IA) + FM * DZ / D * DT
+        BEAD_VX(IB) := BEAD_VX(IB) - FM * DX / D * DT
+        BEAD_VY(IB) := BEAD_VY(IB) - FM * DY / D * DT
+        BEAD_VZ(IB) := BEAD_VZ(IB) - FM * DZ / D * DT
+        ! directionality: CA-N..O and CA-O..N angle at 90 deg (crystal mean)
+        IA2 := BEAD_PARENT(IA)
+        IB2 := BEAD_PARENT(IB)
+        UX := RES_X(IA2) - BEAD_X(IB)
+        UY := RES_Y(IA2) - BEAD_Y(IB)
+        UZ := RES_Z(IA2) - BEAD_Z(IB)
+        WX := BEAD_X(IA) - BEAD_X(IB)
+        UN := SQRT(UX*UX + UY*UY + UZ*UZ)
+        VN := SQRT(WX*WX + WY*WY + WZ*WZ)
+        IF UN > 1.0E-12 .AND. VN > 1.0E-12 THEN
+          CS := MAX(-1.0, MIN(1.0, (UX*WX + UY*WY + UZ*WZ) / (UN * VN)))
+          F := 2.0 * HB_ANGK * CS
+          FX := F * (WX / (UN * VN) - CS * UX / UN / UN)
+          FY := F * (UY / (UN * VN) - CS * UY / UN / UN)
+          FZ := F * (UZ / (UN * VN) - CS * UZ / UN / UN)
+          RES_VX(IA2) := RES_VX(IA2) - FX * DT * FORCE_SCALE
+          RES_VY(IA2) := RES_VY(IA2) - FY * DT * FORCE_SCALE
+          RES_VZ(IA2) := RES_VZ(IA2) - FZ * DT * FORCE_SCALE
+          FX := F * (UX / (UN * VN) - CS * WX / VN / VN)
+          FY := F * (UY / (UN * VN) - CS * WY / VN / VN)
+          FZ := F * (UZ / (UN * VN) - CS * WZ / VN / VN)
+          BEAD_VX(IA) := BEAD_VX(IA) - FX * DT * FORCE_SCALE
+          BEAD_VY(IA) := BEAD_VY(IA) - FY * DT * FORCE_SCALE
+          BEAD_VZ(IA) := BEAD_VZ(IA) - FZ * DT * FORCE_SCALE
+        ENDIF
+      ENDIF
+    ENDIF
+  ENDDO
+
+  ! ── bead damping + position update ──
+  DO K = 1, NB
+    BEAD_VX(K) := BEAD_VX(K) * VDAMP(1)
+    BEAD_VY(K) := BEAD_VY(K) * VDAMP(1)
+    BEAD_VZ(K) := BEAD_VZ(K) * VDAMP(1)
+    BEAD_X(K) := BEAD_X(K) + BEAD_VX(K) * DT
+    BEAD_Y(K) := BEAD_Y(K) + BEAD_VY(K) * DT
+    BEAD_Z(K) := BEAD_Z(K) + BEAD_VZ(K) * DT
+  ENDDO
+
+  ! Velocity damping (per-chain VDAMP: template chains strongly damped)
+  DO I = 1, NTOT
+    C := INT(REAL(I - 1) / REAL(NRES)) + 1
+    RES_VX(I) := RES_VX(I) * VDAMP(C)
+    RES_VY(I) := RES_VY(I) * VDAMP(C)
+    RES_VZ(I) := RES_VZ(I) * VDAMP(C)
+  ENDDO
+
+  ! Position update
+  DO I = 1, NTOT
+    RES_X(I) := RES_X(I) + RES_VX(I) * DT
+    RES_Y(I) := RES_Y(I) + RES_VY(I) * DT
+    RES_Z(I) := RES_Z(I) + RES_VZ(I) * DT
+  ENDDO
+
+  ! H-bond count trace
+  IF MOD(FRAME, 200) = 0 THEN
+    NHB := 0
+    DO K = 1, 20
+      IF HB_PART(K) > 0 THEN
+        NHB := NHB + 1
+      ENDIF
+    ENDDO
+    WRITE(*, "HBTRACE %d %d") FRAME, NHB
+  ENDIF
+
+  ! Trace: mean in-register distance per adjacent chain pair
+  IF MOD(FRAME, 200) = 0 THEN
+    DO C = 1, NC - 1, 2
+      D := 0.0
+      DO K = 1, NRES
+        IA := (C - 1) * NRES + K
+        IB := C * NRES + K
+        D := D + SQRT((RES_X(IA) - RES_X(IB))**2 + (RES_Y(IA) - RES_Y(IB))**2 + (RES_Z(IA) - RES_Z(IB))**2)
+      ENDDO
+      WRITE(*, "TRACE %d %d %.4f") FRAME, C, D / REAL(NRES)
+    ENDDO
+  ENDIF
+
+ENDDO
+
+! Final geometry table
+DO C = 1, NC - 1, 2
+  DO K = 1, NRES
+    IA := (C - 1) * NRES + K
+    IB := C * NRES + K
+    D := SQRT((RES_X(IA) - RES_X(IB))**2 + (RES_Y(IA) - RES_Y(IB))**2 + (RES_Z(IA) - RES_Z(IB))**2)
+    E := 0.0
+    IF K < NRES THEN
+      E := SQRT((RES_X(IA) - RES_X(IB + 1))**2 + (RES_Y(IA) - RES_Y(IB + 1))**2 + (RES_Z(IA) - RES_Z(IB + 1))**2)
+    ENDIF
+    WRITE(*, "GEOM %d %d %.4f %.4f") C, K, D, E
+  ENDDO
+ENDDO
+! H-bond list + count
+NHB := 0
+DO K = 1, 20
+  IF HB_PART(K) > 0 THEN
+    NHB := NHB + 1
+  ENDIF
+ENDDO
+WRITE(*, "NHB_FINAL %d") NHB
+DO K = 1, 20
+  IF HB_PART(K) > 0 THEN
+    IA := 2 * K - 1
+    IB := 2 * HB_PART(K)
+    D := SQRT((BEAD_X(IA) - BEAD_X(IB))**2 + (BEAD_Y(IA) - BEAD_Y(IB))**2 + (BEAD_Z(IA) - BEAD_Z(IB))**2)
+    WRITE(*, "HB %d %d %.4f") IA, IB, D
+  ENDIF
+ENDDO
+
+DO C = 1, NC
+  CX := 0.0
+  CY := 0.0
+  CZ := 0.0
+  DO K = 1, NRES
+    CX := CX + RES_X((C - 1) * NRES + K)
+    CY := CY + RES_Y((C - 1) * NRES + K)
+    CZ := CZ + RES_Z((C - 1) * NRES + K)
+  ENDDO
+  WRITE(*, "COM %d %.4f %.4f %.4f") C, CX / REAL(NRES), CY / REAL(NRES), CZ / REAL(NRES)
+ENDDO
+WRITE(*, "# DONE")
+
+STOP
+
+SUBROUTINE UPDATE_THERMAL(FRAME)
+  INTEGER :: FRAME
+  REAL :: FRAC
+  THERMAL_CURRENT := HEAT_START
+  IF FRAME < 300 THEN
+    FRAC := REAL(FRAME) / 300.0
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * FRAC
+  ELSEIF FRAME < 600 THEN
+    FRAC := REAL(FRAME - 300) / 300.0
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * FRAC
+  ELSEIF FRAME < 900 THEN
+    FRAC := REAL(FRAME - 600) / 300.0
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * FRAC
+  ELSEIF FRAME < 1200 THEN
+    FRAC := REAL(FRAME - 900) / 300.0
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * FRAC
+  ELSE
+    THERMAL_CURRENT := HEAT_START
+  ENDIF
+  ! Quench tail: zero thermal noise after frame 9600
+  IF FRAME > 9600 THEN
+    THERMAL_CURRENT := 0.0
+  ENDIF
+  RETURN
+END

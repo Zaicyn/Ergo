@@ -1,0 +1,232 @@
+! ════════════════════════════════════════════════════════════════════
+! REDIRECT BIAS SWEEP — Deepseek Protocol Tests 2 + 4 (Ergo)
+! ════════════════════════════════════════════════════════════════════
+!
+! Test 2: Does w-accumulation correlate with the NDC regime?
+!   Sweep a bias forcing that drives particle phases toward the
+!   "forbidden" direction (PI off the node reference phase).
+!   w = fraction of particles in forbidden states.
+!   Current analog I = (1 - w) * BIAS  → rises then collapses (NDC).
+!   Theory: steepest w accumulation happens inside the NDC regime.
+!
+! Test 4: Does phase coherence predict redirect reversibility?
+!   After each forward run, release the bias (BIAS := 0) and run a
+!   recovery window. Measure how much w flows back and correlate
+!   against the phase coherence at the moment of release.
+!
+! Output: one line per bias step to stdout.
+!   Redirect stdout to redirect_bias_sweep.log, then run
+!   analyze_bias_sweep.py.
+!
+! ════════════════════════════════════════════════════════════════════
+
+! ── CONSTANTS ──────────────────────────────────────────────────────
+
+PARAMETER INTEGER :: NUM_NODES = 12
+PARAMETER INTEGER :: MAX_PARTICLES = 100000
+PARAMETER REAL :: TWO_PI = 6.28318530717958648
+PARAMETER REAL :: PI = 3.14159265358979324
+
+! Dynamics
+PARAMETER REAL :: DT = 0.01
+PARAMETER REAL :: K_PHASE = 0.5          ! Coupling toward allowed phase
+PARAMETER REAL :: K_BIAS = 2.0           ! Forcing toward forbidden phase
+PARAMETER REAL :: K_DRIFT = 0.1          ! Harmonic distortion
+PARAMETER REAL :: OMEGA_BASE = 1.0       ! Base rotation rate
+
+! Sweep
+PARAMETER INTEGER :: N_BIAS_STEPS = 20   ! BIAS = 0.00 .. 1.00 in 0.05 steps
+PARAMETER REAL :: BIAS_STEP = 0.05
+PARAMETER INTEGER :: RUN_FRAMES = 150    ! Forward run under bias
+PARAMETER INTEGER :: RECOVERY_FRAMES = 150  ! Recovery run at BIAS = 0
+
+! ── PARTICLE STATE ─────────────────────────────────────────────────
+
+STATIC REAL :: PHASE(MAX_PARTICLES)
+STATIC REAL :: OMEGA_NAT(MAX_PARTICLES)
+STATIC INTEGER :: NODE_ID(MAX_PARTICLES)
+
+! ── NODE-LEVEL STATE ──────────────────────────────────────────────
+
+STATIC REAL :: NODE_REF(NUM_NODES)       ! Allowed (reference) phase per node
+
+! ── CONTROL / MEASUREMENT ─────────────────────────────────────────
+
+STATIC INTEGER :: NPART = 1000
+STATIC REAL :: BIAS = 0.0
+
+! Results from MEASURE_STATE (read by main loop)
+STATIC REAL :: W_FRAC = 0.0              ! Fraction in forbidden states
+STATIC REAL :: COHERENCE = 0.0           ! Mean per-node phase lock r
+STATIC REAL :: CURRENT = 0.0             ! Tunneling current analog
+
+! Main-program locals
+INTEGER :: B_STEP, FRAME
+REAL :: W_BASE, W_PEAK, COH_PEAK, W_FINAL, COH_FINAL, I_PEAK
+
+! ════════════════════════════════════════════════════════════════════
+! MAIN EXECUTION — bias sweep
+! ════════════════════════════════════════════════════════════════════
+
+! Node reference phases: evenly spaced around the ring
+CALL INIT_NODE_REFS()
+
+! Log header
+WRITE(*, "bias w_base w_peak current coherence_peak w_final coherence_final")
+
+DO B_STEP = 0, N_BIAS_STEPS
+  BIAS := REAL(B_STEP) * BIAS_STEP
+
+  ! Fresh initial conditions for each bias step
+  CALL INIT_PARTICLES(NPART)
+
+  ! Baseline (random phases) before dynamics
+  CALL MEASURE_STATE()
+  W_BASE := W_FRAC
+
+  ! Forward run under bias (Test 2)
+  DO FRAME = 1, RUN_FRAMES
+    CALL UPDATE_PARTICLES(DT)
+  ENDDO
+
+  CALL MEASURE_STATE()
+  W_PEAK := W_FRAC
+  COH_PEAK := COHERENCE
+  I_PEAK := CURRENT
+
+  ! Recovery run with forcing removed (Test 4)
+  BIAS := 0.0
+  DO FRAME = 1, RECOVERY_FRAMES
+    CALL UPDATE_PARTICLES(DT)
+  ENDDO
+
+  CALL MEASURE_STATE()
+  W_FINAL := W_FRAC
+  COH_FINAL := COHERENCE
+
+  ! One log line per bias step
+  WRITE(*, "%.2f %.4f %.4f %.4f %.4f %.4f %.4f") &
+    REAL(B_STEP) * BIAS_STEP, W_BASE, W_PEAK, I_PEAK, &
+    COH_PEAK, W_FINAL, COH_FINAL
+ENDDO
+
+WRITE(*, "============================================")
+WRITE(*, "BIAS SWEEP COMPLETE: %d steps") N_BIAS_STEPS + 1
+WRITE(*, "Log: redirect_bias_sweep.log")
+WRITE(*, "============================================")
+
+STOP
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: Node reference phases (allowed directions)
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE INIT_NODE_REFS()
+  INTEGER :: NODE
+
+  DO NODE = 1, NUM_NODES
+    NODE_REF(NODE) := REAL(NODE - 1) * (TWO_PI / REAL(NUM_NODES))
+  ENDDO
+
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: Initialize particles (deterministic pseudo-random)
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE INIT_PARTICLES(N)
+  INTEGER :: N
+  INTEGER :: I
+
+  DO I = 1, N
+    NODE_ID(I) := MOD(I, NUM_NODES) + 1
+
+    ! Phase: spread pseudo-randomly around the circle
+    PHASE(I) := MOD(REAL(I) * 0.67, TWO_PI)
+
+    ! Natural frequency: base + small spread
+    OMEGA_NAT(I) := OMEGA_BASE + (MOD(REAL(I) * 0.13, 1.0) - 0.5) * 0.2
+  ENDDO
+
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: Measure w-fraction, phase coherence, current analog
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE MEASURE_STATE()
+  INTEGER :: I, NODE, NFORB, CNT
+  REAL :: D, SC, SS, R_NODE
+
+  ! w-fraction: particles further than PI/2 from their node reference
+  NFORB := 0
+  DO I = 1, NPART
+    D := ABS(PHASE(I) - NODE_REF(NODE_ID(I)))
+    IF D > PI THEN
+      D := TWO_PI - D
+    ENDIF
+    IF D > PI / 2.0 THEN
+      NFORB := NFORB + 1
+    ENDIF
+  ENDDO
+  W_FRAC := REAL(NFORB) / REAL(NPART)
+
+  ! Phase coherence: mean per-node Kuramoto order parameter
+  ! (per-node because node refs are evenly spaced — a global sum
+  ! would cancel by symmetry)
+  COHERENCE := 0.0
+  DO NODE = 1, NUM_NODES
+    SC := 0.0
+    SS := 0.0
+    CNT := 0
+    DO I = 1, NPART
+      IF NODE_ID(I) == NODE THEN
+        SC := SC + COS(PHASE(I) - NODE_REF(NODE))
+        SS := SS + SIN(PHASE(I) - NODE_REF(NODE))
+        CNT := CNT + 1
+      ENDIF
+    ENDDO
+    IF CNT > 0 THEN
+      R_NODE := SQRT(SC * SC + SS * SS) / REAL(CNT)
+      COHERENCE := COHERENCE + R_NODE
+    ENDIF
+  ENDDO
+  COHERENCE := COHERENCE / REAL(NUM_NODES)
+
+  ! Tunneling current analog: driving x participating fraction
+  CURRENT := (1.0 - W_FRAC) * BIAS
+
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SUBROUTINE: Phase dynamics — coupling vs bias forcing
+! ════════════════════════════════════════════════════════════════════
+
+SUBROUTINE UPDATE_PARTICLES(STEP)
+  REAL :: STEP
+  INTEGER :: I, NODE
+  REAL :: COUPLING, FORCING, DPHASE
+
+  DO I = 1, NPART
+    NODE := NODE_ID(I)
+
+    ! Coupling: pull toward the allowed (reference) phase
+    COUPLING := K_PHASE * SIN(NODE_REF(NODE) - PHASE(I))
+
+    ! Bias forcing: push toward the forbidden phase (ref + PI)
+    FORCING := BIAS * K_BIAS * SIN(NODE_REF(NODE) + PI - PHASE(I))
+
+    ! Total phase velocity: natural rotation + coupling + forcing + drift
+    DPHASE := OMEGA_NAT(I) + COUPLING + FORCING + K_DRIFT * SIN(3.0 * PHASE(I))
+
+    PHASE(I) := PHASE(I) + DPHASE * STEP
+
+    ! Wrap to [0, 2PI]
+    IF PHASE(I) < 0.0 THEN
+      PHASE(I) := PHASE(I) + TWO_PI
+    ELSEIF PHASE(I) >= TWO_PI THEN
+      PHASE(I) := PHASE(I) - TWO_PI
+    ENDIF
+  ENDDO
+
+END

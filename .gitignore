@@ -6,6 +6,16 @@
 !galaxy_structured.ergo
 !core/
 !core/**
+# min/ — campaign work (sources only: .ergo/.py/.md; binaries and
+# .out dumps stay ignored, same convention as tests/).
+!min/
+!min/**/
+!min/*.ergo
+!min/*.py
+!min/*.md
+!min/**/*.ergo
+!min/**/*.py
+!min/**/*.md
 !Spec/
 !Spec/**
 !tools/

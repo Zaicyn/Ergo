@@ -1,0 +1,100 @@
+! ════════════════════════════════════════════════════════════════════
+! FDTD_SLIT_1D — flattened-array double-slit FDTD for GPU extraction
+! Physics identical to fdtd_slit_db.ergo (C2=0.25, pulse source, barrier
+! ix=300 (slits [219,230],[283,294]), screen ix=560, PROF 900..1800).
+! Arrays are 1D (NX*NY flat): the stencil is a SINGLE loop (no nesting,
+! no shifted-index linearization needed) -> extracts as GPU kernel.
+! Edge cells stay zero via a precomputed interior mask (BOUND).
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 640, NY = 512
+INTEGER, PARAMETER :: NPTS = 327680
+INTEGER, PARAMETER :: NSTEPS = 2000
+INTEGER, PARAMETER :: NSP = 40
+REAL, PARAMETER :: C2 = 0.25
+REAL, PARAMETER :: AMP = 1.0
+INTEGER, PARAMETER :: IX_SRC = 40, IX_BAR = 300, IX_SCR = 560
+INTEGER, PARAMETER :: SL1A = 219, SL1B = 230, SL2A = 283, SL2B = 294
+
+STATIC REAL :: U(NPTS), UN(NPTS)
+STATIC REAL :: ABSORB(NPTS), PASS(NPTS), BOUND(NPTS), PROF(NY)
+STATIC REAL :: LTAB(3)
+DATA LTAB / 12.0, 16.0, 20.0 /
+
+REAL :: OMEGA, ENV, SV, FX, FY
+INTEGER :: I, J, T, SC, K, NEND
+INTEGER :: IK, JK, INI, INJ, DX, DY, BCOL, R1, R2
+
+DO SC = 1, 3
+  ! Fully arithmetic on-device init: no host loops between GPU kernels
+  ! (host-modified arrays after a kernel are NOT re-uploaded before the
+  ! next frame loop — that was the all-zero GPU bug).
+  DO DMY = 1, 1
+    DO K = 1, NPTS
+      IK := MOD(K - 1, NX) + 1
+      JK := INT(REAL(K - 1) / REAL(NX)) + 1
+      U(K) := 0.0
+      UN(K) := 0.0
+      INI := MIN(1, MAX(0, MIN(IK - 1, NX - IK)))
+      INJ := MIN(1, MAX(0, MIN(JK - 1, NY - JK)))
+      BOUND(K) := REAL(INI * INJ)
+      DX := MIN(IK - 1, NX - IK)
+      DY := MIN(JK - 1, NY - JK)
+      FX := 0.5 + 0.25 * (1.0 + COS(3.14159265358979 * REAL(MAX(0, NSP - DX)) / REAL(NSP + 1)))
+      FY := 0.5 + 0.25 * (1.0 + COS(3.14159265358979 * REAL(MAX(0, NSP - DY)) / REAL(NSP + 1)))
+      ABSORB(K) := FX * FY
+      BCOL := 1 - MIN(1, MAX(IK - IX_BAR, IX_BAR - IK))
+      R1 := MIN(1, MAX(0, MIN(JK - SL1A, SL1B - JK) + 1))
+      R2 := MIN(1, MAX(0, MIN(JK - SL2A, SL2B - JK) + 1))
+      PASS(K) := REAL(1 - BCOL + BCOL * MIN(1, R1 + R2))
+    ENDDO
+  ENDDO
+  DO J = 1, NY
+    PROF(J) := 0.0
+  ENDDO
+  NEND := NPTS - NX - 1
+  OMEGA := 3.14159265358979 / LTAB(SC)
+  DO T = 1, NSTEPS, 2
+    ! ===== step A =====
+    DO K = NX + 2, NEND
+      UN(K) := ((2.0 * U(K) - UN(K) &
+        + C2 * (U(K + 1) + U(K - 1) + U(K + NX) + U(K - NX) - 4.0 * U(K))) &
+        * ABSORB(K) * PASS(K) * BOUND(K)) + UN(K) * (1.0 - BOUND(K))
+    ENDDO
+    SV := AMP * SIN(OMEGA * REAL(T)) * EXP(0.0 - ((REAL(T) - 200.0) / 60.0) ** 2)
+    DO J = 1, NY
+      UN(IX_SRC + (J - 1) * NX) := UN(IX_SRC + (J - 1) * NX) + SV
+    ENDDO
+    IF (T >= 900) THEN
+      IF (T <= 1800) THEN
+        DO J = 1, NY
+          PROF(J) := PROF(J) + UN(IX_SCR + (J - 1) * NX) * UN(IX_SCR + (J - 1) * NX)
+        ENDDO
+      ENDIF
+    ENDIF
+    ! ===== step B =====
+    DO K = NX + 2, NEND
+      U(K) := ((2.0 * UN(K) - U(K) &
+        + C2 * (UN(K + 1) + UN(K - 1) + UN(K + NX) + UN(K - NX) - 4.0 * UN(K))) &
+        * ABSORB(K) * PASS(K) * BOUND(K)) + U(K) * (1.0 - BOUND(K))
+    ENDDO
+    SV := AMP * SIN(OMEGA * REAL(T + 1)) * EXP(0.0 - ((REAL(T + 1) - 200.0) / 60.0) ** 2)
+    DO J = 1, NY
+      U(IX_SRC + (J - 1) * NX) := U(IX_SRC + (J - 1) * NX) + SV
+    ENDDO
+    IF (T + 1 >= 900) THEN
+      IF (T + 1 <= 1800) THEN
+        DO J = 1, NY
+          PROF(J) := PROF(J) + U(IX_SCR + (J - 1) * NX) * U(IX_SCR + (J - 1) * NX)
+        ENDDO
+      ENDIF
+    ENDIF
+  ENDDO
+
+  DO J = 1, NY
+    WRITE(*, "%d %d %.6f") SC, J, PROF(J)
+  ENDDO
+ENDDO
+
+WRITE(*, "# DONE")
