@@ -92,6 +92,9 @@ Solver: Jacobi/red-black relaxation of ∇²φ = 0 with warm starts
   computed every sweep — a per-tile residual below tol for K
   consecutive sweeps is the measured backstop, but the a priori bound
   above is the primary clip.
+- **Precision caveat (see §6):** fjord weights φ~1e-8 underflow f32 —
+  a systematic tip bias, not noise. The far-field tail's handoff is a
+  moment-matched multipole proxy in f64, not CPU relaxation.
 
 ## 5. Parabolic (diffusion / Schrödinger) — specified, future
 
@@ -104,7 +107,67 @@ Solver: explicit diffusion, or unitary Schrödinger evolution.
   regardless of local amplitude; clipping a low-amplitude tile between
   vortices corrupts the global phase field.
 
-## 6. Contract summary
+## 6. The frozen state (precision handoff pattern)
+
+Two thresholds must not be conflated:
+
+- **TOL_ENV** — physics tolerance: below this the contribution is
+  negligible; clip (state 0).
+- **NOISE_FLOOR** — representational limit: `K_NF · eps_f32 · A_ref`.
+  Below this the GPU isn't computing decay, it's computing rounding
+  noise.
+
+Regime check (do this per solver before reaching for this pattern):
+if NOISE_FLOOR < TOL_ENV everywhere, tiles clip on physics before
+precision binds and the two-state framework suffices. Hyperbolic on
+our grids: floor reached at r ~ 10¹² cells — **edge case**. Elliptic
+(DBM): the far-field tail IS the computation (fjord weights φ~1e-8 vs
+exact 0 change morphology; f32 underflow is a systematic tip bias, not
+noise) — the noise floor is the **normal operating condition** and
+Inc-3's f32 scope is distribution-level morphology only.
+
+**States (program-maintained; no compiler changes — frozen is 0 on the
+GPU side plus a program-side ownership transfer via download_at /
+upload_at):**
+
+- 0 — provably unchanged; GPU-stale-but-correct (skip).
+- 1 — dispatched; GPU-authoritative.
+- 2 — frozen: envelope crossed NOISE_FLOOR above TOL_ENV; GPU stops
+  touching it, CPU owns the state.
+
+**Eager frontier, lazy interior.** A frozen tile adjacent to a live
+tile supplies stencil halo values; stale halo injects error into the
+live region. Therefore freeze only stencil-closed interiors — the
+frontier band stays dispatched (eager by construction). Interior
+frozen tiles are read-only and can be fully lazy: their value is
+computed only when queried.
+
+**Resume modes:**
+
+- *Analytic* (hyperbolic, homogeneous media): snapshot = pulse
+  parameters; evaluate the closed-form Green's function in f64 at any
+  (t, r) directly — jumps to arbitrary t, no accumulated integration
+  error. Superposition does NOT break this (linear equation — any
+  pulse count is closed-form); inhomogeneity/scatterers and
+  nonlinearity DO.
+- *Moment-matched multipole proxy* (elliptic): the cluster's far field
+  is fixed by its boundary values; snapshot = cluster moments,
+  evaluate the multipole series in f64. Cheaper and more accurate than
+  CPU-relaxing the frozen region.
+- *Numerical f64 continuation* (parabolic, or inhomogeneous
+  hyperbolic): snapshot = full tile state + boundary trace; lazy
+  queries cost O(t − t_freeze) catch-up (fine if rare), else eager
+  stepping with a documented budget.
+
+**Re-entry (thaw).** A frozen tile's envelope can rise again (new
+pulse, cluster growth). The program re-evaluates the same a priori
+bound over the frozen set each step (cheap, analytic) and thaws 2→1
+with an f64→f32 upload — an honest, documented precision event.
+
+**Oracle:** full f64 CPU reference vs frozen-clipmap run; error at
+query points ≤ tol; frontier never stale by construction.
+
+## 7. Contract summary
 
 | piece | owner | where |
 |---|---|---|
@@ -114,7 +177,7 @@ Solver: explicit diffusion, or unitary Schrödinger evolution.
 | Validation cadence | Ergo program | forced all-tiles-on step every K |
 | Error vs bound audit | findings docs | measured at validation sweeps |
 
-## 7. Reproducibility
+## 8. Reproducibility
 
 | artifact | path |
 |---|---|
