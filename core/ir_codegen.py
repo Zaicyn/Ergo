@@ -6,6 +6,12 @@ direct AST-to-C codegen path — the pipeline is now:
     AST -> Checker -> IR -> C99
 
 The existing AST codegen (codegen.py) is preserved as a reference and fallback.
+
+Tile clipmap: when --gpu-tile-size is active and the program declares a
+STATIC INTEGER array named TILE_CLIP, the host tile loop of every tiled
+non-reduction kernel skips tiles flagged 0 (skipped tile = its output
+elements are not updated this dispatch; stale device values persist —
+soundness is the program's responsibility). See --gpu-tile-size docs.
 """
 
 from __future__ import annotations
@@ -109,6 +115,11 @@ class IRCodeGen:
         # partition the range exactly like the untiled dispatch.
         self.gpu_tile_size = gpu_tile_size
         self._qtile = max(256, (gpu_tile_size // 256) * 256)
+        # Tile clipmap: size expression of the program-declared
+        # TILE_CLIP array, or None when absent/inert. Set in
+        # _emit_gpu_init (needs _array_shapes/_var_types populated).
+        self._tile_clip_size: str | None = None
+        self._clip_warned: set = set()  # reduction kids warned about
         self._in_frame_loop = False
         self._batched_frame = False  # True inside batched frame dispatch loop
         self._frame_gpu_dirty = set()  # GPU arrays written by a dispatch
@@ -3111,6 +3122,30 @@ class IRCodeGen:
         pp_arrays: set[str] = compute_pingpong_arrays(
             self.module, self.gpu_plan) if self.gpu_plan else set()
         self._pp_arrays = pp_arrays
+
+        # Tile clipmap: a CPU-resident STATIC INTEGER array named
+        # TILE_CLIP (reserved name) maintained by the program itself.
+        # When --gpu-tile-size is active, the host tile loop of each
+        # tiled non-reduction kernel skips tiles flagged 0 — the tile's
+        # output elements keep their stale device values. ONE array is
+        # shared by all tiled kernels: QTILE is compile-time uniform, so
+        # tile t covers the same flat element range [t*QTILE, ...) of
+        # every tiled kernel. Skipping is never applied to reduction
+        # kernels (their ordered combine expects every tile's partials).
+        # Inert when tiling is off.
+        self._tile_clip_size = None
+        if self.gpu_tile_size > 0 and "TILE_CLIP" in self._array_shapes:
+            import sys
+            if self._var_types.get("TILE_CLIP") == IRType.INTEGER:
+                cl_shape = self._array_shapes["TILE_CLIP"]
+                self._tile_clip_size = " * ".join(
+                    self._dim_expr(d) for d in cl_shape)
+                print(f"[spirv] TILE_CLIP: per-tile clip active for "
+                      f"tiled non-reduction kernels ({self._tile_clip_size}"
+                      f" slots, QTILE={self._qtile})", file=sys.stderr)
+            else:
+                print("[spirv] WARNING: TILE_CLIP is declared but not "
+                      "INTEGER — clip disabled", file=sys.stderr)
         if self.render:
             self._put("ergo_vk_init(0); /* windowed */")
         else:
@@ -3385,6 +3420,25 @@ class IRCodeGen:
                 self.indent += 1
                 self._put(f"int _hi = _tb + {self._qtile}; "
                           f"if (_hi > _bnd) _hi = _bnd;")
+                if self._tile_clip_size is not None and not tile_red:
+                    # Tile clipmap: TILE_CLIP[_tidx] == 0 -> skip this
+                    # tile's dispatch entirely; its output elements keep
+                    # their stale device values. Soundness of skipping
+                    # is the Ergo program's responsibility. The size
+                    # guard makes an undersized clip array safe (tiles
+                    # beyond it always dispatch).
+                    self._put(f"if (_tidx < {self._tile_clip_size} && "
+                              f"TILE_CLIP[_tidx] == 0) {{ "
+                              f"_tb += {self._qtile}; _tidx++; continue; }}")
+                elif self._tile_clip_size is not None and tile_red:
+                    # Reductions combine partials in fixed [tile][group]
+                    # order expecting every tile present — never clip.
+                    if kid not in self._clip_warned:
+                        self._clip_warned.add(kid)
+                        import sys
+                        print(f"[spirv] WARNING: TILE_CLIP ignored for "
+                              f"reduction kernel_{kid} (clip unsupported "
+                              f"for reductions)", file=sys.stderr)
             self._put(f"struct {{")
             self.indent += 1
             pc_vals = list(scalars)

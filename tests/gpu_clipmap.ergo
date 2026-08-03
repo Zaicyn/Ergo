@@ -1,0 +1,105 @@
+! GPU_CLIPMAP — tile clipmap (activity-driven tile skipping) oracle
+! =====================================================================
+! 2D wave equation on a flattened grid, two-buffer leapfrog (the
+! min/fdtd/stencil_test.ergo idiom), zero initial field, single
+! Gaussian time pulse injected off-center at (IXS, IYS).
+!
+! Hyperbolic a-priori bound: the 5-point stencil's discrete domain of
+! influence grows by exactly one cell (L1 metric) per half-step, so
+! after T full steps every nonzero value lies inside the L1 ball of
+! radius 2*T around the source. Tiles fully outside (plus margin) are
+! clipped: the Ergo program flags them 0 in TILE_CLIP and the compiler's
+! host tile loop skips their dispatch. With zero initial field, a
+! skipped tile would compute exactly 0.0 updates (0*x=0, 0+0=0 in
+! f32), so the field is BITWISE identical to the full untiled run.
+!
+! Sizing contract: tile t covers flat elements [t*QTILE, (t+1)*QTILE)
+! with QTILE = max(256, floor(--gpu-tile-size/256)*256). This program
+! sets QT = 8192 = the --gpu-tile-size used below (already a workgroup
+! multiple), so NT = NPTS/QT = 40 exactly.
+!
+! CPU:     python -m core tests/gpu_clipmap.ergo --precision f32 -o /tmp/clip_cpu
+! FULL:    python -m core tests/gpu_clipmap.ergo --target spirv --precision f32 -o /tmp/clip_full
+! CLIPPED: python -m core tests/gpu_clipmap.ergo --target spirv --precision f32 --gpu-tile-size 8192 -o /tmp/clip_gpu
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 640, NY = 512
+INTEGER, PARAMETER :: NPTS = 327680, NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 60
+INTEGER, PARAMETER :: QT = 8192, NT = 40
+INTEGER, PARAMETER :: IXS = 320, IYS = 256, ISRC = 163520
+REAL, PARAMETER :: C2 = 0.25, AMP = 1.0
+
+STATIC REAL :: U(NPTS), UN(NPTS)
+STATIC INTEGER :: TILE_CLIP(NT)
+REAL :: SV, SUMU, SUMUN, MAXU
+INTEGER :: K, T, IT, KBEG, KEND, DMIN, DX, DY, DD, REACH, NACT, NZ, NZT
+
+! Init kept on the CPU (nested loop is not extracted)
+DO DMY = 1, 1
+  DO K = 1, NPTS
+    U(K) := 0.0
+    UN(K) := 0.0
+  ENDDO
+ENDDO
+
+NACT := 0
+DO T = 1, NSTEPS
+  ! A-priori cone bound: L1 reach = 2 half-steps per step, + 16 margin
+  REACH := 2 * T + 16
+  DO IT = 1, NT
+    TILE_CLIP(IT) := 0
+    KBEG := (IT - 1) * QT + 1
+    KEND := KBEG + QT - 1
+    DMIN := 999999
+    DO K = KBEG, KEND
+      DX := MOD(K - 1, NX) - IXS
+      DY := (K - 1) / NX - IYS
+      DD := ABS(DX) + ABS(DY)
+      IF (DD < DMIN) THEN
+        DMIN := DD
+      ENDIF
+    ENDDO
+    IF (DMIN <= REACH) THEN
+      TILE_CLIP(IT) := 1
+      NACT := NACT + 1
+    ENDIF
+  ENDDO
+  DO K = NX + 2, NEND
+    UN(K) := 2.0 * U(K) - UN(K) &
+      + C2 * (U(K + 1) + U(K - 1) + U(K + NX) + U(K - NX) - 4.0 * U(K))
+  ENDDO
+  SV := AMP * EXP(0.0 - ((REAL(T) - 10.0) / 3.0) ** 2)
+  UN(ISRC) := UN(ISRC) + SV
+  DO K = NX + 2, NEND
+    U(K) := 2.0 * UN(K) - U(K) &
+      + C2 * (UN(K + 1) + UN(K - 1) + UN(K + NX) + UN(K - NX) - 4.0 * UN(K))
+  ENDDO
+ENDDO
+
+! Probes inside the cone + checksums over the clean region (rows
+! 140..500; the rows below 140 are excluded — see note below).
+SUMU := 0.0
+SUMUN := 0.0
+MAXU := 0.0
+NZ := 0
+NZT := 0
+DO K = 89601, 320000
+  SUMU := SUMU + U(K)
+  SUMUN := SUMUN + UN(K)
+  IF (ABS(U(K)) > MAXU) THEN
+    MAXU := ABS(U(K))
+  ENDIF
+  IF (U(K) /= 0.0) THEN
+    NZ := NZ + 1
+  ENDIF
+  IF (ABS(U(K)) > 1.0e-20) THEN
+    NZT := NZT + 1
+  ENDIF
+ENDDO
+
+WRITE(*, "U0=%.9e U1=%.9e U2=%.9e") U(ISRC), U(ISRC + 37), U(ISRC + 13 * NX)
+WRITE(*, "UN0=%.9e UN1=%.9e") UN(ISRC), UN(ISRC - 41)
+WRITE(*, "SUMU=%.9e SUMUN=%.9e MAXU=%.9e") SUMU, SUMUN, MAXU
+WRITE(*, "NZ=%d NZT=%d") NZ, NZT
+WRITE(*, "DISPATCHED=%.2f%%") 100.0 * REAL(NACT) / REAL(NT * NSTEPS)
