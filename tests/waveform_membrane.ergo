@@ -1,0 +1,707 @@
+! WAVEFORM_MEMBRANE - 2D amphiphilic membrane simulation
+! ===================================================================
+! Fixed population of 256 atoms in the plane z = 0.5. Each atom carries
+! an amphiphilic type (HEAD = +1, TAIL = -1). Phase Kuramoto coupling
+! drives alignment; backbone bonds link like types, cross-link bonds
+! link opposite types. The field records deposited amplitude and
+! diffuses on the 2D grid.
+
+IMPLICIT NONE
+
+! ── Grid dimensions (2D simulation, NZ = 1) ─────────────────
+PARAMETER INTEGER :: NX = 32
+PARAMETER INTEGER :: NY = 32
+PARAMETER INTEGER :: NZ = 1
+
+! ── Population ───────────────────────────────────────────────
+PARAMETER INTEGER :: NATOM = 256
+PARAMETER INTEGER :: MAXFRAME = 1000
+
+! ── Time stepping ────────────────────────────────────────────
+PARAMETER REAL :: DT = 0.01
+PARAMETER REAL :: BASE_OMEGA = 1.0
+PARAMETER REAL :: COUPLING_K = 5.0
+PARAMETER REAL :: DAMPING = 0.01
+PARAMETER REAL :: DIFFUSION = 0.1
+
+! ── Curvature / orientation dynamics ─────────────────────────
+PARAMETER REAL :: CURVATURE_STRENGTH = 0.05
+PARAMETER REAL :: THERMAL_NOISE = 0.001
+PARAMETER REAL :: VELOCITY_DAMP = 0.90
+
+! ── Perturbation experiment flags ───────────────────────────
+! 0 = none, 1 = remove central block, 2 = flip types in central block
+PARAMETER INTEGER :: PERTURB_TYPE = 0
+PARAMETER INTEGER :: PERTURB_FRAME = 300
+PARAMETER REAL :: PERTURB_RADIUS = 5.0
+
+! ── Bond detection ───────────────────────────────────────────
+PARAMETER INTEGER :: MAXBOND = 2048
+PARAMETER REAL :: BOND_DIST = 2.5
+PARAMETER REAL :: CROSS_BOND_DIST = 2.5
+PARAMETER REAL :: BOND_PHASE_THRESH = 0.95
+PARAMETER REAL :: CROSS_PHASE_THRESH = 0.90
+PARAMETER INTEGER :: MAX_BACKBONE = 2
+PARAMETER INTEGER :: MAX_CROSS = 1
+
+! ── Membrane type constants ──────────────────────────────────
+PARAMETER INTEGER :: TYPE_HEAD = 1
+PARAMETER INTEGER :: TYPE_TAIL = -1
+
+! ── Wavefield grid ───────────────────────────────────────────
+STATIC REAL :: FIELD_AMP(32, 32, 1)
+STATIC REAL :: FIELD_PHI(32, 32, 1)
+STATIC REAL :: FIELD_AMP_NEXT(32, 32, 1)
+
+! ── Atom state ───────────────────────────────────────────────
+STATIC REAL :: ATOM_X(256)
+STATIC REAL :: ATOM_Y(256)
+STATIC REAL :: ATOM_Z(256)
+STATIC REAL :: ATOM_THETA(256)
+STATIC REAL :: ATOM_OMEGA(256)
+STATIC REAL :: ATOM_NX(256)
+STATIC REAL :: ATOM_NY(256)
+STATIC REAL :: ATOM_NZ(256)
+STATIC REAL :: ATOM_NW(256)
+STATIC INTEGER :: ATOM_TYPE(256)
+STATIC INTEGER :: ATOM_ACTIVE(256)
+STATIC REAL :: ATOM_VX(256)
+STATIC REAL :: ATOM_VY(256)
+
+! ── Curvature diagnostics ────────────────────────────────────
+STATIC REAL :: MEAN_CURVATURE
+STATIC REAL :: RGYR
+STATIC INTEGER :: NBOND_BB
+STATIC INTEGER :: NBOND_CROSS
+STATIC INTEGER :: BB_BOND_I(2048)
+STATIC INTEGER :: BB_BOND_J(2048)
+STATIC INTEGER :: CROSS_BOND_I(2048)
+STATIC INTEGER :: CROSS_BOND_J(2048)
+STATIC INTEGER :: ATOM_DEGREE_BB(256)
+STATIC INTEGER :: ATOM_DEGREE_CROSS(256)
+STATIC INTEGER :: ATOM_PARENT_BOND(256)
+STATIC INTEGER :: COMPONENT_SIZE(256)
+STATIC INTEGER :: MAX_COMPONENT
+
+! ── 4-connected neighbor offsets in the XY plane ───────────────
+STATIC INTEGER :: DXI(4)
+STATIC INTEGER :: DYJ(4)
+DATA DXI / 1, -1, 0, 0 /
+DATA DYJ / 0, 0, 1, -1 /
+
+! ── Working scalars ──────────────────────────────────────────
+STATIC INTEGER :: I, J, K, IP, IM, JP, JM, DIR, NI, NJ, AT, AT2, FRAME, N
+STATIC INTEGER :: N_HEAD, N_TAIL
+STATIC REAL :: X, Y, Z, W, S, R, TH, D, WEIGHT, DIFF, AVG, RR
+STATIC REAL :: SIN_AVG, COS_AVG, THETA_MEAN, COHERENCE, MEAN_W, FLOW_FRAC
+STATIC REAL :: DXB, DYB, DZB, DISTB, DTHB
+
+! ── Initialize ───────────────────────────────────────────────
+CALL INIT_OFFSETS()
+CALL INIT_WAVEFIELD()
+CALL INIT_ATOMS()
+
+! CSV header
+WRITE(*, "frame,active_atoms,n_head,n_tail,coherence,mean_w,flow_frac,nbond_bb,nbond_cross,max_component,mean_curvature,rgyr")
+
+! ════════════════════════════════════════════════════════════
+! MAIN LOOP
+! ════════════════════════════════════════════════════════════
+DO FRAME = 1, MAXFRAME
+
+  ! Compute Viviani normals from current atom phases
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      CALL SET_ATOM_NORMAL(AT)
+    ENDIF
+  ENDDO
+
+  ! Atom phase advance + Kuramoto synchronization
+  CALL ATOM_PHASE_STEP()
+
+  ! Apply perturbation experiment
+  IF FRAME = PERTURB_FRAME THEN
+    IF PERTURB_TYPE = 1 THEN
+      CALL REMOVE_CENTRAL_BLOCK()
+    ELSEIF PERTURB_TYPE = 2 THEN
+      CALL FLIP_CENTRAL_TYPES()
+    ENDIF
+  ENDIF
+
+  ! Field deposition and diffusion
+  CALL FIELD_STEP()
+
+  ! Move atoms in-plane with curvature/orientation forces
+  CALL MOVE_ATOMS()
+
+  ! Update both bond types and connected components
+  CALL BOND_UPDATE()
+  CALL COMPUTE_BOND_STATS()
+
+  ! Output every 10 frames
+  IF MOD(FRAME, 10) = 0 THEN
+    N_HEAD := 0
+    N_TAIL := 0
+    N := 0
+    DO AT = 1, NATOM
+      IF ATOM_ACTIVE(AT) = 1 THEN
+        N := N + 1
+        IF ATOM_TYPE(AT) = TYPE_HEAD THEN
+          N_HEAD := N_HEAD + 1
+        ELSEIF ATOM_TYPE(AT) = TYPE_TAIL THEN
+          N_TAIL := N_TAIL + 1
+        ENDIF
+      ENDIF
+    ENDDO
+
+    WRITE(*, "%d,%d,%d,%d,%.6f,%.6f,%.6f,%d,%d,%d,%.6f,%.6f") &
+      FRAME, N, N_HEAD, N_TAIL, COHERENCE, MEAN_W, FLOW_FRAC, NBOND_BB, NBOND_CROSS, MAX_COMPONENT, &
+      MEAN_CURVATURE, RGYR
+  ENDIF
+
+ENDDO
+
+STOP
+
+! ════════════════════════════════════════════════════════════
+! SUBROUTINES
+! ════════════════════════════════════════════════════════════
+
+SUBROUTINE INIT_OFFSETS()
+  ! 4-connected neighbor offsets already set via DATA
+  RETURN
+END
+
+SUBROUTINE INIT_WAVEFIELD()
+  DO K = 1, NZ
+    DO J = 1, NY
+      DO I = 1, NX
+        FIELD_AMP(I, J, K) := 0.0
+        FIELD_PHI(I, J, K) := 0.0
+        FIELD_AMP_NEXT(I, J, K) := 0.0
+      ENDDO
+    ENDDO
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE INIT_ATOMS()
+  INTEGER :: IX, IY, AT
+  REAL :: STEP, OFFSET, TH0, WW
+
+  STEP := 2.0
+  OFFSET := 0.5
+
+  DO AT = 1, NATOM
+    ATOM_ACTIVE(AT) := 1
+
+    ! 16 x 16 lattice indices (0-based)
+    IX := (AT - 1) / 16
+    IY := MOD(AT - 1, 16)
+
+    ! Perturbed lattice in the z = 0.5 plane
+    ATOM_X(AT) := OFFSET + REAL(IX) * STEP + 0.15 * SIN(REAL(AT) * 0.7)
+    ATOM_Y(AT) := OFFSET + REAL(IY) * STEP + 0.15 * COS(REAL(AT) * 0.9)
+    ATOM_Z(AT) := 0.5
+    ATOM_VX(AT) := 0.0
+    ATOM_VY(AT) := 0.0
+
+    ! Spatially varying initial phase so w-component produces a mix of types
+    TH0 := 0.5 * ATOM_X(AT) + 0.7 * ATOM_Y(AT)
+    ATOM_THETA(AT) := TH0
+    ATOM_OMEGA(AT) := BASE_OMEGA + 0.5 * SIN(TH0)
+
+    ! Compute w-component and assign amphiphilic type
+    WW := (1.0 / 3.0) * SIN(5.0 * TH0)
+    IF WW ≥ 0.0 THEN
+      ATOM_TYPE(AT) := TYPE_HEAD
+    ELSE
+      ATOM_TYPE(AT) := TYPE_TAIL
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE SET_ATOM_NORMAL(AT)
+  INTEGER :: AT
+  REAL :: TH, WW, SS, RR
+
+  TH := ATOM_THETA(AT)
+  WW := (1.0 / 3.0) * SIN(5.0 * TH)
+  SS := SQRT(1.0 - WW * WW)
+
+  ATOM_NX(AT) := SS * (SIN(TH) - 0.5 * SIN(3.0 * TH))
+  ATOM_NY(AT) := SS * (-COS(TH) + 0.5 * COS(3.0 * TH))
+  ATOM_NZ(AT) := SS * COS(TH) * COS(3.0 * TH)
+  ATOM_NW(AT) := WW
+
+  RR := SQRT(ATOM_NX(AT)*ATOM_NX(AT) + ATOM_NY(AT)*ATOM_NY(AT) + &
+            ATOM_NZ(AT)*ATOM_NZ(AT) + ATOM_NW(AT)*ATOM_NW(AT))
+  IF RR > 1.0E-12 THEN
+    ATOM_NX(AT) := ATOM_NX(AT) / RR
+    ATOM_NY(AT) := ATOM_NY(AT) / RR
+    ATOM_NZ(AT) := ATOM_NZ(AT) / RR
+    ATOM_NW(AT) := ATOM_NW(AT) / RR
+  ENDIF
+  RETURN
+END
+
+REAL FUNCTION DOT4(AX, AY, AZ, AW, BX, BY, BZ, BW)
+  REAL :: AX, AY, AZ, AW, BX, BY, BZ, BW
+  DOT4 := AX*BX + AY*BY + AZ*BZ + AW*BW
+  RETURN DOT4
+END
+
+REAL FUNCTION ARCTAN_NORM(XX)
+  REAL :: XX
+  ARCTAN_NORM := (2.0 / 3.141592653589793) * ATAN(XX)
+  RETURN ARCTAN_NORM
+END
+
+SUBROUTINE ATOM_PHASE_STEP()
+  ! 1. Intrinsic phase advance
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      ATOM_THETA(AT) := ATOM_THETA(AT) + ATOM_OMEGA(AT) * DT
+    ENDIF
+  ENDDO
+
+  ! 2. Kuramoto coupling toward the mean phase
+  SIN_AVG := 0.0
+  COS_AVG := 0.0
+  N := 0
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      SIN_AVG := SIN_AVG + SIN(ATOM_THETA(AT))
+      COS_AVG := COS_AVG + COS(ATOM_THETA(AT))
+      N := N + 1
+    ENDIF
+  ENDDO
+
+  IF N > 0 THEN
+    COHERENCE := SQRT(SIN_AVG*SIN_AVG + COS_AVG*COS_AVG) / REAL(N)
+    THETA_MEAN := ATAN2(SIN_AVG, COS_AVG)
+    DO AT = 1, NATOM
+      IF ATOM_ACTIVE(AT) = 1 THEN
+        ATOM_THETA(AT) := ATOM_THETA(AT) + COUPLING_K * SIN(THETA_MEAN - ATOM_THETA(AT)) * DT
+      ENDIF
+    ENDDO
+  ELSE
+    COHERENCE := 0.0
+  ENDIF
+  RETURN
+END
+
+SUBROUTINE FIELD_STEP()
+  ! 1. Start from the current field amplitude
+  DO K = 1, NZ
+    DO J = 1, NY
+      DO I = 1, NX
+        FIELD_AMP_NEXT(I, J, K) := FIELD_AMP(I, J, K)
+      ENDDO
+    ENDDO
+  ENDDO
+
+  ! 2. Deposit atom amplitude and phase into the nearest grid cell
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      I := INT(ATOM_X(AT)) + 1
+      J := INT(ATOM_Y(AT)) + 1
+      K := INT(ATOM_Z(AT)) + 1
+      IF I ≥ 1 .AND. I ≤ NX .AND. J ≥ 1 .AND. J ≤ NY .AND. K ≥ 1 .AND. K ≤ NZ THEN
+        FIELD_AMP_NEXT(I, J, K) := FIELD_AMP_NEXT(I, J, K) + 1.0
+        FIELD_PHI(I, J, K) := ATOM_THETA(AT)
+      ENDIF
+    ENDIF
+  ENDDO
+
+  ! 3. Diffuse amplitude through 4-connected neighbors
+  DO K = 1, NZ
+    DO J = 1, NY
+      DO I = 1, NX
+        AVG := 0.0
+        DO DIR = 1, 4
+          NI := I + DXI(DIR)
+          NJ := J + DYJ(DIR)
+          IF NI < 1 THEN
+            NI := NX
+          ENDIF
+          IF NI > NX THEN
+            NI := 1
+          ENDIF
+          IF NJ < 1 THEN
+            NJ := NY
+          ENDIF
+          IF NJ > NY THEN
+            NJ := 1
+          ENDIF
+          AVG := AVG + FIELD_AMP(NI, NJ, K)
+        ENDDO
+        AVG := AVG / 4.0
+        FIELD_AMP_NEXT(I, J, K) := FIELD_AMP_NEXT(I, J, K) + DIFFUSION * (AVG - FIELD_AMP(I, J, K))
+      ENDDO
+    ENDDO
+  ENDDO
+
+  ! 4. Apply uniform damping and commit
+  DO K = 1, NZ
+    DO J = 1, NY
+      DO I = 1, NX
+        FIELD_AMP(I, J, K) := FIELD_AMP_NEXT(I, J, K) * (1.0 - DAMPING)
+      ENDDO
+    ENDDO
+  ENDDO
+
+  RETURN
+END
+
+SUBROUTINE BOND_UPDATE()
+  INTEGER :: I, J
+
+  NBOND_BB := 0
+  NBOND_CROSS := 0
+  DO I = 1, NATOM
+    ATOM_DEGREE_BB(I) := 0
+    ATOM_DEGREE_CROSS(I) := 0
+  ENDDO
+
+  DO I = 1, NATOM - 1
+    IF ATOM_ACTIVE(I) = 1 THEN
+      DO J = I + 1, NATOM
+        IF ATOM_ACTIVE(J) = 1 THEN
+          DXB := ATOM_X(I) - ATOM_X(J)
+          DYB := ATOM_Y(I) - ATOM_Y(J)
+          DZB := ATOM_Z(I) - ATOM_Z(J)
+          DISTB := SQRT(DXB*DXB + DYB*DYB + DZB*DZB)
+          DTHB := ATOM_THETA(I) - ATOM_THETA(J)
+
+          IF ATOM_TYPE(I) = ATOM_TYPE(J) THEN
+            ! Backbone bond: same type, distance and phase criteria
+            IF DISTB < BOND_DIST .AND. COS(DTHB) > BOND_PHASE_THRESH .AND. &
+               ATOM_DEGREE_BB(I) < MAX_BACKBONE .AND. ATOM_DEGREE_BB(J) < MAX_BACKBONE THEN
+              NBOND_BB := NBOND_BB + 1
+              IF NBOND_BB > MAXBOND THEN
+                NBOND_BB := MAXBOND
+                RETURN
+              ENDIF
+              BB_BOND_I(NBOND_BB) := I
+              BB_BOND_J(NBOND_BB) := J
+              ATOM_DEGREE_BB(I) := ATOM_DEGREE_BB(I) + 1
+              ATOM_DEGREE_BB(J) := ATOM_DEGREE_BB(J) + 1
+            ENDIF
+          ELSE
+            ! Cross-link bond: opposite type, distance and phase criteria
+            IF DISTB < CROSS_BOND_DIST .AND. COS(DTHB) > CROSS_PHASE_THRESH .AND. &
+               ATOM_DEGREE_CROSS(I) < MAX_CROSS .AND. ATOM_DEGREE_CROSS(J) < MAX_CROSS THEN
+              NBOND_CROSS := NBOND_CROSS + 1
+              IF NBOND_CROSS > MAXBOND THEN
+                NBOND_CROSS := MAXBOND
+                RETURN
+              ENDIF
+              CROSS_BOND_I(NBOND_CROSS) := I
+              CROSS_BOND_J(NBOND_CROSS) := J
+              ATOM_DEGREE_CROSS(I) := ATOM_DEGREE_CROSS(I) + 1
+              ATOM_DEGREE_CROSS(J) := ATOM_DEGREE_CROSS(J) + 1
+            ENDIF
+          ENDIF
+
+        ENDIF
+      ENDDO
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE COMPUTE_BOND_STATS()
+  INTEGER :: I, J, R, RI, RJ, IT, IT2, TOTAL_BONDS
+  INTEGER :: N1, N2, CURV_COUNT
+  REAL :: V1X, V1Y, V2X, V2Y, M1, M2, COSA, CX, CY
+
+  ! Union-find over all bonds (backbone + cross-link)
+  DO IT = 1, NATOM
+    ATOM_PARENT_BOND(IT) := IT
+  ENDDO
+
+  DO IT = 1, NBOND_BB
+    I := BB_BOND_I(IT)
+    J := BB_BOND_J(IT)
+
+    R := I
+    DO IT2 = 1, NATOM
+      IF ATOM_PARENT_BOND(R) > R .OR. ATOM_PARENT_BOND(R) < R THEN
+        R := ATOM_PARENT_BOND(R)
+      ENDIF
+    ENDDO
+    RI := R
+
+    R := J
+    DO IT2 = 1, NATOM
+      IF ATOM_PARENT_BOND(R) > R .OR. ATOM_PARENT_BOND(R) < R THEN
+        R := ATOM_PARENT_BOND(R)
+      ENDIF
+    ENDDO
+    RJ := R
+
+    IF RI > RJ .OR. RI < RJ THEN
+      ATOM_PARENT_BOND(RI) := RJ
+    ENDIF
+  ENDDO
+
+  DO IT = 1, NBOND_CROSS
+    I := CROSS_BOND_I(IT)
+    J := CROSS_BOND_J(IT)
+
+    R := I
+    DO IT2 = 1, NATOM
+      IF ATOM_PARENT_BOND(R) > R .OR. ATOM_PARENT_BOND(R) < R THEN
+        R := ATOM_PARENT_BOND(R)
+      ENDIF
+    ENDDO
+    RI := R
+
+    R := J
+    DO IT2 = 1, NATOM
+      IF ATOM_PARENT_BOND(R) > R .OR. ATOM_PARENT_BOND(R) < R THEN
+        R := ATOM_PARENT_BOND(R)
+      ENDIF
+    ENDDO
+    RJ := R
+
+    IF RI > RJ .OR. RI < RJ THEN
+      ATOM_PARENT_BOND(RI) := RJ
+    ENDIF
+  ENDDO
+
+  ! Count component sizes
+  DO IT = 1, NATOM
+    COMPONENT_SIZE(IT) := 0
+  ENDDO
+  DO IT = 1, NATOM
+    IF ATOM_ACTIVE(IT) = 1 THEN
+      R := IT
+      DO IT2 = 1, NATOM
+        IF ATOM_PARENT_BOND(R) > R .OR. ATOM_PARENT_BOND(R) < R THEN
+          R := ATOM_PARENT_BOND(R)
+        ENDIF
+      ENDDO
+      COMPONENT_SIZE(R) := COMPONENT_SIZE(R) + 1
+    ENDIF
+  ENDDO
+
+  MAX_COMPONENT := 0
+  DO IT = 1, NATOM
+    IF COMPONENT_SIZE(IT) > MAX_COMPONENT THEN
+      MAX_COMPONENT := COMPONENT_SIZE(IT)
+    ENDIF
+  ENDDO
+
+  ! Viviani diagnostics over active atoms
+  MEAN_W := 0.0
+  FLOW_FRAC := 0.0
+  N := 0
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      MEAN_W := MEAN_W + ABS(ATOM_NW(AT))
+      IF ABS(ATOM_NW(AT)) > 0.30 THEN
+        FLOW_FRAC := FLOW_FRAC + 1.0
+      ENDIF
+      N := N + 1
+    ENDIF
+  ENDDO
+  IF N > 0 THEN
+    MEAN_W := MEAN_W / REAL(N)
+    FLOW_FRAC := FLOW_FRAC / REAL(N)
+  ELSE
+    MEAN_W := 0.0
+    FLOW_FRAC := 0.0
+  ENDIF
+
+  ! Radius of gyration and local backbone curvature
+  MEAN_CURVATURE := 0.0
+  RGYR := 0.0
+  IF N > 0 THEN
+    CX := 0.0
+    CY := 0.0
+    DO AT = 1, NATOM
+      IF ATOM_ACTIVE(AT) = 1 THEN
+        CX := CX + ATOM_X(AT)
+        CY := CY + ATOM_Y(AT)
+      ENDIF
+    ENDDO
+    CX := CX / REAL(N)
+    CY := CY / REAL(N)
+
+    DO AT = 1, NATOM
+      IF ATOM_ACTIVE(AT) = 1 THEN
+        RGYR := RGYR + (ATOM_X(AT) - CX) ** 2 + (ATOM_Y(AT) - CY) ** 2
+      ENDIF
+    ENDDO
+    RGYR := SQRT(RGYR / REAL(N))
+
+    CURV_COUNT := 0
+    DO AT = 1, NATOM
+      IF ATOM_ACTIVE(AT) = 1 .AND. ATOM_DEGREE_BB(AT) = 2 THEN
+        N1 := 0
+        N2 := 0
+        DO IT = 1, NBOND_BB
+          IF BB_BOND_I(IT) = AT THEN
+            IF N1 = 0 THEN
+              N1 := BB_BOND_J(IT)
+            ELSE
+              N2 := BB_BOND_J(IT)
+            ENDIF
+          ELSEIF BB_BOND_J(IT) = AT THEN
+            IF N1 = 0 THEN
+              N1 := BB_BOND_I(IT)
+            ELSE
+              N2 := BB_BOND_I(IT)
+            ENDIF
+          ENDIF
+        ENDDO
+
+        IF N1 > 0 .AND. N2 > 0 THEN
+          V1X := ATOM_X(N1) - ATOM_X(AT)
+          V1Y := ATOM_Y(N1) - ATOM_Y(AT)
+          V2X := ATOM_X(N2) - ATOM_X(AT)
+          V2Y := ATOM_Y(N2) - ATOM_Y(AT)
+          M1 := SQRT(V1X*V1X + V1Y*V1Y)
+          M2 := SQRT(V2X*V2X + V2Y*V2Y)
+          IF M1 > 1.0E-12 .AND. M2 > 1.0E-12 THEN
+            COSA := (V1X*V2X + V1Y*V2Y) / (M1 * M2)
+            IF COSA > 1.0 THEN
+              COSA := 1.0
+            ENDIF
+            IF COSA < -1.0 THEN
+              COSA := -1.0
+            ENDIF
+            MEAN_CURVATURE := MEAN_CURVATURE + ABS(3.141592653589793 - ACOS(COSA))
+            CURV_COUNT := CURV_COUNT + 1
+          ENDIF
+        ENDIF
+      ENDIF
+    ENDDO
+    IF CURV_COUNT > 0 THEN
+      MEAN_CURVATURE := MEAN_CURVATURE / REAL(CURV_COUNT)
+    ENDIF
+  ENDIF
+
+  RETURN
+END
+
+SUBROUTINE REMOVE_CENTRAL_BLOCK()
+  ! Deactivate atoms inside a circular hole at the center of the sheet.
+  INTEGER :: AT, COUNT
+  REAL :: CX, CY, DXB, DYB, DISTB
+
+  CX := REAL(NX) / 2.0
+  CY := REAL(NY) / 2.0
+  COUNT := 0
+
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      DXB := ATOM_X(AT) - CX
+      DYB := ATOM_Y(AT) - CY
+      DISTB := SQRT(DXB*DXB + DYB*DYB)
+      IF DISTB < PERTURB_RADIUS THEN
+        ATOM_ACTIVE(AT) := 0
+        COUNT := COUNT + 1
+      ENDIF
+    ENDIF
+  ENDDO
+
+  RETURN
+END
+
+SUBROUTINE FLIP_CENTRAL_TYPES()
+  ! Invert amphiphilic type for atoms inside a circular central region.
+  INTEGER :: AT, COUNT
+  REAL :: CX, CY, DXB, DYB, DISTB
+
+  CX := REAL(NX) / 2.0
+  CY := REAL(NY) / 2.0
+  COUNT := 0
+
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      DXB := ATOM_X(AT) - CX
+      DYB := ATOM_Y(AT) - CY
+      DISTB := SQRT(DXB*DXB + DYB*DYB)
+      IF DISTB < PERTURB_RADIUS THEN
+        ATOM_TYPE(AT) := -ATOM_TYPE(AT)
+        COUNT := COUNT + 1
+      ENDIF
+    ENDIF
+  ENDDO
+
+  RETURN
+END
+
+SUBROUTINE MOVE_ATOMS()
+  ! In-plane motion driven by amphiphilic curvature preference + thermal noise.
+  INTEGER :: AT, COUNT
+  REAL :: CX, CY, DX, DY, R, FORCE, RANDX, RANDY
+
+  ! Centroid of active atoms
+  CX := 0.0
+  CY := 0.0
+  COUNT := 0
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      CX := CX + ATOM_X(AT)
+      CY := CY + ATOM_Y(AT)
+      COUNT := COUNT + 1
+    ENDIF
+  ENDDO
+  IF COUNT > 0 THEN
+    CX := CX / REAL(COUNT)
+    CY := CY / REAL(COUNT)
+  ENDIF
+
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      DX := ATOM_X(AT) - CX
+      DY := ATOM_Y(AT) - CY
+      R := SQRT(DX*DX + DY*DY)
+      IF R > 1.0E-12 THEN
+        ! HEAD (+1) driven outward, TAIL (-1) inward
+        FORCE := CURVATURE_STRENGTH * ATOM_TYPE(AT)
+        ATOM_VX(AT) := ATOM_VX(AT) + FORCE * (DX / R) * DT
+        ATOM_VY(AT) := ATOM_VY(AT) + FORCE * (DY / R) * DT
+      ENDIF
+
+      ! Deterministic thermal noise
+      RANDX := SIN(REAL(AT) * 7.3 + REAL(FRAME) * 0.17)
+      RANDY := COS(REAL(AT) * 5.7 + REAL(FRAME) * 0.31)
+      ATOM_VX(AT) := ATOM_VX(AT) + THERMAL_NOISE * RANDX * DT
+      ATOM_VY(AT) := ATOM_VY(AT) + THERMAL_NOISE * RANDY * DT
+
+      ! Velocity damping
+      ATOM_VX(AT) := ATOM_VX(AT) * VELOCITY_DAMP
+      ATOM_VY(AT) := ATOM_VY(AT) * VELOCITY_DAMP
+
+      ! Update position
+      ATOM_X(AT) := ATOM_X(AT) + ATOM_VX(AT) * DT
+      ATOM_Y(AT) := ATOM_Y(AT) + ATOM_VY(AT) * DT
+
+      ! Hard-wall boundaries
+      IF ATOM_X(AT) < 0.0 THEN
+        ATOM_X(AT) := 0.0
+        ATOM_VX(AT) := -ATOM_VX(AT)
+      ENDIF
+      IF ATOM_X(AT) > REAL(NX) THEN
+        ATOM_X(AT) := REAL(NX)
+        ATOM_VX(AT) := -ATOM_VX(AT)
+      ENDIF
+      IF ATOM_Y(AT) < 0.0 THEN
+        ATOM_Y(AT) := 0.0
+        ATOM_VY(AT) := -ATOM_VY(AT)
+      ENDIF
+      IF ATOM_Y(AT) > REAL(NY) THEN
+        ATOM_Y(AT) := REAL(NY)
+        ATOM_VY(AT) := -ATOM_VY(AT)
+      ENDIF
+    ENDIF
+  ENDDO
+
+  RETURN
+END

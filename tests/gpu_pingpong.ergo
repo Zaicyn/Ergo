@@ -1,0 +1,41 @@
+! GPU_PINGPONG — ping-pong (2x buffer) regression test
+! =====================================================================
+! Array A is read AND written by exactly one frame-loop kernel
+! (A(K) := A(K) * DECAY + SRC * MOD(K, 13)), so it qualifies for
+! ping-pong: a 2x device buffer, _pp_rd/_pp_wr offset push constants,
+! and a host-side offset swap at every frame_begin.
+!
+! The mid-frame CPU statement A(7) := A(7) + 0.5 exercises the
+! ping-pong-aware download/upload sync paths (transfers at
+! _pp_wr_offset, the current-state half).
+!
+! Same-index read-write means the offset scheme is equivalent to
+! in-place update, so the GPU result must match the CPU oracle.
+!
+! CPU:  python -m core tests/gpu_pingpong.ergo -o /tmp/pp_cpu
+! GPU:  python -m core tests/gpu_pingpong.ergo --target spirv --precision f32 -o /tmp/pp_gpu
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 100000, NSTEPS = 40
+REAL, PARAMETER :: DECAY = 0.99, SRC = 0.001
+
+STATIC REAL :: A(N)
+INTEGER :: K, T
+
+! Init kept on the CPU (nested loop is not extracted) so the frame
+! kernel is the ONLY kernel accessing A — the ping-pong eligibility
+! rule (ir_gpu.compute_pingpong_arrays).
+DO DMY = 1, 1
+  DO K = 1, N
+    A(K) := 0.001 * MOD(K, 97)
+  ENDDO
+ENDDO
+
+DO T = 1, NSTEPS
+  DO K = 1, N
+    A(K) := A(K) * DECAY + SRC * MOD(K, 13)
+  ENDDO
+  A(7) := A(7) + 0.5
+ENDDO
+
+WRITE(*, "A1=%.6f A2=%.6f A3=%.6f") A(1), A(50000), A(100000)

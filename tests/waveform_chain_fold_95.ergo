@@ -1,0 +1,736 @@
+! WAVEFORM_CHAIN_FOLD - coarse-grained geometric protein-folding chain
+! =====================================================================
+! A single permanent backbone of N beads (C-alpha-like) with sequence-
+! dependent backbone angles. Folding is driven by:
+!   1. Permanent backbone Morse bonds (never break).
+!   2. Backbone angle bending per residue (sequence-dependent target).
+!   3. Steric repulsion between non-local pairs (|i-j| >= 4), except
+!      current H-bonds.
+!   4. Dynamic directional H-bonds: phase-gated contact bonds between
+!      beads at least 3 apart, capped at HBOND_CAP per bead (2 = donor +
+!      acceptor, compatible with both alpha and beta geometry).
+!   5. Global Kuramoto phase synchronization + thermal cycling.
+!
+! CSV output: frame,rgyr,e2e,nhbond,i3,i4,iL,bang_mean,bang_rms, &
+!             coherence,thermal
+
+IMPLICIT NONE
+
+! ── Chain / population ──────────────────────────────────────
+PARAMETER INTEGER :: NATOM = 24
+PARAMETER INTEGER :: MAXHBOND = 512
+PARAMETER INTEGER :: MAXFRAME = 3000
+PARAMETER INTEGER :: NX = 64
+PARAMETER INTEGER :: NY = 64
+PARAMETER INTEGER :: NZ = 64
+
+! ── Time stepping / coupling ──────────────────────────────────
+PARAMETER REAL :: DT = 0.01
+PARAMETER REAL :: BASE_OMEGA = 1.0
+PARAMETER REAL :: COUPLING_K = 5.0
+PARAMETER REAL :: PHASE_NOISE_SCALE = 10.0
+PARAMETER REAL :: VELOCITY_DAMP = 0.9
+PARAMETER REAL :: FORCE_SCALE = 6.0
+
+! ── Five repeated heat/cool cycles + final anneal ─────────────
+PARAMETER REAL :: HEAT_START = 0.001
+PARAMETER REAL :: HEAT_PEAK = 1.0
+PARAMETER INTEGER :: CYCLE1_HEAT_START = 200
+PARAMETER INTEGER :: CYCLE1_HEAT_END = 300
+PARAMETER INTEGER :: CYCLE1_COOL_END = 400
+PARAMETER INTEGER :: CYCLE2_HEAT_END = 500
+PARAMETER INTEGER :: CYCLE2_COOL_END = 600
+PARAMETER INTEGER :: CYCLE3_HEAT_END = 700
+PARAMETER INTEGER :: CYCLE3_COOL_END = 800
+PARAMETER INTEGER :: CYCLE4_HEAT_END = 900
+PARAMETER INTEGER :: CYCLE4_COOL_END = 1000
+PARAMETER INTEGER :: CYCLE5_HEAT_END = 1100
+PARAMETER INTEGER :: CYCLE5_COOL_END = 1200
+
+! ── Backbone Morse potential ────────────────────────────────
+PARAMETER REAL :: BACKBONE_R0 = 1.52
+PARAMETER REAL :: BACKBONE_D = 1.4
+PARAMETER REAL :: MORSE_A = 1.0
+
+! ── H-bond (dynamic contact) potential and rules ─────────────
+PARAMETER REAL :: HBOND_R0 = 2.2
+PARAMETER REAL :: HBOND_D = 0.30
+PARAMETER REAL :: HBOND_FORM_DIST = 2.5
+PARAMETER REAL :: HBOND_BREAK_DIST = 2.8
+PARAMETER REAL :: HBOND_PHASE_FORM = 0.80
+PARAMETER REAL :: HBOND_PHASE_STABLE = 0.95
+PARAMETER INTEGER :: HBOND_CAP = 2
+
+! ── Steric repulsion (non-local non-bonded pairs) ────────────
+PARAMETER REAL :: STERIC_EPSILON = 0.1
+PARAMETER REAL :: STERIC_SIGMA = 1.30
+PARAMETER REAL :: STERIC_CUTOFF = 2.5
+
+! ── Default backbone angle target (degrees → cosine) ─────────
+PARAMETER REAL :: ANG_K_DEF = 0.30
+PARAMETER REAL :: ANG_T0_DEF = 95.0
+
+! ── Backbone torsion (Ramachandran-like dihedral bias) ───────
+! E = K * (1 - cos(phi - phi0)) for each C_alpha quartet.
+! phi0 = 50° biases toward alpha-helix virtual torsion;
+! set phi0 = 180° for a beta-sheet-like twist.
+PARAMETER REAL :: TORSION_K = 2.00
+PARAMETER REAL :: TORSION_PHI0 = 0.8727
+
+! ── Atom state ────────────────────────────────────────────────
+STATIC REAL :: ATOM_X(24)
+STATIC REAL :: ATOM_Y(24)
+STATIC REAL :: ATOM_Z(24)
+STATIC REAL :: ATOM_VX(24)
+STATIC REAL :: ATOM_VY(24)
+STATIC REAL :: ATOM_VZ(24)
+STATIC REAL :: ATOM_THETA(24)
+STATIC REAL :: ATOM_OMEGA(24)
+
+! ── Sequence / residue properties ───────────────────────────
+STATIC REAL :: ANG_K(24)
+STATIC REAL :: ANG_COS0(24)
+STATIC INTEGER :: RES_TYPE(24)
+
+! ── H-bond dynamic state ──────────────────────────────────────
+STATIC INTEGER :: H_BOND_MATRIX(24, 24)
+STATIC INTEGER :: HBOND_DEGREE(24)
+STATIC INTEGER :: NHBOND
+STATIC INTEGER :: HBOND_I(512)
+STATIC INTEGER :: HBOND_J(512)
+
+! ── Diagnostics ────────────────────────────────────────────────
+STATIC REAL :: RGYR
+STATIC REAL :: SPAN
+STATIC REAL :: COHERENCE
+STATIC REAL :: THERMAL_CURRENT
+STATIC REAL :: BANG_MEAN
+STATIC REAL :: BANG_RMS
+STATIC INTEGER :: NHBOND_COUNT
+STATIC INTEGER :: I3_COUNT
+STATIC INTEGER :: I4_COUNT
+STATIC INTEGER :: IL_COUNT
+STATIC INTEGER :: NHBOND_FORM
+STATIC INTEGER :: NHBOND_BREAK
+
+! ── Working scalars ───────────────────────────────────────────
+STATIC INTEGER :: I, J, K, AT, FRAME, N
+STATIC REAL :: DX, DY, DZ, DIST, SIN_AVG, COS_AVG, THETA_MEAN
+
+! ── Initialize ─────────────────────────────────────────────────
+CALL INIT_RESIDUES()
+CALL INIT_CHAIN()
+CALL INIT_HBONDS()
+
+! CSV header
+WRITE(*, "frame,rgyr,e2e,nhbond,i3,i4,iL,bang_mean,bang_rms,coherence,thermal")
+
+! ════════════════════════════════════════════════════════════
+! MAIN LOOP
+! ════════════════════════════════════════════════════════════
+FRAME := 1
+DO WHILE FRAME ≤ MAXFRAME
+
+  CALL COMPUTE_THERMAL()
+  CALL ATOM_PHASE_STEP()
+  CALL MOVE_ATOMS()
+  CALL H_BOND_UPDATE()
+  CALL COMPUTE_DIAGNOSTICS()
+
+  IF MOD(FRAME, 10) = 0 THEN
+    WRITE(*, "%d,%.6f,%.6f,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f") &
+      FRAME, RGYR, SPAN, NHBOND_COUNT, I3_COUNT, I4_COUNT, IL_COUNT, &
+      BANG_MEAN, BANG_RMS, COHERENCE, THERMAL_CURRENT
+  ENDIF
+
+  FRAME := FRAME + 1
+ENDDO
+
+STOP
+
+! ════════════════════════════════════════════════════════════
+! SUBROUTINES
+! ════════════════════════════════════════════════════════════
+
+SUBROUTINE INIT_RESIDUES()
+  ! Default uniform sequence: all residues use the same angle target.
+  ! To design a sequence, override ANG_K and ANG_COS0 here per residue.
+  INTEGER :: AT
+  REAL :: T0_RAD
+
+  T0_RAD := ANG_T0_DEF * 3.14159265 / 180.0
+  DO AT = 1, NATOM
+    ANG_K(AT) := ANG_K_DEF
+    ANG_COS0(AT) := COS(T0_RAD)
+    RES_TYPE(AT) := 1
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE INIT_CHAIN()
+  INTEGER :: AT
+  REAL :: TH0
+
+  DO AT = 1, NATOM
+    ATOM_VX(AT) := 0.0
+    ATOM_VY(AT) := 0.0
+    ATOM_VZ(AT) := 0.0
+
+    ! Loose extended spiral as initial conformation
+    ATOM_X(AT) := 10.0 + 1.45 * REAL(AT - 1)
+    ATOM_Y(AT) := 10.0 + 0.6 * SIN(REAL(AT - 1) * 0.9)
+    ATOM_Z(AT) := 10.0 + 0.6 * COS(REAL(AT - 1) * 0.9)
+
+    ! Spatially varying initial phase
+    TH0 := 0.3 * ATOM_X(AT) + 0.5 * ATOM_Y(AT) + 0.7 * ATOM_Z(AT)
+    ATOM_THETA(AT) := TH0
+    ATOM_OMEGA(AT) := BASE_OMEGA + 0.5 * SIN(TH0)
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE INIT_HBONDS()
+  INTEGER :: AT
+
+  DO AT = 1, NATOM
+    HBOND_DEGREE(AT) := 0
+  ENDDO
+  DO I = 1, NATOM
+    DO J = 1, NATOM
+      H_BOND_MATRIX(I, J) := 0
+    ENDDO
+  ENDDO
+  NHBOND := 0
+  RETURN
+END
+
+SUBROUTINE COMPUTE_THERMAL()
+  IF FRAME < CYCLE1_HEAT_START THEN
+    THERMAL_CURRENT := HEAT_START
+  ELSEIF FRAME < CYCLE1_HEAT_END THEN
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - CYCLE1_HEAT_START) / REAL(CYCLE1_HEAT_END - CYCLE1_HEAT_START)
+  ELSEIF FRAME < CYCLE1_COOL_END THEN
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - CYCLE1_HEAT_END) / REAL(CYCLE1_COOL_END - CYCLE1_HEAT_END)
+  ELSEIF FRAME < CYCLE2_HEAT_END THEN
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - CYCLE1_COOL_END) / REAL(CYCLE2_HEAT_END - CYCLE1_COOL_END)
+  ELSEIF FRAME < CYCLE2_COOL_END THEN
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - CYCLE2_HEAT_END) / REAL(CYCLE2_COOL_END - CYCLE2_HEAT_END)
+  ELSEIF FRAME < CYCLE3_HEAT_END THEN
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - CYCLE2_COOL_END) / REAL(CYCLE3_HEAT_END - CYCLE2_COOL_END)
+  ELSEIF FRAME < CYCLE3_COOL_END THEN
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - CYCLE3_HEAT_END) / REAL(CYCLE3_COOL_END - CYCLE3_HEAT_END)
+  ELSEIF FRAME < CYCLE4_HEAT_END THEN
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - CYCLE3_COOL_END) / REAL(CYCLE4_HEAT_END - CYCLE3_COOL_END)
+  ELSEIF FRAME < CYCLE4_COOL_END THEN
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - CYCLE4_HEAT_END) / REAL(CYCLE4_COOL_END - CYCLE4_HEAT_END)
+  ELSEIF FRAME < CYCLE5_HEAT_END THEN
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - CYCLE4_COOL_END) / REAL(CYCLE5_HEAT_END - CYCLE4_COOL_END)
+  ELSEIF FRAME < CYCLE5_COOL_END THEN
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - CYCLE5_HEAT_END) / REAL(CYCLE5_COOL_END - CYCLE5_HEAT_END)
+  ELSE
+    THERMAL_CURRENT := HEAT_START
+  ENDIF
+  RETURN
+END
+
+SUBROUTINE ATOM_PHASE_STEP()
+  ! Intrinsic phase advance
+  DO AT = 1, NATOM
+    ATOM_THETA(AT) := ATOM_THETA(AT) + ATOM_OMEGA(AT) * DT
+  ENDDO
+
+  ! Global Kuramoto synchronization toward mean phase
+  SIN_AVG := 0.0
+  COS_AVG := 0.0
+  N := 0
+  DO AT = 1, NATOM
+    SIN_AVG := SIN_AVG + SIN(ATOM_THETA(AT))
+    COS_AVG := COS_AVG + COS(ATOM_THETA(AT))
+    N := N + 1
+  ENDDO
+
+  IF N > 0 THEN
+    COHERENCE := SQRT(SIN_AVG*SIN_AVG + COS_AVG*COS_AVG) / REAL(N)
+    THETA_MEAN := ATAN2(SIN_AVG, COS_AVG)
+    DO AT = 1, NATOM
+      ATOM_THETA(AT) := ATOM_THETA(AT) + COUPLING_K * SIN(THETA_MEAN - ATOM_THETA(AT)) * DT
+    ENDDO
+  ELSE
+    COHERENCE := 0.0
+  ENDIF
+
+  ! Phase thermal noise
+  DO AT = 1, NATOM
+    ATOM_THETA(AT) := ATOM_THETA(AT) + &
+      PHASE_NOISE_SCALE * THERMAL_CURRENT * SIN(REAL(AT) * 11.3 + REAL(FRAME) * 0.23) * DT
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE MOVE_ATOMS()
+  ! Thermal jitter, steric repulsion, Morse forces (backbone + H-bonds),
+  ! and backbone angle bending all act as velocity impulses before damping
+  ! and position update.
+  INTEGER :: II, JJ
+  REAL :: SR, SR2, SR6, FM, FX, FY, FZ
+  REAL :: RDIFF, EXP_TERM, MORSE_FORCE
+
+  ! Thermal noise impulse on velocities
+  DO AT = 1, NATOM
+    ATOM_VX(AT) := ATOM_VX(AT) + THERMAL_CURRENT * SIN(REAL(AT) * 7.3 + REAL(FRAME) * 0.17)
+    ATOM_VY(AT) := ATOM_VY(AT) + THERMAL_CURRENT * COS(REAL(AT) * 5.7 + REAL(FRAME) * 0.31)
+    ATOM_VZ(AT) := ATOM_VZ(AT) + THERMAL_CURRENT * SIN(REAL(AT) * 3.1 + REAL(FRAME) * 0.09)
+  ENDDO
+
+  ! Steric repulsion between non-local pairs (|i-j| >= 4), except H-bonds
+  DO II = 1, NATOM - 4
+    DO JJ = II + 4, NATOM
+      IF H_BOND_MATRIX(II, JJ) = 0 THEN
+        DX := ATOM_X(II) - ATOM_X(JJ)
+        DY := ATOM_Y(II) - ATOM_Y(JJ)
+        DZ := ATOM_Z(II) - ATOM_Z(JJ)
+        DIST := SQRT(DX*DX + DY*DY + DZ*DZ)
+        IF DIST > 0.0 .AND. DIST < STERIC_CUTOFF THEN
+          SR := STERIC_SIGMA / DIST
+          SR2 := SR * SR
+          SR6 := SR2 * SR2 * SR2
+          FM := STERIC_EPSILON * SR6
+          FX := FM * DX / DIST
+          FY := FM * DY / DIST
+          FZ := FM * DZ / DIST
+          ATOM_VX(II) := ATOM_VX(II) + FX
+          ATOM_VY(II) := ATOM_VY(II) + FY
+          ATOM_VZ(II) := ATOM_VZ(II) + FZ
+          ATOM_VX(JJ) := ATOM_VX(JJ) - FX
+          ATOM_VY(JJ) := ATOM_VY(JJ) - FY
+          ATOM_VZ(JJ) := ATOM_VZ(JJ) - FZ
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Permanent backbone Morse bonds
+  DO II = 1, NATOM - 1
+    JJ := II + 1
+    DX := ATOM_X(II) - ATOM_X(JJ)
+    DY := ATOM_Y(II) - ATOM_Y(JJ)
+    DZ := ATOM_Z(II) - ATOM_Z(JJ)
+    DIST := SQRT(DX*DX + DY*DY + DZ*DZ)
+    IF DIST > 0.0 THEN
+      RDIFF := DIST - BACKBONE_R0
+      EXP_TERM := EXP(-MORSE_A * RDIFF)
+      MORSE_FORCE := -2.0 * BACKBONE_D * MORSE_A * (1.0 - EXP_TERM) * EXP_TERM
+      FX := MORSE_FORCE * DX / DIST
+      FY := MORSE_FORCE * DY / DIST
+      FZ := MORSE_FORCE * DZ / DIST
+      ATOM_VX(II) := ATOM_VX(II) + FX * DT * FORCE_SCALE
+      ATOM_VY(II) := ATOM_VY(II) + FY * DT * FORCE_SCALE
+      ATOM_VZ(II) := ATOM_VZ(II) + FZ * DT * FORCE_SCALE
+      ATOM_VX(JJ) := ATOM_VX(JJ) - FX * DT * FORCE_SCALE
+      ATOM_VY(JJ) := ATOM_VY(JJ) - FY * DT * FORCE_SCALE
+      ATOM_VZ(JJ) := ATOM_VZ(JJ) - FZ * DT * FORCE_SCALE
+    ENDIF
+  ENDDO
+
+  ! Dynamic H-bond Morse forces
+  DO K = 1, NHBOND
+    II := HBOND_I(K)
+    JJ := HBOND_J(K)
+    DX := ATOM_X(II) - ATOM_X(JJ)
+    DY := ATOM_Y(II) - ATOM_Y(JJ)
+    DZ := ATOM_Z(II) - ATOM_Z(JJ)
+    DIST := SQRT(DX*DX + DY*DY + DZ*DZ)
+    IF DIST > 0.0 THEN
+      RDIFF := DIST - HBOND_R0
+      EXP_TERM := EXP(-MORSE_A * RDIFF)
+      MORSE_FORCE := -2.0 * HBOND_D * MORSE_A * (1.0 - EXP_TERM) * EXP_TERM
+      FX := MORSE_FORCE * DX / DIST
+      FY := MORSE_FORCE * DY / DIST
+      FZ := MORSE_FORCE * DZ / DIST
+      ATOM_VX(II) := ATOM_VX(II) + FX * DT * FORCE_SCALE
+      ATOM_VY(II) := ATOM_VY(II) + FY * DT * FORCE_SCALE
+      ATOM_VZ(II) := ATOM_VZ(II) + FZ * DT * FORCE_SCALE
+      ATOM_VX(JJ) := ATOM_VX(JJ) - FX * DT * FORCE_SCALE
+      ATOM_VY(JJ) := ATOM_VY(JJ) - FY * DT * FORCE_SCALE
+      ATOM_VZ(JJ) := ATOM_VZ(JJ) - FZ * DT * FORCE_SCALE
+    ENDIF
+  ENDDO
+
+  ! Backbone angle bending
+  CALL BACKBONE_ANGLES()
+
+  ! Backbone torsion (Ramachandran-like dihedral bias)
+  CALL BACKBONE_TORSIONS()
+
+  ! Damping and position update with hard-wall boundaries
+  DO AT = 1, NATOM
+    ATOM_VX(AT) := ATOM_VX(AT) * VELOCITY_DAMP
+    ATOM_VY(AT) := ATOM_VY(AT) * VELOCITY_DAMP
+    ATOM_VZ(AT) := ATOM_VZ(AT) * VELOCITY_DAMP
+
+    ATOM_X(AT) := ATOM_X(AT) + ATOM_VX(AT) * DT
+    ATOM_Y(AT) := ATOM_Y(AT) + ATOM_VY(AT) * DT
+    ATOM_Z(AT) := ATOM_Z(AT) + ATOM_VZ(AT) * DT
+
+    IF ATOM_X(AT) < 0.0 THEN
+      ATOM_X(AT) := 0.0
+      ATOM_VX(AT) := -ATOM_VX(AT)
+    ENDIF
+    IF ATOM_X(AT) > REAL(NX) THEN
+      ATOM_X(AT) := REAL(NX)
+      ATOM_VX(AT) := -ATOM_VX(AT)
+    ENDIF
+    IF ATOM_Y(AT) < 0.0 THEN
+      ATOM_Y(AT) := 0.0
+      ATOM_VY(AT) := -ATOM_VY(AT)
+    ENDIF
+    IF ATOM_Y(AT) > REAL(NY) THEN
+      ATOM_Y(AT) := REAL(NY)
+      ATOM_VY(AT) := -ATOM_VY(AT)
+    ENDIF
+    IF ATOM_Z(AT) < 0.0 THEN
+      ATOM_Z(AT) := 0.0
+      ATOM_VZ(AT) := -ATOM_VZ(AT)
+    ENDIF
+    IF ATOM_Z(AT) > REAL(NZ) THEN
+      ATOM_Z(AT) := REAL(NZ)
+      ATOM_VZ(AT) := -ATOM_VZ(AT)
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE BACKBONE_ANGLES()
+  ! E = k*(cos(theta) - cos(theta0))^2 for every backbone triplet.
+  INTEGER :: CEN, A, B
+  REAL :: UX, UY, UZ, WX, WY, WZ, UN, VN, CS, C0, KANG
+  REAL :: S, DEDC, DCUX, DCUY, DCUZ, DCWX, DCWY, DCWZ
+  REAL :: FAX, FAY, FAZ, FCX, FCY, FCZ
+
+  DO CEN = 2, NATOM - 1
+    KANG := ANG_K(CEN)
+    IF KANG > 0.0 THEN
+      A := CEN - 1
+      B := CEN + 1
+      UX := ATOM_X(A) - ATOM_X(CEN)
+      UY := ATOM_Y(A) - ATOM_Y(CEN)
+      UZ := ATOM_Z(A) - ATOM_Z(CEN)
+      WX := ATOM_X(B) - ATOM_X(CEN)
+      WY := ATOM_Y(B) - ATOM_Y(CEN)
+      WZ := ATOM_Z(B) - ATOM_Z(CEN)
+      UN := SQRT(UX*UX + UY*UY + UZ*UZ)
+      VN := SQRT(WX*WX + WY*WY + WZ*WZ)
+      IF UN > 0.0 .AND. VN > 0.0 THEN
+        CS := (UX*WX + UY*WY + UZ*WZ) / (UN * VN)
+        IF CS > 1.0 THEN
+          CS := 1.0
+        ENDIF
+        IF CS < -1.0 THEN
+          CS := -1.0
+        ENDIF
+        C0 := ANG_COS0(CEN)
+        DEDC := 2.0 * KANG * (CS - C0)
+        S := 1.0 / (UN * VN)
+        DCUX := S * WX - CS * UX / (UN * UN)
+        DCUY := S * WY - CS * UY / (UN * UN)
+        DCUZ := S * WZ - CS * UZ / (UN * UN)
+        DCWX := S * UX - CS * WX / (VN * VN)
+        DCWY := S * UY - CS * WY / (VN * VN)
+        DCWZ := S * UZ - CS * WZ / (VN * VN)
+        FAX := -DEDC * DCUX
+        FAY := -DEDC * DCUY
+        FAZ := -DEDC * DCUZ
+        FCX := -DEDC * DCWX
+        FCY := -DEDC * DCWY
+        FCZ := -DEDC * DCWZ
+        ATOM_VX(A) := ATOM_VX(A) + FAX * DT * FORCE_SCALE
+        ATOM_VY(A) := ATOM_VY(A) + FAY * DT * FORCE_SCALE
+        ATOM_VZ(A) := ATOM_VZ(A) + FAZ * DT * FORCE_SCALE
+        ATOM_VX(B) := ATOM_VX(B) + FCX * DT * FORCE_SCALE
+        ATOM_VY(B) := ATOM_VY(B) + FCY * DT * FORCE_SCALE
+        ATOM_VZ(B) := ATOM_VZ(B) + FCZ * DT * FORCE_SCALE
+        ATOM_VX(CEN) := ATOM_VX(CEN) - (FAX + FCX) * DT * FORCE_SCALE
+        ATOM_VY(CEN) := ATOM_VY(CEN) - (FAY + FCY) * DT * FORCE_SCALE
+        ATOM_VZ(CEN) := ATOM_VZ(CEN) - (FAZ + FCZ) * DT * FORCE_SCALE
+      ENDIF
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE BACKBONE_TORSIONS()
+  ! E = K * (1 - cos(phi - phi0)) for each C_alpha quartet.
+  ! phi is the dihedral angle between planes ABC and BCD.
+  INTEGER :: A, B, C, D
+  REAL :: B1X, B1Y, B1Z, B2X, B2Y, B2Z, B3X, B3Y, B3Z
+  REAL :: N1X, N1Y, N1Z, N2X, N2Y, N2Z
+  REAL :: M1X, M1Y, M1Z
+  REAL :: N1N, N2N, B2N, B2N2
+  REAL :: COS_PHI, SIN_PHI, PHI, DEDPHI
+  REAL :: ALPHA, BETA
+  REAL :: FIX, FIY, FIZ, FJX, FJY, FJZ, FKX, FKY, FKZ, FLX, FLY, FLZ
+
+  DO A = 1, NATOM - 3
+    B := A + 1
+    C := A + 2
+    D := A + 3
+
+    B1X := ATOM_X(B) - ATOM_X(A)
+    B1Y := ATOM_Y(B) - ATOM_Y(A)
+    B1Z := ATOM_Z(B) - ATOM_Z(A)
+
+    B2X := ATOM_X(B) - ATOM_X(C)
+    B2Y := ATOM_Y(B) - ATOM_Y(C)
+    B2Z := ATOM_Z(B) - ATOM_Z(C)
+
+    B3X := ATOM_X(D) - ATOM_X(C)
+    B3Y := ATOM_Y(D) - ATOM_Y(C)
+    B3Z := ATOM_Z(D) - ATOM_Z(C)
+
+    N1X := B1Y * B2Z - B1Z * B2Y
+    N1Y := B1Z * B2X - B1X * B2Z
+    N1Z := B1X * B2Y - B1Y * B2X
+
+    N2X := B2Y * B3Z - B2Z * B3Y
+    N2Y := B2Z * B3X - B2X * B3Z
+    N2Z := B2X * B3Y - B2Y * B3X
+
+    N1N := SQRT(N1X*N1X + N1Y*N1Y + N1Z*N1Z)
+    N2N := SQRT(N2X*N2X + N2Y*N2Y + N2Z*N2Z)
+    B2N := SQRT(B2X*B2X + B2Y*B2Y + B2Z*B2Z)
+
+    IF N1N > 0.0001 .AND. N2N > 0.0001 .AND. B2N > 0.0001 THEN
+      COS_PHI := (N1X*N2X + N1Y*N2Y + N1Z*N2Z) / (N1N * N2N)
+      IF COS_PHI > 1.0 THEN
+        COS_PHI := 1.0
+      ENDIF
+      IF COS_PHI < -1.0 THEN
+        COS_PHI := -1.0
+      ENDIF
+
+      ! m1 = (b2 / |b2|) x n1
+      M1X := (B2Y * N1Z - B2Z * N1Y) / B2N
+      M1Y := (B2Z * N1X - B2X * N1Z) / B2N
+      M1Z := (B2X * N1Y - B2Y * N1X) / B2N
+
+      SIN_PHI := (M1X*N2X + M1Y*N2Y + M1Z*N2Z) / (N1N * N2N)
+      IF SIN_PHI > 1.0 THEN
+        SIN_PHI := 1.0
+      ENDIF
+      IF SIN_PHI < -1.0 THEN
+        SIN_PHI := -1.0
+      ENDIF
+
+      PHI := ATAN2(SIN_PHI, COS_PHI)
+      DEDPHI := TORSION_K * SIN(PHI - TORSION_PHI0)
+
+      ! End-atom forces (i and l)
+      FIX := DEDPHI * B2N * N1X / (N1N * N1N)
+      FIY := DEDPHI * B2N * N1Y / (N1N * N1N)
+      FIZ := DEDPHI * B2N * N1Z / (N1N * N1N)
+
+      FLX := -DEDPHI * B2N * N2X / (N2N * N2N)
+      FLY := -DEDPHI * B2N * N2Y / (N2N * N2N)
+      FLZ := -DEDPHI * B2N * N2Z / (N2N * N2N)
+
+      ! Middle-atom forces (j and k) conserve total force and torque
+      B2N2 := B2N * B2N
+      ALPHA := (B1X*B2X + B1Y*B2Y + B1Z*B2Z) / B2N2
+      BETA := (B3X*B2X + B3Y*B2Y + B3Z*B2Z) / B2N2
+
+      FJX := -FIX + ALPHA * FIX + BETA * FLX
+      FJY := -FIY + ALPHA * FIY + BETA * FLY
+      FJZ := -FIZ + ALPHA * FIZ + BETA * FLZ
+
+      FKX := -FLX - ALPHA * FIX - BETA * FLX
+      FKY := -FLY - ALPHA * FIY - BETA * FLY
+      FKZ := -FLZ - ALPHA * FIZ - BETA * FLZ
+
+      ATOM_VX(A) := ATOM_VX(A) + FIX * DT * FORCE_SCALE
+      ATOM_VY(A) := ATOM_VY(A) + FIY * DT * FORCE_SCALE
+      ATOM_VZ(A) := ATOM_VZ(A) + FIZ * DT * FORCE_SCALE
+
+      ATOM_VX(B) := ATOM_VX(B) + FJX * DT * FORCE_SCALE
+      ATOM_VY(B) := ATOM_VY(B) + FJY * DT * FORCE_SCALE
+      ATOM_VZ(B) := ATOM_VZ(B) + FJZ * DT * FORCE_SCALE
+
+      ATOM_VX(C) := ATOM_VX(C) + FKX * DT * FORCE_SCALE
+      ATOM_VY(C) := ATOM_VY(C) + FKY * DT * FORCE_SCALE
+      ATOM_VZ(C) := ATOM_VZ(C) + FKZ * DT * FORCE_SCALE
+
+      ATOM_VX(D) := ATOM_VX(D) + FLX * DT * FORCE_SCALE
+      ATOM_VY(D) := ATOM_VY(D) + FLY * DT * FORCE_SCALE
+      ATOM_VZ(D) := ATOM_VZ(D) + FLZ * DT * FORCE_SCALE
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE H_BOND_UPDATE()
+  ! Dynamic H-bonds: phase-gated contacts, |i-j| >= 3, capped at
+  ! HBOND_CAP per bead. H-bonds are the only contacts that are not
+  ! backbone bonds; they can form and break during the simulation.
+  INTEGER :: EI, EJ
+  REAL :: ALIGN
+
+  ! Recompute H-bond degrees from current state
+  DO AT = 1, NATOM
+    HBOND_DEGREE(AT) := 0
+  ENDDO
+  DO I = 1, NATOM - 1
+    DO J = I + 1, NATOM
+      IF H_BOND_MATRIX(I, J) = 1 THEN
+        HBOND_DEGREE(I) := HBOND_DEGREE(I) + 1
+        HBOND_DEGREE(J) := HBOND_DEGREE(J) + 1
+      ENDIF
+    ENDDO
+  ENDDO
+
+  NHBOND_FORM := 0
+  NHBOND_BREAK := 0
+
+  DO I = 1, NATOM - 3
+    DO J = I + 3, NATOM
+      DX := ATOM_X(I) - ATOM_X(J)
+      DY := ATOM_Y(I) - ATOM_Y(J)
+      DZ := ATOM_Z(I) - ATOM_Z(J)
+      DIST := SQRT(DX*DX + DY*DY + DZ*DZ)
+      ALIGN := COS(ATOM_THETA(I) - ATOM_THETA(J))
+
+      IF H_BOND_MATRIX(I, J) = 1 THEN
+        ! Break if phase misaligned or stretched too far
+        IF ALIGN < HBOND_PHASE_STABLE .OR. DIST > HBOND_BREAK_DIST THEN
+          H_BOND_MATRIX(I, J) := 0
+          HBOND_DEGREE(I) := HBOND_DEGREE(I) - 1
+          HBOND_DEGREE(J) := HBOND_DEGREE(J) - 1
+          NHBOND_BREAK := NHBOND_BREAK + 1
+        ENDIF
+      ELSE
+        ! Form if close, phase-aligned, and valence permits
+        IF DIST < HBOND_FORM_DIST .AND. ALIGN > HBOND_PHASE_FORM .AND. &
+           HBOND_DEGREE(I) < HBOND_CAP .AND. HBOND_DEGREE(J) < HBOND_CAP THEN
+          H_BOND_MATRIX(I, J) := 1
+          HBOND_DEGREE(I) := HBOND_DEGREE(I) + 1
+          HBOND_DEGREE(J) := HBOND_DEGREE(J) + 1
+          NHBOND_FORM := NHBOND_FORM + 1
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Build the H-bond list for the next force evaluation
+  NHBOND := 0
+  DO I = 1, NATOM - 1
+    DO J = I + 1, NATOM
+      IF H_BOND_MATRIX(I, J) = 1 THEN
+        NHBOND := NHBOND + 1
+        IF NHBOND ≤ MAXHBOND THEN
+          HBOND_I(NHBOND) := I
+          HBOND_J(NHBOND) := J
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE COMPUTE_DIAGNOSTICS()
+  ! Radius of gyration, end-to-end distance, H-bond counts by sequence
+  ! separation, and backbone angle statistics.
+  REAL :: CX, CY, CZ, UX, UY, UZ, WX, WY, WZ, UN, VN, CS, ANG
+  REAL :: SUM_ANG, SUM_SQ, MEAN_ANG
+  INTEGER :: CEN, A, B
+
+  CX := 0.0
+  CY := 0.0
+  CZ := 0.0
+  DO AT = 1, NATOM
+    CX := CX + ATOM_X(AT)
+    CY := CY + ATOM_Y(AT)
+    CZ := CZ + ATOM_Z(AT)
+  ENDDO
+  CX := CX / REAL(NATOM)
+  CY := CY / REAL(NATOM)
+  CZ := CZ / REAL(NATOM)
+
+  RGYR := 0.0
+  DO AT = 1, NATOM
+    RGYR := RGYR + (ATOM_X(AT) - CX)**2 + (ATOM_Y(AT) - CY)**2 + (ATOM_Z(AT) - CZ)**2
+  ENDDO
+  RGYR := SQRT(RGYR / REAL(NATOM))
+
+  ! End-to-end distance
+  DX := ATOM_X(1) - ATOM_X(NATOM)
+  DY := ATOM_Y(1) - ATOM_Y(NATOM)
+  DZ := ATOM_Z(1) - ATOM_Z(NATOM)
+  SPAN := SQRT(DX*DX + DY*DY + DZ*DZ)
+
+  ! H-bond inventory
+  NHBOND_COUNT := 0
+  I3_COUNT := 0
+  I4_COUNT := 0
+  IL_COUNT := 0
+  DO I = 1, NATOM - 1
+    DO J = I + 1, NATOM
+      IF H_BOND_MATRIX(I, J) = 1 THEN
+        NHBOND_COUNT := NHBOND_COUNT + 1
+        IF J - I = 3 THEN
+          I3_COUNT := I3_COUNT + 1
+        ELSEIF J - I = 4 THEN
+          I4_COUNT := I4_COUNT + 1
+        ELSEIF J - I ≥ 5 THEN
+          IL_COUNT := IL_COUNT + 1
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Backbone angle statistics
+  SUM_ANG := 0.0
+  SUM_SQ := 0.0
+  N := 0
+  DO CEN = 2, NATOM - 1
+    A := CEN - 1
+    B := CEN + 1
+    UX := ATOM_X(A) - ATOM_X(CEN)
+    UY := ATOM_Y(A) - ATOM_Y(CEN)
+    UZ := ATOM_Z(A) - ATOM_Z(CEN)
+    WX := ATOM_X(B) - ATOM_X(CEN)
+    WY := ATOM_Y(B) - ATOM_Y(CEN)
+    WZ := ATOM_Z(B) - ATOM_Z(CEN)
+    UN := SQRT(UX*UX + UY*UY + UZ*UZ)
+    VN := SQRT(WX*WX + WY*WY + WZ*WZ)
+    IF UN > 0.0 .AND. VN > 0.0 THEN
+      CS := (UX*WX + UY*WY + UZ*WZ) / (UN * VN)
+      IF CS > 1.0 THEN
+        CS := 1.0
+      ENDIF
+      IF CS < -1.0 THEN
+        CS := -1.0
+      ENDIF
+      ANG := ACOS(CS) * 57.29578
+      SUM_ANG := SUM_ANG + ANG
+      SUM_SQ := SUM_SQ + ANG * ANG
+      N := N + 1
+    ENDIF
+  ENDDO
+  IF N > 0 THEN
+    MEAN_ANG := SUM_ANG / REAL(N)
+    BANG_MEAN := MEAN_ANG
+    BANG_RMS := SQRT(SUM_SQ / REAL(N) - MEAN_ANG * MEAN_ANG)
+  ELSE
+    BANG_MEAN := 0.0
+    BANG_RMS := 0.0
+  ENDIF
+  RETURN
+END

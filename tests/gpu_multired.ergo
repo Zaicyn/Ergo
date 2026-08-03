@@ -1,0 +1,44 @@
+! GPU_MULTIRED — multi-accumulator staged reduction test
+! =====================================================================
+! Three accumulators in one loop: two REAL sums plus one INTEGER count.
+! GPU (staged reduction, per-acc workgroup combine) must match the CPU
+! sequential result bitwise (f64; integer sums exact).
+!
+! CPU:  python -m core tests/gpu_multired.ergo -o /tmp/mr_cpu
+! GPU:  python -m core tests/gpu_multired.ergo --target spirv -o /tmp/mr_gpu
+
+INTEGER, PARAMETER :: N = 4096
+STATIC REAL :: A(N)
+STATIC REAL :: S1, S2
+STATIC INTEGER :: CNT
+
+IMPLICIT NONE
+INTEGER :: I
+
+DO I = 1, N
+  A(I) := REAL(I)
+ENDDO
+
+S1 := 0.0
+S2 := 0.0
+CNT := 0
+DO I = 1, N
+  S1 := S1 + A(I)
+  S2 := S2 + A(I) * A(I)
+  CNT := CNT + 1
+ENDDO
+
+! S1 = N(N+1)/2 = 8390656
+! S2 = N(N+1)(2N+1)/6 = 22914881536
+! CNT = 4096
+PRINT S1
+PRINT S2
+PRINT CNT
+
+! Second accumulation round on nonzero accumulators
+DO I = 1, N
+  S1 := S1 + 1.0
+  CNT := CNT + 1
+ENDDO
+PRINT S1
+PRINT CNT

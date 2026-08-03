@@ -1,0 +1,36 @@
+! GPU_TILE — --gpu-tile-size regression test
+! =====================================================================
+! An injective map (B := A * SCALE + 1) and a scalar reduction
+! (TOTAL := sum B) over 3M elements. Run untiled vs tiled — outputs
+! must be BITWISE identical: the tile step is quantized to a workgroup
+! (256) multiple, so reduction partials partition the range exactly
+! like the untiled dispatch and the host ordered combine sees the same
+! partial sequence.
+!
+! CPU:    python -m core tests/gpu_tile.ergo --precision f32 -o /tmp/tile_cpu
+! GPU:    python -m core tests/gpu_tile.ergo --target spirv --precision f32 -o /tmp/tile_gpu
+! TILED:  python -m core tests/gpu_tile.ergo --target spirv --precision f32 --gpu-tile-size 100000 -o /tmp/tile_gpu_t
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 3000000
+REAL, PARAMETER :: SCALE = 0.5
+
+STATIC REAL :: A(N), B(N)
+REAL :: TOTAL
+INTEGER :: K
+
+DO K = 1, N
+  A(K) := REAL(MOD(K, 1000)) * 0.001
+  B(K) := 0.0
+ENDDO
+
+DO K = 1, N
+  B(K) := A(K) * SCALE + 1.0
+ENDDO
+
+TOTAL := 0.0
+DO K = 1, N
+  TOTAL := TOTAL + B(K)
+ENDDO
+
+WRITE(*, "B1=%.6f B2=%.6f TOTAL=%.6f") B(1), B(N), TOTAL

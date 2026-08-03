@@ -1,0 +1,44 @@
+! GPU_SEGRED — segmented reduction extraction test
+! =====================================================================
+! ACC(BLKOF(I)) := ACC(BLKOF(I)) + PROD(I) over 3 padded segments
+! (seg_len = 512 = 2 workgroups each, NTOT = 1536).
+!
+! Round 1: PROD(I) = I  →  seg sums 131328 / 393472 / 655616
+! Round 2: PROD(I) = 1  →  += 512 per segment (ACC nonzero entering
+!          the second round — accumulation must ADD onto it)
+! Final:   131840 / 393984 / 656128
+!
+! CPU:  python -m core tests/gpu_segred.ergo -o /tmp/seg_cpu
+! GPU:  python -m core tests/gpu_segred.ergo --target spirv -o /tmp/seg_gpu
+
+INTEGER, PARAMETER :: NSEG = 3
+INTEGER, PARAMETER :: SEGLEN = 512
+INTEGER, PARAMETER :: NTOT = 1536
+
+STATIC REAL :: PROD(NTOT)
+STATIC REAL :: ACC(NSEG)
+STATIC INTEGER :: BLKOF(NTOT)
+
+IMPLICIT NONE
+INTEGER :: I, R
+
+DO I = 1, NTOT
+  BLKOF(I) := (I - 1) / SEGLEN + 1
+ENDDO
+DO I = 1, NTOT
+  PROD(I) := REAL(I)
+ENDDO
+
+! Two accumulation rounds over the same accumulator array.
+DO R = 1, 2
+  DO I = 1, NTOT
+    ACC(BLKOF(I)) := ACC(BLKOF(I)) + PROD(I)
+  ENDDO
+  DO I = 1, NTOT
+    PROD(I) := 1.0
+  ENDDO
+ENDDO
+
+PRINT ACC(1)
+PRINT ACC(2)
+PRINT ACC(3)

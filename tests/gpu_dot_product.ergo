@@ -1,0 +1,27 @@
+! GPU_DOT_PRODUCT — staged reduction extraction test
+! =====================================================================
+! total := sum_I A(I)*B(I) with A(I)=B(I)=I → sum of squares
+!   expected = N(N+1)(2N+1)/6 = 4096*4097*8193/6 = 22914881536
+!
+! CPU:  python -m core tests/gpu_dot_product.ergo -o /tmp/dot_cpu
+! GPU:  python -m core tests/gpu_dot_product.ergo --target spirv -o /tmp/dot_gpu
+
+INTEGER, PARAMETER :: N = 4096
+
+STATIC REAL :: A(N), B(N)
+STATIC REAL :: total
+
+IMPLICIT NONE
+INTEGER :: I
+
+DO I = 1, N
+  A(I) := REAL(I)
+  B(I) := REAL(I)
+ENDDO
+
+total := 0.0
+DO I = 1, N
+  total := total + A(I) * B(I)
+ENDDO
+
+PRINT total

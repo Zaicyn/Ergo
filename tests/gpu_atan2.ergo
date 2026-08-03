@@ -1,0 +1,29 @@
+! GPU_ATAN2 — ATAN2 intrinsic lowering test (SPIR-V backend)
+! =====================================================================
+! Per-element atan2 on known values. Transcendentals evaluate f64->f32
+! ->f64 on GPU (spec 9.10), so GPU vs CPU differs at ~1e-6 relative —
+! compared against the CPU result computed in f64 with that tolerance.
+!
+! CPU:  python -m core tests/gpu_atan2.ergo -o /tmp/a2_cpu
+! GPU:  python -m core tests/gpu_atan2.ergo --target spirv -o /tmp/a2_gpu
+
+INTEGER, PARAMETER :: N = 256
+STATIC REAL :: Y(N), X(N), R(N)
+
+IMPLICIT NONE
+INTEGER :: I
+
+DO I = 1, N
+  Y(I) := REAL(I) / 64.0 - 2.0
+  X(I) := REAL(257 - I) / 32.0 - 4.0
+ENDDO
+
+DO I = 1, N
+  R(I) := ATAN2(Y(I), X(I))
+ENDDO
+
+PRINT R(1)
+PRINT R(64)
+PRINT R(128)
+PRINT R(200)
+PRINT R(256)

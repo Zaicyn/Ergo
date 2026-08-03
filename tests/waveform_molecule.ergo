@@ -1,0 +1,529 @@
+! WAVEFORM_MOLECULE - 3D geometric molecule with dynamic bond chemistry
+! =====================================================================
+! 32 atoms in a 4x4x2 lattice. Each atom carries a phase and an element
+! type (C/H/O/N) derived from its initial Viviani w-component. Bonds form,
+! break, and reform based on distance, phase alignment, and local stress.
+! A Morse potential gives each bond a true potential energy, and a thermal
+! cycle (heat/cool/anneal) tests whether the molecule rearranges.
+!
+! CSV output: frame,nbond,total_energy,mean_energy,max_energy,n_breaks, &
+!             n_reforms,fingerprint,total_strength,coherence,mean_w,rgyr,thermal
+
+IMPLICIT NONE
+
+! ── Grid / population ───────────────────────────────────────
+PARAMETER INTEGER :: NATOM = 32
+PARAMETER INTEGER :: MAXBOND = 256
+PARAMETER INTEGER :: MAXFRAME = 1000
+PARAMETER INTEGER :: NX = 8
+PARAMETER INTEGER :: NY = 8
+PARAMETER INTEGER :: NZ = 4
+
+! ── Time stepping / coupling ──────────────────────────────────
+PARAMETER REAL :: DT = 0.01
+PARAMETER REAL :: BASE_OMEGA = 1.0
+PARAMETER REAL :: COUPLING_K = 5.0
+PARAMETER REAL :: HEAT_START = 0.001
+PARAMETER REAL :: HEAT_PEAK = 1.0
+PARAMETER REAL :: PHASE_NOISE_SCALE = 10.0
+PARAMETER INTEGER :: HEAT_FRAME_START = 300
+PARAMETER INTEGER :: HEAT_FRAME_END = 500
+PARAMETER INTEGER :: COOL_FRAME_END = 700
+PARAMETER REAL :: VELOCITY_DAMP = 0.9
+
+! ── Element type indices ─────────────────────────────────────
+PARAMETER INTEGER :: ELEM_C = 1
+PARAMETER INTEGER :: ELEM_H = 2
+PARAMETER INTEGER :: ELEM_O = 3
+PARAMETER INTEGER :: ELEM_N = 4
+PARAMETER INTEGER :: NELEM = 4
+
+! ── Bond criteria ──────────────────────────────────────────────
+PARAMETER REAL :: BOND_DIST = 2.5
+PARAMETER REAL :: BOND_ORDER_HIGH = 1.5
+PARAMETER REAL :: BOND_ORDER_SINGLE = 1.0
+PARAMETER REAL :: PHASE_HIGH = 0.95
+PARAMETER REAL :: PHASE_SINGLE = 0.80
+PARAMETER REAL :: STRESS_BREAK = 0.05
+PARAMETER REAL :: STRESS_REFORM = 0.18
+
+! ── Morse potential ───────────────────────────────────────────
+PARAMETER REAL :: MORSE_A = 1.0
+
+! ── Element properties (static lookup table) ───────────────────
+STATIC REAL :: ELEM_ZEFF(4)
+STATIC REAL :: ELEM_RADIUS(4)
+STATIC REAL :: ELEM_EN(4)
+STATIC INTEGER :: ELEM_PERIOD(4)
+
+! ── Atom state ────────────────────────────────────────────────
+STATIC REAL :: ATOM_X(32)
+STATIC REAL :: ATOM_Y(32)
+STATIC REAL :: ATOM_Z(32)
+STATIC REAL :: ATOM_VX(32)
+STATIC REAL :: ATOM_VY(32)
+STATIC REAL :: ATOM_VZ(32)
+STATIC REAL :: ATOM_THETA(32)
+STATIC REAL :: ATOM_OMEGA(32)
+STATIC REAL :: ATOM_NW(32)
+STATIC INTEGER :: ATOM_ELEMENT(32)
+STATIC INTEGER :: ATOM_ACTIVE(32)
+
+! ── Dynamic bond state ─────────────────────────────────────────
+STATIC INTEGER :: BOND_MATRIX(32, 32)
+STATIC REAL :: ALIGN_PREV(32, 32)
+STATIC REAL :: ALIGN_CURR(32, 32)
+
+! ── Bond list (snapshot of active bonds each frame) ───────────
+STATIC INTEGER :: NBOND
+STATIC INTEGER :: BOND_I(256)
+STATIC INTEGER :: BOND_J(256)
+STATIC REAL :: BOND_ORDER(256)
+STATIC REAL :: BOND_ENERGY(256)
+STATIC REAL :: BOND_STRENGTH(256)
+
+! ── Diagnostics ────────────────────────────────────────────────
+STATIC REAL :: TOTAL_POTENTIAL_ENERGY
+STATIC REAL :: MEAN_POTENTIAL_ENERGY
+STATIC REAL :: MAX_POTENTIAL_ENERGY
+STATIC REAL :: TOTAL_BOND_STRENGTH
+STATIC REAL :: COHERENCE
+STATIC REAL :: MEAN_W
+STATIC REAL :: RGYR
+STATIC REAL :: THERMAL_CURRENT
+STATIC INTEGER :: N_BOND_BREAKS
+STATIC INTEGER :: N_BOND_REFORM
+STATIC INTEGER :: FINGERPRINT
+
+! ── Working scalars ───────────────────────────────────────────
+STATIC INTEGER :: I, J, K, AT, FRAME, N
+STATIC REAL :: X, Y, Z, W, TH, DTH, DX, DY, DZ, DIST, WEIGHT
+STATIC REAL :: SIN_AVG, COS_AVG, THETA_MEAN
+
+! ── Initialize ────────────────────────────────────────────────
+CALL INIT_ELEMENTS()
+CALL INIT_ATOMS()
+CALL INIT_BONDS()
+
+! CSV header
+WRITE(*, "frame,nbond,total_energy,mean_energy,max_energy,n_breaks,n_reforms,fingerprint,total_strength,coherence,mean_w,rgyr,thermal")
+
+! ════════════════════════════════════════════════════════════
+! MAIN LOOP
+! ════════════════════════════════════════════════════════════
+FRAME := 1
+DO WHILE FRAME ≤ MAXFRAME
+
+  CALL COMPUTE_THERMAL()
+  CALL ATOM_PHASE_STEP()
+  CALL MOVE_ATOMS()
+  CALL BOND_UPDATE()
+  CALL COMPUTE_RGYR()
+
+  ! Mean |w| over active atoms
+  MEAN_W := 0.0
+  N := 0
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      MEAN_W := MEAN_W + ABS(ATOM_NW(AT))
+      N := N + 1
+    ENDIF
+  ENDDO
+  IF N > 0 THEN
+    MEAN_W := MEAN_W / REAL(N)
+  ENDIF
+
+  IF MOD(FRAME, 10) = 0 THEN
+    WRITE(*, "%d,%d,%.6f,%.6f,%.6f,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f") &
+      FRAME, NBOND, TOTAL_POTENTIAL_ENERGY, MEAN_POTENTIAL_ENERGY, &
+      MAX_POTENTIAL_ENERGY, N_BOND_BREAKS, N_BOND_REFORM, FINGERPRINT, &
+      TOTAL_BOND_STRENGTH, COHERENCE, MEAN_W, RGYR, THERMAL_CURRENT
+  ENDIF
+
+  FRAME := FRAME + 1
+ENDDO
+
+STOP
+
+! ════════════════════════════════════════════════════════════
+! SUBROUTINES
+! ════════════════════════════════════════════════════════════
+
+SUBROUTINE INIT_ELEMENTS()
+  ! C
+  ELEM_ZEFF(1) := 2.75
+  ELEM_RADIUS(1) := 0.76
+  ELEM_EN(1) := 2.55
+  ELEM_PERIOD(1) := 2
+  ! H
+  ELEM_ZEFF(2) := 1.00
+  ELEM_RADIUS(2) := 0.31
+  ELEM_EN(2) := 2.20
+  ELEM_PERIOD(2) := 1
+  ! O
+  ELEM_ZEFF(3) := 3.45
+  ELEM_RADIUS(3) := 0.66
+  ELEM_EN(3) := 3.44
+  ELEM_PERIOD(3) := 2
+  ! N
+  ELEM_ZEFF(4) := 3.10
+  ELEM_RADIUS(4) := 0.71
+  ELEM_EN(4) := 3.04
+  ELEM_PERIOD(4) := 2
+  RETURN
+END
+
+SUBROUTINE INIT_ATOMS()
+  INTEGER :: IX, IY, IZ, AT
+  REAL :: STEP, OFFSET, TH0, WW
+
+  STEP := 2.0
+  OFFSET := 0.5
+
+  AT := 0
+  DO IZ = 1, 2
+    DO IY = 1, 4
+      DO IX = 1, 4
+        AT := AT + 1
+        ATOM_ACTIVE(AT) := 1
+        ATOM_VX(AT) := 0.0
+        ATOM_VY(AT) := 0.0
+        ATOM_VZ(AT) := 0.0
+
+        ATOM_X(AT) := OFFSET + REAL(IX - 1) * STEP
+        ATOM_Y(AT) := OFFSET + REAL(IY - 1) * STEP
+        ATOM_Z(AT) := OFFSET + REAL(IZ - 1) * STEP
+
+        ! Spatially varying initial phase
+        TH0 := 0.3 * ATOM_X(AT) + 0.5 * ATOM_Y(AT) + 0.7 * ATOM_Z(AT)
+        ATOM_THETA(AT) := TH0
+        ATOM_OMEGA(AT) := BASE_OMEGA + 0.5 * SIN(TH0)
+
+        ! Viviani w-component determines element type
+        WW := (1.0 / 3.0) * SIN(5.0 * TH0)
+        ATOM_NW(AT) := WW
+        IF WW ≥ 0.15 THEN
+          ATOM_ELEMENT(AT) := ELEM_C
+        ELSEIF WW ≥ 0.0 THEN
+          ATOM_ELEMENT(AT) := ELEM_H
+        ELSEIF WW ≥ -0.15 THEN
+          ATOM_ELEMENT(AT) := ELEM_O
+        ELSE
+          ATOM_ELEMENT(AT) := ELEM_N
+        ENDIF
+      ENDDO
+    ENDDO
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE INIT_BONDS()
+  INTEGER :: EI, EJ
+  REAL :: TH0, WW, DTH0, ALIGN0
+
+  DO I = 1, NATOM
+    DO J = 1, NATOM
+      BOND_MATRIX(I, J) := 0
+      ALIGN_PREV(I, J) := 0.0
+      ALIGN_CURR(I, J) := 0.0
+    ENDDO
+  ENDDO
+
+  ! Seed previous alignment from initial phases so first-frame stress is real
+  DO I = 1, NATOM - 1
+    DO J = I + 1, NATOM
+      DTH0 := ATOM_THETA(I) - ATOM_THETA(J)
+      ALIGN_PREV(I, J) := COS(DTH0)
+    ENDDO
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE COMPUTE_THERMAL()
+  IF FRAME < HEAT_FRAME_START THEN
+    THERMAL_CURRENT := HEAT_START
+  ELSEIF FRAME < HEAT_FRAME_END THEN
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - HEAT_FRAME_START) / REAL(HEAT_FRAME_END - HEAT_FRAME_START)
+  ELSEIF FRAME < COOL_FRAME_END THEN
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * &
+      REAL(FRAME - HEAT_FRAME_END) / REAL(COOL_FRAME_END - HEAT_FRAME_END)
+  ELSE
+    THERMAL_CURRENT := HEAT_START
+  ENDIF
+  RETURN
+END
+
+SUBROUTINE ATOM_PHASE_STEP()
+  ! Intrinsic phase advance
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      ATOM_THETA(AT) := ATOM_THETA(AT) + ATOM_OMEGA(AT) * DT
+    ENDIF
+  ENDDO
+
+  ! Global Kuramoto synchronization toward mean phase
+  SIN_AVG := 0.0
+  COS_AVG := 0.0
+  N := 0
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      SIN_AVG := SIN_AVG + SIN(ATOM_THETA(AT))
+      COS_AVG := COS_AVG + COS(ATOM_THETA(AT))
+      N := N + 1
+    ENDIF
+  ENDDO
+
+  IF N > 0 THEN
+    COHERENCE := SQRT(SIN_AVG*SIN_AVG + COS_AVG*COS_AVG) / REAL(N)
+    THETA_MEAN := ATAN2(SIN_AVG, COS_AVG)
+    DO AT = 1, NATOM
+      IF ATOM_ACTIVE(AT) = 1 THEN
+        ATOM_THETA(AT) := ATOM_THETA(AT) + COUPLING_K * SIN(THETA_MEAN - ATOM_THETA(AT)) * DT
+      ENDIF
+    ENDDO
+  ELSE
+    COHERENCE := 0.0
+  ENDIF
+
+  ! Phase thermal noise: strong during heating, weak during cooling
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      ATOM_THETA(AT) := ATOM_THETA(AT) + &
+        PHASE_NOISE_SCALE * THERMAL_CURRENT * SIN(REAL(AT) * 11.3 + REAL(FRAME) * 0.23) * DT
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE MOVE_ATOMS()
+  ! Small thermal vibrations in 3D, with hard-wall boundaries
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      ATOM_VX(AT) := ATOM_VX(AT) + THERMAL_CURRENT * SIN(REAL(AT) * 7.3 + REAL(FRAME) * 0.17)
+      ATOM_VY(AT) := ATOM_VY(AT) + THERMAL_CURRENT * COS(REAL(AT) * 5.7 + REAL(FRAME) * 0.31)
+      ATOM_VZ(AT) := ATOM_VZ(AT) + THERMAL_CURRENT * SIN(REAL(AT) * 3.1 + REAL(FRAME) * 0.09)
+
+      ATOM_VX(AT) := ATOM_VX(AT) * VELOCITY_DAMP
+      ATOM_VY(AT) := ATOM_VY(AT) * VELOCITY_DAMP
+      ATOM_VZ(AT) := ATOM_VZ(AT) * VELOCITY_DAMP
+
+      ATOM_X(AT) := ATOM_X(AT) + ATOM_VX(AT) * DT
+      ATOM_Y(AT) := ATOM_Y(AT) + ATOM_VY(AT) * DT
+      ATOM_Z(AT) := ATOM_Z(AT) + ATOM_VZ(AT) * DT
+
+      IF ATOM_X(AT) < 0.0 THEN
+        ATOM_X(AT) := 0.0
+        ATOM_VX(AT) := -ATOM_VX(AT)
+      ENDIF
+      IF ATOM_X(AT) > REAL(NX) THEN
+        ATOM_X(AT) := REAL(NX)
+        ATOM_VX(AT) := -ATOM_VX(AT)
+      ENDIF
+      IF ATOM_Y(AT) < 0.0 THEN
+        ATOM_Y(AT) := 0.0
+        ATOM_VY(AT) := -ATOM_VY(AT)
+      ENDIF
+      IF ATOM_Y(AT) > REAL(NY) THEN
+        ATOM_Y(AT) := REAL(NY)
+        ATOM_VY(AT) := -ATOM_VY(AT)
+      ENDIF
+      IF ATOM_Z(AT) < 0.0 THEN
+        ATOM_Z(AT) := 0.0
+        ATOM_VZ(AT) := -ATOM_VZ(AT)
+      ENDIF
+      IF ATOM_Z(AT) > REAL(NZ) THEN
+        ATOM_Z(AT) := REAL(NZ)
+        ATOM_VZ(AT) := -ATOM_VZ(AT)
+      ENDIF
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE BOND_UPDATE()
+  ! Detect bonds, compute stress, break/reform, and accumulate energies.
+  INTEGER :: EI, EJ
+  REAL :: ZI, ZJ, RI, RJ, ENI, ENJ, PERI, PERJ
+  REAL :: BO, IMP_I, IMP_J, OMEGA_I, OMEGA_J, BOND_SCALE
+  REAL :: DISS, EQDIST, ALIGN, STRESS
+  REAL :: RDIFF, EXP_TERM, MORSE_ENERGY
+
+  NBOND := 0
+  N_BOND_BREAKS := 0
+  N_BOND_REFORM := 0
+  TOTAL_POTENTIAL_ENERGY := 0.0
+  TOTAL_BOND_STRENGTH := 0.0
+  MAX_POTENTIAL_ENERGY := -1.0E30
+  FINGERPRINT := 0
+
+  DO I = 1, NATOM - 1
+    IF ATOM_ACTIVE(I) = 1 THEN
+      DO J = I + 1, NATOM
+        IF ATOM_ACTIVE(J) = 1 THEN
+          DX := ATOM_X(I) - ATOM_X(J)
+          DY := ATOM_Y(I) - ATOM_Y(J)
+          DZ := ATOM_Z(I) - ATOM_Z(J)
+          DIST := SQRT(DX*DX + DY*DY + DZ*DZ)
+
+          IF DIST < BOND_DIST THEN
+            DTH := ATOM_THETA(I) - ATOM_THETA(J)
+            ALIGN := COS(DTH)
+            ALIGN_CURR(I, J) := ALIGN
+
+            ! Bond order from alignment
+            IF ALIGN > PHASE_HIGH THEN
+              BO := BOND_ORDER_HIGH
+            ELSEIF ALIGN > PHASE_SINGLE THEN
+              BO := BOND_ORDER_SINGLE
+            ELSE
+              BO := 0.0
+            ENDIF
+
+            ! Spectral-tool dissociation energy and equilibrium distance
+            EI := ATOM_ELEMENT(I)
+            EJ := ATOM_ELEMENT(J)
+            ZI := ELEM_ZEFF(EI)
+            ZJ := ELEM_ZEFF(EJ)
+            RI := ELEM_RADIUS(EI)
+            RJ := ELEM_RADIUS(EJ)
+            ENI := ELEM_EN(EI)
+            ENJ := ELEM_EN(EJ)
+            PERI := REAL(ELEM_PERIOD(EI))
+            PERJ := REAL(ELEM_PERIOD(EJ))
+
+            IMP_I := 1.0 + 0.15 * LOG(ZI / (RI * RI) + 0.1)
+            IMP_I := IMP_I / SQRT(PERI)
+            OMEGA_I := 1.0 + 0.2 * LOG(ZI * RI + 0.1) + 0.1 * (ENI - 2.5)
+            OMEGA_I := OMEGA_I / SQRT(PERI)
+
+            IMP_J := 1.0 + 0.15 * LOG(ZJ / (RJ * RJ) + 0.1)
+            IMP_J := IMP_J / SQRT(PERJ)
+            OMEGA_J := 1.0 + 0.2 * LOG(ZJ * RJ + 0.1) + 0.1 * (ENJ - 2.5)
+            OMEGA_J := OMEGA_J / SQRT(PERJ)
+
+            BOND_SCALE := 1.0 + 0.8 * (BO - 1.0)
+            DISS := BO / (RI + RJ)
+            DISS := DISS * BOND_SCALE
+            DISS := DISS * (IMP_I + IMP_J) / 2.0
+            DISS := DISS * (OMEGA_I + OMEGA_J) / 2.0
+
+            EQDIST := RI + RJ
+
+            ! Stress = 1 - alignment (Aizawa-style: high stress = misaligned)
+            STRESS := 1.0 - ALIGN
+
+            ! Break if currently bonded and too stressed or too far
+            IF BOND_MATRIX(I, J) = 1 THEN
+              IF STRESS > STRESS_BREAK .OR. BO = 0.0 THEN
+                BOND_MATRIX(I, J) := 0
+                N_BOND_BREAKS := N_BOND_BREAKS + 1
+              ELSE
+                ! Active bond: record and accumulate energy
+                NBOND := NBOND + 1
+                IF NBOND ≤ MAXBOND THEN
+                  BOND_I(NBOND) := I
+                  BOND_J(NBOND) := J
+                  BOND_ORDER(NBOND) := BO
+                  BOND_STRENGTH(NBOND) := DISS
+
+                  RDIFF := DIST - EQDIST
+                  EXP_TERM := EXP(-MORSE_A * RDIFF)
+                  MORSE_ENERGY := -DISS * (1.0 - EXP_TERM) * (1.0 - EXP_TERM)
+                  BOND_ENERGY(NBOND) := MORSE_ENERGY
+
+                  TOTAL_POTENTIAL_ENERGY := TOTAL_POTENTIAL_ENERGY + MORSE_ENERGY
+                  TOTAL_BOND_STRENGTH := TOTAL_BOND_STRENGTH + DISS
+                  IF MORSE_ENERGY > MAX_POTENTIAL_ENERGY THEN
+                    MAX_POTENTIAL_ENERGY := MORSE_ENERGY
+                  ENDIF
+                ENDIF
+                FINGERPRINT := FINGERPRINT + I * J
+              ENDIF
+            ELSE
+              ! Form new bond if aligned and low stress
+              IF BO > 0.0 .AND. STRESS < STRESS_REFORM THEN
+                BOND_MATRIX(I, J) := 1
+                N_BOND_REFORM := N_BOND_REFORM + 1
+                NBOND := NBOND + 1
+                IF NBOND ≤ MAXBOND THEN
+                  BOND_I(NBOND) := I
+                  BOND_J(NBOND) := J
+                  BOND_ORDER(NBOND) := BO
+                  BOND_STRENGTH(NBOND) := DISS
+
+                  RDIFF := DIST - EQDIST
+                  EXP_TERM := EXP(-MORSE_A * RDIFF)
+                  MORSE_ENERGY := -DISS * (1.0 - EXP_TERM) * (1.0 - EXP_TERM)
+                  BOND_ENERGY(NBOND) := MORSE_ENERGY
+
+                  TOTAL_POTENTIAL_ENERGY := TOTAL_POTENTIAL_ENERGY + MORSE_ENERGY
+                  TOTAL_BOND_STRENGTH := TOTAL_BOND_STRENGTH + DISS
+                  IF MORSE_ENERGY > MAX_POTENTIAL_ENERGY THEN
+                    MAX_POTENTIAL_ENERGY := MORSE_ENERGY
+                  ENDIF
+                ENDIF
+                FINGERPRINT := FINGERPRINT + I * J
+              ENDIF
+            ENDIF
+          ELSE
+            ! Out of range: zero alignment and break any existing bond
+            ALIGN_CURR(I, J) := 0.0
+            IF BOND_MATRIX(I, J) = 1 THEN
+              BOND_MATRIX(I, J) := 0
+              N_BOND_BREAKS := N_BOND_BREAKS + 1
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDIF
+  ENDDO
+
+  IF NBOND > 0 THEN
+    MEAN_POTENTIAL_ENERGY := TOTAL_POTENTIAL_ENERGY / REAL(NBOND)
+  ELSE
+    MEAN_POTENTIAL_ENERGY := 0.0
+  ENDIF
+
+  ! Copy current alignments to previous for next frame stress estimate
+  DO I = 1, NATOM - 1
+    DO J = I + 1, NATOM
+      ALIGN_PREV(I, J) := ALIGN_CURR(I, J)
+    ENDDO
+  ENDDO
+
+  RETURN
+END
+
+SUBROUTINE COMPUTE_RGYR()
+  REAL :: CX, CY, CZ
+
+  CX := 0.0
+  CY := 0.0
+  CZ := 0.0
+  N := 0
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      CX := CX + ATOM_X(AT)
+      CY := CY + ATOM_Y(AT)
+      CZ := CZ + ATOM_Z(AT)
+      N := N + 1
+    ENDIF
+  ENDDO
+  IF N > 0 THEN
+    CX := CX / REAL(N)
+    CY := CY / REAL(N)
+    CZ := CZ / REAL(N)
+  ENDIF
+
+  RGYR := 0.0
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      RGYR := RGYR + (ATOM_X(AT) - CX)**2 + (ATOM_Y(AT) - CY)**2 + (ATOM_Z(AT) - CZ)**2
+    ENDIF
+  ENDDO
+  IF N > 0 THEN
+    RGYR := SQRT(RGYR / REAL(N))
+  ENDIF
+  RETURN
+END

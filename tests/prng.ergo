@@ -1,0 +1,88 @@
+! PRNG — HASH/RAND intrinsic statistics validation
+! =====================================================================
+! Validates the splitmix64-backed intrinsics:
+!   marginal mean/variance of RAND over 100k samples,
+!   lag-1..8 autocorrelation,
+!   conditional uniformity (the rotor-battery failure mode: variate
+!   conditioned on another hash exceeding a threshold must keep
+!   mean ≈ 0.5 and max ≈ 1.0 — the 32-bit idiom gave 0.22 / 0.71),
+!   determinism (same seed → same sequence, checked over two runs).
+!
+! IDIOM MIGRATION (rotor engine's failing form, 32-bit wrap):
+!   H := IEOR(ST * 2654435761, IEOR(BLK * 40503, 7919))
+!   H := IEOR(H, ISHFT(H, -30))
+!   H := H * 6364136223846793005          ! wraps at 32 bits — biased
+!   X := (REAL(IAND(H, 65535)) + 0.5) / 65536.0
+! becomes, with identical-or-better statistics (validated below):
+!   S := HASH(S)                          ! chain advances (Weyl step)
+!   X := RAND(S)                          ! uniform [0,1), 53-bit mantissa
+! and independent streams are just independent seed offsets:
+!   X2 := RAND(555123 + I)
+!
+! CPU:  python -m core tests/prng.ergo -o /tmp/prng_cpu
+! GPU:  python -m core tests/prng.ergo --target spirv -o /tmp/prng_gpu
+
+INTEGER, PARAMETER :: N = 100000
+INTEGER, PARAMETER :: SEED = 9137, SEED2 = 555123
+
+STATIC REAL :: X(N), Y(N)
+STATIC REAL :: SM, SV, M, V, AC, NUM, CX, XMAX
+STATIC INTEGER :: S, I, K, NCOND, H0
+
+IMPLICIT NONE
+
+DO I = 1, N
+  X(I) := RAND(SEED + I)
+  Y(I) := RAND(SEED2 + I)
+ENDDO
+
+! ── marginal mean / variance ──
+SM := 0.0
+SV := 0.0
+DO I = 1, N
+  SM := SM + X(I)
+ENDDO
+M := SM / REAL(N)
+DO I = 1, N
+  SV := SV + (X(I) - M) * (X(I) - M)
+ENDDO
+V := SV / REAL(N)
+WRITE(*, "mean %f (want 0.5±0.005)") M
+WRITE(*, "var %f (want 0.0833±0.001)") V
+
+! ── lag-1..8 autocorrelation ──
+DO K = 1, 8
+  NUM := 0.0
+  DO I = 1, N - K
+    NUM := NUM + X(I) * X(I + K)
+  ENDDO
+  NUM := NUM / REAL(N - K)
+  AC := (NUM - M * M) / V
+  WRITE(*, "autocorr lag %d %f (want |r| < 0.01)") K, AC
+ENDDO
+
+! ── conditional uniformity (rotor failure mode) ──
+CX := 0.0
+NCOND := 0
+XMAX := 0.0
+DO I = 1, N
+  IF Y(I) > 0.7 THEN
+    CX := CX + X(I)
+    NCOND := NCOND + 1
+    IF X(I) > XMAX THEN
+      XMAX := X(I)
+    ENDIF
+  ENDIF
+ENDDO
+WRITE(*, "cond-mean %f (want 0.5±0.01; 32-bit idiom gave 0.22)") CX / REAL(NCOND)
+WRITE(*, "cond-max %f (want > 0.999; 32-bit idiom gave 0.71)") XMAX
+WRITE(*, "cond-count %d (want 30000±1000)") NCOND
+
+! ── determinism: chained hash sequence ──
+S := SEED
+H0 := 0
+DO I = 1, 1000
+  S := HASH(S)
+  H0 := H0 + MOD(S, 1000003)
+ENDDO
+WRITE(*, "chain-checksum %d (must match across runs)") H0

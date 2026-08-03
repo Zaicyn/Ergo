@@ -1,0 +1,753 @@
+! WAVEFORM_CHAIN_FOLD_VHS - villin headpiece subdomain (PDB 1VII) prototype
+! =====================================================================
+! Sequence: MLSDEDFKAVFGMTRSAFANLPLWKQQNLKKEKGLF (36 residues)
+! Designed secondary structure:
+!   Helix 1: 1-11    MLSDEDFKAVF
+!   Turn:   12-16    GMTRS
+!   Helix 2: 17-27   AFANLPLWKQQN
+!   Helix 3: 28-36   LKKEKGLF
+! Folding is driven by geometry: backbone Morse bonds, per-residue angle
+! bending, backbone torsion, steric exclusion, and dynamic H-bonds.
+!
+! Torsion forces use analytic gradients validated against finite
+! differences to ~1e-10 in the Python mirror:
+!   b1=r2-r1, b2=r3-r2, b3=r4-r3 ; n1=b1 x b2, n2=b2 x b3
+!   dphi/dr1 = -|b2|/|n1|^2 n1 ; dphi/dr4 = +|b2|/|n2|^2 n2
+!   dphi/dr2 = -(1 + b1.b2/|b2|^2) dphi/dr1 + (b3.b2/|b2|^2) dphi/dr4
+!   dphi/dr3 = -(dphi/dr1 + dphi/dr2 + dphi/dr4)
+!
+! CSV: frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean, &
+!      e_morse,e_angle,e_torsion,thermal,hb_forms,hb_breaks
+
+IMPLICIT NONE
+
+! ── Chain / run ─────────────────────────────────────────────
+PARAMETER INTEGER :: NRES = 36
+PARAMETER INTEGER :: MAXHB = 256
+PARAMETER INTEGER :: MAXFRAME = 4000
+
+! ── Time stepping / coupling ──────────────────────────────────
+PARAMETER REAL :: DT = 0.01
+PARAMETER REAL :: FORCE_SCALE = 6.0
+PARAMETER REAL :: VELOCITY_DAMP = 0.9
+PARAMETER REAL :: BASE_OMEGA = 1.0
+PARAMETER REAL :: COUPLING_K = 5.0
+PARAMETER REAL :: PHASE_NOISE_SCALE = 10.0
+PARAMETER REAL :: SEED = 0.0
+
+! ── Thermal schedule: five heat/cool cycles + final anneal ─────
+PARAMETER REAL :: HEAT_START = 0.001
+PARAMETER REAL :: HEAT_PEAK = 1.0
+
+! ── Backbone (permanent) ─────────────────────────────────────
+PARAMETER REAL :: BACKBONE_R0 = 1.52
+PARAMETER REAL :: BACKBONE_D = 1.4
+PARAMETER REAL :: MORSE_A = 1.0
+
+! ── H-bonds (dynamic contacts) ────────────────────────────────
+PARAMETER REAL :: HB_R0 = 2.2
+PARAMETER REAL :: HB_D = 0.30
+PARAMETER REAL :: HB_FORM = 2.5
+PARAMETER REAL :: HB_BREAK = 2.8
+PARAMETER INTEGER :: HB_CAP = 2
+PARAMETER REAL :: HB_PHASE_FORM = 0.80
+PARAMETER REAL :: HB_PHASE_STABLE = 0.95
+
+! ── Steric exclusion ─────────────────────────────────────────
+PARAMETER REAL :: STERIC_SIG = 1.30
+PARAMETER REAL :: STERIC_EPS = 0.1
+PARAMETER REAL :: STERIC_CUT = 2.5
+
+! ── Hydrophobic attraction (VHS core packing) ─────────────────
+PARAMETER REAL :: HYDRO_R0 = 4.5
+PARAMETER REAL :: HYDRO_CUTOFF = 8.0
+PARAMETER REAL :: HYDRO_STRENGTH = 0.02
+PARAMETER REAL :: HYDRO_ALPHA = 1.0
+
+! ── Residue state ─────────────────────────────────────────────
+STATIC REAL :: RES_X(36)
+STATIC REAL :: RES_Y(36)
+STATIC REAL :: RES_Z(36)
+STATIC REAL :: RES_VX(36)
+STATIC REAL :: RES_VY(36)
+STATIC REAL :: RES_VZ(36)
+STATIC REAL :: RES_THETA(36)
+STATIC REAL :: RES_OMEGA(36)
+
+! ── Per-residue sequence parameters ──────────────────────────
+STATIC REAL :: RES_ANGK(36)
+STATIC REAL :: RES_ANGT0(36)
+STATIC REAL :: RES_TORSK(36)
+STATIC REAL :: RES_TORSP0(36)
+STATIC REAL :: HYDROPHOB(36)
+
+! ── H-bond state ──────────────────────────────────────────────
+STATIC INTEGER :: HBOND_MATRIX(36, 36)
+STATIC INTEGER :: NHBOND
+STATIC INTEGER :: HB_I(256)
+STATIC INTEGER :: HB_J(256)
+
+! ── Diagnostics ────────────────────────────────────────────────
+STATIC REAL :: RGYR
+STATIC REAL :: E2E
+STATIC REAL :: BANG_MEAN
+STATIC REAL :: BANG_RMS
+STATIC REAL :: TORS_MEAN
+STATIC REAL :: ALPHA_FRAC
+STATIC REAL :: E_MORSE
+STATIC REAL :: E_ANGLE
+STATIC REAL :: E_TORSION
+STATIC REAL :: THERMAL_CURRENT
+STATIC INTEGER :: I3CNT
+STATIC INTEGER :: I4CNT
+STATIC INTEGER :: ILCNT
+STATIC INTEGER :: HB_FORMS
+STATIC INTEGER :: HB_BREAKS
+
+! ── Working scalars ───────────────────────────────────────────
+STATIC INTEGER :: I, J, K, FRAME, N
+STATIC REAL :: DX, DY, DZ, DIST, ALIGN, DTH
+STATIC REAL :: SIN_AVG, COS_AVG, THETA_MEAN, COHERENCE
+STATIC REAL :: SUM_PHI, CX, CY, CZ
+
+! ── Initialize ─────────────────────────────────────────────────
+CALL INIT_SEQUENCE()
+CALL INIT_COIL()
+CALL INIT_HBONDS()
+
+WRITE(*, "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,thermal,hb_forms,hb_breaks")
+
+! ════════════════════════════════════════════════════════════
+! MAIN LOOP
+! ════════════════════════════════════════════════════════════
+FRAME := 1
+DO WHILE FRAME ≤ MAXFRAME
+
+  CALL COMPUTE_THERMAL()
+  CALL PHASE_STEP()
+  CALL CHAIN_MOVE()
+  CALL HBOND_UPDATE()
+  CALL CHAIN_DIAG()
+
+  IF MOD(FRAME, 10) = 0 THEN
+    WRITE(*, "%d,%.6f,%.6f,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d") &
+      FRAME, RGYR, E2E, NHBOND, I3CNT, I4CNT, ILCNT, BANG_MEAN, BANG_RMS, &
+      TORS_MEAN, ALPHA_FRAC, E_MORSE, E_ANGLE, E_TORSION, THERMAL_CURRENT, HB_FORMS, HB_BREAKS
+  ENDIF
+
+  FRAME := FRAME + 1
+ENDDO
+
+STOP
+
+! ════════════════════════════════════════════════════════════
+! SUBROUTINES
+! ════════════════════════════════════════════════════════════
+
+SUBROUTINE INIT_SEQUENCE()
+  ! VHS / PDB 1VII sequence design:
+  !   MLSDEDFKAVFGMTRSAFANLPLWKQQNLKKEKGLF
+  !   Helix 1: 1-11    MLSDEDFKAVF
+  !   Turn:   12-16    GMTRS
+  !   Helix 2: 17-27   AFANLPLWKQQN
+  !   Helix 3: 28-36   LKKEKGLF
+  !
+  ! Helix-prone defaults: angle 95 deg, alpha torsion 50 deg.
+  DO I = 1, NRES
+    RES_ANGK(I) := 0.30
+    RES_ANGT0(I) := 95.0 * 3.14159265 / 180.0
+    RES_TORSK(I) := 0.50
+    RES_TORSP0(I) := 50.0 * 3.14159265 / 180.0
+  ENDDO
+  ! Turn region: looser angle, no torsion bias.
+  DO I = 12, 16
+    RES_ANGK(I) := 0.05
+    RES_ANGT0(I) := 115.0 * 3.14159265 / 180.0
+    RES_TORSK(I) := 0.0
+  ENDDO
+
+  ! Hydrophobicity: 1.0 for F/L/A/V/I/M/W, 0.0 otherwise.
+  ! Sequence: MLSDEDFKAVFGMTRSAFANLPLWKQQNLKKEKGLF
+  HYDROPHOB(1) := 1.0   ! M
+  HYDROPHOB(2) := 1.0   ! L
+  HYDROPHOB(3) := 0.0   ! S
+  HYDROPHOB(4) := 0.0   ! D
+  HYDROPHOB(5) := 0.0   ! E
+  HYDROPHOB(6) := 0.0   ! D
+  HYDROPHOB(7) := 1.0   ! F
+  HYDROPHOB(8) := 0.0   ! K
+  HYDROPHOB(9) := 1.0   ! A
+  HYDROPHOB(10) := 1.0  ! V
+  HYDROPHOB(11) := 1.0  ! F
+  HYDROPHOB(12) := 0.0  ! G
+  HYDROPHOB(13) := 1.0  ! M
+  HYDROPHOB(14) := 0.0  ! T
+  HYDROPHOB(15) := 0.0  ! R
+  HYDROPHOB(16) := 0.0  ! S
+  HYDROPHOB(17) := 1.0  ! A
+  HYDROPHOB(18) := 1.0  ! F
+  HYDROPHOB(19) := 1.0  ! A
+  HYDROPHOB(20) := 0.0  ! N
+  HYDROPHOB(21) := 1.0  ! L
+  HYDROPHOB(22) := 0.0  ! P
+  HYDROPHOB(23) := 1.0  ! L
+  HYDROPHOB(24) := 1.0  ! W
+  HYDROPHOB(25) := 0.0  ! K
+  HYDROPHOB(26) := 0.0  ! Q
+  HYDROPHOB(27) := 0.0  ! N
+  HYDROPHOB(28) := 1.0  ! L
+  HYDROPHOB(29) := 0.0  ! K
+  HYDROPHOB(30) := 0.0  ! K
+  HYDROPHOB(31) := 0.0  ! E
+  HYDROPHOB(32) := 0.0  ! K
+  HYDROPHOB(33) := 0.0  ! G
+  HYDROPHOB(34) := 1.0  ! L
+  HYDROPHOB(35) := 1.0  ! F
+  HYDROPHOB(36) := 1.0  ! F
+  RETURN
+END
+
+SUBROUTINE INIT_COIL()
+  ! Deterministic hash-walk self-avoiding coil (denatured start)
+  INTEGER :: ATT, J2, OK
+  REAL :: U1, U2, COSTH, SINTH, PHI2, UX, UY, UZ, CANDX, CANDY, CANDZ, DD
+
+  RES_X(1) := 10.0
+  RES_Y(1) := 10.0
+  RES_Z(1) := 10.0
+  DO I = 2, NRES
+    OK := 0
+    ATT := 0
+    DO WHILE ATT < 20
+      ATT := ATT + 1
+      U1 := MOD(ABS(SIN(REAL(I) * 12.9898 + REAL(ATT) * 3.7 + SEED) * 43758.5453), 1.0)
+      U2 := MOD(ABS(SIN(REAL(I) * 78.2330 + REAL(ATT) * 1.3 + SEED) * 12543.1230), 1.0)
+      COSTH := 2.0 * U1 - 1.0
+      SINTH := SQRT(1.0 - COSTH * COSTH)
+      PHI2 := 2.0 * 3.14159265 * U2
+      UX := SINTH * COS(PHI2)
+      UY := SINTH * SIN(PHI2)
+      UZ := COSTH
+      CANDX := RES_X(I - 1) + UX * BACKBONE_R0
+      CANDY := RES_Y(I - 1) + UY * BACKBONE_R0
+      CANDZ := RES_Z(I - 1) + UZ * BACKBONE_R0
+      OK := 1
+      IF I ≥ 5 THEN
+        DO J2 = 1, I - 4
+          DD := SQRT((CANDX - RES_X(J2))**2 + (CANDY - RES_Y(J2))**2 + &
+                     (CANDZ - RES_Z(J2))**2)
+          IF DD < 1.55 THEN
+            OK := 0
+          ENDIF
+        ENDDO
+      ENDIF
+      IF OK = 1 THEN
+        ATT := 20
+      ENDIF
+    ENDDO
+    RES_X(I) := CANDX
+    RES_Y(I) := CANDY
+    RES_Z(I) := CANDZ
+  ENDDO
+
+  ! Phases from position hash; zero velocities
+  DO I = 1, NRES
+    RES_THETA(I) := 0.3 * RES_X(I) + 0.5 * RES_Y(I) + 0.7 * RES_Z(I) + SEED
+    RES_OMEGA(I) := BASE_OMEGA + 0.5 * SIN(RES_THETA(I))
+    RES_VX(I) := 0.0
+    RES_VY(I) := 0.0
+    RES_VZ(I) := 0.0
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE INIT_HBONDS()
+  DO I = 1, NRES
+    DO J = 1, NRES
+      HBOND_MATRIX(I, J) := 0
+    ENDDO
+  ENDDO
+  NHBOND := 0
+  RETURN
+END
+
+SUBROUTINE COMPUTE_THERMAL()
+  IF FRAME < 200 THEN
+    THERMAL_CURRENT := HEAT_START
+  ELSEIF FRAME < 300 THEN
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * REAL(FRAME - 200) / 100.0
+  ELSEIF FRAME < 400 THEN
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * REAL(FRAME - 300) / 100.0
+  ELSEIF FRAME < 500 THEN
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * REAL(FRAME - 400) / 100.0
+  ELSEIF FRAME < 600 THEN
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * REAL(FRAME - 500) / 100.0
+  ELSEIF FRAME < 700 THEN
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * REAL(FRAME - 600) / 100.0
+  ELSEIF FRAME < 800 THEN
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * REAL(FRAME - 700) / 100.0
+  ELSEIF FRAME < 900 THEN
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * REAL(FRAME - 800) / 100.0
+  ELSEIF FRAME < 1000 THEN
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * REAL(FRAME - 900) / 100.0
+  ELSEIF FRAME < 1100 THEN
+    THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * REAL(FRAME - 1000) / 100.0
+  ELSEIF FRAME < 1200 THEN
+    THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * REAL(FRAME - 1100) / 100.0
+  ELSE
+    THERMAL_CURRENT := HEAT_START
+  ENDIF
+  RETURN
+END
+
+SUBROUTINE PHASE_STEP()
+  DO I = 1, NRES
+    RES_THETA(I) := RES_THETA(I) + RES_OMEGA(I) * DT
+  ENDDO
+
+  SIN_AVG := 0.0
+  COS_AVG := 0.0
+  DO I = 1, NRES
+    SIN_AVG := SIN_AVG + SIN(RES_THETA(I))
+    COS_AVG := COS_AVG + COS(RES_THETA(I))
+  ENDDO
+  COHERENCE := SQRT(SIN_AVG*SIN_AVG + COS_AVG*COS_AVG) / REAL(NRES)
+  THETA_MEAN := ATAN2(SIN_AVG, COS_AVG)
+  DO I = 1, NRES
+    RES_THETA(I) := RES_THETA(I) + COUPLING_K * SIN(THETA_MEAN - RES_THETA(I)) * DT
+  ENDDO
+
+  DO I = 1, NRES
+    RES_THETA(I) := RES_THETA(I) + &
+      PHASE_NOISE_SCALE * THERMAL_CURRENT * SIN(REAL(I) * 11.3 + REAL(FRAME) * 0.23) * DT
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE CHAIN_MOVE()
+  ! Thermal impulses, steric repulsion, backbone + H-bond Morse forces,
+  ! backbone angle bending, backbone torsion. Then damp + integrate.
+  REAL :: SR, FM, FX, FY, FZ, G, RDIFF, MF
+  REAL :: UX, UY, UZ, WX, WY, WZ, UN, VN, CS, C0, DEDC, S
+  REAL :: DCUX, DCUY, DCUZ, DCWX, DCWY, DCWZ
+  REAL :: FAX, FAY, FAZ, FCX, FCY, FCZ
+  INTEGER :: II, JJ, KK
+
+  E_MORSE := 0.0
+  E_ANGLE := 0.0
+
+  ! Thermal noise impulses
+  DO I = 1, NRES
+    RES_VX(I) := RES_VX(I) + THERMAL_CURRENT * SIN(REAL(I) * 7.3 + REAL(FRAME) * 0.17)
+    RES_VY(I) := RES_VY(I) + THERMAL_CURRENT * COS(REAL(I) * 5.7 + REAL(FRAME) * 0.31)
+    RES_VZ(I) := RES_VZ(I) + THERMAL_CURRENT * SIN(REAL(I) * 3.1 + REAL(FRAME) * 0.09)
+  ENDDO
+
+  ! Steric repulsion: |i-j| >= 4, not H-bonded
+  DO II = 1, NRES - 4
+    DO JJ = II + 4, NRES
+      IF HBOND_MATRIX(II, JJ) = 0 THEN
+        DX := RES_X(II) - RES_X(JJ)
+        DY := RES_Y(II) - RES_Y(JJ)
+        DZ := RES_Z(II) - RES_Z(JJ)
+        DIST := SQRT(DX*DX + DY*DY + DZ*DZ)
+        IF DIST > 0.0 .AND. DIST < STERIC_CUT THEN
+          SR := STERIC_SIG / DIST
+          FM := STERIC_EPS * SR * SR * SR * SR * SR * SR
+          FX := FM * DX / DIST
+          FY := FM * DY / DIST
+          FZ := FM * DZ / DIST
+          RES_VX(II) := RES_VX(II) + FX
+          RES_VY(II) := RES_VY(II) + FY
+          RES_VZ(II) := RES_VZ(II) + FZ
+          RES_VX(JJ) := RES_VX(JJ) - FX
+          RES_VY(JJ) := RES_VY(JJ) - FY
+          RES_VZ(JJ) := RES_VZ(JJ) - FZ
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Hydrophobic attraction between hydrophobic residue pairs (VHS core)
+  DO II = 1, NRES - 4
+    DO JJ = II + 4, NRES
+      IF HYDROPHOB(II) > 0.0 .AND. HYDROPHOB(JJ) > 0.0 THEN
+        DX := RES_X(II) - RES_X(JJ)
+        DY := RES_Y(II) - RES_Y(JJ)
+        DZ := RES_Z(II) - RES_Z(JJ)
+        DIST := SQRT(DX*DX + DY*DY + DZ*DZ)
+        IF DIST > 0.0 .AND. DIST < HYDRO_CUTOFF THEN
+          FM := -HYDRO_STRENGTH * HYDROPHOB(II) * HYDROPHOB(JJ) * &
+                EXP(-HYDRO_ALPHA * (DIST - HYDRO_R0))
+          FX := FM * DX / DIST
+          FY := FM * DY / DIST
+          FZ := FM * DZ / DIST
+          RES_VX(II) := RES_VX(II) + FX * DT * FORCE_SCALE
+          RES_VY(II) := RES_VY(II) + FY * DT * FORCE_SCALE
+          RES_VZ(II) := RES_VZ(II) + FZ * DT * FORCE_SCALE
+          RES_VX(JJ) := RES_VX(JJ) - FX * DT * FORCE_SCALE
+          RES_VY(JJ) := RES_VY(JJ) - FY * DT * FORCE_SCALE
+          RES_VZ(JJ) := RES_VZ(JJ) - FZ * DT * FORCE_SCALE
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Morse on permanent backbone bonds
+  DO II = 1, NRES - 1
+    JJ := II + 1
+    DX := RES_X(II) - RES_X(JJ)
+    DY := RES_Y(II) - RES_Y(JJ)
+    DZ := RES_Z(II) - RES_Z(JJ)
+    DIST := SQRT(DX*DX + DY*DY + DZ*DZ)
+    IF DIST > 0.0 THEN
+      RDIFF := DIST - BACKBONE_R0
+      G := EXP(-MORSE_A * RDIFF)
+      E_MORSE := E_MORSE + BACKBONE_D * (G * G - 2.0 * G)
+      MF := -2.0 * BACKBONE_D * MORSE_A * (1.0 - G) * G
+      FX := MF * DX / DIST
+      FY := MF * DY / DIST
+      FZ := MF * DZ / DIST
+      RES_VX(II) := RES_VX(II) + FX * DT * FORCE_SCALE
+      RES_VY(II) := RES_VY(II) + FY * DT * FORCE_SCALE
+      RES_VZ(II) := RES_VZ(II) + FZ * DT * FORCE_SCALE
+      RES_VX(JJ) := RES_VX(JJ) - FX * DT * FORCE_SCALE
+      RES_VY(JJ) := RES_VY(JJ) - FY * DT * FORCE_SCALE
+      RES_VZ(JJ) := RES_VZ(JJ) - FZ * DT * FORCE_SCALE
+    ENDIF
+  ENDDO
+
+  ! Morse on current H-bonds
+  DO KK = 1, NHBOND
+    II := HB_I(KK)
+    JJ := HB_J(KK)
+    DX := RES_X(II) - RES_X(JJ)
+    DY := RES_Y(II) - RES_Y(JJ)
+    DZ := RES_Z(II) - RES_Z(JJ)
+    DIST := SQRT(DX*DX + DY*DY + DZ*DZ)
+    IF DIST > 0.0 THEN
+      RDIFF := DIST - HB_R0
+      G := EXP(-MORSE_A * RDIFF)
+      E_MORSE := E_MORSE + HB_D * (G * G - 2.0 * G)
+      MF := -2.0 * HB_D * MORSE_A * (1.0 - G) * G
+      FX := MF * DX / DIST
+      FY := MF * DY / DIST
+      FZ := MF * DZ / DIST
+      RES_VX(II) := RES_VX(II) + FX * DT * FORCE_SCALE
+      RES_VY(II) := RES_VY(II) + FY * DT * FORCE_SCALE
+      RES_VZ(II) := RES_VZ(II) + FZ * DT * FORCE_SCALE
+      RES_VX(JJ) := RES_VX(JJ) - FX * DT * FORCE_SCALE
+      RES_VY(JJ) := RES_VY(JJ) - FY * DT * FORCE_SCALE
+      RES_VZ(JJ) := RES_VZ(JJ) - FZ * DT * FORCE_SCALE
+    ENDIF
+  ENDDO
+
+  ! Backbone angle bending (i-1, i, i+1)
+  DO II = 2, NRES - 1
+    IF RES_ANGK(II) > 0.0 THEN
+      UX := RES_X(II - 1) - RES_X(II)
+      UY := RES_Y(II - 1) - RES_Y(II)
+      UZ := RES_Z(II - 1) - RES_Z(II)
+      WX := RES_X(II + 1) - RES_X(II)
+      WY := RES_Y(II + 1) - RES_Y(II)
+      WZ := RES_Z(II + 1) - RES_Z(II)
+      UN := SQRT(UX*UX + UY*UY + UZ*UZ)
+      VN := SQRT(WX*WX + WY*WY + WZ*WZ)
+      IF UN > 0.0 .AND. VN > 0.0 THEN
+        CS := (UX*WX + UY*WY + UZ*WZ) / (UN * VN)
+        IF CS > 1.0 THEN
+          CS := 1.0
+        ENDIF
+        IF CS < -1.0 THEN
+          CS := -1.0
+        ENDIF
+        C0 := COS(RES_ANGT0(II))
+        E_ANGLE := E_ANGLE + RES_ANGK(II) * (CS - C0) * (CS - C0)
+        DEDC := 2.0 * RES_ANGK(II) * (CS - C0)
+        S := 1.0 / (UN * VN)
+        DCUX := S * WX - CS * UX / (UN * UN)
+        DCUY := S * WY - CS * UY / (UN * UN)
+        DCUZ := S * WZ - CS * UZ / (UN * UN)
+        DCWX := S * UX - CS * WX / (VN * VN)
+        DCWY := S * UY - CS * WY / (VN * VN)
+        DCWZ := S * UZ - CS * WZ / (VN * VN)
+        FAX := -DEDC * DCUX
+        FAY := -DEDC * DCUY
+        FAZ := -DEDC * DCUZ
+        FCX := -DEDC * DCWX
+        FCY := -DEDC * DCWY
+        FCZ := -DEDC * DCWZ
+        RES_VX(II-1) := RES_VX(II-1) + FAX * DT * FORCE_SCALE
+        RES_VY(II-1) := RES_VY(II-1) + FAY * DT * FORCE_SCALE
+        RES_VZ(II-1) := RES_VZ(II-1) + FAZ * DT * FORCE_SCALE
+        RES_VX(II+1) := RES_VX(II+1) + FCX * DT * FORCE_SCALE
+        RES_VY(II+1) := RES_VY(II+1) + FCY * DT * FORCE_SCALE
+        RES_VZ(II+1) := RES_VZ(II+1) + FCZ * DT * FORCE_SCALE
+        RES_VX(II) := RES_VX(II) - (FAX + FCX) * DT * FORCE_SCALE
+        RES_VY(II) := RES_VY(II) - (FAY + FCY) * DT * FORCE_SCALE
+        RES_VZ(II) := RES_VZ(II) - (FAZ + FCZ) * DT * FORCE_SCALE
+      ENDIF
+    ENDIF
+  ENDDO
+
+  CALL TORSION_FORCES()
+
+  ! Damping and position update (no walls)
+  DO I = 1, NRES
+    RES_VX(I) := RES_VX(I) * VELOCITY_DAMP
+    RES_VY(I) := RES_VY(I) * VELOCITY_DAMP
+    RES_VZ(I) := RES_VZ(I) * VELOCITY_DAMP
+    RES_X(I) := RES_X(I) + RES_VX(I) * DT
+    RES_Y(I) := RES_Y(I) + RES_VY(I) * DT
+    RES_Z(I) := RES_Z(I) + RES_VZ(I) * DT
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE TORSION_FORCES()
+  ! Proper dihedrals (i, i+1, i+2, i+3), E = k*(1 - cos(phi - phi0)).
+  ! Analytic gradients validated to ~1e-10 against finite differences.
+  INTEGER :: A, B, C, D
+  REAL :: B1X, B1Y, B1Z, B2X, B2Y, B2Z, B3X, B3Y, B3Z
+  REAL :: N1X, N1Y, N1Z, N2X, N2Y, N2Z, C12X, C12Y, C12Z
+  REAL :: N1N, N2N, B2N, CP, SP, PHI, TK, P0, DEDPHI
+  REAL :: G1X, G1Y, G1Z, G4X, G4Y, G4Z, G2X, G2Y, G2Z, G3X, G3Y, G3Z
+  REAL :: CB1, CB2, F1X, F1Y, F1Z, F2X, F2Y, F2Z, F3X, F3Y, F3Z, F4X, F4Y, F4Z
+  INTEGER :: N_ALPHA, N_TORSION
+  REAL :: PHI_CUTOFF
+
+  PHI_CUTOFF := 25.0 * 3.14159265 / 180.0
+  E_TORSION := 0.0
+  SUM_PHI := 0.0
+  N := 0
+  N_ALPHA := 0
+  N_TORSION := 0
+
+  DO A = 1, NRES - 3
+    TK := RES_TORSK(A)
+    IF TK > 0.0 THEN
+      B := A + 1
+      C := A + 2
+      D := A + 3
+      P0 := RES_TORSP0(A)
+
+      B1X := RES_X(B) - RES_X(A)
+      B1Y := RES_Y(B) - RES_Y(A)
+      B1Z := RES_Z(B) - RES_Z(A)
+      B2X := RES_X(C) - RES_X(B)
+      B2Y := RES_Y(C) - RES_Y(B)
+      B2Z := RES_Z(C) - RES_Z(B)
+      B3X := RES_X(D) - RES_X(C)
+      B3Y := RES_Y(D) - RES_Y(C)
+      B3Z := RES_Z(D) - RES_Z(C)
+
+      N1X := B1Y * B2Z - B1Z * B2Y
+      N1Y := B1Z * B2X - B1X * B2Z
+      N1Z := B1X * B2Y - B1Y * B2X
+      N2X := B2Y * B3Z - B2Z * B3Y
+      N2Y := B2Z * B3X - B2X * B3Z
+      N2Z := B2X * B3Y - B2Y * B3X
+
+      N1N := SQRT(N1X*N1X + N1Y*N1Y + N1Z*N1Z)
+      N2N := SQRT(N2X*N2X + N2Y*N2Y + N2Z*N2Z)
+      B2N := SQRT(B2X*B2X + B2Y*B2Y + B2Z*B2Z)
+
+      IF N1N > 0.0 .AND. N2N > 0.0 .AND. B2N > 0.0 THEN
+        C12X := N1Y * N2Z - N1Z * N2Y
+        C12Y := N1Z * N2X - N1X * N2Z
+        C12Z := N1X * N2Y - N1Y * N2X
+        CP := (N1X*N2X + N1Y*N2Y + N1Z*N2Z) / (N1N * N2N)
+        SP := (C12X*B2X + C12Y*B2Y + C12Z*B2Z) / (N1N * N2N * B2N)
+        PHI := ATAN2(SP, CP)
+
+        E_TORSION := E_TORSION + TK * (1.0 - COS(PHI - P0))
+        SUM_PHI := SUM_PHI + PHI
+        N := N + 1
+        N_TORSION := N_TORSION + 1
+        IF ABS(PHI - P0) < PHI_CUTOFF THEN
+          N_ALPHA := N_ALPHA + 1
+        ENDIF
+
+        DEDPHI := TK * SIN(PHI - P0)
+        G1X := -B2N / (N1N * N1N) * N1X
+        G1Y := -B2N / (N1N * N1N) * N1Y
+        G1Z := -B2N / (N1N * N1N) * N1Z
+        G4X :=  B2N / (N2N * N2N) * N2X
+        G4Y :=  B2N / (N2N * N2N) * N2Y
+        G4Z :=  B2N / (N2N * N2N) * N2Z
+        CB1 := (B1X*B2X + B1Y*B2Y + B1Z*B2Z) / (B2N * B2N)
+        CB2 := (B3X*B2X + B3Y*B2Y + B3Z*B2Z) / (B2N * B2N)
+        G2X := -(1.0 + CB1) * G1X + CB2 * G4X
+        G2Y := -(1.0 + CB1) * G1Y + CB2 * G4Y
+        G2Z := -(1.0 + CB1) * G1Z + CB2 * G4Z
+        G3X := -(G1X + G2X + G4X)
+        G3Y := -(G1Y + G2Y + G4Y)
+        G3Z := -(G1Z + G2Z + G4Z)
+
+        F1X := -DEDPHI * G1X
+        F1Y := -DEDPHI * G1Y
+        F1Z := -DEDPHI * G1Z
+        F2X := -DEDPHI * G2X
+        F2Y := -DEDPHI * G2Y
+        F2Z := -DEDPHI * G2Z
+        F3X := -DEDPHI * G3X
+        F3Y := -DEDPHI * G3Y
+        F3Z := -DEDPHI * G3Z
+        F4X := -DEDPHI * G4X
+        F4Y := -DEDPHI * G4Y
+        F4Z := -DEDPHI * G4Z
+
+        RES_VX(A) := RES_VX(A) + F1X * DT * FORCE_SCALE
+        RES_VY(A) := RES_VY(A) + F1Y * DT * FORCE_SCALE
+        RES_VZ(A) := RES_VZ(A) + F1Z * DT * FORCE_SCALE
+        RES_VX(B) := RES_VX(B) + F2X * DT * FORCE_SCALE
+        RES_VY(B) := RES_VY(B) + F2Y * DT * FORCE_SCALE
+        RES_VZ(B) := RES_VZ(B) + F2Z * DT * FORCE_SCALE
+        RES_VX(C) := RES_VX(C) + F3X * DT * FORCE_SCALE
+        RES_VY(C) := RES_VY(C) + F3Y * DT * FORCE_SCALE
+        RES_VZ(C) := RES_VZ(C) + F3Z * DT * FORCE_SCALE
+        RES_VX(D) := RES_VX(D) + F4X * DT * FORCE_SCALE
+        RES_VY(D) := RES_VY(D) + F4Y * DT * FORCE_SCALE
+        RES_VZ(D) := RES_VZ(D) + F4Z * DT * FORCE_SCALE
+      ENDIF
+    ENDIF
+  ENDDO
+
+  IF N > 0 THEN
+    TORS_MEAN := SUM_PHI / REAL(N) * 57.29578
+  ELSE
+    TORS_MEAN := 0.0
+  ENDIF
+
+  IF N_TORSION > 0 THEN
+    ALPHA_FRAC := REAL(N_ALPHA) / REAL(N_TORSION)
+  ELSE
+    ALPHA_FRAC := 0.0
+  ENDIF
+  RETURN
+END
+
+SUBROUTINE HBOND_UPDATE()
+  ! Phase-gated contacts between residues >= 3 apart, capped at HB_CAP each.
+  INTEGER :: DEG(36)
+  INTEGER :: II, JJ
+
+  HB_FORMS := 0
+  HB_BREAKS := 0
+  DO II = 1, NRES
+    DEG(II) := 0
+  ENDDO
+  DO II = 1, NRES - 3
+    DO JJ = II + 3, NRES
+      IF HBOND_MATRIX(II, JJ) = 1 THEN
+        DEG(II) := DEG(II) + 1
+        DEG(JJ) := DEG(JJ) + 1
+      ENDIF
+    ENDDO
+  ENDDO
+
+  DO II = 1, NRES - 3
+    DO JJ = II + 3, NRES
+      DX := RES_X(II) - RES_X(JJ)
+      DY := RES_Y(II) - RES_Y(JJ)
+      DZ := RES_Z(II) - RES_Z(JJ)
+      DIST := SQRT(DX*DX + DY*DY + DZ*DZ)
+      DTH := RES_THETA(II) - RES_THETA(JJ)
+      ALIGN := COS(DTH)
+      IF HBOND_MATRIX(II, JJ) = 1 THEN
+        IF ALIGN < HB_PHASE_STABLE .OR. DIST > HB_BREAK THEN
+          HBOND_MATRIX(II, JJ) := 0
+          DEG(II) := DEG(II) - 1
+          DEG(JJ) := DEG(JJ) - 1
+          HB_BREAKS := HB_BREAKS + 1
+        ENDIF
+      ELSE
+        IF DIST < HB_FORM .AND. ALIGN > HB_PHASE_FORM .AND. &
+           DEG(II) < HB_CAP .AND. DEG(JJ) < HB_CAP THEN
+          HBOND_MATRIX(II, JJ) := 1
+          DEG(II) := DEG(II) + 1
+          DEG(JJ) := DEG(JJ) + 1
+          HB_FORMS := HB_FORMS + 1
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Rebuild bond list and count i3/i4/long-range
+  NHBOND := 0
+  I3CNT := 0
+  I4CNT := 0
+  ILCNT := 0
+  DO II = 1, NRES - 3
+    DO JJ = II + 3, NRES
+      IF HBOND_MATRIX(II, JJ) = 1 THEN
+        NHBOND := NHBOND + 1
+        IF NHBOND ≤ MAXHB THEN
+          HB_I(NHBOND) := II
+          HB_J(NHBOND) := JJ
+        ENDIF
+        IF JJ - II = 3 THEN
+          I3CNT := I3CNT + 1
+        ELSEIF JJ - II = 4 THEN
+          I4CNT := I4CNT + 1
+        ELSE
+          ILCNT := ILCNT + 1
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE CHAIN_DIAG()
+  REAL :: UX, UY, UZ, WX, WY, WZ, UN, VN, CS, BA, BSUM, BSQ
+
+  ! Radius of gyration and end-to-end distance
+  CX := 0.0
+  CY := 0.0
+  CZ := 0.0
+  DO I = 1, NRES
+    CX := CX + RES_X(I)
+    CY := CY + RES_Y(I)
+    CZ := CZ + RES_Z(I)
+  ENDDO
+  CX := CX / REAL(NRES)
+  CY := CY / REAL(NRES)
+  CZ := CZ / REAL(NRES)
+  RGYR := 0.0
+  DO I = 1, NRES
+    RGYR := RGYR + (RES_X(I) - CX)**2 + (RES_Y(I) - CY)**2 + (RES_Z(I) - CZ)**2
+  ENDDO
+  RGYR := SQRT(RGYR / REAL(NRES))
+  E2E := SQRT((RES_X(1) - RES_X(NRES))**2 + (RES_Y(1) - RES_Y(NRES))**2 + &
+              (RES_Z(1) - RES_Z(NRES))**2)
+
+  ! Backbone angle statistics
+  BSUM := 0.0
+  BSQ := 0.0
+  DO I = 2, NRES - 1
+    UX := RES_X(I - 1) - RES_X(I)
+    UY := RES_Y(I - 1) - RES_Y(I)
+    UZ := RES_Z(I - 1) - RES_Z(I)
+    WX := RES_X(I + 1) - RES_X(I)
+    WY := RES_Y(I + 1) - RES_Y(I)
+    WZ := RES_Z(I + 1) - RES_Z(I)
+    UN := SQRT(UX*UX + UY*UY + UZ*UZ)
+    VN := SQRT(WX*WX + WY*WY + WZ*WZ)
+    IF UN > 0.0 .AND. VN > 0.0 THEN
+      CS := (UX*WX + UY*WY + UZ*WZ) / (UN * VN)
+      IF CS > 1.0 THEN
+        CS := 1.0
+      ENDIF
+      IF CS < -1.0 THEN
+        CS := -1.0
+      ENDIF
+      BA := ATAN2(SQRT(1.0 - CS * CS), CS) * 57.29578
+      BSUM := BSUM + BA
+      BSQ := BSQ + BA * BA
+    ENDIF
+  ENDDO
+  BANG_MEAN := BSUM / REAL(NRES - 2)
+  BANG_RMS := SQRT(BSQ / REAL(NRES - 2) - BANG_MEAN * BANG_MEAN)
+  RETURN
+END

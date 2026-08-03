@@ -1,0 +1,45 @@
+! GPU_STENCIL2D — nested 2D stencil extraction test
+! =====================================================================
+! 2D diffusion blur on a 16x12 grid, double-buffered (U -> UN swap by
+! copy). Checks: nested stencil extracts as a flattened kernel and
+! matches the CPU result bitwise (f64, + - * only).
+!
+! CPU:  python -m core tests/gpu_stencil2d.ergo -o /tmp/s2d_cpu
+! GPU:  python -m core tests/gpu_stencil2d.ergo --target spirv -o /tmp/s2d_gpu
+
+INTEGER, PARAMETER :: NX = 16, NY = 12
+INTEGER, PARAMETER :: NSTEPS = 40
+REAL, PARAMETER :: C2 = 0.2
+
+STATIC REAL :: U(NX, NY), UN(NX, NY)
+
+IMPLICIT NONE
+INTEGER :: I, J, T
+
+! Init: U(I,J) = I + 100*J (exactly representable in f64)
+DO J = 1, NY
+  DO I = 1, NX
+    U(I, J) := REAL(I + 100 * J)
+    UN(I, J) := 0.0
+  ENDDO
+ENDDO
+
+! Double-buffered blur: UN = U + C2*(neighbors - 4U), then copy back
+DO T = 1, NSTEPS
+  DO J = 2, NY - 1
+    DO I = 2, NX - 1
+      UN(I, J) := U(I, J) + C2 * (U(I + 1, J) + U(I - 1, J) &
+        + U(I, J + 1) + U(I, J - 1) - 4.0 * U(I, J))
+    ENDDO
+  ENDDO
+  DO J = 2, NY - 1
+    DO I = 2, NX - 1
+      U(I, J) := UN(I, J)
+    ENDDO
+  ENDDO
+ENDDO
+
+PRINT U(3, 3)
+PRINT U(8, 6)
+PRINT U(14, 10)
+PRINT UN(8, 6)

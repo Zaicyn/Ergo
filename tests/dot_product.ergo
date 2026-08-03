@@ -1,0 +1,50 @@
+! dot_product.ergo - DOT_PRODUCT / NORM2 intrinsic tests
+! All expected values are hand-computed.
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: N = 4
+
+STATIC REAL :: ONES(N), E1(N), E2(N), A(N), B(N), V(2)
+REAL :: d
+INTEGER :: i
+
+! Case 1: ONES·ONES with ONES(i) = 1 → N = 4
+DO i = 1, N
+  ONES(i) := 1.0
+ENDDO
+d := DOT_PRODUCT(ONES, ONES)
+PRINT d              ! expect 4.000000
+
+! Case 2: orthogonal basis vectors → 0
+DO i = 1, N
+  E1(i) := 0.0
+  E2(i) := 0.0
+ENDDO
+E1(1) := 1.0
+E2(2) := 1.0
+d := DOT_PRODUCT(E1, E2)
+PRINT d              ! expect 0.000000
+
+! Case 3: mixed non-integer values
+! A = (1.5, -2.0, 0.25, 3.0), B = (2.0, 0.5, 4.0, -1.0)
+! A·B = 3.0 - 1.0 + 1.0 - 3.0 = 0.0
+A(1) := 1.5
+A(2) := -2.0
+A(3) := 0.25
+A(4) := 3.0
+B(1) := 2.0
+B(2) := 0.5
+B(3) := 4.0
+B(4) := -1.0
+d := DOT_PRODUCT(A, B)
+PRINT d              ! expect 0.000000
+
+! Case 4: NORM2 of (3, 4) → 5
+V(1) := 3.0
+V(2) := 4.0
+d := NORM2(V)
+PRINT d              ! expect 5.000000
+
+! Case 5: NORM2 of ONES → sqrt(4) = 2
+d := NORM2(ONES)
+PRINT d              ! expect 2.000000

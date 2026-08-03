@@ -1,0 +1,1384 @@
+! WAVEFORM_CLUSTER - Adaptive multi-scale waveform-knot simulation
+! ===================================================================
+! Atoms/clusters are nodes in a 3D waveform field. Stable regions are
+! coarse-grained molecular clusters; unstable regions refine into
+! atomistic nodes. The S3-normalized Viviani normal provides the
+! exchange coupling between neighboring knots, and phase curvature is
+! the stress metric that drives COASTING -> ACTIVE -> FLOW transitions.
+
+IMPLICIT NONE
+
+! ── Grid dimensions ─────────────────────────────────────────
+PARAMETER INTEGER :: NX = 16
+PARAMETER INTEGER :: NY = 16
+PARAMETER INTEGER :: NZ = 16
+
+! ── Capacity limits ──────────────────────────────────────────
+PARAMETER INTEGER :: MAXCLUSTER = 64
+PARAMETER INTEGER :: MAXATOM = 256
+PARAMETER INTEGER :: MAXKNOT = 256
+PARAMETER INTEGER :: MAXFRAME = 1000
+
+! ── Time stepping ────────────────────────────────────────────
+PARAMETER REAL :: DT = 0.01
+PARAMETER REAL :: EXCHANGE_RATE = 0.05
+PARAMETER REAL :: DAMPING = 0.001
+PARAMETER REAL :: BASE_OMEGA = 1.0
+PARAMETER REAL :: COUPLING_K = 5.0
+
+! ── Perturbation experiment flags ───────────────────────────
+! 0 = none, 1 = remove hotspot, 2 = sign flip, 3 = type flip,
+! 4 = partial type flip (HEAD->TAIL), 5 = flip then unflip
+PARAMETER INTEGER :: PERTURB_TYPE = 0
+PARAMETER INTEGER :: PERTURB_FRAME = 300
+PARAMETER INTEGER :: PERTURB_UNFLIP_FRAME = 500
+PARAMETER INTEGER :: PERTURB_DURATION = 50
+PARAMETER REAL :: HOTSPOT_RADIUS = 2.0
+PARAMETER REAL :: FLIP_RADIUS = 3.0
+
+! ── Flipped-zone tracking ───────────────────────────────────
+STATIC REAL :: CLUSTER_THETA_ORIG(64)
+STATIC INTEGER :: CLUSTER_FLIPPED(64)
+STATIC INTEGER :: N_FLIPPED
+STATIC INTEGER :: N_COAST_FLIP, N_ACTIVE_FLIP, N_FLOW_FLIP
+STATIC REAL :: SUM_STRESS_FLIP, MAX_STRESS_FLIP, MEAN_STRESS_FLIP
+STATIC REAL :: MAX_LYAP_FLIP
+STATIC INTEGER :: N_REFINE_EVENTS, N_COARSEN_EVENTS
+
+! Perturbation center for cluster mesh (default matches 4x4x4 cluster block)
+PARAMETER REAL :: FLIP_CENTER_X = 2.0
+PARAMETER REAL :: FLIP_CENTER_Y = 2.0
+PARAMETER REAL :: FLIP_CENTER_Z = 2.0
+
+! ── Stability thresholds ───────────────────────────────────
+! stress = |phase curvature| multiplied by geometric w-coupling
+PARAMETER REAL :: THRESH_ACTIVE = 0.05
+PARAMETER REAL :: THRESH_FLOW = 0.2
+PARAMETER REAL :: THRESH_REFINE = 0.5
+PARAMETER REAL :: THRESH_COARSEN = 0.005
+PARAMETER REAL :: THRESH_ACTIVE_NORM = 0.03183
+PARAMETER REAL :: THRESH_FLOW_NORM = 0.12566
+PARAMETER REAL :: THRESH_REFINE_NORM = 0.29500
+PARAMETER REAL :: THRESH_COARSEN_NORM = 0.00318
+PARAMETER REAL :: W_COUP_FACTOR = 2.0
+PARAMETER INTEGER :: REFINE_ATOM_COUNT = 6
+PARAMETER INTEGER :: COARSEN_TICKS = 50
+
+! ── Bond detection ─────────────────────────────────────────
+PARAMETER INTEGER :: MAXBOND = 512
+PARAMETER REAL :: BOND_DIST = 3.0
+PARAMETER REAL :: BOND_PHASE_THRESH = 0.95
+PARAMETER INTEGER :: MAX_BOND_DEGREE = 2
+
+! ── State constants ──────────────────────────────────────────
+PARAMETER INTEGER :: STATE_COAST = 1
+PARAMETER INTEGER :: STATE_ACTIVE = 2
+PARAMETER INTEGER :: STATE_FLOW = 3
+
+! ── Wavefield grid ───────────────────────────────────────────
+STATIC REAL :: FIELD_AMP(16, 16, 16)
+STATIC REAL :: FIELD_PHI(16, 16, 16)
+STATIC REAL :: FIELD_AMP_NEXT(16, 16, 16)
+STATIC REAL :: FIELD_PHI_NEXT(16, 16, 16)
+STATIC REAL :: FIELD_AMP_DELTA(16, 16, 16)
+
+! ── Cell-to-cluster map (0 = empty) ──────────────────────────
+STATIC INTEGER :: CELL_CLUSTER(16, 16, 16)
+
+! ── Cluster state ────────────────────────────────────────────
+STATIC INTEGER :: NCLUSTER
+STATIC REAL :: CLUSTER_X(64)
+STATIC REAL :: CLUSTER_Y(64)
+STATIC REAL :: CLUSTER_Z(64)
+STATIC REAL :: CLUSTER_THETA(64)
+STATIC REAL :: CLUSTER_BASE_OMEGA(64)
+STATIC REAL :: CLUSTER_OMEGA(64)
+STATIC REAL :: CLUSTER_NX(64)
+STATIC REAL :: CLUSTER_NY(64)
+STATIC REAL :: CLUSTER_NZ(64)
+STATIC REAL :: CLUSTER_NW(64)
+STATIC REAL :: CLUSTER_STRESS(64)
+STATIC REAL :: CLUSTER_STRESS_NORM(64)
+STATIC REAL :: CLUSTER_SURFACE_TENSION(64)
+STATIC INTEGER :: CLUSTER_STATE(64)
+STATIC INTEGER :: CLUSTER_ACTIVE(64)
+STATIC INTEGER :: CLUSTER_CI(64)
+STATIC INTEGER :: CLUSTER_CJ(64)
+STATIC INTEGER :: CLUSTER_CK(64)
+STATIC INTEGER :: CLUSTER_REFINE_AGE(64)
+
+! ── Atomistic layer (refined clusters) ───────────────────────
+STATIC INTEGER :: NATOM
+STATIC REAL :: ATOM_X(256)
+STATIC REAL :: ATOM_Y(256)
+STATIC REAL :: ATOM_Z(256)
+STATIC REAL :: ATOM_THETA(256)
+STATIC REAL :: ATOM_OMEGA(256)
+STATIC REAL :: ATOM_NX(256)
+STATIC REAL :: ATOM_NY(256)
+STATIC REAL :: ATOM_NZ(256)
+STATIC REAL :: ATOM_NW(256)
+STATIC REAL :: ATOM_STRESS(256)
+STATIC REAL :: ATOM_STRESS_NORM(256)
+STATIC INTEGER :: ATOM_ACTIVE(256)
+STATIC INTEGER :: ATOM_PARENT(256)
+STATIC INTEGER :: ATOM_FLIPPED(256)
+STATIC INTEGER :: ATOM_AGE(256)
+
+! ── Atom bond graph (diagnostic for chain/fold detection) ─────
+STATIC INTEGER :: NBOND
+STATIC INTEGER :: BOND_I(512)
+STATIC INTEGER :: BOND_J(512)
+STATIC INTEGER :: ATOM_DEGREE(256)
+STATIC INTEGER :: ATOM_PARENT_BOND(256)
+STATIC INTEGER :: COMPONENT_SIZE(256)
+STATIC INTEGER :: DEGREE_0, DEGREE_1, DEGREE_2, DEGREE_3
+STATIC INTEGER :: MAX_COMPONENT
+
+! ── Flipped-atom bond diagnostics ───────────────────────────
+STATIC INTEGER :: N_ATOM_FLIPPED
+STATIC INTEGER :: NBOND_FLIP, NBOND_MIX
+STATIC INTEGER :: DEGREE_0_FLIP, DEGREE_1_FLIP, DEGREE_2_FLIP, DEGREE_3_FLIP
+STATIC INTEGER :: MAX_COMPONENT_FLIP
+
+! ── Knot/crossroad registry ──────────────────────────────────
+STATIC INTEGER :: NKNOT
+STATIC INTEGER :: KNOT_I(256)
+STATIC INTEGER :: KNOT_J(256)
+STATIC INTEGER :: KNOT_K(256)
+STATIC REAL :: KNOT_STRENGTH(256)
+
+! ── Neighbor offsets for 6-connected grid ────────────────────
+STATIC INTEGER :: DXI(6)
+STATIC INTEGER :: DYJ(6)
+STATIC INTEGER :: DZK(6)
+DATA DXI /  1, -1,  0,  0,  0,  0 /
+DATA DYJ /  0,  0,  1, -1,  0,  0 /
+DATA DZK /  0,  0,  0,  0,  1, -1 /
+
+! ── Working scalars (STATIC so subroutines can access them) ───
+STATIC INTEGER :: I, J, K, IP, IM, JP, JM, KP, KM, CL, AT, DIR, NI, NJ, NK, NCL, FRAME, N
+STATIC INTEGER :: N_COAST, N_ACTIVE, N_FLOW, N_REFINE, NCOARSEN
+STATIC REAL :: X, Y, Z, W, S, R, TH, D, WEIGHT, DIFF, CURV, AVG, MED
+STATIC REAL :: XI, YI, ZI, DXP, DXM, DYP, DYM, DZP, DZM, GRAD2
+STATIC REAL :: NX1, NY1, NZ1, NW1, NX2, NY2, NZ2, NW2
+STATIC REAL :: SUM_STRESS, MAX_STRESS, MEAN_STRESS, SUM_AMP, MAX_AMP
+STATIC REAL :: SIN_AVG, COS_AVG, THETA_MEAN, COHERENCE
+STATIC REAL :: SUM_ARCTAN_STRESS, MAX_ARCTAN_STRESS, MEAN_ARCTAN_STRESS
+STATIC REAL :: SUM_SURFACE, MAX_SURFACE, MEAN_SURFACE
+STATIC REAL :: MAX_LYAPUNOV, LYAP_RATE, LOCAL_OMEGA
+STATIC REAL :: MEAN_W_ATOM, FLOW_FRACTION
+STATIC REAL :: K_SIGN
+STATIC INTEGER :: N_ACTIVE_ATOM
+STATIC REAL :: AMP_OLD, AMP_NEW, AMP_ABS, SURF_FLUX
+
+! ── Initialize ─────────────────────────────────────────────
+CALL INIT_OFFSETS()
+CALL INIT_WAVEFIELD()
+CALL INIT_CLUSTERS()
+
+! Initialize mutable globals
+NATOM := 0
+NKNOT := 0
+
+! CSV header
+WRITE(*, "frame,clusters,atoms,knots,mean_stress,max_stress,total_amp,max_amp,coherence,mean_arctan,max_arctan,max_lyap,mean_surf,mean_w,flow_frac,nbond,max_comp,deg0,deg1,deg2,coast,active,flow,refined,active_atoms,n_flipped,stress_flip,max_stress_flip,coast_flip,active_flip,flow_flip,lyap_flip,n_refine_events,n_coarsen_events,n_atom_flipped,nbond_flip,nbond_mix,deg0_flip,deg1_flip,deg2_flip,deg3_flip,max_comp_flip")
+
+! ════════════════════════════════════════════════════════════
+! MAIN LOOP
+! ════════════════════════════════════════════════════════════
+DO FRAME = 1, MAXFRAME
+
+  ! Reset per-frame event counters
+  N_REFINE_EVENTS := 0
+  N_COARSEN_EVENTS := 0
+
+  ! Compute normals from current phases
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_ACTIVE(CL) = 1 THEN
+      CALL SET_CLUSTER_NORMAL(CL)
+    ENDIF
+  ENDDO
+
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      CALL SET_ATOM_NORMAL(AT)
+    ENDIF
+  ENDDO
+
+  ! Measure phase-curvature stress and update states
+  CALL COMPUTE_CLUSTER_STRESS()
+  CALL UPDATE_STATES()
+
+  ! Multi-resolution adaptation
+  CALL ADAPTIVE_REFINE()
+  CALL COMPUTE_ATOM_STRESS()
+  CALL COARSEN_STABLE()
+
+  ! Apply perturbation experiment
+  K_SIGN := 1.0
+  IF PERTURB_TYPE = 2 THEN
+    IF FRAME ≥ PERTURB_FRAME .AND. FRAME < PERTURB_FRAME + PERTURB_DURATION THEN
+      K_SIGN := -1.0
+    ENDIF
+  ELSEIF PERTURB_TYPE = 1 THEN
+    IF FRAME = PERTURB_FRAME THEN
+      CALL REMOVE_HOTSPOT()
+    ENDIF
+  ELSEIF PERTURB_TYPE = 3 THEN
+    IF FRAME = PERTURB_FRAME THEN
+      CALL FLIP_CLUSTER_TYPES()
+    ENDIF
+  ELSEIF PERTURB_TYPE = 4 THEN
+    IF FRAME = PERTURB_FRAME THEN
+      CALL PARTIAL_FLIP_CLUSTER_TYPES()
+    ENDIF
+  ELSEIF PERTURB_TYPE = 5 THEN
+    IF FRAME = PERTURB_FRAME THEN
+      CALL FLIP_CLUSTER_TYPES()
+    ENDIF
+    IF FRAME = PERTURB_UNFLIP_FRAME THEN
+      CALL UNFLIP_CLUSTER_TYPES()
+    ENDIF
+  ENDIF
+
+  ! Propagate wavefield
+  CALL WAVE_STEP()
+
+  ! Detect knots / crossroads
+  CALL KNOT_UPDATE()
+
+  ! Update atom bond graph and statistics
+  CALL BOND_UPDATE()
+  CALL COMPUTE_BOND_STATS()
+  CALL COMPUTE_NORMALIZED_DIAGNOSTICS()
+
+  ! Output every 10 frames
+  IF MOD(FRAME, 10) = 0 THEN
+    CALL COUNT_STATES()
+    SUM_STRESS := 0.0
+    MAX_STRESS := 0.0
+    N := 0
+    DO CL = 1, NCLUSTER
+      IF CLUSTER_ACTIVE(CL) = 1 THEN
+        SUM_STRESS := SUM_STRESS + CLUSTER_STRESS(CL)
+        IF CLUSTER_STRESS(CL) > MAX_STRESS THEN
+          MAX_STRESS := CLUSTER_STRESS(CL)
+        ENDIF
+        N := N + 1
+      ENDIF
+    ENDDO
+    IF N > 0 THEN
+      MEAN_STRESS := SUM_STRESS / REAL(N)
+    ELSE
+      MEAN_STRESS := 0.0
+    ENDIF
+    SUM_AMP := 0.0
+    MAX_AMP := 0.0
+    DO K = 1, NZ
+      DO J = 1, NY
+        DO I = 1, NX
+          SUM_AMP := SUM_AMP + FIELD_AMP(I, J, K)
+          IF FIELD_AMP(I, J, K) > MAX_AMP THEN
+            MAX_AMP := FIELD_AMP(I, J, K)
+          ENDIF
+        ENDDO
+      ENDDO
+    ENDDO
+    N_ACTIVE_ATOM := 0
+    DO AT = 1, NATOM
+      IF ATOM_ACTIVE(AT) = 1 THEN
+        N_ACTIVE_ATOM := N_ACTIVE_ATOM + 1
+      ENDIF
+    ENDDO
+
+    WRITE(*, "%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%d,%d,%d,%.6f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d") &
+      FRAME, N, NATOM, NKNOT, MEAN_STRESS, MAX_STRESS, SUM_AMP, MAX_AMP, COHERENCE, &
+      MEAN_ARCTAN_STRESS, MAX_ARCTAN_STRESS, MAX_LYAPUNOV, MEAN_SURFACE, MEAN_W_ATOM, FLOW_FRACTION, &
+      NBOND, MAX_COMPONENT, DEGREE_0, DEGREE_1, DEGREE_2, N_COAST, N_ACTIVE, N_FLOW, N_REFINE, N_ACTIVE_ATOM, &
+      N_FLIPPED, MEAN_STRESS_FLIP, MAX_STRESS_FLIP, N_COAST_FLIP, N_ACTIVE_FLIP, N_FLOW_FLIP, &
+      MAX_LYAP_FLIP, N_REFINE_EVENTS, N_COARSEN_EVENTS, &
+      N_ATOM_FLIPPED, NBOND_FLIP, NBOND_MIX, DEGREE_0_FLIP, DEGREE_1_FLIP, DEGREE_2_FLIP, DEGREE_3_FLIP, MAX_COMPONENT_FLIP
+  ENDIF
+
+ENDDO
+
+STOP
+
+! ════════════════════════════════════════════════════════════
+! SUBROUTINES
+! ════════════════════════════════════════════════════════════
+
+SUBROUTINE INIT_OFFSETS()
+  ! 6-connected neighbor offsets already set via DATA
+  RETURN
+END
+
+SUBROUTINE INIT_WAVEFIELD()
+  DO K = 1, NZ
+    DO J = 1, NY
+      DO I = 1, NX
+        FIELD_AMP(I, J, K) := 0.0
+        FIELD_PHI(I, J, K) := 0.0
+        FIELD_AMP_NEXT(I, J, K) := 0.0
+        FIELD_PHI_NEXT(I, J, K) := 0.0
+        CELL_CLUSTER(I, J, K) := 0
+      ENDDO
+    ENDDO
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE INIT_CLUSTERS()
+  INTEGER :: IC, JC, KC, IDX
+  REAL :: STEP, OFFSET, TH0
+
+  STEP := 1.0
+  OFFSET := 0.5
+  NCLUSTER := 0
+
+  DO KC = 1, 4
+    DO JC = 1, 4
+      DO IC = 1, 4
+        NCLUSTER := NCLUSTER + 1
+        IF NCLUSTER > MAXCLUSTER THEN
+          NCLUSTER := MAXCLUSTER
+          RETURN
+        ENDIF
+        CL := NCLUSTER
+
+        CLUSTER_X(CL) := OFFSET + REAL(IC - 1) * STEP
+        CLUSTER_Y(CL) := OFFSET + REAL(JC - 1) * STEP
+        CLUSTER_Z(CL) := OFFSET + REAL(KC - 1) * STEP
+        CLUSTER_CI(CL) := INT(CLUSTER_X(CL)) + 1
+        CLUSTER_CJ(CL) := INT(CLUSTER_Y(CL)) + 1
+        CLUSTER_CK(CL) := INT(CLUSTER_Z(CL)) + 1
+
+        ! Clamp to grid
+        IF CLUSTER_CI(CL) < 1 THEN
+          CLUSTER_CI(CL) := 1
+        ENDIF
+        IF CLUSTER_CI(CL) > NX THEN
+          CLUSTER_CI(CL) := NX
+        ENDIF
+        IF CLUSTER_CJ(CL) < 1 THEN
+          CLUSTER_CJ(CL) := 1
+        ENDIF
+        IF CLUSTER_CJ(CL) > NY THEN
+          CLUSTER_CJ(CL) := NY
+        ENDIF
+        IF CLUSTER_CK(CL) < 1 THEN
+          CLUSTER_CK(CL) := 1
+        ENDIF
+        IF CLUSTER_CK(CL) > NZ THEN
+          CLUSTER_CK(CL) := NZ
+        ENDIF
+        ! Unique phase per cluster (Viviani harmonic seed)
+        TH0 := REAL(CL - 1) * (6.283185307179586 / REAL(MAXCLUSTER))
+        CLUSTER_THETA(CL) := TH0
+        CLUSTER_THETA_ORIG(CL) := TH0
+        CLUSTER_BASE_OMEGA(CL) := BASE_OMEGA + 2.0 * SIN(TH0)
+        CLUSTER_OMEGA(CL) := CLUSTER_BASE_OMEGA(CL)
+        CLUSTER_STRESS(CL) := 0.0
+        CLUSTER_STATE(CL) := STATE_COAST
+        CLUSTER_ACTIVE(CL) := 1
+        CLUSTER_REFINE_AGE(CL) := 0
+        CLUSTER_FLIPPED(CL) := 0
+
+        CELL_CLUSTER(CLUSTER_CI(CL), CLUSTER_CJ(CL), CLUSTER_CK(CL)) := CL
+
+        ! Initial amplitude bump
+        FIELD_AMP(CLUSTER_CI(CL), CLUSTER_CJ(CL), CLUSTER_CK(CL)) := 1.0
+      ENDDO
+    ENDDO
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE SET_CLUSTER_NORMAL(CL)
+  INTEGER :: CL
+  REAL :: TH, WW, SS, RR
+
+  TH := CLUSTER_THETA(CL)
+  WW := (1.0 / 3.0) * SIN(5.0 * TH)
+  SS := SQRT(1.0 - WW * WW)
+
+  CLUSTER_NX(CL) := SS * (SIN(TH) - 0.5 * SIN(3.0 * TH))
+  CLUSTER_NY(CL) := SS * (-COS(TH) + 0.5 * COS(3.0 * TH))
+  CLUSTER_NZ(CL) := SS * COS(TH) * COS(3.0 * TH)
+  CLUSTER_NW(CL) := WW
+
+  RR := SQRT(CLUSTER_NX(CL)*CLUSTER_NX(CL) + CLUSTER_NY(CL)*CLUSTER_NY(CL) + &
+            CLUSTER_NZ(CL)*CLUSTER_NZ(CL) + CLUSTER_NW(CL)*CLUSTER_NW(CL))
+  IF RR > 1.0E-12 THEN
+    CLUSTER_NX(CL) := CLUSTER_NX(CL) / RR
+    CLUSTER_NY(CL) := CLUSTER_NY(CL) / RR
+    CLUSTER_NZ(CL) := CLUSTER_NZ(CL) / RR
+    CLUSTER_NW(CL) := CLUSTER_NW(CL) / RR
+  ENDIF
+  RETURN
+END
+
+SUBROUTINE SET_ATOM_NORMAL(AT)
+  INTEGER :: AT
+  REAL :: TH, WW, SS, RR
+
+  TH := ATOM_THETA(AT)
+  WW := (1.0 / 3.0) * SIN(5.0 * TH)
+  SS := SQRT(1.0 - WW * WW)
+
+  ATOM_NX(AT) := SS * (SIN(TH) - 0.5 * SIN(3.0 * TH))
+  ATOM_NY(AT) := SS * (-COS(TH) + 0.5 * COS(3.0 * TH))
+  ATOM_NZ(AT) := SS * COS(TH) * COS(3.0 * TH)
+  ATOM_NW(AT) := WW
+
+  RR := SQRT(ATOM_NX(AT)*ATOM_NX(AT) + ATOM_NY(AT)*ATOM_NY(AT) + &
+            ATOM_NZ(AT)*ATOM_NZ(AT) + ATOM_NW(AT)*ATOM_NW(AT))
+  IF RR > 1.0E-12 THEN
+    ATOM_NX(AT) := ATOM_NX(AT) / RR
+    ATOM_NY(AT) := ATOM_NY(AT) / RR
+    ATOM_NZ(AT) := ATOM_NZ(AT) / RR
+    ATOM_NW(AT) := ATOM_NW(AT) / RR
+  ENDIF
+  RETURN
+END
+
+REAL FUNCTION DOT4(AX, AY, AZ, AW, BX, BY, BZ, BW)
+  REAL :: AX, AY, AZ, AW, BX, BY, BZ, BW
+  DOT4 := AX*BX + AY*BY + AZ*BZ + AW*BW
+  RETURN DOT4
+END
+
+REAL FUNCTION ARCTAN_NORM(XX)
+  REAL :: XX
+  ! Map (-inf, +inf) -> (-1, +1), preserving sign and differential structure near zero
+  ARCTAN_NORM := (2.0 / 3.141592653589793) * ATAN(XX)
+  RETURN ARCTAN_NORM
+END
+
+SUBROUTINE COMPUTE_CLUSTER_STRESS()
+  ! Stress = average phase mismatch with neighboring cluster knots
+  ! Surface tension = boundary flux of amplitude, normalized by area and base omega
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_ACTIVE(CL) = 1 THEN
+      I := CLUSTER_CI(CL)
+      J := CLUSTER_CJ(CL)
+      K := CLUSTER_CK(CL)
+
+      CURV := 0.0
+      SURF_FLUX := 0.0
+      N := 0
+      DO DIR = 1, 6
+        NI := I + DXI(DIR)
+        NJ := J + DYJ(DIR)
+        NK := K + DZK(DIR)
+        IF NI < 1 THEN
+          NI := NX
+        ENDIF
+        IF NI > NX THEN
+          NI := 1
+        ENDIF
+        IF NJ < 1 THEN
+          NJ := NY
+        ENDIF
+        IF NJ > NY THEN
+          NJ := 1
+        ENDIF
+        IF NK < 1 THEN
+          NK := NZ
+        ENDIF
+        IF NK > NZ THEN
+          NK := 1
+        ENDIF
+
+        SURF_FLUX := SURF_FLUX + (FIELD_AMP(NI, NJ, NK) - FIELD_AMP(I, J, K))
+
+        NCL := CELL_CLUSTER(NI, NJ, NK)
+        IF NCL > 0 THEN
+          IF CLUSTER_ACTIVE(NCL) = 1 THEN
+            CURV := CURV + ABS(FIELD_PHI(NI, NJ, NK) - FIELD_PHI(I, J, K))
+            N := N + 1
+          ENDIF
+        ENDIF
+      ENDDO
+
+      IF N > 0 THEN
+        CLUSTER_STRESS(CL) := (CURV / REAL(N)) * MAX(0.1, 1.0 + W_COUP_FACTOR * CLUSTER_NW(CL))
+      ELSE
+        CLUSTER_STRESS(CL) := 0.0
+      ENDIF
+      CLUSTER_STRESS_NORM(CL) := ARCTAN_NORM(CLUSTER_STRESS(CL))
+      IF ABS(CLUSTER_BASE_OMEGA(CL)) > 1.0E-12 THEN
+        CLUSTER_SURFACE_TENSION(CL) := ABS(SURF_FLUX) / (6.0 * ABS(CLUSTER_BASE_OMEGA(CL)))
+      ELSE
+        CLUSTER_SURFACE_TENSION(CL) := 0.0
+      ENDIF
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE COMPUTE_ATOM_STRESS()
+  ! Phase curvature at each atom's nearest grid cell
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      I := INT(ATOM_X(AT)) + 1
+      J := INT(ATOM_Y(AT)) + 1
+      K := INT(ATOM_Z(AT)) + 1
+      IF I ≥ 1 .AND. I ≤ NX .AND. J ≥ 1 .AND. J ≤ NY .AND. K ≥ 1 .AND. K ≤ NZ THEN
+        IP := I + 1
+        IF IP > NX THEN
+          IP := 1
+        ENDIF
+        IM := I - 1
+        IF IM < 1 THEN
+          IM := NX
+        ENDIF
+        JP := J + 1
+        IF JP > NY THEN
+          JP := 1
+        ENDIF
+        JM := J - 1
+        IF JM < 1 THEN
+          JM := NY
+        ENDIF
+        KP := K + 1
+        IF KP > NZ THEN
+          KP := 1
+        ENDIF
+        KM := K - 1
+        IF KM < 1 THEN
+          KM := NZ
+        ENDIF
+        CURV := (FIELD_PHI(IP, J, K) + FIELD_PHI(IM, J, K) + &
+                 FIELD_PHI(I, JP, K) + FIELD_PHI(I, JM, K) + &
+                 FIELD_PHI(I, J, KP) + FIELD_PHI(I, J, KM) - &
+                 6.0 * FIELD_PHI(I, J, K))
+        ATOM_STRESS(AT) := ABS(CURV) * MAX(0.1, 1.0 + W_COUP_FACTOR * ATOM_NW(AT))
+        ATOM_STRESS_NORM(AT) := ARCTAN_NORM(ATOM_STRESS(AT))
+      ELSE
+        ATOM_STRESS(AT) := 0.0
+        ATOM_STRESS_NORM(AT) := 0.0
+      ENDIF
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE UPDATE_STATES()
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_ACTIVE(CL) = 1 THEN
+      IF CLUSTER_STRESS_NORM(CL) < THRESH_ACTIVE_NORM THEN
+        CLUSTER_STATE(CL) := STATE_COAST
+        CLUSTER_OMEGA(CL) := CLUSTER_BASE_OMEGA(CL)
+      ELSEIF CLUSTER_STRESS_NORM(CL) < THRESH_FLOW_NORM THEN
+        CLUSTER_STATE(CL) := STATE_ACTIVE
+        CLUSTER_OMEGA(CL) := CLUSTER_BASE_OMEGA(CL) * 2.0
+      ELSE
+        CLUSTER_STATE(CL) := STATE_FLOW
+        CLUSTER_OMEGA(CL) := CLUSTER_BASE_OMEGA(CL) * 3.0
+      ENDIF
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE WAVE_STEP()
+  ! 1. Advance phase at each active cluster cell by its omega
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_ACTIVE(CL) = 1 THEN
+      I := CLUSTER_CI(CL)
+      J := CLUSTER_CJ(CL)
+      K := CLUSTER_CK(CL)
+      FIELD_PHI(I, J, K) := FIELD_PHI(I, J, K) + CLUSTER_OMEGA(CL) * DT
+    ENDIF
+  ENDDO
+
+  ! Atom phase advance (they carry their own harmonic phase)
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      ATOM_THETA(AT) := ATOM_THETA(AT) + ATOM_OMEGA(AT) * DT
+    ENDIF
+  ENDDO
+
+  ! Atom phase synchronization (Kuramoto coupling toward mean phase)
+  SIN_AVG := 0.0
+  COS_AVG := 0.0
+  N := 0
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      SIN_AVG := SIN_AVG + SIN(ATOM_THETA(AT))
+      COS_AVG := COS_AVG + COS(ATOM_THETA(AT))
+      N := N + 1
+    ENDIF
+  ENDDO
+  IF N > 0 THEN
+    COHERENCE := SQRT(SIN_AVG*SIN_AVG + COS_AVG*COS_AVG) / REAL(N)
+    THETA_MEAN := ATAN2(SIN_AVG, COS_AVG)
+    DO AT = 1, NATOM
+      IF ATOM_ACTIVE(AT) = 1 THEN
+        ATOM_THETA(AT) := ATOM_THETA(AT) + COUPLING_K * K_SIGN * SIN(THETA_MEAN - ATOM_THETA(AT)) * DT
+      ENDIF
+    ENDDO
+  ELSE
+    COHERENCE := 0.0
+  ENDIF
+
+  ! 2. Exchange amplitude between cluster cells, weighted by S3 dot product
+  ! Copy current amplitudes to next buffer
+  DO K = 1, NZ
+    DO J = 1, NY
+      DO I = 1, NX
+        FIELD_AMP_NEXT(I, J, K) := FIELD_AMP(I, J, K)
+      ENDDO
+    ENDDO
+  ENDDO
+
+  ! Cluster-cluster exchange
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_ACTIVE(CL) = 1 THEN
+      I := CLUSTER_CI(CL)
+      J := CLUSTER_CJ(CL)
+      K := CLUSTER_CK(CL)
+
+      NX1 := CLUSTER_NX(CL)
+      NY1 := CLUSTER_NY(CL)
+      NZ1 := CLUSTER_NZ(CL)
+      NW1 := CLUSTER_NW(CL)
+
+      DO DIR = 1, 6
+        NI := I + DXI(DIR)
+        NJ := J + DYJ(DIR)
+        NK := K + DZK(DIR)
+        IF NI < 1 THEN
+          NI := NX
+        ENDIF
+        IF NI > NX THEN
+          NI := 1
+        ENDIF
+        IF NJ < 1 THEN
+          NJ := NY
+        ENDIF
+        IF NJ > NY THEN
+          NJ := 1
+        ENDIF
+        IF NK < 1 THEN
+          NK := NZ
+        ENDIF
+        IF NK > NZ THEN
+          NK := 1
+        ENDIF
+        NCL := CELL_CLUSTER(NI, NJ, NK)
+        IF NCL > 0 THEN
+          IF CLUSTER_ACTIVE(NCL) = 1 THEN
+            NX2 := CLUSTER_NX(NCL)
+            NY2 := CLUSTER_NY(NCL)
+            NZ2 := CLUSTER_NZ(NCL)
+            NW2 := CLUSTER_NW(NCL)
+            D := DOT4(NX1, NY1, NZ1, NW1, NX2, NY2, NZ2, NW2)
+            WEIGHT := D * EXCHANGE_RATE * DT
+            DIFF := FIELD_AMP(NI, NJ, NK) - FIELD_AMP(I, J, K)
+            FIELD_AMP_NEXT(I, J, K) := FIELD_AMP_NEXT(I, J, K) + WEIGHT * DIFF
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDIF
+  ENDDO
+
+  ! 3. Atomistic nodes deposit amplitude into their nearest cell
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      I := INT(ATOM_X(AT)) + 1
+      J := INT(ATOM_Y(AT)) + 1
+      K := INT(ATOM_Z(AT)) + 1
+      IF I ≥ 1 .AND. I ≤ NX .AND. J ≥ 1 .AND. J ≤ NY .AND. K ≥ 1 .AND. K ≤ NZ THEN
+        FIELD_AMP_NEXT(I, J, K) := FIELD_AMP_NEXT(I, J, K) + 0.1 * SIN(ATOM_THETA(AT))
+      ENDIF
+    ENDIF
+  ENDDO
+
+  ! 4. Store raw amplitude delta (pre-damping) for Lyapunov diagnostics
+  DO K = 1, NZ
+    DO J = 1, NY
+      DO I = 1, NX
+        FIELD_AMP_DELTA(I, J, K) := FIELD_AMP_NEXT(I, J, K) - FIELD_AMP(I, J, K)
+      ENDDO
+    ENDDO
+  ENDDO
+
+  ! 5. Commit next buffer with uniform damping
+  DO K = 1, NZ
+    DO J = 1, NY
+      DO I = 1, NX
+        FIELD_AMP(I, J, K) := FIELD_AMP_NEXT(I, J, K) * (1.0 - DAMPING)
+      ENDDO
+    ENDDO
+  ENDDO
+
+  RETURN
+END
+
+SUBROUTINE ADAPTIVE_REFINE()
+  ! Stressed FLOW clusters refine into atomistic nodes
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_ACTIVE(CL) = 1 THEN
+      IF CLUSTER_STATE(CL) = STATE_FLOW .AND. CLUSTER_STRESS_NORM(CL) > THRESH_REFINE_NORM THEN
+        IF CLUSTER_REFINE_AGE(CL) ≤ 0 THEN
+          CALL SPAWN_ATOMS(CL)
+          CLUSTER_ACTIVE(CL) := 0
+          CELL_CLUSTER(CLUSTER_CI(CL), CLUSTER_CJ(CL), CLUSTER_CK(CL)) := 0
+          N_REFINE_EVENTS := N_REFINE_EVENTS + 1
+        ENDIF
+      ENDIF
+      IF CLUSTER_REFINE_AGE(CL) > 0 THEN
+        CLUSTER_REFINE_AGE(CL) := CLUSTER_REFINE_AGE(CL) - 1
+      ENDIF
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE SPAWN_ATOMS(PARENT)
+  INTEGER :: PARENT, BASE, M
+  REAL :: RADIUS, PX, PY, PZ, AX, AY, AZ, ANG, ZZ, RR
+
+  IF NATOM + REFINE_ATOM_COUNT > MAXATOM THEN
+    RETURN
+  ENDIF
+
+  BASE := NATOM
+  RADIUS := 1.5
+  PX := CLUSTER_X(PARENT)
+  PY := CLUSTER_Y(PARENT)
+  PZ := CLUSTER_Z(PARENT)
+
+  DO M = 1, REFINE_ATOM_COUNT
+    NATOM := NATOM + 1
+    AT := NATOM
+
+    ANG := REAL(M - 1) * (6.283185307179586 / REAL(REFINE_ATOM_COUNT))
+    ZZ := 2.0 * REAL(M - 1) / REAL(REFINE_ATOM_COUNT - 1) - 1.0
+    IF REFINE_ATOM_COUNT = 1 THEN
+      ZZ := 0.0
+    ENDIF
+    RR := SQRT(1.0 - ZZ * ZZ)
+    AX := PX + RADIUS * RR * COS(ANG)
+    AY := PY + RADIUS * RR * SIN(ANG)
+    AZ := PZ + RADIUS * ZZ
+
+    ATOM_X(AT) := AX
+    ATOM_Y(AT) := AY
+    ATOM_Z(AT) := AZ
+    ATOM_THETA(AT) := CLUSTER_THETA(PARENT) + REAL(M) * 0.5
+    ATOM_OMEGA(AT) := CLUSTER_BASE_OMEGA(PARENT)
+    ATOM_STRESS(AT) := 0.0
+    ATOM_ACTIVE(AT) := 1
+    ATOM_PARENT(AT) := PARENT
+    ATOM_FLIPPED(AT) := CLUSTER_FLIPPED(PARENT)
+    ATOM_AGE(AT) := 0
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE COARSEN_STABLE()
+  ! Collapse atom groups older than COARSEN_TICKS with low stress back to clusters
+  INTEGER :: P, LOW_STRESS, ALL_OLD, ALL_ACTIVE
+  REAL :: CX, CY, CZ, CTH, COMEGA
+
+  DO P = 1, NCLUSTER
+    ! Gather atoms belonging to parent P
+    LOW_STRESS := 1
+    ALL_OLD := 1
+    ALL_ACTIVE := 1
+    CX := 0.0
+    CY := 0.0
+    CZ := 0.0
+    CTH := 0.0
+    COMEGA := 0.0
+    N := 0
+
+    DO AT = 1, NATOM
+      IF ATOM_ACTIVE(AT) = 1 .AND. ATOM_PARENT(AT) = P THEN
+        N := N + 1
+        CX := CX + ATOM_X(AT)
+        CY := CY + ATOM_Y(AT)
+        CZ := CZ + ATOM_Z(AT)
+        CTH := CTH + ATOM_THETA(AT)
+        COMEGA := COMEGA + ATOM_OMEGA(AT)
+        IF ATOM_STRESS_NORM(AT) > THRESH_COARSEN_NORM THEN
+          LOW_STRESS := 0
+        ENDIF
+        IF ATOM_AGE(AT) < COARSEN_TICKS THEN
+          ALL_OLD := 0
+        ENDIF
+      ENDIF
+    ENDDO
+
+    IF N > 0 .AND. LOW_STRESS = 1 .AND. ALL_OLD = 1 .AND. CLUSTER_ACTIVE(P) = 0 THEN
+      CX := CX / REAL(N)
+      CY := CY / REAL(N)
+      CZ := CZ / REAL(N)
+      CTH := CTH / REAL(N)
+      COMEGA := COMEGA / REAL(N)
+
+      ! Reactivate cluster
+      CLUSTER_X(P) := CX
+      CLUSTER_Y(P) := CY
+      CLUSTER_Z(P) := CZ
+      CLUSTER_THETA(P) := CTH
+      CLUSTER_OMEGA(P) := COMEGA
+      CLUSTER_CI(P) := INT(CX) + 1
+      CLUSTER_CJ(P) := INT(CY) + 1
+      CLUSTER_CK(P) := INT(CZ) + 1
+      IF CLUSTER_CI(P) < 1 THEN
+        CLUSTER_CI(P) := 1
+      ENDIF
+      IF CLUSTER_CI(P) > NX THEN
+        CLUSTER_CI(P) := NX
+      ENDIF
+      IF CLUSTER_CJ(P) < 1 THEN
+        CLUSTER_CJ(P) := 1
+      ENDIF
+      IF CLUSTER_CJ(P) > NY THEN
+        CLUSTER_CJ(P) := NY
+      ENDIF
+      IF CLUSTER_CK(P) < 1 THEN
+        CLUSTER_CK(P) := 1
+      ENDIF
+      IF CLUSTER_CK(P) > NZ THEN
+        CLUSTER_CK(P) := NZ
+      ENDIF
+      CLUSTER_ACTIVE(P) := 1
+      CLUSTER_STATE(P) := STATE_COAST
+      CLUSTER_STRESS(P) := 0.0
+      CLUSTER_REFINE_AGE(P) := COARSEN_TICKS
+      CELL_CLUSTER(CLUSTER_CI(P), CLUSTER_CJ(P), CLUSTER_CK(P)) := P
+      N_COARSEN_EVENTS := N_COARSEN_EVENTS + 1
+
+      ! Deactivate atoms
+      DO AT = 1, NATOM
+        IF ATOM_ACTIVE(AT) = 1 .AND. ATOM_PARENT(AT) = P THEN
+          ATOM_ACTIVE(AT) := 0
+        ENDIF
+      ENDDO
+    ENDIF
+  ENDDO
+
+  ! Increment atom ages
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      ATOM_AGE(AT) := ATOM_AGE(AT) + 1
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE KNOT_UPDATE()
+  ! Knots are cells with high amplitude AND high phase-gradient magnitude
+  INTEGER :: COUNT
+  REAL :: G2, G2_MAX, AMP_MED
+
+  ! Compute median-ish amplitude threshold (simple average here)
+  AVG := 0.0
+  COUNT := 0
+  DO K = 1, NZ
+    DO J = 1, NY
+      DO I = 1, NX
+        AVG := AVG + FIELD_AMP(I, J, K)
+        COUNT := COUNT + 1
+      ENDDO
+    ENDDO
+  ENDDO
+  IF COUNT > 0 THEN
+    AMP_MED := AVG / REAL(COUNT)
+  ELSE
+    AMP_MED := 0.0
+  ENDIF
+
+  NKNOT := 0
+  DO K = 1, NZ
+    DO J = 1, NY
+      DO I = 1, NX
+        IP := I + 1
+        IF IP > NX THEN
+          IP := 1
+        ENDIF
+        IM := I - 1
+        IF IM < 1 THEN
+          IM := NX
+        ENDIF
+        JP := J + 1
+        IF JP > NY THEN
+          JP := 1
+        ENDIF
+        JM := J - 1
+        IF JM < 1 THEN
+          JM := NY
+        ENDIF
+        KP := K + 1
+        IF KP > NZ THEN
+          KP := 1
+        ENDIF
+        KM := K - 1
+        IF KM < 1 THEN
+          KM := NZ
+        ENDIF
+        G2 := (FIELD_PHI(IP, J, K) - FIELD_PHI(IM, J, K)) ** 2 + &
+              (FIELD_PHI(I, JP, K) - FIELD_PHI(I, JM, K)) ** 2 + &
+              (FIELD_PHI(I, J, KP) - FIELD_PHI(I, J, KM)) ** 2
+
+        IF FIELD_AMP(I, J, K) > AMP_MED .AND. G2 > 1.0 .AND. NKNOT < MAXKNOT THEN
+          NKNOT := NKNOT + 1
+          KNOT_I(NKNOT) := I
+          KNOT_J(NKNOT) := J
+          KNOT_K(NKNOT) := K
+          KNOT_STRENGTH(NKNOT) := FIELD_AMP(I, J, K) * SQRT(G2)
+        ENDIF
+      ENDDO
+    ENDDO
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE COUNT_STATES()
+  INTEGER :: CL, II, JJ, KK
+  REAL :: AMP_OLD, AMP_NEW
+
+  N_COAST := 0
+  N_ACTIVE := 0
+  N_FLOW := 0
+  N_REFINE := 0
+  N_FLIPPED := 0
+  N_COAST_FLIP := 0
+  N_ACTIVE_FLIP := 0
+  N_FLOW_FLIP := 0
+  SUM_STRESS_FLIP := 0.0
+  MAX_STRESS_FLIP := 0.0
+  MAX_LYAP_FLIP := 0.0
+
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_ACTIVE(CL) = 1 THEN
+      IF CLUSTER_STATE(CL) = STATE_COAST THEN
+        N_COAST := N_COAST + 1
+      ELSEIF CLUSTER_STATE(CL) = STATE_ACTIVE THEN
+        N_ACTIVE := N_ACTIVE + 1
+      ELSEIF CLUSTER_STATE(CL) = STATE_FLOW THEN
+        N_FLOW := N_FLOW + 1
+      ENDIF
+      IF CLUSTER_STRESS(CL) > THRESH_REFINE THEN
+        N_REFINE := N_REFINE + 1
+      ENDIF
+
+      IF CLUSTER_FLIPPED(CL) = 1 THEN
+        N_FLIPPED := N_FLIPPED + 1
+        SUM_STRESS_FLIP := SUM_STRESS_FLIP + CLUSTER_STRESS(CL)
+        IF CLUSTER_STRESS(CL) > MAX_STRESS_FLIP THEN
+          MAX_STRESS_FLIP := CLUSTER_STRESS(CL)
+        ENDIF
+        IF CLUSTER_STATE(CL) = STATE_COAST THEN
+          N_COAST_FLIP := N_COAST_FLIP + 1
+        ELSEIF CLUSTER_STATE(CL) = STATE_ACTIVE THEN
+          N_ACTIVE_FLIP := N_ACTIVE_FLIP + 1
+        ELSEIF CLUSTER_STATE(CL) = STATE_FLOW THEN
+          N_FLOW_FLIP := N_FLOW_FLIP + 1
+        ENDIF
+
+        II := CLUSTER_CI(CL)
+        JJ := CLUSTER_CJ(CL)
+        KK := CLUSTER_CK(CL)
+        AMP_OLD := FIELD_AMP(II, JJ, KK) - FIELD_AMP_DELTA(II, JJ, KK)
+        AMP_NEW := FIELD_AMP(II, JJ, KK)
+        IF ABS(AMP_OLD) > 1.0E-12 .AND. ABS(CLUSTER_OMEGA(CL)) > 1.0E-12 THEN
+          LYAP_RATE := LOG(ABS(AMP_NEW / AMP_OLD)) / DT / CLUSTER_OMEGA(CL)
+          IF ABS(LYAP_RATE) > MAX_LYAP_FLIP THEN
+            MAX_LYAP_FLIP := ABS(LYAP_RATE)
+          ENDIF
+        ENDIF
+      ENDIF
+    ENDIF
+  ENDDO
+
+  IF N_FLIPPED > 0 THEN
+    MEAN_STRESS_FLIP := SUM_STRESS_FLIP / REAL(N_FLIPPED)
+  ELSE
+    MEAN_STRESS_FLIP := 0.0
+  ENDIF
+  RETURN
+END
+
+SUBROUTINE BOND_UPDATE()
+  INTEGER :: I, J, IT, IT2
+  REAL :: DXB, DYB, DZB, DISTB, DTHB
+
+  NBOND := 0
+  DO IT = 1, NATOM
+    ATOM_DEGREE(IT) := 0
+  ENDDO
+
+  DO I = 1, NATOM - 1
+    IF ATOM_ACTIVE(I) = 1 THEN
+      DO J = I + 1, NATOM
+        IF ATOM_ACTIVE(J) = 1 .AND. ATOM_DEGREE(I) < MAX_BOND_DEGREE .AND. ATOM_DEGREE(J) < MAX_BOND_DEGREE THEN
+          DXB := ATOM_X(I) - ATOM_X(J)
+          DYB := ATOM_Y(I) - ATOM_Y(J)
+          DZB := ATOM_Z(I) - ATOM_Z(J)
+          DISTB := SQRT(DXB*DXB + DYB*DYB + DZB*DZB)
+          IF DISTB < BOND_DIST THEN
+            DTHB := ATOM_THETA(I) - ATOM_THETA(J)
+            IF COS(DTHB) > BOND_PHASE_THRESH .AND. &
+               (ATOM_PARENT(I) > ATOM_PARENT(J) .OR. ATOM_PARENT(I) < ATOM_PARENT(J)) THEN
+              NBOND := NBOND + 1
+              IF NBOND > MAXBOND THEN
+                NBOND := MAXBOND
+                RETURN
+              ENDIF
+              BOND_I(NBOND) := I
+              BOND_J(NBOND) := J
+              ATOM_DEGREE(I) := ATOM_DEGREE(I) + 1
+              ATOM_DEGREE(J) := ATOM_DEGREE(J) + 1
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE COMPUTE_BOND_STATS()
+  INTEGER :: I, J, R, RI, RJ, IT, IT2, FI, FJ
+
+  DEGREE_0 := 0
+  DEGREE_1 := 0
+  DEGREE_2 := 0
+  DEGREE_3 := 0
+  N_ATOM_FLIPPED := 0
+  DEGREE_0_FLIP := 0
+  DEGREE_1_FLIP := 0
+  DEGREE_2_FLIP := 0
+  DEGREE_3_FLIP := 0
+
+  DO IT = 1, NATOM
+    IF ATOM_ACTIVE(IT) = 1 THEN
+      IF ATOM_DEGREE(IT) = 0 THEN
+        DEGREE_0 := DEGREE_0 + 1
+      ELSEIF ATOM_DEGREE(IT) = 1 THEN
+        DEGREE_1 := DEGREE_1 + 1
+      ELSEIF ATOM_DEGREE(IT) = 2 THEN
+        DEGREE_2 := DEGREE_2 + 1
+      ELSE
+        DEGREE_3 := DEGREE_3 + 1
+      ENDIF
+
+      IF ATOM_FLIPPED(IT) = 1 THEN
+        N_ATOM_FLIPPED := N_ATOM_FLIPPED + 1
+        IF ATOM_DEGREE(IT) = 0 THEN
+          DEGREE_0_FLIP := DEGREE_0_FLIP + 1
+        ELSEIF ATOM_DEGREE(IT) = 1 THEN
+          DEGREE_1_FLIP := DEGREE_1_FLIP + 1
+        ELSEIF ATOM_DEGREE(IT) = 2 THEN
+          DEGREE_2_FLIP := DEGREE_2_FLIP + 1
+        ELSE
+          DEGREE_3_FLIP := DEGREE_3_FLIP + 1
+        ENDIF
+      ENDIF
+    ENDIF
+  ENDDO
+
+  NBOND_FLIP := 0
+  NBOND_MIX := 0
+
+  ! Union-find for flipped-only connected components
+  DO IT = 1, NATOM
+    ATOM_PARENT_BOND(IT) := IT
+  ENDDO
+
+  DO IT = 1, NBOND
+    I := BOND_I(IT)
+    J := BOND_J(IT)
+    FI := ATOM_FLIPPED(I)
+    FJ := ATOM_FLIPPED(J)
+    IF FI = 1 .AND. FJ = 1 THEN
+      NBOND_FLIP := NBOND_FLIP + 1
+    ELSEIF FI = 1 .OR. FJ = 1 THEN
+      NBOND_MIX := NBOND_MIX + 1
+    ENDIF
+
+    IF FI = 1 .AND. FJ = 1 THEN
+      ! Find root of I
+      R := I
+      DO IT2 = 1, MAXATOM
+        IF ATOM_PARENT_BOND(R) > R .OR. ATOM_PARENT_BOND(R) < R THEN
+          R := ATOM_PARENT_BOND(R)
+        ENDIF
+      ENDDO
+      RI := R
+
+      ! Find root of J
+      R := J
+      DO IT2 = 1, MAXATOM
+        IF ATOM_PARENT_BOND(R) > R .OR. ATOM_PARENT_BOND(R) < R THEN
+          R := ATOM_PARENT_BOND(R)
+        ENDIF
+      ENDDO
+      RJ := R
+
+      IF RI > RJ .OR. RI < RJ THEN
+        ATOM_PARENT_BOND(RI) := RJ
+      ENDIF
+    ENDIF
+  ENDDO
+
+  ! Count flipped-only component sizes
+  DO IT = 1, NATOM
+    COMPONENT_SIZE(IT) := 0
+  ENDDO
+  DO IT = 1, NATOM
+    IF ATOM_ACTIVE(IT) = 1 .AND. ATOM_FLIPPED(IT) = 1 THEN
+      R := IT
+      DO IT2 = 1, MAXATOM
+        IF ATOM_PARENT_BOND(R) > R .OR. ATOM_PARENT_BOND(R) < R THEN
+          R := ATOM_PARENT_BOND(R)
+        ENDIF
+      ENDDO
+      COMPONENT_SIZE(R) := COMPONENT_SIZE(R) + 1
+    ENDIF
+  ENDDO
+
+  MAX_COMPONENT_FLIP := 0
+  DO IT = 1, NATOM
+    IF COMPONENT_SIZE(IT) > MAX_COMPONENT_FLIP THEN
+      MAX_COMPONENT_FLIP := COMPONENT_SIZE(IT)
+    ENDIF
+  ENDDO
+
+  ! Union-find for all-atom connected components
+  DO IT = 1, NATOM
+    ATOM_PARENT_BOND(IT) := IT
+  ENDDO
+
+  DO IT = 1, NBOND
+    I := BOND_I(IT)
+    J := BOND_J(IT)
+
+    ! Find root of I
+    R := I
+    DO IT2 = 1, MAXATOM
+      IF ATOM_PARENT_BOND(R) > R .OR. ATOM_PARENT_BOND(R) < R THEN
+        R := ATOM_PARENT_BOND(R)
+      ENDIF
+    ENDDO
+    RI := R
+
+    ! Find root of J
+    R := J
+    DO IT2 = 1, MAXATOM
+      IF ATOM_PARENT_BOND(R) > R .OR. ATOM_PARENT_BOND(R) < R THEN
+        R := ATOM_PARENT_BOND(R)
+      ENDIF
+    ENDDO
+    RJ := R
+
+    IF RI > RJ .OR. RI < RJ THEN
+      ATOM_PARENT_BOND(RI) := RJ
+    ENDIF
+  ENDDO
+
+  ! Count all component sizes
+  DO IT = 1, NATOM
+    COMPONENT_SIZE(IT) := 0
+  ENDDO
+  DO IT = 1, NATOM
+    IF ATOM_ACTIVE(IT) = 1 THEN
+      R := IT
+      DO IT2 = 1, MAXATOM
+        IF ATOM_PARENT_BOND(R) > R .OR. ATOM_PARENT_BOND(R) < R THEN
+          R := ATOM_PARENT_BOND(R)
+        ENDIF
+      ENDDO
+      COMPONENT_SIZE(R) := COMPONENT_SIZE(R) + 1
+    ENDIF
+  ENDDO
+
+  MAX_COMPONENT := 0
+  DO IT = 1, NATOM
+    IF COMPONENT_SIZE(IT) > MAX_COMPONENT THEN
+      MAX_COMPONENT := COMPONENT_SIZE(IT)
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE COMPUTE_NORMALIZED_DIAGNOSTICS()
+  INTEGER :: CL, AT
+  REAL :: AMP_OLD, AMP_NEW
+
+  ! Arctan-normalized stress and surface tension over active clusters
+  SUM_ARCTAN_STRESS := 0.0
+  MAX_ARCTAN_STRESS := 0.0
+  SUM_SURFACE := 0.0
+  MAX_SURFACE := 0.0
+  N := 0
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_ACTIVE(CL) = 1 THEN
+      SUM_ARCTAN_STRESS := SUM_ARCTAN_STRESS + CLUSTER_STRESS_NORM(CL)
+      IF CLUSTER_STRESS_NORM(CL) > MAX_ARCTAN_STRESS THEN
+        MAX_ARCTAN_STRESS := CLUSTER_STRESS_NORM(CL)
+      ENDIF
+      SUM_SURFACE := SUM_SURFACE + CLUSTER_SURFACE_TENSION(CL)
+      IF CLUSTER_SURFACE_TENSION(CL) > MAX_SURFACE THEN
+        MAX_SURFACE := CLUSTER_SURFACE_TENSION(CL)
+      ENDIF
+      N := N + 1
+    ENDIF
+  ENDDO
+  IF N > 0 THEN
+    MEAN_ARCTAN_STRESS := SUM_ARCTAN_STRESS / REAL(N)
+    MEAN_SURFACE := SUM_SURFACE / REAL(N)
+  ELSE
+    MEAN_ARCTAN_STRESS := 0.0
+    MEAN_SURFACE := 0.0
+  ENDIF
+
+  ! Max Lyapunov rate over active cluster cells
+  MAX_LYAPUNOV := 0.0
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_ACTIVE(CL) = 1 THEN
+      I := CLUSTER_CI(CL)
+      J := CLUSTER_CJ(CL)
+      K := CLUSTER_CK(CL)
+      AMP_OLD := FIELD_AMP(I, J, K) - FIELD_AMP_DELTA(I, J, K)
+      AMP_NEW := FIELD_AMP(I, J, K)
+      IF ABS(AMP_OLD) > 1.0E-12 .AND. ABS(CLUSTER_OMEGA(CL)) > 1.0E-12 THEN
+        LYAP_RATE := LOG(ABS(AMP_NEW / AMP_OLD)) / DT / CLUSTER_OMEGA(CL)
+        IF ABS(LYAP_RATE) > MAX_LYAPUNOV THEN
+          MAX_LYAPUNOV := ABS(LYAP_RATE)
+        ENDIF
+      ENDIF
+    ENDIF
+  ENDDO
+
+  ! Viviani validity for active atoms
+  MEAN_W_ATOM := 0.0
+  FLOW_FRACTION := 0.0
+  N := 0
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      MEAN_W_ATOM := MEAN_W_ATOM + ABS(ATOM_NW(AT))
+      IF ABS(ATOM_NW(AT)) > 0.30 THEN
+        FLOW_FRACTION := FLOW_FRACTION + 1.0
+      ENDIF
+      N := N + 1
+    ENDIF
+  ENDDO
+  IF N > 0 THEN
+    MEAN_W_ATOM := MEAN_W_ATOM / REAL(N)
+    FLOW_FRACTION := FLOW_FRACTION / REAL(N)
+  ELSE
+    MEAN_W_ATOM := 0.0
+    FLOW_FRACTION := 0.0
+  ENDIF
+  RETURN
+END
+
+SUBROUTINE REMOVE_HOTSPOT()
+  ! Remove atoms near the current maximum-amplitude cell (dark-night test).
+  INTEGER :: HI, HJ, HK, AT, COUNT
+  REAL :: AMAX, DXH, DYH, DZH, DIST
+
+  HI := 1
+  HJ := 1
+  HK := 1
+  AMAX := FIELD_AMP(1, 1, 1)
+
+  DO K = 1, NZ
+    DO J = 1, NY
+      DO I = 1, NX
+        IF FIELD_AMP(I, J, K) > AMAX THEN
+          AMAX := FIELD_AMP(I, J, K)
+          HI := I
+          HJ := J
+          HK := K
+        ENDIF
+      ENDDO
+    ENDDO
+  ENDDO
+
+  COUNT := 0
+  DO AT = 1, NATOM
+    IF ATOM_ACTIVE(AT) = 1 THEN
+      DXH := ATOM_X(AT) - (REAL(HI) - 0.5)
+      DYH := ATOM_Y(AT) - (REAL(HJ) - 0.5)
+      DZH := ATOM_Z(AT) - (REAL(HK) - 0.5)
+      DIST := SQRT(DXH*DXH + DYH*DYH + DZH*DZH)
+      IF DIST < HOTSPOT_RADIUS THEN
+        ATOM_ACTIVE(AT) := 0
+        COUNT := COUNT + 1
+      ENDIF
+    ENDIF
+  ENDDO
+
+  RETURN
+END
+
+SUBROUTINE FLIP_CLUSTER_TYPES()
+  ! Flip Viviani type (w-component sign) for clusters within FLIP_RADIUS of center.
+  INTEGER :: CL
+  REAL :: CX, CY, CZ, DIST, PI_FIFTH
+
+  PI_FIFTH := 3.141592653589793 / 5.0
+
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_ACTIVE(CL) = 1 .AND. CLUSTER_FLIPPED(CL) = 0 THEN
+      CX := CLUSTER_X(CL) - FLIP_CENTER_X
+      CY := CLUSTER_Y(CL) - FLIP_CENTER_Y
+      CZ := CLUSTER_Z(CL) - FLIP_CENTER_Z
+      DIST := SQRT(CX*CX + CY*CY + CZ*CZ)
+      IF DIST < FLIP_RADIUS THEN
+        CLUSTER_THETA_ORIG(CL) := CLUSTER_THETA(CL)
+        CLUSTER_THETA(CL) := CLUSTER_THETA(CL) + PI_FIFTH
+        CLUSTER_FLIPPED(CL) := 1
+      ENDIF
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE PARTIAL_FLIP_CLUSTER_TYPES()
+  ! Partial flip: only HEAD (w >= 0) clusters become TAIL within radius.
+  INTEGER :: CL
+  REAL :: CX, CY, CZ, DIST, PI_FIFTH
+
+  PI_FIFTH := 3.141592653589793 / 5.0
+
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_ACTIVE(CL) = 1 .AND. CLUSTER_FLIPPED(CL) = 0 THEN
+      CX := CLUSTER_X(CL) - FLIP_CENTER_X
+      CY := CLUSTER_Y(CL) - FLIP_CENTER_Y
+      CZ := CLUSTER_Z(CL) - FLIP_CENTER_Z
+      DIST := SQRT(CX*CX + CY*CY + CZ*CZ)
+      IF DIST < FLIP_RADIUS .AND. CLUSTER_NW(CL) ≥ 0.0 THEN
+        CLUSTER_THETA_ORIG(CL) := CLUSTER_THETA(CL)
+        CLUSTER_THETA(CL) := CLUSTER_THETA(CL) + PI_FIFTH
+        CLUSTER_FLIPPED(CL) := 1
+      ENDIF
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE UNFLIP_CLUSTER_TYPES()
+  ! Restore original phase/type for all flipped clusters.
+  INTEGER :: CL
+  REAL :: PI_FIFTH
+
+  PI_FIFTH := 3.141592653589793 / 5.0
+
+  DO CL = 1, NCLUSTER
+    IF CLUSTER_FLIPPED(CL) = 1 THEN
+      CLUSTER_THETA(CL) := CLUSTER_THETA(CL) - PI_FIFTH
+      CLUSTER_FLIPPED(CL) := 0
+    ENDIF
+  ENDDO
+  RETURN
+END
