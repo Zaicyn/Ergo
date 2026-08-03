@@ -1,11 +1,19 @@
 """Ergo x86-64 JIT — direct machine code emission for in-game scripting.
 
+**EXPERIMENTAL — KNOWN BROKEN beyond trivial examples.** Constants in
+expressions are not loaded correctly (can crash the host process via a
+segfault in generated code), comparison/logical ops and INTEGER arithmetic
+are unimplemented, arrays are unsupported, and no type checking is
+performed. This is a long-term cross-platform project (machine-code
+backends for many platforms); for a working JIT today use core.jit (the
+gcc-based proof of concept).
+
 Compiles a subset of Ergo (arithmetic, branches, loops, array access)
 directly to x86-64 machine code in memory. No C intermediate, no gcc,
 no temp files. ~0.5ms compile time for typical scripts.
 
 Usage:
-    from mcl.jit_x86 import jit_x86
+    from core.jit_x86 import jit_x86
 
     fn = jit_x86('''
     REAL FUNCTION SQUARE(X)

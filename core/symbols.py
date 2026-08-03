@@ -61,6 +61,7 @@ class FuncSymbol:
     param_types: dict[str, str]
     param_shapes: dict[str, tuple | None] = field(default_factory=dict)
     is_subroutine: bool = False
+    is_external: bool = False  # True if pre-seeded from another file (LSP cross-file)
     line: int = 0
 
 
@@ -99,7 +100,17 @@ class SymbolTable:
         return None
 
     def declare_func(self, fsym: FuncSymbol):
+        """Register a function/subroutine. Returns error string if redefined."""
+        existing = self.functions.get(fsym.name)
+        if existing is not None:
+            # Allow re-definition if it shadows a pre-seeded cross-file symbol
+            if existing.is_external:
+                self.functions[fsym.name] = fsym
+                return None
+            kind = "SUBROUTINE" if fsym.is_subroutine else "FUNCTION"
+            return f"{kind} '{fsym.name}' is already defined"
         self.functions[fsym.name] = fsym
+        return None
 
     def lookup_func(self, name: str) -> FuncSymbol | None:
         return self.functions.get(name)

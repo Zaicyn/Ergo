@@ -13,9 +13,11 @@ from __future__ import annotations
 from .ir import (
     IRModule, IRFunc, IRVar, IRBlock, IRIf, IRLoop, IRSelect, IRWhileLoop,
     IRInst, IRConst, IRRef, IRType, StorageClass, Op, Operand,
+    get_real_precision,
 )
 from .ir_gpu import GPUPlan, KernelPlan
 from . import ast_nodes as ast
+from .errors import MCLError
 
 
 def _c_type(t: IRType) -> str:
@@ -39,7 +41,7 @@ C_TYPE = {
     IRType.VOID: "void",
 }
 
-# Math intrinsics -> C function name
+# Math intrinsics -> C function name (f32 mode appends "f": sin -> sinf)
 C_MATH = {
     Op.SIN: "sin", Op.COS: "cos", Op.TAN: "tan",
     Op.ASIN: "asin", Op.ACOS: "acos", Op.ATAN: "atan", Op.ATAN2: "atan2",
@@ -48,37 +50,110 @@ C_MATH = {
 }
 
 
+def _real_math(base: str) -> str:
+    """libm function name for the current REAL precision (sin vs sinf)."""
+    return base + "f" if get_real_precision() == 32 else base
+
+
+def _c_str_escape(s: str) -> str:
+    """Escape a string's contents for a C string literal."""
+    return (s.replace("\\", "\\\\")
+             .replace('"', '\\"')
+             .replace("\n", "\\n"))
+
+
+def _c_str_lit(value) -> str:
+    """Emit a string value as a quoted, escaped C string literal."""
+    return f'"{_c_str_escape(str(value))}"'
+
+
+def _real_lit(value) -> str:
+    """Format a REAL literal respecting the precision setting.
+
+    f32 mode keeps the repr digits and appends an 'f' suffix — C rounds the
+    decimal to the nearest f32, matching how spirv-as rounds the same
+    decimal on the GPU side. repr() of inf/nan is not valid C ('inf.0'
+    was emitted before), so those map to GCC/Clang builtins (this
+    compiler's driver is gcc-only).
+    """
+    f32 = get_real_precision() == 32
+    s = repr(value) if isinstance(value, float) else str(value)
+    if s in ("inf", "-inf", "nan"):
+        if f32:
+            return {"inf": "__builtin_inff()",
+                    "-inf": "-__builtin_inff()",
+                    "nan": '__builtin_nanf("")'}[s]
+        return {"inf": "__builtin_inf()",
+                "-inf": "-__builtin_inf()",
+                "nan": '__builtin_nan("")'}[s]
+    if "." not in s and "e" not in s.lower():
+        s += ".0"
+    if f32:
+        s += "f"
+    return s
+
+
 class IRCodeGen:
     def __init__(self, module: IRModule, gpu_plan: GPUPlan | None = None,
-                 backend=None, render: bool = False, jit_mode: bool = False):
+                 backend=None, render: bool = False, jit_mode: bool = False,
+                 no_verify: bool = False, gpu_tile_size: int = 0):
         self.module = module
         self.gpu_plan = gpu_plan
         self.backend = backend
         self.render = render
         self.jit_mode = jit_mode
+        self.no_verify = no_verify
+        # --gpu-tile-size: dispatch extracted kernels in contiguous tiles
+        # over the same buffer (0 = whole-range dispatch, unchanged).
+        # Quantized to a workgroup multiple so tiled reduction partials
+        # partition the range exactly like the untiled dispatch.
+        self.gpu_tile_size = gpu_tile_size
+        self._qtile = max(256, (gpu_tile_size // 256) * 256)
         self._in_frame_loop = False
         self._batched_frame = False  # True inside batched frame dispatch loop
+        self._frame_gpu_dirty = set()  # GPU arrays written by a dispatch
+                                       # in the current frame (D19)
         self._frame_ended_early = False  # True when frame_end emitted before CPU suffix
+        # Coalesced reductions: reduction kernels dispatched into the
+        # current batched frame whose host read-back is deferred to one
+        # drain + one combined download (see _flush_pending_reductions).
+        self._pending_reductions: list = []
         self.lines: list[str] = []
         self.indent = 0
         self._last_line_directive = 0
+        # Per-loop counter for hoisted DO bound temporaries (_ergo_endN etc.)
+        self._loop_tmp_counter = 0
         # Track var types for PRINT format inference
         self._var_types: dict[str, IRType] = {}
         # Track arrays for subscript codegen
         self._array_shapes: dict[str, tuple] = {}
         # Track function return types
         self._func_return_types: dict[str, IRType] = {}
+        # ALLOCATABLE arrays declared with a size companion (_ergo_sz_*)
+        self._allocatable: set[str] = set()
 
         # Build kernel lookup: loop source line -> KernelPlan
         # Used by _emit_loop to decide whether to emit dispatch or for-loop
         self._kernel_by_line: dict[int, KernelPlan] = {}
+        self._kernel_by_id: dict[int, KernelPlan] = {}
         if gpu_plan:
             for k in gpu_plan.kernels:
                 self._kernel_by_line[k.source_line] = k
+                self._kernel_by_id[k.kernel_id] = k
 
         # Track arrays recently uploaded to GPU (cleared on CPU write).
         # Used to eliminate redundant uploads in the merged render+sync pass.
         self._gpu_current: set[str] = set()
+        # CPU-dirty arrays: written on the host, not yet uploaded. Shared
+        # across ALL body-nesting levels (an init loop in an outer body
+        # must be visible to the upload-before-dispatch logic of kernels
+        # nested in inner loops). Cleared per-array on upload and when a
+        # GPU kernel rewrites the array.
+        self._cpu_dirty: set[str] = set()
+        # Arrays already downloaded in the current loop body — used by the
+        # end-of-iteration refresh to avoid re-downloading data the
+        # mid-body logic already fetched this iteration.
+        self._body_downloaded: set[str] = set()
 
         # Pre-analyze subroutine array access for GPU sync around CPU calls.
         # Maps func_name -> (arrays_read, arrays_written)
@@ -205,13 +280,29 @@ class IRCodeGen:
         if self._uses_allocate(mod):
             self._emit_arena_decl()
 
+        # Emit the _ergo_dot helper once if DOT_PRODUCT/NORM2 is used.
+        if self._uses_dot(mod):
+            self._emit_dot_helper()
+
+        # Emit the splitmix64 hash helpers once if HASH/RAND is used.
+        if self._uses_hash(mod):
+            self._emit_hash_helper()
+
         # Embed SPIR-V binaries as byte arrays (if GPU)
         if has_gpu:
             self._emit_spirv_embeds()
             self._put_raw("")
 
-        # Emit functions
+        # Emit functions. Skip definitions with no remaining call sites:
+        # subroutine inlining (GPU extraction) can leave dead definitions
+        # whose bodies need not be CPU-lowerable (e.g. RING_* intrinsics,
+        # which are GPU-only).
+        referenced = None
+        if not self.jit_mode:
+            referenced = self._collect_referenced_funcs(mod)
         for fn in mod.functions:
+            if referenced is not None and fn.name not in referenced:
+                continue  # dead after inlining — no call sites remain
             self._emit_function(fn)
             self._put_raw("")
 
@@ -227,6 +318,7 @@ class IRCodeGen:
         self._emit_cli_parsing()
 
         # Declare main locals
+        self._allocatable.clear()
         for v in mod.main_locals:
             self._emit_local_decl(v, mod)
 
@@ -308,17 +400,18 @@ class IRCodeGen:
                 self._last_line_directive = line
 
     def _const_lit(self, t: IRType, value) -> str:
+        if t == IRType.STRING:
+            return _c_str_lit(value)
+        if t == IRType.REAL and isinstance(value, str):
+            # Defensive: during the TYPE_MAP transition a string literal
+            # may still arrive REAL-typed — treat it as a string.
+            return _c_str_lit(value)
         if t == IRType.REAL:
-            s = repr(value) if isinstance(value, float) else str(value)
-            if "." not in s and "e" not in s.lower():
-                s += ".0"
-            return s
+            return _real_lit(value)
         if t == IRType.INTEGER:
             return str(value)
         if t == IRType.LOGICAL:
             return "1" if value else "0"
-        if t == IRType.STRING:
-            return f'"{value}"'
         return str(value)
 
     def _operand(self, op: Operand) -> str:
@@ -332,10 +425,17 @@ class IRCodeGen:
 
     def _emit_static_var(self, g: IRVar, mod: IRModule):
         ct = self._c_type(g.type)
+        # JIT mode: omit the `static` keyword so the symbol is exported
+        # from the shared library and reachable via ctypes (JitLibrary
+        # reads/writes STATIC storage directly — the Ergo idiom).
+        kw = "" if self.jit_mode else "static "
         if g.shape:
-            dims = "".join(f"[{self._dim_expr(d)}]" for d in g.shape)
+            # Column-major (LOCKED): declare the C array with reversed
+            # dims — Ergo A(d0,d1,d2) → C A[d2][d1][d0] — so a reversed
+            # subscript (see LOAD/STORE) addresses first-index-fastest.
+            dims = "".join(f"[{self._dim_expr(d)}]" for d in reversed(g.shape))
             init = self._data_init(g.name, mod)
-            self._put(f"static {ct} {g.name}{dims}{init};")
+            self._put(f"{kw}{ct} {g.name}{dims}{init};")
         else:
             init = ""
             if g.init_value is not None:
@@ -344,7 +444,7 @@ class IRCodeGen:
                 vals = mod.data_inits[g.name]
                 if vals:
                     init = f" = {self._const_lit(g.type, self._ast_lit_value(vals[0]))}"
-            self._put(f"static {ct} {g.name}{init};")
+            self._put(f"{kw}{ct} {g.name}{init};")
 
     def _data_init(self, name: str, mod: IRModule) -> str:
         if name not in mod.data_inits:
@@ -355,14 +455,33 @@ class IRCodeGen:
         val_strs = [self._ast_lit_str(v) for v in vals]
         return " = {" + ", ".join(val_strs) + "}"
 
+    def _data_values(self, v: IRVar, mod: IRModule) -> list:
+        """DATA values for v — module table first, then the IRVar's own
+        record (populated by the builder for function-local DATA)."""
+        vals = mod.data_inits.get(v.name)
+        if vals:
+            return vals
+        return v.data_init or []
+
+    def _data_array_init(self, v: IRVar, mod: IRModule) -> str:
+        """Braced C array initializer from DATA values, or ""."""
+        vals = self._data_values(v, mod)
+        if not vals:
+            return ""
+        return " = {" + ", ".join(self._ast_lit_str(x) for x in vals) + "}"
+
+    def _data_scalar_init(self, v: IRVar, mod: IRModule) -> str:
+        """C scalar initializer from DATA values, or ""."""
+        vals = self._data_values(v, mod)
+        if not vals:
+            return ""
+        return f" = {self._const_lit(v.type, self._ast_lit_value(vals[0]))}"
+
     def _ast_lit_str(self, node) -> str:
         """Convert an AST literal to a C literal string."""
         if isinstance(node, ast.Literal):
             if node.type == "REAL":
-                s = repr(node.value)
-                if "." not in s and "e" not in s.lower():
-                    s += ".0"
-                return s
+                return _real_lit(node.value)
             if node.type == "INTEGER":
                 return str(node.value)
         return "0"
@@ -421,8 +540,14 @@ class IRCodeGen:
                 if len(p.shape) == 1:
                     parts.append(f"{ct} {p.name}[]")
                 else:
-                    dims = "".join(f"[{self._dim_expr(d)}]" for d in p.shape[1:])
-                    parts.append(f"{ct} {p.name}[][{dims[1:-1]}]" if len(p.shape) > 1 else f"{ct} *{p.name}")
+                    # Column-major (LOCKED): the caller's C array has
+                    # reversed dims. A C function parameter drops the
+                    # outermost C dim, i.e. the first dim of the reversed
+                    # shape — so the trailing dims are reversed(shape) minus
+                    # its first element.
+                    dims = "".join(f"[{self._dim_expr(d)}]"
+                                   for d in reversed(p.shape[:-1]))
+                    parts.append(f"{ct} {p.name}[]{dims}")
             else:
                 parts.append(f"{ct} {p.name}")
         return ", ".join(parts)
@@ -446,6 +571,7 @@ class IRCodeGen:
                 self._array_shapes[p.name] = p.shape
 
         # Declare locals
+        self._allocatable.clear()
         for v in fn.locals:
             if v.name not in param_set:
                 self._emit_local_decl_simple(v)
@@ -461,6 +587,13 @@ class IRCodeGen:
         self._emit_body(fn.body)
         self._kernel_by_line = saved_kernel_map
 
+        # Fortran semantics: falling off the end of a function returns the
+        # function-name variable. Emit it explicitly — running off the end
+        # of a non-void C function is undefined behavior. An explicit user
+        # RETURN simply makes this line unreachable — harmless.
+        if not fn.is_subroutine:
+            self._put(f"return {fn.name}_;")
+
         self.indent -= 1
         self._put("}")
 
@@ -474,14 +607,20 @@ class IRCodeGen:
             self._put(f"const {ct} {v.name} = {init};")
         elif v.storage == StorageClass.ALLOCATABLE:
             self._put(f"{ct} *{v.name} = NULL;")
+            # Byte-size companion, set by ALLOCATE; used by ZERO.
+            self._put(f"size_t _ergo_sz_{v.name} = 0;")
+            self._allocatable.add(v.name)
         elif v.shape:
-            dims = "".join(f"[{self._dim_expr(d)}]" for d in v.shape)
-            init = self._data_init(v.name, mod)
+            # Column-major (LOCKED): reversed C dims (see _emit_static_var).
+            dims = "".join(f"[{self._dim_expr(d)}]" for d in reversed(v.shape))
+            init = self._data_array_init(v, mod)
             self._put(f"{ct} {v.name}{dims}{init};")
         else:
             init = ""
             if v.init_value is not None:
                 init = f" = {self._const_lit(v.type, v.init_value)}"
+            else:
+                init = self._data_scalar_init(v, mod)
             self._put(f"{ct} {v.name}{init};")
 
     def _emit_local_decl_simple(self, v: IRVar):
@@ -491,11 +630,21 @@ class IRCodeGen:
             self._put(f"const {ct} {v.name} = {init};")
         elif v.storage == StorageClass.ALLOCATABLE:
             self._put(f"{ct} *{v.name} = NULL;")
+            # Byte-size companion, set by ALLOCATE; used by ZERO.
+            self._put(f"size_t _ergo_sz_{v.name} = 0;")
+            self._allocatable.add(v.name)
         elif v.shape:
-            dims = "".join(f"[{self._dim_expr(d)}]" for d in v.shape)
-            self._put(f"{ct} {v.name}{dims};")
+            # Column-major (LOCKED): reversed C dims (see _emit_static_var).
+            dims = "".join(f"[{self._dim_expr(d)}]" for d in reversed(v.shape))
+            init = self._data_array_init(v, self.module)
+            self._put(f"{ct} {v.name}{dims}{init};")
         else:
-            self._put(f"{ct} {v.name};")
+            init = ""
+            if v.init_value is not None:
+                init = f" = {self._const_lit(v.type, v.init_value)}"
+            else:
+                init = self._data_scalar_init(v, self.module)
+            self._put(f"{ct} {v.name}{init};")
 
     # ── structured body emission ─────────────────────────────
 
@@ -511,10 +660,22 @@ class IRCodeGen:
         last_dispatch_arrays: set[str] | None = None
         # Track arrays modified on CPU since last GPU dispatch,
         # so we can upload them before the next GPU dispatch.
-        cpu_dirty_arrays: set[str] = set()
+        # Instance-level set (shared across nested bodies — a CPU write
+        # in an outer body must upload before kernels in inner loops).
+        cpu_dirty_arrays = self._cpu_dirty
         gpu_array_set = set(self._gpu_arrays()) if self.gpu_plan else set()
 
         for i, item in enumerate(items):
+            # Coalesced reductions: the first non-dispatch item may read
+            # accumulator results — drain the frame once and combine the
+            # pending group before any CPU code runs.
+            _next_is_gpu = (isinstance(item, IRLoop)
+                            and item.line in self._kernel_by_line
+                            and self._is_gpu_kernel(
+                                self._kernel_by_line[item.line]))
+            if not _next_is_gpu and self._pending_reductions:
+                self._flush_pending_reductions()
+
             # If we just dispatched and this item is NOT another extracted
             # loop, the CPU is about to read — download GPU arrays first.
             # Only download arrays the CPU suffix actually reads.
@@ -527,16 +688,29 @@ class IRCodeGen:
                     # must finish in one cmd_buf before any transfer.
                     more_dispatches = False
                     if self._batched_frame:
+                        pre_reads: set[str] = set()
                         for future in items[i:]:
                             if isinstance(future, IRLoop):
                                 if self._kernel_by_line.get(future.line):
                                     more_dispatches = True
                                     break
+                            self._collect_cpu_array_reads([future], pre_reads)
+                            self._collect_cpu_array_writes([future], pre_reads)
+                        # Deferral is only valid when no intervening CPU
+                        # item reads (or overwrites) a just-dispatched
+                        # array before the next dispatch — otherwise that
+                        # CPU code would see a stale host copy (e.g. a
+                        # CPU-side reduction between two GPU kernels).
+                        if more_dispatches and \
+                                (pre_reads & last_dispatch_arrays):
+                            more_dispatches = False
                     if more_dispatches:
                         # Keep accumulating dispatch arrays; don't download yet
                         pass
                     else:
                         # Scan remaining items to find which arrays CPU reads
+                        # (kernel-aware: reads/writes inside extracted
+                        # kernels are device-side, not CPU access)
                         remaining = items[i:]
                         cpu_reads: set[str] = set()
                         for ri in remaining:
@@ -544,8 +718,8 @@ class IRCodeGen:
                                 k = self._kernel_by_line.get(ri.line)
                                 if k:
                                     continue  # GPU kernel — skip
-                            self._collect_array_reads([ri], cpu_reads)
-                            self._collect_array_writes([ri], cpu_reads)
+                            self._collect_cpu_array_reads([ri], cpu_reads)
+                            self._collect_cpu_array_writes([ri], cpu_reads)
                         needed = last_dispatch_arrays & cpu_reads
                         if needed:
                             # In batched frame mode, end the GPU command buffer
@@ -574,6 +748,7 @@ class IRCodeGen:
                             for arr in sorted(needed):
                                 shape = self._array_shapes.get(arr)
                                 if shape:
+                                    self._body_downloaded.add(arr)
                                     size_expr = " * ".join(
                                         self._dim_expr(d) for d in shape)
                                     sz = self._gpu_sizeof(arr)
@@ -590,6 +765,16 @@ class IRCodeGen:
                                 self.indent -= 1
                                 self._put("}")
                         last_dispatch_arrays = None
+                        # Re-open the frame for any subsequent GPU work in
+                        # this iteration (e.g. a nested dispatch loop's next
+                        # iteration). frame_begin is designed to be called
+                        # after frame_wait (see vk_host.c:1354). Without
+                        # this, dispatches after an early drain record into
+                        # a command buffer that is no longer recording.
+                        if self._batched_frame and self._frame_ended_early:
+                            self._put("ergo_vk_frame_begin();")
+                            self._frame_ended_early = False
+                            self._frame_gpu_dirty.clear()
 
             if isinstance(item, IRBlock):
                 self._emit_block(item)
@@ -636,10 +821,11 @@ class IRCodeGen:
                     self._gpu_current -= block_writes
             elif isinstance(item, IRIf):
                 self._emit_if(item)
-                # Track CPU-dirty arrays from IF body writes
+                # Track CPU-dirty arrays from IF body writes (skipping
+                # sub-loops extracted as GPU kernels — device writes).
                 if gpu_array_set:
                     if_writes: set[str] = set()
-                    self._collect_array_writes([item], if_writes)
+                    self._collect_cpu_array_writes([item], if_writes)
                     if_writes &= gpu_array_set
                     cpu_dirty_arrays |= if_writes
                     self._gpu_current -= if_writes
@@ -674,9 +860,12 @@ class IRCodeGen:
                         last_dispatch_arrays = set()
                     last_dispatch_arrays |= kernel.arrays_written
                 else:
-                    # CPU loop — track which GPU arrays it may modify
+                    # CPU loop — track which GPU arrays it may modify.
+                    # Sub-loops extracted as GPU kernels write on the
+                    # device, not the CPU — excluding them avoids stale
+                    # re-uploads of GPU-current data.
                     cpu_writes: set[str] = set()
-                    self._collect_array_writes([item], cpu_writes)
+                    self._collect_cpu_array_writes([item], cpu_writes)
                     cpu_writes &= gpu_array_set
                     cpu_dirty_arrays |= cpu_writes
                     self._gpu_current -= cpu_writes
@@ -705,6 +894,16 @@ class IRCodeGen:
                         if last_dispatch_arrays is None:
                             last_dispatch_arrays = set()
                         last_dispatch_arrays |= inner_gpu_written
+                        # GPU kernels inside this loop rewrote these
+                        # arrays, so the device copy is now newer: any
+                        # CPU-dirty flag set BEFORE the loop is stale and
+                        # must be cleared (otherwise a later dispatch
+                        # uploads stale host data over the kernel results).
+                        # Arrays the CPU also wrote inside this same loop
+                        # stay dirty (conservative, order-blind).
+                        fresh = inner_gpu_written - cpu_writes
+                        cpu_dirty_arrays -= fresh
+                        self._gpu_current |= fresh
                 # For SPLIT kernels, the suffix upload already synced
                 # CPU-modified arrays to GPU. Clear them from dirty set.
                 if kernel and kernel.is_partial:
@@ -727,10 +926,21 @@ class IRCodeGen:
                 self._emit_census_net_send()
                 self._put("}")
 
+        # Flush any coalesced reduction group still pending at the end of
+        # the body (e.g. a reduction as the last item of a frame loop).
+        if self._pending_reductions:
+            self._flush_pending_reductions()
+
         # If the body ends after a dispatch, download for any
         # subsequent CPU code (e.g. PRINT after last loop).
         # Suppressed in frame loops where render reads GPU memory directly.
-        if last_dispatch_arrays is not None and not suppress_final_download:
+        # Also skipped inside a batched frame: downloads there happen only
+        # at drain points driven by actual CPU reads (the mid-body
+        # intersection check) — otherwise every nested dispatch loop
+        # (e.g. a ping-pong matvec loop) would drain the frame and
+        # download full arrays once per iteration.
+        if (last_dispatch_arrays is not None and not suppress_final_download
+                and not self._batched_frame):
             if self._batched_frame and not self._frame_ended_early:
                 self._put("ergo_vk_frame_end();")
                 self._put("ergo_vk_frame_wait();")
@@ -750,6 +960,13 @@ class IRCodeGen:
                         self._put(f"ergo_vk_download(d_{arr}, {arr}, "
                                   f"{size_expr} * {sz});")
             last_dispatch_arrays = None
+            # Re-open the frame for any subsequent GPU work in this
+            # iteration (nested dispatch loops). See the note at the
+            # mid-body download site above.
+            if self._batched_frame and self._frame_ended_early:
+                self._put("ergo_vk_frame_begin();")
+                self._frame_ended_early = False
+                self._frame_gpu_dirty.clear()
 
         return cpu_dirty_arrays
 
@@ -784,6 +1001,51 @@ class IRCodeGen:
         else:
             self._put("}")
 
+    @staticmethod
+    def _is_simple_bound(s: str) -> bool:
+        """True if s is a plain literal or name (safe to evaluate inline)."""
+        s = s.strip()
+        if s.lstrip("-").isdigit():
+            return True
+        return s.isidentifier()
+
+    def _emit_do_header(self, var: str, start: str, end: str, step: str):
+        """Emit a Fortran-semantics DO loop header (and open its scope).
+
+        Bounds and step are evaluated ONCE into per-loop temporaries
+        (Fortran evaluates loop bounds at entry), the comparator follows
+        the step sign (so negative-step loops actually run), and the loop
+        variable is assigned — not redeclared — so it retains its final
+        value after the loop instead of shadowing the outer local.
+        """
+        self._loop_tmp_counter += 1
+        n = self._loop_tmp_counter
+        decls = [f"int _ergo_end{n} = ({end})",
+                 f"int _ergo_step{n} = ({step})"]
+        # Hoist a complex start expression too: it must also be
+        # evaluated exactly once at loop entry.
+        if not self._is_simple_bound(start):
+            decls.append(f"int _ergo_start{n} = ({start})")
+            start = f"_ergo_start{n}"
+        if var not in self._var_types:
+            # Undeclared loop variable: declare it inside the hoist
+            # block so the loop still compiles (scoped as before).
+            decls.append(f"int {var}")
+        self._put("{ " + "; ".join(decls) + ";")
+        self.indent += 1
+        self._put(f"for ({var} = ({start}); "
+                  f"_ergo_step{n} > 0 ? {var} <= _ergo_end{n} "
+                  f": {var} >= _ergo_end{n}; "
+                  f"{var} += _ergo_step{n}) {{")
+        self.indent += 1
+
+    def _emit_do_footer(self):
+        """Close the for-loop and the hoist block opened by _emit_do_header."""
+        self.indent -= 1
+        self._put("}")
+        self.indent -= 1
+        self._put("}")
+
     def _emit_loop(self, node: IRLoop):
         self._emit_line(node.line)
 
@@ -816,11 +1078,9 @@ class IRCodeGen:
                 end = self._operand(node.end)
                 step = self._operand(node.step)
                 self._emit_gpu_download_for_suffix(kernel)
-                self._put(f"for (int {node.var} = {start}; {node.var} <= {end}; {node.var} += {step}) {{")
-                self.indent += 1
+                self._emit_do_header(node.var, start, end, step)
                 self._emit_body(suffix_items)
-                self.indent -= 1
-                self._put("}")
+                self._emit_do_footer()
                 self._emit_gpu_upload_after_suffix(kernel, suffix_items)
             return
 
@@ -848,28 +1108,44 @@ class IRCodeGen:
             has_gpu_dispatches = self._items_contain_dispatch(node.body)
             use_batched = has_gpu_dispatches and self.gpu_plan
             self._batched_frame = use_batched
-            # Re-upload all GPU arrays before the frame loop starts,
-            # in case CPU code between init and here modified them
-            # (e.g. seeding initial population).
+            # Upload CPU-modified arrays before the frame loop starts.
+            # ONLY CPU-dirty ones: arrays written by pre-loop GPU kernels
+            # are already current on the device — uploading their stale
+            # host copies would clobber the kernel results (e.g. an init
+            # kernel's output re-zeroed by its BSS host copy).
             gpu_arrays = self._gpu_arrays()
-            if gpu_arrays:
+            to_upload = sorted(a for a in gpu_arrays
+                               if a in self._cpu_dirty)
+            if to_upload:
                 self._put("/* Sync CPU state to GPU before frame loop */")
-                for arr in gpu_arrays:
+                for arr in to_upload:
                     shape = self._array_shapes.get(arr)
                     if shape:
                         size_expr = " * ".join(self._dim_expr(d) for d in shape)
                         sz = self._gpu_sizeof(arr)
                         self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
                                   f"{size_expr} * {sz});")
+                self._cpu_dirty -= set(to_upload)
+                self._gpu_current |= set(to_upload)
             # Use runtime _max_frames if DEFAULT_FRAMES is the bound
             _loop_end = "_max_frames" if end == "DEFAULT_FRAMES" and "DEFAULT_FRAMES" in self._var_types else end
-            self._put(f"for (int {node.var} = {start}; {node.var} <= {_loop_end}; {node.var} += {step}) {{")
-            self.indent += 1
+            self._emit_do_header(node.var, start, _loop_end, step)
             if use_batched:
                 self._put("ergo_vk_frame_begin();")
-                if hasattr(self, '_pp_arrays') and self._pp_arrays:
-                    self._put("/* Ping-pong: swap read/write offsets */")
-                    self._put("{ int _tmp = _pp_rd_offset; _pp_rd_offset = _pp_wr_offset; _pp_wr_offset = _tmp; }")
+                self._frame_gpu_dirty.clear()
+                # Ping-pong: swap read/write offsets — but ONLY in loops
+                # that actually dispatch a ping-pong kernel. A swap in an
+                # unrelated batched loop (e.g. a one-iteration init loop
+                # over the same arrays) would desync the halves.
+                if getattr(self, '_pp_arrays', set()):
+                    _loop_kids: set[int] = set()
+                    self._collect_kernel_ids(node.body, _loop_kids)
+                    if any((self._kernel_by_id[i].arrays_read
+                            & self._kernel_by_id[i].arrays_written
+                            & self._pp_arrays)
+                           for i in _loop_kids if i in self._kernel_by_id):
+                        self._put("/* Ping-pong: swap read/write offsets */")
+                        self._put("{ int _tmp = _pp_rd_offset; _pp_rd_offset = _pp_wr_offset; _pp_wr_offset = _tmp; }")
             # NET: non-blocking drain of incoming global field from oracle.
             # If complete, replace local GRID_DENSITY before stencil.
             if self._has_net:
@@ -915,8 +1191,12 @@ class IRCodeGen:
                 color_arr = particle["color"]
 
                 # Runtime color channel: ERGO_COLOR=VEL_X etc.
+                # Only GPU-resident arrays have device buffers — filter
+                # candidates accordingly (PUMP_RESID etc. are CPU-only).
+                gpu_set = set(self._gpu_arrays())
                 real_arrays = [a for a in self._array_shapes
-                               if self._var_types.get(a) == IRType.REAL
+                               if a in gpu_set
+                               and self._var_types.get(a) == IRType.REAL
                                and self._array_shapes[a] == self._array_shapes.get("POS_X")]
                 if real_arrays:
                     self._put("/* Runtime color channel selection */")
@@ -1048,41 +1328,67 @@ class IRCodeGen:
             # becomes PP_RD next frame after the swap at frame_begin.
             if upload_set:
                 pp = getattr(self, '_pp_arrays', set())
-                # Guard uploads with the same condition as suffix downloads:
-                # only upload when CPU code actually modified arrays.
-                verify_meta = self._find_verify_meta(node.body)
-                upload_guard = (verify_meta and
-                                verify_meta.get("every", 1) > 1 and
-                                use_batched)
-                if upload_guard:
-                    every = verify_meta["every"]
-                    self._put(f"if (!_oracle_init || "
-                              f"_oracle_frame % {every} == 0) {{")
-                    self.indent += 1
+                # Uploads feeding GPU kernels must happen EVERY frame —
+                # gating them to oracle frames starves the next dispatch of
+                # current data (e.g. a CPU-scattered grid read by the next
+                # kernel). Only arrays no kernel reads may share the
+                # oracle's gated schedule.
+                kernel_reads: set[str] = set()
+                for bodyitem in node.body:
+                    if isinstance(bodyitem, IRLoop):
+                        k = self._kernel_by_line.get(bodyitem.line)
+                        if k:
+                            kernel_reads |= k.arrays_read
+                per_frame = upload_set & kernel_reads
+                oracle_only = upload_set - kernel_reads
                 # Ensure GPU is idle before transfers (idempotent)
                 if use_batched:
                     self._put("ergo_vk_frame_wait();")
-                self._put("/* Upload CPU-modified arrays for next frame */")
-                for arr in sorted(upload_set):
-                    shape = self._array_shapes.get(arr)
-                    if shape:
-                        size_expr = " * ".join(
-                            self._dim_expr(d) for d in shape)
-                        sz = self._gpu_sizeof(arr)
-                        if arr in pp:
-                            self._put(f"ergo_vk_upload_at(d_{arr}, {arr}, "
-                                      f"(size_t)_pp_wr_offset * {sz}, "
-                                      f"{size_expr} * {sz});")
-                        else:
-                            self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
-                                      f"{size_expr} * {sz});")
-                if upload_guard:
-                    self.indent -= 1
-                    self._put("}")
+                if per_frame:
+                    self._put("/* Upload kernel-read arrays (every frame) */")
+                    for arr in sorted(per_frame):
+                        shape = self._array_shapes.get(arr)
+                        if shape:
+                            size_expr = " * ".join(
+                                self._dim_expr(d) for d in shape)
+                            sz = self._gpu_sizeof(arr)
+                            if arr in pp:
+                                self._put(f"ergo_vk_upload_at(d_{arr}, {arr}, "
+                                          f"(size_t)_pp_wr_offset * {sz}, "
+                                          f"{size_expr} * {sz});")
+                            else:
+                                self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
+                                          f"{size_expr} * {sz});")
+                if oracle_only:
+                    verify_meta = self._find_verify_meta(node.body)
+                    upload_guard = (verify_meta and
+                                    verify_meta.get("every", 1) > 1 and
+                                    use_batched)
+                    if upload_guard:
+                        every = verify_meta["every"]
+                        self._put(f"if (!_oracle_init || "
+                                  f"_oracle_frame % {every} == 0) {{")
+                        self.indent += 1
+                    self._put("/* Upload CPU-modified arrays (oracle schedule) */")
+                    for arr in sorted(oracle_only):
+                        shape = self._array_shapes.get(arr)
+                        if shape:
+                            size_expr = " * ".join(
+                                self._dim_expr(d) for d in shape)
+                            sz = self._gpu_sizeof(arr)
+                            if arr in pp:
+                                self._put(f"ergo_vk_upload_at(d_{arr}, {arr}, "
+                                          f"(size_t)_pp_wr_offset * {sz}, "
+                                          f"{size_expr} * {sz});")
+                            else:
+                                self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
+                                          f"{size_expr} * {sz});")
+                    if upload_guard:
+                        self.indent -= 1
+                        self._put("}")
             if self.render:
                 self._put(f"if (ergo_vk_should_close()) break;")
-            self.indent -= 1
-            self._put("}")
+            self._emit_do_footer()
             if use_batched:
                 self._put("/* Flush last frame */")
                 self._put("ergo_vk_frame_begin(); ergo_vk_frame_end();")
@@ -1090,9 +1396,60 @@ class IRCodeGen:
             self._batched_frame = False
             self._frame_ended_early = False
         else:
-            self._put(f"for (int {node.var} = {start}; {node.var} <= {end}; {node.var} += {step}) {{")
-            self.indent += 1
+            self._emit_do_header(node.var, start, end, step)
+            # Per-loop scoping for the download tracker: nested loops
+            # save/merge so an outer loop's end-refresh sees every
+            # download in its body.
+            saved_downloaded = self._body_downloaded
+            self._body_downloaded = set()
             dirty = self._emit_body(node.body)
+            this_loop_downloads = self._body_downloaded
+            self._body_downloaded = saved_downloaded | this_loop_downloads
+            # CPU loop inside a batched frame: the NEXT iteration may
+            # read GPU-written arrays on the host (e.g. a CPU stencil
+            # interleaved with point-source kernels). The mid-body
+            # download logic can't see next-iteration reads, so refresh
+            # those arrays at the end of each iteration — but ONLY arrays
+            # the body actually reads on the CPU (kernel-aware: a loop of
+            # pure GPU work, like a ping-pong matvec nest, pays nothing).
+            if self._batched_frame and self.gpu_plan:
+                inner_written: set[str] = set()
+
+                def _kernel_writes(items):
+                    for bi in items:
+                        if isinstance(bi, IRLoop):
+                            ik = self._kernel_by_line.get(bi.line)
+                            if ik:
+                                inner_written.update(ik.arrays_written)
+                            else:
+                                _kernel_writes(bi.body)
+                        elif isinstance(bi, IRIf):
+                            _kernel_writes(bi.then_body)
+                            if bi.else_body:
+                                _kernel_writes(bi.else_body)
+                _kernel_writes(node.body)
+                cpu_rd: set[str] = set()
+                self._collect_cpu_array_reads(node.body, cpu_rd)
+                # Skip arrays the mid-body logic already downloaded this
+                # iteration — re-downloading would be pure waste.
+                needed = (inner_written & cpu_rd) - this_loop_downloads
+                if needed:
+                    if not self._frame_ended_early:
+                        self._put("ergo_vk_frame_end();")
+                        self._put("ergo_vk_frame_wait();")
+                        self._frame_ended_early = True
+                    self._put("/* Refresh host copies for next iteration */")
+                    for arr in sorted(needed):
+                        shape = self._array_shapes.get(arr)
+                        if shape:
+                            size_expr = " * ".join(
+                                self._dim_expr(d) for d in shape)
+                            sz = self._gpu_sizeof(arr)
+                            self._put(f"ergo_vk_download(d_{arr}, {arr}, "
+                                      f"{size_expr} * {sz});")
+                    self._put("ergo_vk_frame_begin();")
+                    self._frame_ended_early = False
+                    self._frame_gpu_dirty.clear()
             # If this loop body contains GPU dispatches and ends with
             # CPU-dirty arrays, upload them before the next iteration
             # so GPU kernels read current data.
@@ -1116,22 +1473,14 @@ class IRCodeGen:
                             sz = self._gpu_sizeof(arr)
                             self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
                                       f"{size_expr} * {sz});")
-            # Inner loops (e.g. SIM_SPAWN) may inherit _batched_frame from
-            # the outer frame loop. Only emit frame_end/flush if the inner
-            # loop itself contains GPU dispatches AND the frame is still open.
-            inner_has_dispatches = self._items_contain_dispatch(node.body)
-            _saved_batched = self._batched_frame
-            _saved_ended_early = self._frame_ended_early
-            if self._batched_frame and inner_has_dispatches and not self._frame_ended_early:
-                self._put("ergo_vk_frame_end();")
-            self.indent -= 1
-            self._put("}")
-            if self._batched_frame and inner_has_dispatches and not self._frame_ended_early:
-                self._put("/* Flush last frame */")
-                self._put("ergo_vk_frame_begin(); ergo_vk_frame_end();")
-            # Restore outer frame state
-            self._batched_frame = _saved_batched
-            self._frame_ended_early = _saved_ended_early
+            # Nested loops inside a frame loop must NOT close the frame:
+            # the outer frame loop owns the lifecycle (begin per outer
+            # iteration, end at the finalizer), and early drains re-open
+            # the frame immediately (see the download sites). A frame_end
+            # here lands inside the nested loop's braces — it would close
+            # the frame per inner iteration and leave the next iteration's
+            # dispatches recording into a dead command buffer.
+            self._emit_do_footer()
 
     def _emit_minmax_scan(self, arr: str, count_expr: str):
         """Emit fixed value range for render color mapping.
@@ -1200,19 +1549,22 @@ class IRCodeGen:
                         self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
                                   f"{size_expr} * {sz});")
 
-        # Emit condition block (computes the condition value)
-        self._emit_block(node.cond_block)
+        # Emit as for(;;) with the condition checked at the TOP of each
+        # iteration: CYCLE (continue) then naturally re-evaluates the
+        # condition. (A trailing re-evaluation is skipped by continue,
+        # which previously caused infinite loops.)
         cond = self._operand(node.condition)
-        self._put(f"while ({cond}) {{")
+        self._put("for (;;) {")
         self.indent += 1
+
+        self._emit_block(node.cond_block)
+        self._put(f"if (!({cond})) break;")
 
         if is_frame_loop and self._batched_frame:
             self._put("ergo_vk_frame_begin();")
+            self._frame_gpu_dirty.clear()
 
         self._emit_body(node.body)
-
-        # Re-evaluate condition at end of loop body
-        self._emit_block(node.cond_block)
 
         if is_frame_loop and self._batched_frame:
             self._put("ergo_vk_frame_end();")
@@ -1267,6 +1619,29 @@ class IRCodeGen:
         self.indent -= 1
         self._put("}")
 
+    def _subscripts(self, array_name: str, index_args: list) -> str:
+        """C subscript string for an array access (column-major LOCKED:
+        the C array is declared with reversed dims).
+
+        The loop-linearization pass (ir_gpu) can rewrite a multi-dim
+        access to a single 0-based column-major linear index. On the host
+        the C array is still multi-dimensional, so a single index arg on
+        a multi-rank array must be decomposed back into C subscripts —
+        A[lin] on double A[NY][NX] is otherwise a row-pointer type error.
+        """
+        shape = self._array_shapes.get(array_name)
+        if shape and len(shape) > 1 and len(index_args) == 1:
+            linear = self._operand(index_args[0])
+            subs = []
+            rem = linear
+            for d in shape[:-1]:
+                dim = self._dim_expr(d)
+                subs.append(f"({rem}) % ({dim})")
+                rem = f"({rem}) / ({dim})"
+            subs.append(rem)
+            return "][".join(reversed(subs))
+        return "][".join(self._operand(a) for a in reversed(index_args))
+
     # ── instruction emission ─────────────────────────────────
 
     def _emit_inst(self, inst: IRInst):
@@ -1278,6 +1653,8 @@ class IRCodeGen:
         if op == Op.COPY:
             if inst.meta.get("kind") == "cycle":
                 self._put("continue;")
+            if inst.meta.get("kind") == "exit":
+                self._put("break;")
                 return
             if result and args:
                 self._put(f"{result} = {self._operand(args[0])};")
@@ -1290,7 +1667,8 @@ class IRCodeGen:
             return
 
         if op == Op.POW:
-            self._put(f"{result} = pow({self._operand(args[0])}, {self._operand(args[1])});")
+            self._put(f"{result} = {_real_math('pow')}("
+                      f"{self._operand(args[0])}, {self._operand(args[1])});")
             return
 
         if op == Op.MOD:
@@ -1298,7 +1676,7 @@ class IRCodeGen:
             if self._is_int_operand(args[0]) and self._is_int_operand(args[1]):
                 self._put(f"{result} = ({a} % {b});")
             else:
-                self._put(f"{result} = fmod({a}, {b});")
+                self._put(f"{result} = {_real_math('fmod')}({a}, {b});")
             return
 
         if op == Op.NEG:
@@ -1365,9 +1743,22 @@ class IRCodeGen:
 
         # Math intrinsics
         if op in C_MATH:
-            c_func = C_MATH[op]
+            c_func = _real_math(C_MATH[op])
             a = ", ".join(self._operand(a) for a in args)
             self._put(f"{result} = {c_func}({a});")
+            return
+
+        # DOT_PRODUCT / NORM2 — whole-array reductions. Array names ride in
+        # meta; the element count comes from the compile-time shape. Args
+        # are 1D so layout is flat (column-major note is moot).
+        if op in (Op.DOT_PRODUCT, Op.NORM2):
+            arrays = inst.meta.get("arrays", [])
+            n = self._dot_size(arrays[0], inst.line)
+            if op == Op.DOT_PRODUCT:
+                self._put(f"{result} = _ergo_dot({arrays[0]}, {arrays[1]}, {n});")
+            else:
+                self._put(f"{result} = {_real_math('sqrt')}("
+                          f"_ergo_dot({arrays[0]}, {arrays[0]}, {n}));")
             return
 
         # ABS — type aware
@@ -1376,7 +1767,27 @@ class IRCodeGen:
             if self._is_int_operand(args[0]):
                 self._put(f"{result} = abs({a});")
             else:
-                self._put(f"{result} = fabs({a});")
+                self._put(f"{result} = {_real_math('fabs')}({a});")
+            return
+
+        # SIGN — type aware: |a| with the sign of b
+        if op == Op.SIGN:
+            a, b = self._operand(args[0]), self._operand(args[1])
+            if self._is_int_operand(args[0]):
+                self._put(f"{result} = (abs({a}) * (({b}) >= 0 ? 1 : -1));")
+            else:
+                self._put(f"{result} = {_real_math('copysign')}({a}, {b});")
+            return
+
+        # PRNG intrinsics — splitmix64 at the runtime's native width
+        # (see _emit_hash_helper for constants and statistics notes).
+        if op == Op.HASH:
+            a = self._operand(args[0])
+            self._put(f"{result} = _ergo_hash32((unsigned long long)({a}));")
+            return
+        if op == Op.RAND:
+            a = self._operand(args[0])
+            self._put(f"{result} = _ergo_rand01((unsigned long long)({a}));")
             return
 
         # MAX / MIN
@@ -1385,14 +1796,14 @@ class IRCodeGen:
             if self._is_int_operand(args[0]):
                 self._put(f"{result} = (({a}) > ({b}) ? ({a}) : ({b}));")
             else:
-                self._put(f"{result} = fmax({a}, {b});")
+                self._put(f"{result} = {_real_math('fmax')}({a}, {b});")
             return
         if op == Op.MIN:
             a, b = self._operand(args[0]), self._operand(args[1])
             if self._is_int_operand(args[0]):
                 self._put(f"{result} = (({a}) < ({b}) ? ({a}) : ({b}));")
             else:
-                self._put(f"{result} = fmin({a}, {b});")
+                self._put(f"{result} = {_real_math('fmin')}({a}, {b});")
             return
 
         # CLAMP — branchless
@@ -1401,13 +1812,18 @@ class IRCodeGen:
             if self._is_int_operand(args[0]):
                 self._put(f"{result} = (({x}) < ({lo}) ? ({lo}) : (({x}) > ({hi}) ? ({hi}) : ({x})));")
             else:
-                self._put(f"{result} = fmin(fmax({x}, {lo}), {hi});")
+                fmin = _real_math('fmin')
+                fmax = _real_math('fmax')
+                self._put(f"{result} = {fmin}({fmax}({x}, {lo}), {hi});")
             return
 
         # Array LOAD
         if op == Op.LOAD:
             array_name = inst.meta.get("array", "?")
-            indices = "][".join(self._operand(a) for a in args)
+            # Column-major (LOCKED convention, first index fastest): the C
+            # array is declared with reversed dims, so emit subscripts in
+            # reverse — Ergo A(i,j,k) → C A[k-1][j-1][i-1].
+            indices = self._subscripts(array_name, args)
             self._put(f"{result} = {array_name}[{indices}];")
             return
 
@@ -1415,7 +1831,8 @@ class IRCodeGen:
         if op == Op.STORE:
             array_name = inst.meta.get("array", "?")
             val = self._operand(args[0])
-            indices = "][".join(self._operand(a) for a in args[1:])
+            # Column-major: reversed subscripts (see LOAD above).
+            indices = self._subscripts(array_name, args[1:])
             self._put(f"{array_name}[{indices}] = {val};")
             return
 
@@ -1423,10 +1840,14 @@ class IRCodeGen:
         # 64-byte aligned, bounds-checked, abort on exhaustion.
         if op == Op.ALLOC:
             ct = self._c_type(inst.type)
-            size = " * ".join(self._operand(a) for a in args)
+            # Cast each dim to size_t so the product can't overflow int
+            # before promotion on large allocations.
+            size = " * ".join(f"(size_t)({self._operand(a)})" for a in args)
             self._put("{")
             self.indent += 1
-            self._put(f"size_t _sz = ({size}) * sizeof({ct});")
+            self._put(f"size_t _sz = {size} * sizeof({ct});")
+            if result in self._allocatable:
+                self._put(f"_ergo_sz_{result} = _sz;")
             self._put("size_t _aligned = (_sz + 63) & ~(size_t)63;")
             self._put("if (_ergo_arena_offset + _aligned > "
                       "ERGO_ARENA_BYTES) {")
@@ -1462,10 +1883,27 @@ class IRCodeGen:
                     size_expr = " * ".join(
                         self._dim_expr(d) for d in shape)
                     sz = self._gpu_sizeof(array_name)
+                    # D19 (WAW hazard): if an earlier dispatch in this frame
+                    # wrote this buffer, the TRANSFER-stage fill must be
+                    # ordered after the COMPUTE writes — the pre-dispatch
+                    # barrier only covers fill→compute, not compute→fill.
+                    # Drain and re-open the frame before filling.
+                    if array_name in self._frame_gpu_dirty:
+                        self._put("ergo_vk_frame_end();")
+                        self._put("ergo_vk_frame_wait();")
+                        self._put("ergo_vk_frame_begin();")
+                        self._frame_gpu_dirty.clear()
+                        self._frame_ended_early = False
                     self._put(f"ergo_vk_frame_fill(d_{array_name}, "
                               f"{size_expr} * {sz});")
+                    self._frame_gpu_dirty.add(array_name)
                     return
-            self._put(f"memset({array_name}, 0, sizeof({array_name}));")
+            # ALLOCATABLE arrays are pointers — sizeof would be the pointer
+            # size. Use the byte-size companion recorded at ALLOCATE time.
+            if array_name in self._allocatable:
+                self._put(f"memset({array_name}, 0, _ergo_sz_{array_name});")
+            else:
+                self._put(f"memset({array_name}, 0, sizeof({array_name}));")
             return
 
         # Function call (with return value)
@@ -1479,18 +1917,23 @@ class IRCodeGen:
         if op == Op.CALL_VOID:
             func = inst.meta.get("func", "?")
             a = ", ".join(self._operand(a) for a in args)
-            # GPU sync: download arrays before CPU call, upload after
+            # GPU sync: download arrays before CPU call, upload after.
+            # Not gated on _in_frame_loop (D18): a non-inlined subroutine
+            # outside the frame loop reads stale CPU copies otherwise.
+            # Downloads are filtered to arrays that are actually
+            # GPU-resident, so init-region calls (CPU data not yet
+            # uploaded) are not clobbered with GPU garbage.
             has_gpu = self.gpu_plan and self.gpu_plan.kernels
             gpu_arrays = set(self._gpu_arrays()) if has_gpu else set()
             sub_access = self._sub_array_access.get(func)
-            need_sync = has_gpu and sub_access and self._in_frame_loop
+            need_sync = has_gpu and sub_access
             dl_arrays = set()
             ul_arrays = set()
             if need_sync:
                 reads, writes = sub_access
                 pp = getattr(self, '_pp_arrays', set())
                 # Download GPU arrays this sub reads
-                dl_arrays = (reads | writes) & gpu_arrays
+                dl_arrays = (reads | writes) & gpu_arrays & self._gpu_current
                 if dl_arrays:
                     # Ensure GPU cmd buf is submitted and idle before transfer
                     if self._batched_frame and not self._frame_ended_early:
@@ -1535,6 +1978,7 @@ class IRCodeGen:
                             self._put(
                                 f"ergo_vk_upload(d_{arr}, {arr}, "
                                 f"{size_expr} * {sz});")
+                self._gpu_current |= ul_arrays
             # NET hook: send census packet after adaptive census call
             if func == "SIM_CENSUS_ADAPTIVE" and self._has_net:
                 self._put("if (_consensus_enabled) {")
@@ -1555,6 +1999,9 @@ class IRCodeGen:
             fmt = inst.meta.get("fmt", "")
             advance = inst.meta.get("advance", True)
             stream = "stderr" if unit == "0" else "stdout"
+            # The format text is embedded in a C string literal — escape
+            # it the same way as string constants.
+            fmt = _c_str_escape(fmt)
             if advance:
                 fmt = fmt + "\\n"
             if args:
@@ -1579,12 +2026,13 @@ class IRCodeGen:
             self._put("return;")
             return
 
-        # STOP
+        # STOP — terminate the whole program from any context.
+        # (return 0 would only exit the current function.)
         if op == Op.STOP:
             if self.gpu_plan and self.gpu_plan.kernels:
                 self._emit_final_hash_hook()
                 self._put("ergo_vk_shutdown();")
-            self._put("return 0;")
+            self._put("exit(0);")
             return
 
         # VERIFY — CPU oracle checkpoint
@@ -1596,6 +2044,16 @@ class IRCodeGen:
         if op == Op.SORT_BY_GEN:
             self._emit_sort_by_gen(inst)
             return
+
+        # RING_*/WARP_* subgroup intrinsics only exist inside GPU kernels.
+        # On the CPU path there is no meaningful lowering — fail loudly
+        # instead of leaving an uninitialized temp for later reads.
+        if op in (Op.RING_PREV, Op.RING_NEXT, Op.RING_SHIFT, Op.RING_BROADCAST,
+                  Op.WARP_BALLOT, Op.WARP_BALLOT_COUNT, Op.WARP_BALLOT_PREFIX,
+                  Op.WARP_BROADCAST_FIRST):
+            raise MCLError(
+                "RING/WARP subgroup intrinsics are only available in GPU "
+                "kernels (--target), not on the CPU path")
 
         self._put(f"/* unhandled IR op: {op.value} */")
 
@@ -1698,6 +2156,96 @@ class IRCodeGen:
         return None
 
     def _emit_sort_by_gen(self, inst: IRInst):
+        """Emit sort-by-GEN.
+
+        Default: deterministic CPU counting sort (stable, by GEN class) —
+        the GPU scatter assigns slots in atomic-arrival order, which is not
+        reproducible. Under --gpu-fast-math: the GPU histogram/scan/scatter
+        pipeline (fast, nondeterministic within-class order).
+        """
+        arrays = inst.meta["arrays"]
+        use_gpu_sort = (getattr(self.backend, 'gpu_fast_math', False)
+                        if self.backend else False)
+        if use_gpu_sort:
+            self._emit_sort_by_gen_gpu(inst)
+            return
+        self._emit_sort_by_gen_cpu(arrays)
+
+    def _emit_sort_by_gen_cpu(self, arrays: list):
+        """Deterministic counting sort on the CPU.
+
+        Downloads GPU-resident arrays, stable-sorts by
+        (FLAGS[i] >> GEN_SHIFT) & GEN_MASK (≤32 bins) with an explicit
+        counting pass (bitwise reproducible), copies back, and re-uploads.
+        """
+        for name in ("NPART", "GEN_SHIFT", "GEN_MASK"):
+            if name not in self._var_types:
+                raise MCLError(
+                    f"SORT_BY_GEN requires a '{name}' scalar in scope")
+
+        # Drain the frame before host transfers (batched mode).
+        drained = False
+        if self._batched_frame and not self._frame_ended_early:
+            self._put("ergo_vk_frame_end();")
+            self._put("ergo_vk_frame_wait();")
+            self._frame_ended_early = True
+            drained = True
+
+        self._put("/* SORT_BY_GEN — deterministic CPU counting sort */")
+        self._put("{")
+        self.indent += 1
+        self._put("int _cnt[32] = {0};")
+        self._put("int _pos[32];")
+
+        # Download arrays that live on the GPU.
+        has_gpu = self.gpu_plan and self.gpu_plan.kernels
+        all_arrs = list(arrays)
+        if "FLAGS" not in all_arrs:
+            all_arrs.insert(0, "FLAGS")
+        if has_gpu:
+            for arr in all_arrs:
+                if arr in self._gpu_current:
+                    ct = self._c_type(self._var_types.get(arr, IRType.REAL))
+                    self._put(f"ergo_vk_download(d_{arr}, {arr}, "
+                              f"NPART * sizeof({ct}));")
+
+        # Histogram pass.
+        self._put("for (int _i = 0; _i < NPART; _i++)")
+        self._put("  _cnt[(FLAGS[_i] >> GEN_SHIFT) & GEN_MASK]++;")
+
+        # Scatter each array into scratch, then copy back and upload.
+        for arr in arrays:
+            ct = self._c_type(self._var_types.get(arr, IRType.REAL))
+            self._put("{")
+            self.indent += 1
+            self._put(f"static char _st_raw[sizeof({arr})];")
+            self._put("_pos[0] = 0;")
+            self._put("for (int _b = 1; _b < 32; _b++) "
+                      "_pos[_b] = _pos[_b-1] + _cnt[_b-1];")
+            self._put("for (int _i = 0; _i < NPART; _i++) {")
+            self.indent += 1
+            self._put("int _k = (FLAGS[_i] >> GEN_SHIFT) & GEN_MASK;")
+            self._put(f"(({ct} *)_st_raw)[_pos[_k]++] = {arr}[_i];")
+            self.indent -= 1
+            self._put("}")
+            self._put(f"memcpy({arr}, _st_raw, sizeof({arr}));")
+            if has_gpu:
+                self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
+                          f"NPART * sizeof({ct}));")
+            self._gpu_current.add(arr)
+            self.indent -= 1
+            self._put("}")
+
+        self.indent -= 1
+        self._put("}")
+
+        # Re-open the frame for subsequent GPU work.
+        if drained or (self._batched_frame and self._frame_ended_early):
+            self._put("ergo_vk_frame_begin();")
+            self._frame_ended_early = False
+            self._frame_gpu_dirty.clear()
+
+    def _emit_sort_by_gen_gpu(self, inst: IRInst):
         """Emit GPU sort-by-GEN dispatch: histogram → scan → scatter → swap."""
         arrays = inst.meta["arrays"]
         # Find the matching sort plan
@@ -1777,11 +2325,22 @@ class IRCodeGen:
         state, and reports divergence. The shadow arrays are evolved
         independently by the CPU each frame using the same physics.
         """
+        if self.no_verify:
+            # --no-verify: omit the oracle entirely. Also the reason a
+            # CPU copy of the physics subroutine (possibly containing
+            # GPU-only RING ops) is not needed.
+            self._put("/* VERIFY omitted by --no-verify */")
+            return
+
         arrays = inst.meta["arrays"]
         n = inst.meta["oracle_size"]
         every = inst.meta["every"]
         tol = inst.meta["tolerance"]
 
+        # ERGO_NO_VERIFY=1 disables the oracle at runtime (no recompile):
+        # no shadow state, no downloads/uploads, no shadow physics.
+        self._put(f"if (!getenv(\"ERGO_NO_VERIFY\")) {{")
+        self.indent += 1
         self._put(f"/* === CPU Oracle: verify {n} particles, every {every} frames === */")
 
         # Lazy init: copy seed state into shadow arrays on first call
@@ -1802,14 +2361,24 @@ class IRCodeGen:
             self.indent += 1
 
         # Sparse download: just the first N elements of each array
-        # For ping-pong arrays, read from the current-state half (PP_RD offset)
+        # For ping-pong arrays, read from the current-state half (PP_WR
+        # after the frame's dispatches — the swap happens at frame_begin)
         has_gpu = self.gpu_plan and self.gpu_plan.kernels
         if has_gpu:
             # Ensure GPU cmd buf is submitted and idle before transfer
             if self._batched_frame and not self._frame_ended_early:
                 self._put("ergo_vk_frame_end();")
                 self._put("ergo_vk_frame_wait();")
-                self._frame_ended_early = True
+                # D21: re-open the frame for the rest of this iteration.
+                # The end/wait above is inside the `every` gate, so on
+                # non-oracle frames it never executes — but the codegen
+                # flag must still reflect the frame as OPEN on every path,
+                # or the finalizer skips the close and the fence for this
+                # frame is never submitted (the next re-begin then waits
+                # on it forever — the galaxy_full freeze).
+                self._put("ergo_vk_frame_begin();")
+                self._frame_gpu_dirty.clear()
+                self._frame_ended_early = False
             pp = getattr(self, '_pp_arrays', set())
             for arr in arrays:
                 sz = self._gpu_sizeof(arr)
@@ -1939,6 +2508,9 @@ class IRCodeGen:
             self.indent -= 1
             self._put(f"}} else {{ _oracle_frame++; }}")
 
+        self.indent -= 1
+        self._put(f"}}  /* end oracle (ERGO_NO_VERIFY) */")
+
     def _emit_census_net_send(self):
         """Emit census packet send after SIM_CENSUS_ADAPTIVE call.
 
@@ -2014,6 +2586,9 @@ class IRCodeGen:
         self._put(f"{{")
         self.indent += 1
         has_gpu = self.gpu_plan and self.gpu_plan.kernels
+        # Upload only if GRID_DENSITY_GLOBAL is actually GPU-resident
+        # (when the stencil runs on CPU, no device buffer exists).
+        gd_global_on_gpu = "GRID_DENSITY_GLOBAL" in self._gpu_arrays()
         # 1. Drain multicast socket for field broadcast (O(1) from oracle)
         self._put(f"for (int _fi = 0; _fi < 200; _fi++) {{")
         self.indent += 1
@@ -2024,7 +2599,7 @@ class IRCodeGen:
         self._put(f"if (_fc == 1) {{")  # field complete
         self.indent += 1
         self._emit_field_to_grid("GRID_DENSITY_GLOBAL")
-        if has_gpu:
+        if has_gpu and gd_global_on_gpu:
             self._put(f"ergo_vk_upload(d_GRID_DENSITY_GLOBAL, "
                       f"GRID_DENSITY_GLOBAL, "
                       f"sizeof(GRID_DENSITY_GLOBAL));")
@@ -2052,7 +2627,7 @@ class IRCodeGen:
                   f"_fh.payload_len)) {{")
         self.indent += 1
         self._emit_field_to_grid("GRID_DENSITY_GLOBAL")
-        if has_gpu:
+        if has_gpu and gd_global_on_gpu:
             self._put(f"ergo_vk_upload(d_GRID_DENSITY_GLOBAL, "
                       f"GRID_DENSITY_GLOBAL, "
                       f"sizeof(GRID_DENSITY_GLOBAL));")
@@ -2134,16 +2709,22 @@ class IRCodeGen:
                        if a in gpu]
         if not hash_arrays:
             return
+        # The hook hashes NPART elements per array. A GPU program without
+        # an NPART scalar has no countable particle state — skip the hook
+        # entirely so the emitted C still compiles.
+        if "NPART" not in self._var_types:
+            return
+        elem = IRType.REAL.c_type  # float in f32 mode, double in f64
         self._put("if (getenv(\"ERGO_HASH_FINAL\")) {")
         self.indent += 1
         self._put("ergo_vk_frame_wait();")
         for arr in hash_arrays:
             self._put(f"ergo_vk_download(d_{arr}, {arr}, "
-                      f"NPART * sizeof(float));")
+                      f"NPART * sizeof({elem}));")
         self._put("unsigned long long _h = 14695981039346656037ULL;")
         for arr in hash_arrays:
             self._put(f"_h = _ergo_fnv1a_update(_h, {arr}, "
-                      f"NPART * sizeof(float));")
+                      f"NPART * sizeof({elem}));")
         self._put("printf(\"ERGO_FINAL_HASH=%016llx\\n\", _h);")
         self.indent -= 1
         self._put("}")
@@ -2192,6 +2773,117 @@ class IRCodeGen:
         self._put_raw("static size_t _ergo_arena_offset = 0;")
         self._put_raw("")
 
+    # ── DOT_PRODUCT / NORM2 lowering ──────────────────────────
+    # Whole-array reductions on 1D constant-shape arrays. No allocation,
+    # no hidden temporaries — a flat scalar loop the C compiler vectorizes.
+
+    def _uses_dot(self, mod: IRModule) -> bool:
+        """Return True if any DOT_PRODUCT/NORM2 instruction is reachable."""
+        def walk_items(items) -> bool:
+            for item in items:
+                if isinstance(item, IRBlock):
+                    for inst in item.insts:
+                        if inst.op in (Op.DOT_PRODUCT, Op.NORM2):
+                            return True
+                elif isinstance(item, IRLoop):
+                    if walk_items(item.body):
+                        return True
+                elif isinstance(item, IRWhileLoop):
+                    if walk_items(item.body):
+                        return True
+                elif isinstance(item, IRIf):
+                    if walk_items(item.then_body):
+                        return True
+                    if item.else_body and walk_items(item.else_body):
+                        return True
+            return False
+        if walk_items(mod.main_body):
+            return True
+        for fn in mod.functions:
+            if walk_items(fn.body):
+                return True
+        return False
+
+    def _uses_hash(self, mod: IRModule) -> bool:
+        """Return True if any HASH/RAND instruction is reachable."""
+        def walk_items(items) -> bool:
+            for item in items:
+                if isinstance(item, IRBlock):
+                    for inst in item.insts:
+                        if inst.op in (Op.HASH, Op.RAND):
+                            return True
+                elif isinstance(item, IRLoop):
+                    if walk_items(item.body):
+                        return True
+                elif isinstance(item, IRWhileLoop):
+                    if walk_items(item.body):
+                        return True
+                elif isinstance(item, IRIf):
+                    if walk_items(item.then_body):
+                        return True
+                    if item.else_body and walk_items(item.else_body):
+                        return True
+            return False
+        if walk_items(mod.main_body):
+            return True
+        for fn in mod.functions:
+            if walk_items(fn.body):
+                return True
+        return False
+
+    # ── HASH / RAND lowering ───────────────────────────────────
+    # splitmix64 finalizer (Stafford 2013). Constants: the Weyl increment
+    # is the golden-ratio 2^64/phi; both multipliers are Stafford's
+    # odd 64-bit constants chosen for maximal avalanche. The full 64-bit
+    # output passes PractRand and BigCrush; we only use high bits, whose
+    # quality dominates the low bits'.
+    #   HASH(x) → INTEGER: bits 63..33 of the finalize — non-negative
+    #   int32 [0, 2^31-1]. Chaining S := HASH(S) is the canonical
+    #   splitmix64 state advance (each call applies the Weyl increment).
+    #   RAND(x) → REAL: top 53 bits × 2^-53, uniform on [0, 1), exact
+    #   in f64.
+    def _emit_hash_helper(self) -> None:
+        self._put_raw("/* Ergo PRNG helpers: splitmix64 finalizer "
+                      "(see above). */")
+        self._put_raw("static inline unsigned long long _ergo_splitmix64("
+                      "unsigned long long x) {")
+        self._put_raw("    x += 0x9E3779B97F4A7C15ULL;")
+        self._put_raw("    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;")
+        self._put_raw("    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;")
+        self._put_raw("    return x ^ (x >> 31);")
+        self._put_raw("}")
+        self._put_raw("static inline int _ergo_hash32(unsigned long long x) {")
+        self._put_raw("    return (int)(_ergo_splitmix64(x) >> 33);")
+        self._put_raw("}")
+        self._put_raw("static inline double _ergo_rand01(unsigned long long x) {")
+        self._put_raw("    return (double)(_ergo_splitmix64(x) >> 11) * 0x1.0p-53;")
+        self._put_raw("}")
+        self._put_raw("")
+
+    def _emit_dot_helper(self) -> None:
+        rt = _c_type(IRType.REAL)
+        self._put_raw("/* Ergo reduction helper: flat dot product over n "
+                      "elements. */")
+        self._put_raw("/* No allocation; the C compiler vectorizes the "
+                      "loop. */")
+        self._put_raw(f"static inline {rt} _ergo_dot(const {rt}* a, "
+                      f"const {rt}* b, int n) {{")
+        self._put_raw(f"    {rt} acc = 0.0;")
+        self._put_raw("    for (int i = 0; i < n; i++) acc += a[i] * b[i];")
+        self._put_raw("    return acc;")
+        self._put_raw("}")
+        self._put_raw("")
+
+    def _dot_size(self, array_name: str, line: int = 0) -> str:
+        """Compile-time element count for a 1D constant-shape array."""
+        shape = self._array_shapes.get(array_name)
+        if shape and len(shape) == 1:
+            return self._dim_expr(shape[0])
+        raise MCLError(
+            f"DOT_PRODUCT/NORM2: '{array_name}' is not a 1D array with a "
+            f"compile-time-known shape (ALLOCATABLE, runtime-shaped and "
+            f"assumed-shape arguments are not supported)", line or None)
+
     def _gpu_arrays(self) -> list[str]:
         """Arrays that need GPU buffers — only those used by frame-loop kernels.
         Sorted largest-first to minimize VRAM fragmentation."""
@@ -2216,6 +2908,20 @@ class IRCodeGen:
             self._gpu_arrays()  # populate cache
         all_arrays = kernel.arrays_read | kernel.arrays_written
         return all_arrays.issubset(self._cached_gpu_array_set)
+
+    def _kernel_tiled(self, kernel) -> bool:
+        """True if this kernel is dispatched in tiles (--gpu-tile-size).
+
+        Must agree EXACTLY with the SPIRV backend's _EmitContext._tiled
+        (push-constant layout depends on it): tiling applies to every
+        dispatched kernel except segmented reductions, whose
+        group→segment mapping assumes a whole-range dispatch. The device
+        iteration model is i = gid+1 (+ _tile_base), so any kernel that
+        is correct untiled partitions identically under tiling.
+        """
+        return (self.gpu_tile_size > 0
+                and not kernel.reduction_array
+                and self._is_gpu_kernel(kernel))
 
     def _emit_spirv_embeds(self):
         """Assemble SPIR-V text with spirv-as and embed binaries as C byte arrays."""
@@ -2387,9 +3093,24 @@ class IRCodeGen:
         self.indent -= 1
         self._put(f"}}")
 
+    @staticmethod
+    def _plan_red_accs(kernel) -> int:
+        """Number of scalar accumulators in a reduction kernel."""
+        if kernel.reduction_vars:
+            return len(kernel.reduction_vars)
+        return 1 if kernel.reduction_var else 0
+
     def _emit_gpu_init(self):
         """Emit Vulkan init, buffer allocation, and pipeline creation."""
         self._put("/* === Vulkan init === */")
+        # Ping-pong: arrays read AND written by exactly one frame-loop
+        # kernel get 2x buffers + rd/wr offset push constants. Single
+        # source of truth shared with the SPIRV backend
+        # (ir_gpu.compute_pingpong_arrays) — the two MUST agree.
+        from .ir_gpu import compute_pingpong_arrays
+        pp_arrays: set[str] = compute_pingpong_arrays(
+            self.module, self.gpu_plan) if self.gpu_plan else set()
+        self._pp_arrays = pp_arrays
         if self.render:
             self._put("ergo_vk_init(0); /* windowed */")
         else:
@@ -2397,10 +3118,6 @@ class IRCodeGen:
         # Compute VRAM-based particle capacity (50% of DEVICE_LOCAL heap)
         self._emit_vram_capacity()
         self._put("")
-
-        # Ping-pong disabled until SPIRV offset injection bug is resolved
-        pp_arrays: set[str] = set()
-        self._pp_arrays = pp_arrays
 
         # Allocate device buffers (2x for ping-pong arrays).
         # Particle arrays (1D, sized by MAXPART) use CAPACITY for VRAM-aware sizing.
@@ -2428,11 +3145,42 @@ class IRCodeGen:
                 self._put(f"ErgoVkBuf d_{arr} = ergo_vk_create_buffer("
                           f"{sz}); /* scalar fallback */")
         if pp_arrays:
-            # Pre-swapped: first frame_begin swap will flip to rd=0, wr=CAPACITY
-            # so frame 1 reads from offset 0 (where initial upload landed)
-            # and writes to the second half [CAPACITY..2*CAPACITY)
-            self._put(f"int _pp_rd_offset = CAPACITY;")
+            # Pre-swapped: first frame_begin swap flips to rd=0, wr=N
+            # so frame 1 reads offset 0 (where the initial upload landed)
+            # and writes the second half [N..2N). The offset is in
+            # ELEMENTS; the detection rule guarantees every pp array
+            # shares one shape, so a single global offset pair suffices.
+            # (Was hardcoded to CAPACITY — undefined and wrong-sized for
+            # programs without MAXPART.)
+            ref = sorted(pp_arrays)[0]
+            dims = []
+            for d in self._array_shapes[ref]:
+                expr = self._dim_expr(d)
+                dims.append("CAPACITY" if expr == "MAXPART" else expr)
+            pp_n = " * ".join(dims)
+            self._put(f"int _pp_rd_offset = {pp_n};")
             self._put(f"int _pp_wr_offset = 0;")
+        # REDUCTION output buffers: one REAL partial per workgroup per
+        # accumulator (layout [acc][workgroup]). Sized
+        # n_acc * ceil(bound/256) — the host reads them back in group
+        # order and performs the final sum (no atomics device-side).
+        for k in self.gpu_plan.kernels:
+            n_acc = self._plan_red_accs(k)
+            if n_acc or k.reduction_array:
+                ct = self._c_type(IRType.REAL)
+                rbound = self._operand(k.loop_bound)
+                if self._kernel_tiled(k):
+                    # Tiled: partials layout [tile][acc][group] with
+                    # GPT = QTILE/256 groups per tile (see spirv.py).
+                    gpt = self._qtile // 256
+                    self._put(f"ErgoVkBuf d__reduce_{k.kernel_id} = "
+                              f"ergo_vk_create_buffer((size_t){max(n_acc, 1)} * "
+                              f"((({rbound} + {self._qtile - 1}) / {self._qtile})"
+                              f" * {gpt} * sizeof({ct})));")
+                else:
+                    self._put(f"ErgoVkBuf d__reduce_{k.kernel_id} = "
+                              f"ergo_vk_create_buffer((size_t){max(n_acc, 1)} * "
+                              f"((({rbound} + 255) / 256) * sizeof({ct})));")
         self._put("")
 
         # Load SPIR-V pipelines — for now, from external .spv files
@@ -2442,8 +3190,9 @@ class IRCodeGen:
             if not self._is_gpu_kernel(k):
                 continue  # skip init-only kernels without GPU buffers
             n_bufs = len(k.arrays_written) + len(k.arrays_read - k.arrays_written)
-            scalars = sorted(k.scalars_read,
-                             key=lambda s: (0 if self._var_types.get(s, IRType.REAL) == IRType.REAL else 1, s))
+            if k.reduction_var or k.reduction_array or k.reduction_vars:
+                n_bufs += 1  # per-workgroup partials output buffer
+            scalars = self._kernel_pc_scalars(k)
             pc_size = 0
             from .ir import get_real_precision
             real_sz = 4 if get_real_precision() == 32 else 8
@@ -2464,6 +3213,12 @@ class IRCodeGen:
             k_pp = k.arrays_read & k.arrays_written
             if k_pp and hasattr(self, '_pp_arrays') and k_pp & self._pp_arrays:
                 pc_size += 4 * 2  # _pp_rd_offset + _pp_wr_offset
+            # Tile bounds: _tile_base/_tile_hi, plus _tile_idx for
+            # reduction kernels — appended after all other members,
+            # matching the device struct (spirv.py _declare_push_constants).
+            if self._kernel_tiled(k):
+                n_tile = 3 if (k.reduction_var or k.reduction_vars) else 2
+                pc_size += 4 * n_tile
             self._put(f"ErgoVkPipe pipe_{k.kernel_id} = ergo_vk_load_shader("
                       f"kernel_{k.kernel_id}_spv, kernel_{k.kernel_id}_spv_size, "
                       f"{n_bufs}, {pc_size});")
@@ -2476,8 +3231,20 @@ class IRCodeGen:
             self._put(f"ErgoVkBuf d_sort_offsets = ergo_vk_create_buffer(32 * sizeof(int));")
             for arr in sp.arrays:
                 sz = self._gpu_sizeof(arr)
+                # Size from the array's real shape (mirror of the regular
+                # d_ buffer allocation — the handles swap, so sizes must
+                # match). Never hardcode MAXPART: not every module has it.
+                shape = self._array_shapes.get(arr)
+                if shape:
+                    dims = []
+                    for d in shape:
+                        expr = self._dim_expr(d)
+                        dims.append("CAPACITY" if expr == "MAXPART" else expr)
+                    size_expr = " * ".join(dims)
+                else:
+                    size_expr = "1"
                 self._put(f"ErgoVkBuf d_sort_{arr} = ergo_vk_create_buffer("
-                          f"MAXPART * {sz});")
+                          f"{size_expr} * {sz});")
             self._put("")
             # Histogram kernel: 2 buffers (FLAGS, histogram), 3 push constants (NPART, GEN_SHIFT, GEN_MASK)
             self._put("/* Sort-by-GEN: compute pipelines */")
@@ -2549,10 +3316,28 @@ class IRCodeGen:
                               f"{size_expr} * {sz});")
                     self._put("")
 
+    def _kernel_pc_scalars(self, k) -> list[str]:
+        """Push-constant scalar list for a kernel, sorted by type (reals
+        first, then ints) to match the SPIRV struct layout.
+
+        Includes the loop-bound variable when it is a runtime ref:
+        extraction's scalars_read does not cover loop bounds, which left
+        runtime-valued bounds unresolvable in the backend (they silently
+        became 0 — an empty kernel)."""
+        scalars = set(k.scalars_read)
+        bound = getattr(k, "loop_bound", None)
+        if isinstance(bound, IRRef):
+            scalars.add(bound.name)
+        return sorted(
+            scalars,
+            key=lambda s: (0 if self._var_types.get(s, IRType.REAL) == IRType.REAL else 1, s))
+
     def _emit_gpu_dispatch(self, kernel: KernelPlan):
         """Emit a GPU kernel dispatch in place of a CPU loop."""
         kid = kernel.kernel_id
         bound = self._operand(kernel.loop_bound)
+        red = (kernel.reduction_var or kernel.reduction_array
+               or kernel.reduction_vars)
 
         self._put(f"/* GPU dispatch: kernel_{kid} (source line {kernel.source_line}) */")
 
@@ -2564,21 +3349,42 @@ class IRCodeGen:
         for arr in sorted(kernel.arrays_read - kernel.arrays_written):
             self._put(f"ergo_vk_bind_buffer(pipe_{kid}, {buf_idx}, d_{arr});")
             buf_idx += 1
+        if red:
+            # Per-workgroup partials output (bound last — matches the
+            # SPIRV binding order in _declare_buffers).
+            self._put(f"ergo_vk_bind_buffer(pipe_{kid}, {buf_idx}, "
+                      f"d__reduce_{kid});")
+            buf_idx += 1
 
         # Push constants — member names prefixed with _s_ to avoid
         # collision with #define'd PARAMETER macros (e.g. PFLAG_ACTIVE).
         # Sort by type (doubles first, then ints) to match SPIRV layout
         # and avoid mixed-type padding mismatches.
-        scalars = sorted(kernel.scalars_read,
-                         key=lambda s: (0 if self._var_types.get(s, IRType.REAL) == IRType.REAL else 1, s))
-        # Check for ping-pong arrays (read AND written)
-        # Uses self._pp_arrays which is disabled until PP bug is fixed
+        scalars = self._kernel_pc_scalars(kernel)
+        # Check for ping-pong arrays (read AND written by this kernel).
+        # self._pp_arrays comes from ir_gpu.compute_pingpong_arrays —
+        # the same set the SPIRV backend used for offset injection.
         pp_arrays = kernel.arrays_read & kernel.arrays_written & getattr(self, '_pp_arrays', set())
         has_pp = len(pp_arrays) > 0 and self._is_gpu_kernel(kernel)
 
-        if scalars or has_pp:
+        tiled = self._kernel_tiled(kernel)
+        tile_red = tiled and bool(kernel.reduction_var
+                                  or kernel.reduction_vars)
+
+        if scalars or has_pp or tiled:
             self._put(f"{{")
             self.indent += 1
+            if tiled:
+                # Per-tile push constants: _tile_base/_tile_hi (+
+                # _tile_idx for reductions) trail the scalar/pp members,
+                # matching the device struct. QTILE is a workgroup
+                # multiple, so reduction group boundaries coincide with
+                # the untiled dispatch (bitwise-identical combine).
+                self._put(f"int _tb = 0, _bnd = ({bound}), _tidx = 0;")
+                self._put(f"while (_tb < _bnd) {{")
+                self.indent += 1
+                self._put(f"int _hi = _tb + {self._qtile}; "
+                          f"if (_hi > _bnd) _hi = _bnd;")
             self._put(f"struct {{")
             self.indent += 1
             pc_vals = list(scalars)
@@ -2591,16 +3397,261 @@ class IRCodeGen:
                 self._put(f"int _s__pp_wr_offset;")
                 pc_vals.append("_pp_rd_offset")
                 pc_vals.append("_pp_wr_offset")
+            if tiled:
+                self._put(f"int _s__tile_base;")
+                self._put(f"int _s__tile_hi;")
+                pc_vals.append("_tb")
+                pc_vals.append("_hi")
+                if tile_red:
+                    self._put(f"int _s__tile_idx;")
+                    pc_vals.append("_tidx")
             self.indent -= 1
             self._put(f"}} _pc = {{ {', '.join(pc_vals)} }};")
             self._put(f"ergo_vk_push_constants(pipe_{kid}, &_pc, sizeof(_pc));")
+            if tiled:
+                groups = "((_hi - _tb + 255) / 256)"
+                if self._batched_frame:
+                    self._put(f"ergo_vk_frame_dispatch(pipe_{kid}, {groups});")
+                else:
+                    self._put(f"ergo_vk_dispatch(pipe_{kid}, {groups});")
+                self._put(f"_tb += {self._qtile}; _tidx++;")
+                self.indent -= 1
+                self._put(f"}}")
             self.indent -= 1
             self._put(f"}}")
 
         if self._batched_frame:
-            self._put(f"ergo_vk_frame_dispatch(pipe_{kid}, ({bound} + 255) / 256);")
+            if not tiled:
+                self._put(f"ergo_vk_frame_dispatch(pipe_{kid}, ({bound} + 255) / 256);")
+            self._frame_gpu_dirty |= kernel.arrays_written
+            if red:
+                # Coalesced reduction: record the dispatch into the
+                # current frame and defer the host read-back — one drain
+                # + one combined download for the whole run of
+                # consecutive reduction kernels (flushed before the next
+                # non-dispatch item; see _emit_body). Tiled reductions
+                # skip the combined multi-download at flush time (their
+                # partials use the [tile][acc][group] layout).
+                self._pending_reductions.append(kernel)
         else:
-            self._put(f"ergo_vk_dispatch(pipe_{kid}, ({bound} + 255) / 256);")
+            if not tiled:
+                self._put(f"ergo_vk_dispatch(pipe_{kid}, ({bound} + 255) / 256);")
+            if red:
+                self._emit_reduction_readback(kernel)
+
+    def _emit_reduction_readback(self, kernel: KernelPlan,
+                                 chunk_var: str = "_rchunk",
+                                 downloaded: bool = False):
+        """Emit the host read-back + ordered combine for one reduction
+        kernel's partials buffer.
+
+        Group order is fixed, so the result is deterministic for a fixed
+        dispatch shape. The CPU accumulator(s) still hold their pre-loop
+        values — the combine ADDS onto them. When `downloaded` is True,
+        the partials are already in `chunk_var` (combined multi-download
+        of a coalesced group; requires _G <= 1024) and only the combine
+        is emitted.
+        """
+        kid = kernel.kernel_id
+        bound = self._operand(kernel.loop_bound)
+        red = kernel.reduction_var or kernel.reduction_array
+        ct = self._c_type(IRType.REAL)
+        # All scalar accumulators of a (multi-)reduction kernel; the
+        # partials buffer is laid out [acc][workgroup].
+        accs = kernel.reduction_vars or (
+            [kernel.reduction_var] if kernel.reduction_var else [])
+
+        if self._kernel_tiled(kernel):
+            # Tiled partials use the [tile][acc][group] layout — the
+            # generic path below assumes [acc][workgroup].
+            self._emit_tiled_reduction_readback(kernel, accs)
+            return
+
+        # F98: the accumulator array may ALSO be written by other kernels
+        # (e.g. an extracted zeroing loop), making it GPU-resident. Sync
+        # the host copy from the device before combining (otherwise the
+        # host adds onto stale values and a later download would clobber
+        # the combined sums), and write the combined values back after.
+        seg_acc = kernel.reduction_array
+        seg_acc_gpu = False
+        seg_size = seg_sz = None
+        if seg_acc and seg_acc in set(self._gpu_arrays()):
+            seg_shape = self._array_shapes.get(seg_acc)
+            if seg_shape:
+                seg_acc_gpu = True
+                seg_size = " * ".join(self._dim_expr(d) for d in seg_shape)
+                seg_sz = self._gpu_sizeof(seg_acc)
+                self._put(f"/* Sync segmented accumulator with device copy */")
+                self._put(f"ergo_vk_download(d_{seg_acc}, {seg_acc}, "
+                          f"{seg_size} * {seg_sz});")
+
+        self._put(f"/* Reduction read-back: ordered sum of group "
+                  f"partials into '{red}' */")
+        self._put("{")
+        self.indent += 1
+        self._put(f"int _G = (({bound}) + 255) / 256;")
+        if kernel.reduction_array:
+            # Segmented: group g's partial belongs to segment g / Gseg
+            # (segments are contiguous, equal-length, 256-padded —
+            # validated at extraction).
+            nseg = self._dim_expr(
+                self._array_shapes[kernel.reduction_array][0])
+            self._put(f"int _Nseg = ({nseg});")
+            self._put("int _Gseg = _G / _Nseg;")
+        if downloaded:
+            # Partials already fetched by the coalesced multi-download.
+            if kernel.reduction_array:
+                self._put(f"for (int _j = 0; _j < _G; _j++) "
+                          f"{kernel.reduction_array}[_j / _Gseg] "
+                          f"+= {chunk_var}[_j];")
+            else:
+                for ai, acc in enumerate(accs):
+                    cast = ("(int)" if self._var_types.get(acc)
+                            == IRType.INTEGER else "")
+                    self._put(f"for (int _j = 0; _j < _G; _j++) "
+                              f"{acc} += {cast}{chunk_var}[_j "
+                              f"+ {ai} * _G];")
+        else:
+            self._put(f"{ct} {chunk_var}[1024];")
+            if kernel.reduction_array:
+                self._put("for (int _c = 0; _c < _G; _c += 1024) {")
+                self.indent += 1
+                self._put("int _n = (_G - _c < 1024) ? (_G - _c) : 1024;")
+                self._put(f"ergo_vk_download_at(d__reduce_{kid}, {chunk_var}, "
+                          f"(size_t)_c * sizeof({ct}), _n * sizeof({ct}));")
+                self._put(f"for (int _j = 0; _j < _n; _j++) "
+                          f"{kernel.reduction_array}[(_c + _j) / _Gseg] "
+                          f"+= {chunk_var}[_j];")
+                self.indent -= 1
+                self._put("}")
+            else:
+                for ai, acc in enumerate(accs):
+                    cast = ("(int)" if self._var_types.get(acc)
+                            == IRType.INTEGER else "")
+                    self._put("for (int _c = 0; _c < _G; _c += 1024) {")
+                    self.indent += 1
+                    self._put("int _n = (_G - _c < 1024) ? (_G - _c) : 1024;")
+                    self._put(f"ergo_vk_download_at(d__reduce_{kid}, "
+                              f"{chunk_var}, (size_t)({ai} * _G + _c) * "
+                              f"sizeof({ct}), _n * sizeof({ct}));")
+                    self._put(f"for (int _j = 0; _j < _n; _j++) "
+                              f"{acc} += {cast}{chunk_var}[_j];")
+                    self.indent -= 1
+                    self._put("}")
+        self.indent -= 1
+        self._put("}")
+
+        if seg_acc_gpu:
+            self._put(f"ergo_vk_upload(d_{seg_acc}, {seg_acc}, "
+                      f"{seg_size} * {seg_sz});")
+            self._gpu_current.add(seg_acc)
+        self._gpu_current |= kernel.arrays_read
+
+    def _emit_tiled_reduction_readback(self, kernel: KernelPlan,
+                                       accs: list):
+        """Host read-back + ordered combine for a TILED reduction kernel.
+
+        Partials are laid out [tile][acc][group] with GPT = QTILE/256
+        groups per tile. Since QTILE is a workgroup multiple, tile t
+        group g covers exactly the elements of untiled group t*GPT+g, so
+        summing in [tile][group] order is bitwise identical to the
+        untiled combine.
+        """
+        kid = kernel.kernel_id
+        bound = self._operand(kernel.loop_bound)
+        ct = self._c_type(IRType.REAL)
+        gpt = self._qtile // 256
+        n_acc = max(len(accs), 1)
+        self._put(f"/* Tiled reduction read-back: ordered sum over "
+                  f"[tile][group] partials into "
+                  f"'{kernel.reduction_var}' */")
+        self._put("{")
+        self.indent += 1
+        self._put(f"int _G = (({bound}) + 255) / 256;")
+        self._put(f"int _NT = (({bound}) + {self._qtile - 1}) / {self._qtile};")
+        self._put(f"{ct} _rtile[{gpt}];")
+        for ai, acc in enumerate(accs):
+            cast = ("(int)" if self._var_types.get(acc)
+                    == IRType.INTEGER else "")
+            self._put(f"for (int _t = 0; _t < _NT; _t++) {{")
+            self.indent += 1
+            self._put(f"int _ng = _G - _t * {gpt}; "
+                      f"if (_ng > {gpt}) _ng = {gpt};")
+            self._put(f"ergo_vk_download_at(d__reduce_{kid}, _rtile, "
+                      f"(size_t)(_t * {n_acc * gpt} + {ai * gpt}) * "
+                      f"sizeof({ct}), _ng * sizeof({ct}));")
+            self._put(f"for (int _j = 0; _j < _ng; _j++) "
+                      f"{acc} += {cast}_rtile[_j];")
+            self.indent -= 1
+            self._put("}")
+        self.indent -= 1
+        self._put("}")
+        self._gpu_current |= kernel.arrays_read
+
+    def _flush_pending_reductions(self):
+        """Drain the batched frame ONCE for a run of coalesced reduction
+        kernels, download all their partials in ONE transfer (when the
+        group counts fit the chunk buffers), then emit the per-kernel
+        ordered combines. Called before the next non-dispatch item (the
+        F-era intersection check in _emit_body decides when CPU reads
+        force this) and at the end of a body."""
+        if not self._pending_reductions:
+            return
+        pending = self._pending_reductions
+        self._pending_reductions = []
+
+        if self._batched_frame and not self._frame_ended_early:
+            self._put("/* Coalesced reduction group: single drain */")
+            self._put("ergo_vk_frame_end();")
+            self._put("ergo_vk_frame_wait();")
+            self._frame_ended_early = True
+
+        # Combined download for the whole group when every kernel's
+        # group count is a compile-time constant <= 1024 (the chunk
+        # size); otherwise fall back to per-kernel chunked downloads.
+        ct = self._c_type(IRType.REAL)
+        gs = [self._resolve_const(k.loop_bound) for k in pending]
+        group_counts = [((b + 255) // 256) if b is not None else None
+                        for b in gs]
+        multi = (len(pending) > 1
+                 and all(g is not None and g <= 1024
+                         for g in group_counts)
+                 # Tiled reductions use the [tile][acc][group] partials
+                 # layout — the combined multi-download assumes
+                 # [acc][workgroup], so they take the per-kernel path.
+                 and not any(self._kernel_tiled(k) for k in pending))
+        if multi:
+            self._put("/* Coalesced partials download: one transfer for "
+                      "the whole reduction group */")
+            self._put("{")
+            self.indent += 1
+            for k in pending:
+                self._put(f"{ct} _rc{k.kernel_id}[1024];")
+            bufs = ", ".join(f"d__reduce_{k.kernel_id}" for k in pending)
+            dsts = ", ".join(f"_rc{k.kernel_id}" for k in pending)
+            offs = ", ".join("0" for _ in pending)
+            sizes = ", ".join(
+                f"{g} * sizeof({ct})" for g in group_counts)
+            n = len(pending)
+            self._put(f"{{ ErgoVkBuf _mb[{n}] = {{ {bufs} }};")
+            self._put(f"  void *_md[{n}] = {{ {dsts} }};")
+            self._put(f"  size_t _mo[{n}] = {{ {offs} }};")
+            self._put(f"  size_t _ms[{n}] = {{ {sizes} }};")
+            self._put(f"  ergo_vk_download_multi(_mb, _md, _mo, _ms, {n}); }}")
+            for k in pending:
+                self._emit_reduction_readback(
+                    k, chunk_var=f"_rc{k.kernel_id}", downloaded=True)
+            self.indent -= 1
+            self._put("}")
+        else:
+            for k in pending:
+                self._emit_reduction_readback(k)
+
+        # Re-open the frame for subsequent GPU work.
+        if self._batched_frame and self._frame_ended_early:
+            self._put("ergo_vk_frame_begin();")
+            self._frame_ended_early = False
+            self._frame_gpu_dirty.clear()
 
     def _emit_gpu_download_for_suffix(self, kernel: KernelPlan):
         """Download arrays that the structural CPU suffix needs to read.
@@ -2645,6 +3696,38 @@ class IRCodeGen:
         # Mark these arrays as GPU-current
         self._gpu_current |= suffix_writes
 
+    def _collect_referenced_funcs(self, mod: IRModule) -> set[str]:
+        """Names of functions/subroutines referenced by any CALL or
+        CALL_VOID in the module (main body + every function body)."""
+        refs: set[str] = set()
+
+        def scan(items):
+            for item in items:
+                if isinstance(item, IRBlock):
+                    for inst in item.insts:
+                        if inst.op in (Op.CALL, Op.CALL_VOID):
+                            refs.add(inst.meta.get("func", ""))
+                        elif inst.op == Op.VERIFY and not self.no_verify:
+                            # The oracle evolves its shadow state by calling
+                            # the module's physics subroutine directly
+                            # (hardcoded at _emit_verify) — it must be kept.
+                            refs.add("SIM_PHYSICS_STEP")
+                elif isinstance(item, IRIf):
+                    scan(item.then_body)
+                    if item.else_body:
+                        scan(item.else_body)
+                elif isinstance(item, (IRLoop, IRWhileLoop)):
+                    scan(item.body)
+                elif isinstance(item, IRSelect):
+                    for _v, body in item.cases:
+                        scan(body)
+
+        scan(mod.main_body)
+        for fn in mod.functions:
+            scan(fn.body)
+        refs.discard("")
+        return refs
+
     def _collect_array_writes(self, items: list, writes: set[str]):
         """Walk IR items and collect names of arrays written by STORE or ZERO ops."""
         for item in items:
@@ -2663,6 +3746,58 @@ class IRCodeGen:
             elif isinstance(item, IRWhileLoop):
                 self._collect_array_writes(item.body, writes)
 
+    def _collect_cpu_array_writes(self, items: list, writes: set[str]):
+        """Like _collect_array_writes, but skips sub-loops extracted as
+        GPU kernels — their writes happen on the device, not the CPU.
+        Used for CPU-dirty tracking so a CPU loop wrapping GPU dispatches
+        (e.g. a ping-pong matvec loop) doesn't force stale re-uploads."""
+        for item in items:
+            if isinstance(item, IRLoop):
+                if item.line in self._kernel_by_line:
+                    continue  # GPU kernel — device write, not a CPU write
+                self._collect_cpu_array_writes(item.body, writes)
+            elif isinstance(item, IRBlock):
+                for inst in item.insts:
+                    if inst.op in (Op.STORE, Op.ZERO):
+                        arr = inst.meta.get("array", "")
+                        if arr:
+                            writes.add(arr)
+            elif isinstance(item, IRIf):
+                self._collect_cpu_array_writes(item.then_body, writes)
+                if item.else_body:
+                    self._collect_cpu_array_writes(item.else_body, writes)
+            elif isinstance(item, IRWhileLoop):
+                self._collect_cpu_array_writes(item.body, writes)
+
+    def _collect_cpu_array_reads(self, items: list, reads: set[str]):
+        """Like _collect_array_reads, but skips sub-loops extracted as
+        GPU kernels — their reads happen on the device, not the CPU.
+        Without this, a kernel nested in an IF (e.g. a PROF accumulate)
+        makes the mid-body download logic see phantom CPU reads and
+        download the whole array every iteration — and that download can
+        clobber host init values the device never had."""
+        for item in items:
+            if isinstance(item, IRLoop):
+                if item.line in self._kernel_by_line:
+                    continue  # GPU kernel — device-side read
+                self._collect_cpu_array_reads(item.body, reads)
+            elif isinstance(item, IRBlock):
+                for inst in item.insts:
+                    if inst.op == Op.LOAD:
+                        arr = inst.meta.get("array", "")
+                        if arr:
+                            reads.add(arr)
+                    elif inst.op in (Op.DOT_PRODUCT, Op.NORM2):
+                        for arr in inst.meta.get("arrays", []):
+                            if arr and arr != "?":
+                                reads.add(arr)
+            elif isinstance(item, IRIf):
+                self._collect_cpu_array_reads(item.then_body, reads)
+                if item.else_body:
+                    self._collect_cpu_array_reads(item.else_body, reads)
+            elif isinstance(item, IRWhileLoop):
+                self._collect_cpu_array_reads(item.body, reads)
+
     def _collect_array_reads(self, items: list, reads: set[str]):
         """Walk IR items and collect names of arrays read by LOAD ops."""
         for item in items:
@@ -2672,6 +3807,11 @@ class IRCodeGen:
                         arr = inst.meta.get("array", "")
                         if arr:
                             reads.add(arr)
+                    elif inst.op in (Op.DOT_PRODUCT, Op.NORM2):
+                        # Whole-array reductions read every element.
+                        for arr in inst.meta.get("arrays", []):
+                            if arr and arr != "?":
+                                reads.add(arr)
             elif isinstance(item, IRIf):
                 self._collect_array_reads(item.then_body, reads)
                 if item.else_body:
@@ -2732,6 +3872,9 @@ class IRCodeGen:
 
     def _format_for_operand(self, op: Operand) -> str:
         if isinstance(op, IRConst):
+            # Defensive: REAL-typed string literal (TYPE_MAP transition)
+            if op.type == IRType.STRING or isinstance(op.value, str):
+                return "%s"
             return {
                 IRType.INTEGER: "%d", IRType.REAL: "%f",
                 IRType.LOGICAL: "%d",
@@ -2740,6 +3883,6 @@ class IRCodeGen:
             t = self._var_types.get(op.name, op.type)
             return {
                 IRType.INTEGER: "%d", IRType.REAL: "%f",
-                IRType.LOGICAL: "%d",
+                IRType.LOGICAL: "%d", IRType.STRING: "%s",
             }.get(t, "%f")
         return "%f"

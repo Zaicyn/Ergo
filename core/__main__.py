@@ -49,6 +49,12 @@ def main():
         help="Auto-promote leaked locals to buffer arrays to enable "
              "GPU extraction across flow/structural boundaries",
     )
+    parser.add_argument(
+        "--no-verify", action="store_true",
+        help="Omit the VERIFY oracle entirely (also skips the CPU copy of "
+             "the physics subroutine the oracle calls — required for "
+             "sources whose physics uses GPU-only RING intrinsics)",
+    )
 
     # Simulation sizing
     parser.add_argument(
@@ -85,6 +91,15 @@ def main():
     parser.add_argument(
         "--precision", choices=["f32", "f64"], default="f64",
         help="Floating-point precision for REAL type (default: f64)",
+    )
+    parser.add_argument(
+        "--gpu-tile-size", type=int, default=0, metavar="N",
+        help="Dispatch extracted GPU kernels in tiles of N elements over "
+             "the same buffer, with per-tile push constants "
+             "(_tile_base/_tile_hi). 0/absent = whole-range dispatch "
+             "(unchanged). The tile step is quantized to a workgroup "
+             "multiple so tiled reductions combine bitwise-identically "
+             "to untiled ones. SPIRV target only.",
     )
 
     # Arena (for ALLOCATABLE arrays — bump allocator, see
@@ -149,7 +164,8 @@ def main():
                         print(d)
                     print()
             linearize_nested_loops(mod)
-            plan = extract_kernels(mod, allow_split=not args.no_split)
+            plan = extract_kernels(mod, allow_split=not args.no_split,
+                                   gpu_fast_math=args.gpu_fast_math)
 
             if not plan.kernels and not plan.rejections:
                 print("No loops found.")
@@ -227,7 +243,9 @@ def main():
                               render=args.render,
                               promote_locals=args.promote_locals,
                               param_overrides=param_overrides,
-                              arena_size=arena_size)
+                              arena_size=arena_size,
+                              no_verify=args.no_verify,
+                              gpu_tile_size=args.gpu_tile_size)
         if args.emit_c:
             print(c_code)
         else:

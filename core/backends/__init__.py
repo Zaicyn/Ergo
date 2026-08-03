@@ -37,6 +37,8 @@ class KernelBackend:
         self.module = module
         self.plan = plan
         self.gpu_fast_math = gpu_fast_math
+        self._f32_warned: set = set()  # kernel ids already warned about
+                                       # f32 transcendental evaluation
 
     def generate(self) -> str:
         """Emit device code (IR text) for all extracted kernels."""

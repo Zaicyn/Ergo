@@ -86,6 +86,14 @@ void ergo_vk_download(ErgoVkBuf buf, void *data, size_t size);
 void ergo_vk_download_at(ErgoVkBuf buf, void *data, size_t offset, size_t size);
 
 /*
+ * Download N buffers in one transfer submission: bufs[i] at offsets[i],
+ * sizes[i] bytes each, into dsts[i]. Replaces N submit+wait cycles with 1.
+ */
+void ergo_vk_download_multi(const ErgoVkBuf *bufs, void * const *dsts,
+                            const size_t *offsets, const size_t *sizes,
+                            int n);
+
+/*
  * Upload `size` bytes from host `data` into device buffer `buf` at byte `offset`.
  */
 void ergo_vk_upload_at(ErgoVkBuf buf, const void *data, size_t offset, size_t size);

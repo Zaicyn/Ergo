@@ -1,10 +1,12 @@
 """Ergo compiler driver: source -> tokens -> AST -> IR -> C -> executable."""
 
+import importlib
 import subprocess
 import tempfile
 import os
 import sys
 
+from . import ast_nodes as ast
 from .lexer import Lexer
 from .parser import Parser
 from .checker import Checker
@@ -34,6 +36,45 @@ DETERMINISTIC_FLAGS = [
 ]
 
 
+def _apply_param_overrides(tree: ast.Program, param_overrides: dict) -> None:
+    """Rewrite matching PARAMETER initializers in the AST.
+
+    Runs after parsing, before type checking, so the checker's
+    bounds/shape analysis sees the overridden values. Overrides are
+    integer-valued (CLI -N/-M), so the replacement init is an INTEGER
+    Literal. Only Declaration nodes with parameter=True are touched;
+    the walk covers every place a Declaration can appear (top-level
+    units, function/subroutine declarations and bodies, and nested
+    statement bodies).
+    """
+    def _rewrite(decls) -> None:
+        for decl in decls:
+            if isinstance(decl, ast.Declaration) and decl.parameter:
+                for v in decl.variables:
+                    if v.name in param_overrides:
+                        v.init_value = ast.Literal(
+                            "INTEGER", param_overrides[v.name])
+
+    def _walk(stmts) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, ast.Declaration):
+                _rewrite([stmt])
+            elif isinstance(stmt, (ast.FunctionDef, ast.SubroutineDef)):
+                _rewrite(stmt.declarations)
+                _walk(stmt.body)
+            elif isinstance(stmt, ast.IfStmt):
+                _walk(stmt.then_body)
+                if stmt.else_body:
+                    _walk(stmt.else_body)
+            elif isinstance(stmt, (ast.DoLoop, ast.DoWhileStmt)):
+                _walk(stmt.body)
+            elif isinstance(stmt, ast.SelectCaseStmt):
+                for _, case_body in stmt.cases:
+                    _walk(case_body)
+
+    _walk(tree.units)
+
+
 def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
                    skip_check: bool = False,
                    cpu_fast_math: bool = False,
@@ -43,7 +84,9 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
                    render: bool = False,
                    promote_locals_flag: bool = False,
                    param_overrides: dict = None,
-                   arena_size: int = None) -> str:
+                   arena_size: int = None,
+                   no_verify: bool = False,
+                   gpu_tile_size: int = 0) -> str:
     """Compile MCL source to an executable (or just emit C if requested).
 
     target: if set, extract GPU kernels and emit device code via the
@@ -56,6 +99,13 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
 
     # Parse
     tree = Parser(tokens).parse()
+
+    # Apply -N / -M parameter overrides at the AST level, BEFORE the
+    # type checker runs, so bounds/shape checks validate against the
+    # overridden values (the IR-level override below still applies and
+    # prints the [override] message).
+    if param_overrides:
+        _apply_param_overrides(tree, param_overrides)
 
     # Type check
     if not skip_check:
@@ -85,15 +135,21 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
                 promo_diags = promote_locals(ir_module)
                 for d in promo_diags:
                     print(d, file=sys.stderr)
-            return _compile_target(ir_module, target, output, emit_c,
-                                   cpu_fast_math, gpu_fast_math,
-                                   no_split, render, arena_size)
+            target_result = _compile_target(ir_module, target, output, emit_c,
+                                            cpu_fast_math, gpu_fast_math,
+                                            no_split, render, arena_size,
+                                            no_verify, gpu_tile_size)
+            if target_result is not None:
+                return target_result
+            # None = no extractable kernels; continue down the normal CPU
+            # path below so a binary is still produced.
 
         if render:
             from .ir_inline import inline_subroutines
             for d in inline_subroutines(ir_module):
                 print(d, file=sys.stderr)
-        c_code = IRCodeGen(ir_module, render=render).generate()
+        c_code = IRCodeGen(ir_module, render=render,
+                           no_verify=no_verify).generate()
     else:
         c_code = CodeGen(tree, source_file=source_path).generate()
 
@@ -141,7 +197,9 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
                     cpu_fast_math: bool, gpu_fast_math: bool,
                     no_split: bool = False,
                     render: bool = False,
-                    arena_size: int = None) -> str:
+                    arena_size: int = None,
+                    no_verify: bool = False,
+                    gpu_tile_size: int = 0) -> str:
     """Kernel extraction + vendor backend compilation path."""
     # Load the requested backend (vendor-specific, loaded on demand)
     from .backends import get_backend
@@ -159,8 +217,11 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
     for d in lin_diags:
         print(f"[{target}] {d}", file=sys.stderr)
 
-    # Extract kernels (vendor-neutral analysis)
-    plan = extract_kernels(ir_module, allow_split=not no_split)
+    # Extract kernels (vendor-neutral analysis). SCATTER loops are only
+    # extractable under --gpu-fast-math (spec 8.2/9.9); by default they
+    # fall back to CPU loops for bitwise-sequential semantics.
+    plan = extract_kernels(ir_module, allow_split=not no_split,
+                           gpu_fast_math=gpu_fast_math)
 
     # Fuse adjacent compatible kernels
     fuse_diags = fuse_kernels(plan, ir_module)
@@ -185,7 +246,7 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
     if not plan.kernels:
         print(f"[{target}] No extractable kernels found. "
               f"Falling back to CPU path.", file=sys.stderr)
-        c_code = IRCodeGen(ir_module, render=render).generate()
+        c_code = IRCodeGen(ir_module, render=render, no_verify=no_verify).generate()
         if emit_c:
             return c_code
         # Still need to compile with vk_host if rendering
@@ -222,16 +283,24 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
                 return c_code
             finally:
                 os.unlink(c_path)
-        return c_code
+        # No kernels and no render: signal the caller to continue down the
+        # normal CPU path (codegen + gcc) so a binary is still produced.
+        return None
 
     # Instantiate backend and generate device code
-    backend = backend_cls(ir_module, plan, gpu_fast_math=gpu_fast_math)
+    backend_kwargs = {}
+    if gpu_tile_size:
+        # SPIRV-only feature for now (nvvm raises on construction anyway)
+        backend_kwargs["gpu_tile_size"] = gpu_tile_size
+    backend = backend_cls(ir_module, plan, gpu_fast_math=gpu_fast_math,
+                          **backend_kwargs)
     device_code = backend.generate()
     host_launches = backend.generate_host_launches()
 
     # Generate GPU-aware host code (extracted loops -> dispatches)
     c_code = IRCodeGen(ir_module, gpu_plan=plan, backend=backend,
-                       render=render).generate()
+                       render=render, no_verify=no_verify,
+                       gpu_tile_size=gpu_tile_size).generate()
 
     if emit_c:
         result = []
@@ -295,14 +364,12 @@ def _load_backend(target: str):
     """Import the backend module so it registers itself.
 
     Backends are loaded on demand — no vendor code is imported until
-    the user requests a specific target.
+    the user requests a specific target. Uses a package-relative
+    import so it works whatever the compiler package is named.
     """
-    if target == "nvvm":
-        import mcl.backends.nvvm  # noqa: F401
-    elif target == "spirv":
-        import mcl.backends.spirv  # noqa: F401
-    else:
+    if target not in ("nvvm", "spirv"):
         raise MCLError(f"Unknown target '{target}'. Available: nvvm, spirv")
+    importlib.import_module(f".backends.{target}", package=__package__)
 
 
 def compile_file(path: str, output: str = None, emit_c: bool = False,
@@ -313,7 +380,9 @@ def compile_file(path: str, output: str = None, emit_c: bool = False,
                  render: bool = False,
                  promote_locals: bool = False,
                  param_overrides: dict = None,
-                 arena_size: int = None) -> str:
+                 arena_size: int = None,
+                 no_verify: bool = False,
+                 gpu_tile_size: int = 0) -> str:
     """Compile an MCL source file."""
     with open(path, "r", encoding="utf-8") as f:
         source = f.read()
@@ -330,4 +399,6 @@ def compile_file(path: str, output: str = None, emit_c: bool = False,
                           no_split=no_split, render=render,
                           promote_locals_flag=promote_locals,
                           param_overrides=param_overrides,
-                          arena_size=arena_size)
+                          arena_size=arena_size,
+                          no_verify=no_verify,
+                          gpu_tile_size=gpu_tile_size)

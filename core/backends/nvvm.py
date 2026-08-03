@@ -1,5 +1,18 @@
 """NVIDIA NVVM IR backend for Ergo GPU kernels.
 
+**EXPERIMENTAL — KNOWN BROKEN. Do not use.** The backend raises MCLError
+on instantiation; the code below is kept for reference until the CUDA
+path is revived. Use `--target spirv`.
+
+Known-broken catalog (from the 2026-07 audit): TAN/SINH/COSH/TANH map to
+.approx intrinsics unconditionally; fast-math EXP/LOG swap to ex2/lg2
+WITHOUT the required scale correction (EXP returns 2^x); no atomics or
+serialization for SCATTER kernels (data race); invalid LLVM IR for
+integer arrays (hardcoded double* params), mixed int/real arithmetic
+(no sitofp), binary intrinsics declared unary (pow/maxnum/minnum),
+CYCLE/IF emission (double terminators, no phi nodes); fcmp one vs the
+CPU's unordered-not-equal NaN semantics.
+
 Consumes KernelPlan objects (from ir_gpu.py) and the parent IRModule,
 and emits NVVM IR text (.ll) for each kernel function. Also generates
 the host-side C99 code that loads and launches kernels via the CUDA
@@ -81,6 +94,11 @@ class NVVMBackend(KernelBackend):
     def __init__(self, module: IRModule, plan: GPUPlan,
                  gpu_fast_math: bool = False):
         super().__init__(module, plan, gpu_fast_math)
+        from ..errors import MCLError
+        raise MCLError(
+            "--target nvvm is experimental and currently broken "
+            "(see the docstring banner in core/backends/nvvm.py); "
+            "use --target spirv")
         self._lines: list[str] = []
         self._ssa_counter = 0
 

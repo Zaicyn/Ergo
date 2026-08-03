@@ -16,11 +16,14 @@ Design decisions (locked in):
 
 from __future__ import annotations
 
+import sys
+
 from ..ir import (
     IRModule, IRVar, IRBlock, IRIf, IRLoop, IRSelect,
     IRInst, IRConst, IRRef, IRType, StorageClass, Op, Operand,
 )
 from ..ir_gpu import KernelPlan, GPUPlan, SortByGenPlan
+from ..errors import MCLError
 from . import KernelBackend, register_backend
 
 
@@ -58,6 +61,7 @@ GLSL_EXT = {
     Op.ASIN:  "Asin",
     Op.ACOS:  "Acos",
     Op.ATAN:  "Atan",
+    Op.ATAN2: "Atan2",
     Op.SINH:  "Sinh",
     Op.COSH:  "Cosh",
     Op.TANH:  "Tanh",
@@ -70,10 +74,20 @@ GLSL_EXT = {
     Op.MIN:   "FMin",
 }
 
-# GLSL.std.450 ops that require f32 — must cast f64->f32->f64
+# GLSL.std.450 ops that require f32 — must cast f64->f32->f64.
+# (Sqrt is defined for f64 and emitted natively — verified with
+# spirv-val. Pow is 16/32-bit only and stays on the f32 path.)
 GLSL_F32_ONLY = {
-    Op.SIN, Op.COS, Op.TAN, Op.ASIN, Op.ACOS, Op.ATAN,
-    Op.SINH, Op.COSH, Op.TANH, Op.EXP, Op.LOG, Op.SQRT, Op.POW,
+    Op.SIN, Op.COS, Op.TAN, Op.ASIN, Op.ACOS, Op.ATAN, Op.ATAN2,
+    Op.SINH, Op.COSH, Op.TANH, Op.EXP, Op.LOG, Op.POW,
+}
+
+# Human-readable names for the f32-precision warning.
+_GLSL_F32_ONLY_NAMES = {
+    Op.SIN: "SIN", Op.COS: "COS", Op.TAN: "TAN", Op.ASIN: "ASIN",
+    Op.ACOS: "ACOS", Op.ATAN: "ATAN", Op.ATAN2: "ATAN2", Op.SINH: "SINH",
+    Op.COSH: "COSH", Op.TANH: "TANH", Op.EXP: "EXP", Op.LOG: "LOG",
+    Op.POW: "POW",
 }
 
 
@@ -84,8 +98,16 @@ class SPIRVBackend(KernelBackend):
     device_ext = ".spvasm"
 
     def __init__(self, module: IRModule, plan: GPUPlan,
-                 gpu_fast_math: bool = False):
+                 gpu_fast_math: bool = False,
+                 gpu_tile_size: int = 0):
         super().__init__(module, plan, gpu_fast_math)
+        self.gpu_tile_size = gpu_tile_size
+        # Ping-pong arrays (2x buffers, rd/wr offset push constants).
+        # Single source of truth shared with the host codegen — the two
+        # MUST agree per kernel on which arrays carry offsets and on the
+        # push-constant layout.
+        from ..ir_gpu import compute_pingpong_arrays
+        self._pp_arrays = compute_pingpong_arrays(module, plan)
 
         # Build type lookup from module
         self._var_types: dict[str, IRType] = {}
@@ -140,10 +162,48 @@ class SPIRVBackend(KernelBackend):
         for v in self.module.main_locals:
             if v.shape:
                 array_shapes[v.name] = v.shape
+        # Transcendental precision policy (spec Part 8.5): in f64 mode,
+        # Sqrt/Pow are emitted natively (GLSL.std.450 defines them for
+        # f64), but the remaining transcendentals are f32-only in GLSL and
+        # are evaluated f64→f32→f64. Warn ONCE per kernel per backend
+        # instance (generate() is called twice by the driver).
+        from ..ir import get_real_precision
+        if get_real_precision() == 64:
+            used = self._collect_f32_only_ops(kernel.loop.body)
+            if used and kernel.kernel_id not in self._f32_warned:
+                self._f32_warned.add(kernel.kernel_id)
+                names = ", ".join(sorted(_GLSL_F32_ONLY_NAMES[o] for o in used))
+                print(f"[spirv] WARNING kernel_{kernel.kernel_id} (line "
+                      f"{kernel.source_line}): {names} evaluated at f32 "
+                      f"(GLSL.std.450 has no f64 forms) — expect ~1e-7 "
+                      f"relative deviation vs the CPU path",
+                      file=sys.stderr)
         ctx = _EmitContext(kernel, self._var_types, self.gpu_fast_math,
-                          array_shapes)
+                          array_shapes,
+                          pingpong_arrays=self._pp_arrays,
+                          gpu_tile_size=self.gpu_tile_size)
         ctx.emit_module()
         return "\n".join(ctx.lines) + "\n"
+
+    @staticmethod
+    def _collect_f32_only_ops(items: list) -> set:
+        """Collect GLSL_F32_ONLY ops used anywhere in a kernel body."""
+        found: set = set()
+        for item in items:
+            if isinstance(item, IRBlock):
+                for inst in item.insts:
+                    if inst.op in GLSL_F32_ONLY:
+                        found.add(inst.op)
+            elif isinstance(item, IRIf):
+                found |= SPIRVBackend._collect_f32_only_ops(item.then_body)
+                if item.else_body:
+                    found |= SPIRVBackend._collect_f32_only_ops(item.else_body)
+            elif isinstance(item, (IRLoop, IRWhileLoop)):
+                found |= SPIRVBackend._collect_f32_only_ops(item.body)
+            elif isinstance(item, IRSelect):
+                for _val, body in item.cases:
+                    found |= SPIRVBackend._collect_f32_only_ops(body)
+        return found
 
     # ── sort-by-GEN kernel generators ────────────────────────
     #
@@ -652,20 +712,225 @@ class _EmitContext:
 
     WORKGROUP_SIZE = 256
 
+    @staticmethod
+    def _iter_blocks(items):
+        """Yield every IRBlock in items, descending into IF/loop/select bodies."""
+        for item in items:
+            if isinstance(item, IRBlock):
+                yield item
+            elif isinstance(item, IRIf):
+                yield from _EmitContext._iter_blocks(item.then_body)
+                if item.else_body:
+                    yield from _EmitContext._iter_blocks(item.else_body)
+            elif isinstance(item, (IRLoop, IRWhileLoop)):
+                yield from _EmitContext._iter_blocks(item.body)
+            elif isinstance(item, IRSelect):
+                for _v, body in item.cases:
+                    yield from _EmitContext._iter_blocks(body)
+
+    def _analyze_fetch_adds(self):
+        """Precompute atomic fetch-add fusion pairs (slot-claim pattern).
+
+        The pattern `SLOT := counter + 1; counter := counter + 1` claims a
+        unique slot per thread — but a plain load + a separate atomicAdd
+        leaves every thread reading the same counter value (slots collide,
+        skipped slots stay zero). For each LOAD L(arr, e) that feeds an
+        ADD with a constant int delta c, where a LATER RMW store to arr at
+        the same e is an atomic add of the same delta c: fuse into ONE
+        OpAtomicIAdd emitted at the load (returning the old value), and
+        skip the partner store. Only for non-partial kernels, with
+        gpu_fast_math, where the array is atomic-classified.
+        """
+        if not self.gpu_fast_math or self.kernel.is_partial:
+            return
+
+        # Def map for index folding (result name → defining inst).
+        defs: dict[str, IRInst] = {}
+        for blk in self._iter_blocks(self.kernel.loop.body):
+            for inst in blk.insts:
+                if inst.result:
+                    defs[inst.result] = inst
+
+        def const_val(op, depth=0):
+            """Fold an operand to a constant int through const-only def
+            chains (ADD/SUB/COPY); None if not provably constant."""
+            if depth > 20:
+                return None
+            if isinstance(op, IRConst):
+                return op.value if (op.type == IRType.INTEGER and
+                                    isinstance(op.value, int)) else None
+            if not isinstance(op, IRRef):
+                return None
+            d = defs.get(op.name)
+            if d is None:
+                return None
+            if d.op in (Op.ADD, Op.SUB) and len(d.args) == 2:
+                a = const_val(d.args[0], depth + 1)
+                b = const_val(d.args[1], depth + 1)
+                if a is None or b is None:
+                    return None
+                return a + b if d.op == Op.ADD else a - b
+            if d.op == Op.COPY and d.args:
+                return const_val(d.args[0], depth + 1)
+            return None
+
+        def idx_key(op):
+            v = const_val(op)
+            if v is not None:
+                return ("v", v)
+            if isinstance(op, IRRef):
+                return ("r", op.name)
+            return None
+
+        # Walk items in program order, numbering every instruction.
+        seq: dict[int, int] = {}          # id(inst) → program-order index
+        loads: dict[int, tuple] = {}      # id(load) → (arr, idx_args, delta, seq)
+        add_delta: dict[str, tuple] = {}  # ref-name → (delta, add_result_name)
+        store_values: set[str] = set()    # result names feeding any RMW store
+        n = 0
+
+        def walk(items):
+            nonlocal n
+            for item in items:
+                if isinstance(item, IRBlock):
+                    for inst in item.insts:
+                        seq[id(inst)] = n
+                        n += 1
+                        if inst.op == Op.STORE and inst.args and isinstance(inst.args[0], IRRef):
+                            store_values.add(inst.args[0].name)
+                        elif inst.op == Op.ADD and len(inst.args) == 2:
+                            a1, a2 = inst.args
+                            for ref_arg, const_arg in ((a1, a2), (a2, a1)):
+                                if (isinstance(ref_arg, IRRef) and
+                                        isinstance(const_arg, IRConst) and
+                                        const_arg.type == IRType.INTEGER and
+                                        isinstance(const_arg.value, int)):
+                                    add_delta.setdefault(ref_arg.name,
+                                                         (const_arg.value, inst.result))
+                        elif inst.op == Op.LOAD and inst.result:
+                            arr = inst.meta.get("array", "")
+                            if arr:
+                                loads[id(inst)] = (arr, inst.args, inst.result, seq[id(inst)])
+                elif isinstance(item, IRIf):
+                    walk(item.then_body)
+                    if item.else_body:
+                        walk(item.else_body)
+                elif isinstance(item, (IRLoop, IRWhileLoop)):
+                    walk(item.body)
+                elif isinstance(item, IRSelect):
+                    for _v, body in item.cases:
+                        walk(body)
+
+        walk(self.kernel.loop.body)
+
+        # A claim-candidate load: its result feeds an ADD with a const-int
+        # delta (the slot value), anywhere in the body (statements are one
+        # per block, so load and add are in different IRBlocks).
+        # A claim-candidate load: its result feeds an ADD with a const-int
+        # delta (the slot value), anywhere in the body (statements are one
+        # per block, so load and add are in different IRBlocks). Exclude
+        # ADDs whose result feeds an RMW store — those are the store's own
+        # read (already accounted for by the claim's fusion, not a claim).
+        claims = {}
+        for lid, (arr, largs, result_name, lseq) in loads.items():
+            if result_name in add_delta:
+                delta, add_result = add_delta[result_name]
+                if add_result not in store_values:
+                    claims[lid] = (arr, largs, delta, lseq)
+        if not claims:
+            return
+
+        # Match each candidate load with a LATER RMW store: same array,
+        # same index, atomic-add of the same delta.
+        def walk_stores(items):
+            for item in items:
+                if isinstance(item, IRBlock):
+                    for store in item.insts:
+                        if store.op != Op.STORE:
+                            continue
+                        arr = store.meta.get("array", "")
+                        if arr not in self.kernel.atomic_arrays:
+                            continue
+                        for lid, (larr, largs, delta, lseq) in claims.items():
+                            if larr != arr or seq[id(store)] <= lseq:
+                                continue
+                            if ([idx_key(a) for a in largs] !=
+                                    [idx_key(a) for a in store.args[1:]]):
+                                continue
+                            d = self._rmw_add_delta(store)
+                            if d is not None and d == delta:
+                                self._fetch_add_loads[lid] = (delta, store)
+                                self._fused_stores.add(id(store))
+                elif isinstance(item, IRIf):
+                    walk_stores(item.then_body)
+                    if item.else_body:
+                        walk_stores(item.else_body)
+                elif isinstance(item, (IRLoop, IRWhileLoop)):
+                    walk_stores(item.body)
+                elif isinstance(item, IRSelect):
+                    for _v, body in item.cases:
+                        walk_stores(body)
+
+        walk_stores(self.kernel.loop.body)
+
+    def _rmw_add_delta(self, store_inst: IRInst) -> int | None:
+        """If the store's value is `LOAD(same_arr) + <const int>`, return
+        that constant's value (the atomic-add delta); else None."""
+        val_ref = store_inst.args[0]
+        if not isinstance(val_ref, IRRef):
+            return None
+        def_inst = self._find_def(val_ref.name, self.kernel.loop.body)
+        if def_inst is None or def_inst.op != Op.ADD or len(def_inst.args) != 2:
+            return None
+        arr = store_inst.meta.get("array", "")
+        for x, y in [(def_inst.args[0], def_inst.args[1]),
+                     (def_inst.args[1], def_inst.args[0])]:
+            if (isinstance(x, IRRef) and isinstance(y, IRConst) and
+                    y.type == IRType.INTEGER and isinstance(y.value, int)):
+                ld = self._find_def(x.name, self.kernel.loop.body)
+                if ld and ld.op == Op.LOAD and ld.meta.get("array", "") == arr:
+                    return y.value
+        return None
+
     def __init__(self, kernel: KernelPlan, var_types: dict[str, IRType],
                  gpu_fast_math: bool,
-                 array_shapes: dict[str, tuple] | None = None):
+                 array_shapes: dict[str, tuple] | None = None,
+                 pingpong_arrays: set[str] | None = None,
+                 gpu_tile_size: int = 0):
         self.kernel = kernel
         self.var_types = var_types
-        # gpu_fast_math is plumbed through but no SPIRV emission site
-        # currently reads it. See note in mcl/ir_gpu.py near the
-        # SCATTER definition.
+        # Spec 9.9: atomic ops for SCATTER kernels are only legal under
+        # --gpu-fast-math. Enforced at every atomic emission site via
+        # _require_atomic_gate().
         self.gpu_fast_math = gpu_fast_math
         self.array_shapes = array_shapes or {}
-        # Ping-pong: arrays that are both read and written get offset push constants
-        # Ping-pong disabled until offset injection bug is resolved
-        # (particles don't move with PP enabled — SPIRV OpIAdd on indices not working)
-        self.pingpong_arrays = set()
+        # Ping-pong: arrays that are both read and written get offset push
+        # constants. `pingpong_arrays` is the global set (shared with the
+        # host codegen); `_k_pp` is this kernel's slice of it — offsets
+        # are only injected (and PC members only declared) for arrays this
+        # kernel both reads and writes, matching the host `has_pp`
+        # condition exactly.
+        self.pingpong_arrays = set(pingpong_arrays or ())
+        self._k_pp = ((kernel.arrays_read & kernel.arrays_written)
+                      & self.pingpong_arrays)
+        # Tiling (--gpu-tile-size): dispatch the kernel in contiguous
+        # tiles with per-tile _tile_base/_tile_hi push constants.
+        # Segmented reductions keep the whole-range dispatch (their
+        # group→segment mapping assumes it). QTILE is quantized to a
+        # workgroup multiple so tiled reduction partials partition the
+        # range exactly like the untiled dispatch (bitwise-identical
+        # ordered combine).
+        self.gpu_tile_size = gpu_tile_size
+        self._tiled = gpu_tile_size > 0 and not kernel.reduction_array
+        self._qtile = max(self.WORKGROUP_SIZE,
+                          (gpu_tile_size // self.WORKGROUP_SIZE)
+                          * self.WORKGROUP_SIZE)
+
+        # Atomic fetch-add fusion (slot-claim pattern): id(load_inst) →
+        # (delta:int, store_inst), and id(store_inst) to skip because its
+        # increment was already emitted at the partner load.
+        self._fetch_add_loads: dict[int, tuple] = {}
+        self._fused_stores: set[int] = set()
 
         self.lines: list[str] = []
 
@@ -680,6 +945,8 @@ class _EmitContext:
         self._needs_subgroup = False
         # Track whether kernel uses warp ballot (nullable pattern compaction)
         self._needs_ballot = False
+        # Track whether the kernel uses 64-bit integer ops (HASH/RAND)
+        self._needs_int64 = False
 
         # Section buffers — filled during emit, flushed in order
         self._header: list[str] = []
@@ -722,6 +989,17 @@ class _EmitContext:
 
         # SubgroupInvocationID variable (for ring shuffle)
         self.id_gl_subgroup_inv: int = 0
+
+        # REDUCTION kernel state: output buffer variable, workgroup
+        # builtins, and the shared-memory partials array
+        self._reduce_var_id: int = 0
+        self.id_gl_local_inv: int = 0
+        self.id_gl_workgroup: int = 0
+        self.id_wg_partials: int = 0
+        self.id_ptr_wg_real: int = 0
+        # Segmented reduction: SPIR-V ID of the value captured from the
+        # suppressed STORE to the accumulator array
+        self._seg_val: int | None = None
 
         # Track array element types for LOAD/STORE
         self._array_elem_types: dict[str, IRType] = {}
@@ -788,6 +1066,27 @@ class _EmitContext:
         self._const_ids[key] = cid
         return cid
 
+    def _u64_type(self) -> int:
+        """Get (allocating once) the u64 type ID — for HASH/RAND lowering."""
+        if not hasattr(self, 'id_u64') or self.id_u64 == 0:
+            self.id_u64 = self._alloc("u64")
+            self._types.append(
+                f"     {self._id(self.id_u64)} = OpTypeInt 64 0")
+        return self.id_u64
+
+    def _get_u64_const(self, hex_value: str) -> int:
+        """Get or create a u64 constant (hex literal, e.g. '0x9E37...')."""
+        key = ("u64", hex_value)
+        if key in self._const_ids:
+            return self._const_ids[key]
+        u64 = self._u64_type()
+        cid = self._alloc()
+        self._types.append(
+            f"         {self._id(cid)} = OpConstant {self._id(u64)} {hex_value}")
+        self._set_ssa_type(cid, u64)
+        self._const_ids[key] = cid
+        return cid
+
     def _get_i32_const(self, value: int) -> int:
         """Get or create an i32 constant."""
         key = ("i32", value)
@@ -819,6 +1118,9 @@ class _EmitContext:
         # Scan body to determine if we need GLSL extended instructions
         self._scan_for_glsl_ext(k.loop.body)
 
+        # Precompute atomic fetch-add fusion pairs (slot-claim pattern)
+        self._analyze_fetch_adds()
+
         # --- Phase 1: Allocate type IDs and declare types ---
         self._declare_types()
 
@@ -830,6 +1132,8 @@ class _EmitContext:
         self._declare_builtin()
         if self._needs_subgroup:
             self._declare_subgroup_builtin()
+        if self._is_reduction():
+            self._declare_reduction_support()
 
         # --- Phase 4: Build header (must know all interface variables) ---
         self._build_header(buf_vars, pc_member_ids)
@@ -859,6 +1163,8 @@ class _EmitContext:
                         self._needs_glsl_ext = True
                     if inst.op == Op.LOG10:
                         self._needs_glsl_ext = True
+                    if inst.op in (Op.HASH, Op.RAND):
+                        self._needs_int64 = True
                     if inst.op in (Op.RING_PREV, Op.RING_NEXT, Op.RING_SHIFT, Op.RING_BROADCAST):
                         self._needs_subgroup = True
                     if inst.op in (Op.WARP_BALLOT, Op.WARP_BALLOT_COUNT,
@@ -1015,6 +1321,30 @@ class _EmitContext:
             self._array_elem_types[arr] = arr_type
             binding += 1
 
+        # REDUCTION kernels get one extra output buffer (bound last, after
+        # all array buffers — the host binds it in the same order): one
+        # REAL partial per workgroup. The host performs the final ordered
+        # sum across groups, so no atomics are needed.
+        if self._is_reduction():
+            struct_id = self._alloc("struct__reduce")
+            self._types.append(
+                f"     {self._id(struct_id)} = OpTypeStruct {self._id(self.id_rta_real)}")
+            self._decorations.append(
+                f"               OpDecorate {self._id(struct_id)} Block")
+            self._decorations.append(
+                f"               OpMemberDecorate {self._id(struct_id)} 0 Offset 0")
+            ptr_struct_id = self._alloc("ptr_sb__reduce")
+            self._types.append(
+                f"     {self._id(ptr_struct_id)} = OpTypePointer StorageBuffer {self._id(struct_id)}")
+            var_id = self._alloc("var__reduce")
+            self._globals.append(
+                f"     {self._id(var_id)} = OpVariable {self._id(ptr_struct_id)} StorageBuffer")
+            self._decorations.append(
+                f"               OpDecorate {self._id(var_id)} DescriptorSet 0")
+            self._decorations.append(
+                f"               OpDecorate {self._id(var_id)} Binding {binding}")
+            self._reduce_var_id = var_id
+
         return buf_vars
 
     def _declare_push_constants(self) -> dict[str, tuple[int, int]]:
@@ -1023,13 +1353,37 @@ class _EmitContext:
         Returns dict: scalar_name -> (member_index, type_id).
         """
         k = self.kernel
-        if not k.scalars_read:
+        # Include the loop-bound variable when it's a runtime ref —
+        # extraction's scalars_read doesn't cover bounds, and without a
+        # push-constant slot a runtime bound is unresolvable (it used to
+        # silently become 0: an empty kernel).
+        scalars_set = set(k.scalars_read)
+        bound = getattr(k, "loop_bound", None)
+        bound_name = bound_type = None
+        if isinstance(bound, IRRef):
+            scalars_set.add(bound.name)
+            # Hoisted bounds temps (e.g. N-1) are not in var_types and
+            # would default to REAL — but the host types them from the IR
+            # (int _t_3), so the push-constant layout must use the IR
+            # operand's type or host (int, 4B) and device (f64, 8B)
+            # disagree.
+            bound_name, bound_type = bound.name, bound.type
+        # Ping-pong offsets and tile bounds are push constants too —
+        # don't bail out on scalar-free kernels (the old early return
+        # here silently dropped the pp members: the host pushed them and
+        # swapped buffers, the device never injected offsets).
+        needs_pp = bool(self._k_pp)
+        if not scalars_set and not needs_pp and not self._tiled:
             return {}
         # Sort by type: doubles first, then ints. This avoids mixed-type
         # padding mismatches between C struct layout and SPIRV offsets.
-        scalars = sorted(k.scalars_read,
-                         key=lambda s: (0 if self.var_types.get(s, IRType.REAL) == IRType.REAL else 1, s))
-        if not scalars:
+        def _pc_type(s):
+            if s == bound_name and bound_type is not None:
+                return bound_type
+            return self.var_types.get(s, IRType.REAL)
+        scalars = sorted(scalars_set,
+                         key=lambda s: (0 if _pc_type(s) == IRType.REAL else 1, s))
+        if not scalars and not needs_pp and not self._tiled:
             return {}
 
         # Build struct members
@@ -1042,7 +1396,7 @@ class _EmitContext:
         self.id_pc_struct = self._alloc("pc_struct")
 
         for i, s in enumerate(scalars):
-            t = self.var_types.get(s, IRType.REAL)
+            t = _pc_type(s)
             if t == IRType.REAL:
                 type_id = self.id_real
                 size = self.real_size
@@ -1060,12 +1414,29 @@ class _EmitContext:
                 offset += (self.real_size - offset % self.real_size)
 
         # Ping-pong offsets: add _pp_rd_offset and _pp_wr_offset as i32 push constants
-        if self.pingpong_arrays:
+        if self._k_pp:
             for pp_name in ("_pp_rd_offset", "_pp_wr_offset"):
                 idx = len(member_types)
                 member_types.append(self.id_i32)
                 member_info[pp_name] = (idx, self.id_i32)
                 # Align to 4 bytes (i32)
+                if offset % 4 != 0:
+                    offset += (4 - offset % 4)
+                self._decorations.append(
+                    f"               OpMemberDecorate {self._id(self.id_pc_struct)} {idx} Offset {offset}")
+                offset += 4
+
+        # Tile bounds (--gpu-tile-size): _tile_base/_tile_hi i32, plus
+        # _tile_idx for reduction kernels (partial-slot tile index).
+        # Appended AFTER all other members, matching the host packing.
+        if self._tiled:
+            tile_names = ["_tile_base", "_tile_hi"]
+            if self._is_reduction():
+                tile_names.append("_tile_idx")
+            for t_name in tile_names:
+                idx = len(member_types)
+                member_types.append(self.id_i32)
+                member_info[t_name] = (idx, self.id_i32)
                 if offset % 4 != 0:
                     offset += (4 - offset % 4)
                 self._decorations.append(
@@ -1115,12 +1486,12 @@ class _EmitContext:
             f"BuiltIn GlobalInvocationId")
 
     def _declare_subgroup_builtin(self):
-        """Declare gl_SubgroupInvocationID input variable for ring shuffle."""
+        """Declare gl_SubgroupInvocationID and gl_SubgroupSize inputs."""
         # Pointer type: Input pointer to u32
         self.id_ptr_input_u32 = self._alloc("ptr_input_u32")
         self._types.append(
             f"     {self._id(self.id_ptr_input_u32)} = OpTypePointer Input {self._id(self.id_u32)}")
-        # Variable
+        # Variables
         self.id_gl_subgroup_inv = self._alloc("gl_SubgroupInvocationID")
         self._globals.append(
             f"     {self._id(self.id_gl_subgroup_inv)} = OpVariable "
@@ -1128,6 +1499,76 @@ class _EmitContext:
         self._decorations.append(
             f"               OpDecorate {self._id(self.id_gl_subgroup_inv)} "
             f"BuiltIn SubgroupLocalInvocationId")
+        # gl_SubgroupSize: actual subgroup width (32 NVIDIA, 64 AMD, ...)
+        # — RING_* lane wrapping must use this, not a hardcoded 32 (B14).
+        self.id_gl_subgroup_size = self._alloc("gl_SubgroupSize")
+        self._globals.append(
+            f"     {self._id(self.id_gl_subgroup_size)} = OpVariable "
+            f"{self._id(self.id_ptr_input_u32)} Input")
+        self._decorations.append(
+            f"               OpDecorate {self._id(self.id_gl_subgroup_size)} "
+            f"BuiltIn SubgroupSize")
+
+    def _declare_reduction_support(self):
+        """Declare workgroup builtins and shared memory for REDUCTION kernels.
+
+        LocalInvocationId / WorkgroupId inputs, plus a Workgroup-storage
+        array of WORKGROUP_SIZE REALs holding per-thread partials for the
+        tree combine.
+        """
+        self.id_gl_local_inv = self._alloc("gl_LocalInvocationID")
+        self._globals.append(
+            f"     {self._id(self.id_gl_local_inv)} = OpVariable "
+            f"{self._id(self.id_ptr_input_v3uint)} Input")
+        self._decorations.append(
+            f"               OpDecorate {self._id(self.id_gl_local_inv)} "
+            f"BuiltIn LocalInvocationId")
+        self.id_gl_workgroup = self._alloc("gl_WorkgroupID")
+        self._globals.append(
+            f"     {self._id(self.id_gl_workgroup)} = OpVariable "
+            f"{self._id(self.id_ptr_input_v3uint)} Input")
+        self._decorations.append(
+            f"               OpDecorate {self._id(self.id_gl_workgroup)} "
+            f"BuiltIn WorkgroupId")
+        # Shared-memory partials: real _wg_partial[WORKGROUP_SIZE]
+        c_wg = self._get_u32_const(self.WORKGROUP_SIZE)
+        id_arr = self._alloc("arr_wg_real")
+        self._types.append(
+            f"     {self._id(id_arr)} = OpTypeArray {self._id(self.id_real)} "
+            f"{self._id(c_wg)}")
+        id_ptr_arr = self._alloc("ptr_wg_arr")
+        self._types.append(
+            f"     {self._id(id_ptr_arr)} = OpTypePointer Workgroup "
+            f"{self._id(id_arr)}")
+        self.id_wg_partials = self._alloc("wg_partials")
+        self._globals.append(
+            f"     {self._id(self.id_wg_partials)} = OpVariable "
+            f"{self._id(id_ptr_arr)} Workgroup")
+        self.id_ptr_wg_real = self._alloc("ptr_wg_real")
+        self._types.append(
+            f"     {self._id(self.id_ptr_wg_real)} = OpTypePointer Workgroup "
+            f"{self._id(self.id_real)}")
+
+    def _load_subgroup_mask(self) -> int:
+        """Emit OpLoad of gl_SubgroupSize minus one → lane-wrap mask.
+
+        Vulkan guarantees subgroup sizes are powers of two, so
+        (lane + k) & (size - 1) wraps correctly for any subgroup width.
+        Emitted inline at each use site (same pattern as the lane load)
+        so dominance holds regardless of surrounding control flow.
+        """
+        size = self._alloc()
+        self._function.append(
+            f"         {self._id(size)} = OpLoad {self._id(self.id_u32)} "
+            f"{self._id(self.id_gl_subgroup_size)}")
+        self._set_ssa_type(size, self.id_u32)
+        const_1 = self._get_u32_const(1)
+        mask = self._alloc()
+        self._function.append(
+            f"         {self._id(mask)} = OpISub {self._id(self.id_u32)} "
+            f"{self._id(size)} {self._id(const_1)}")
+        self._set_ssa_type(mask, self.id_u32)
+        return mask
 
     def _peek_id(self, name: str) -> int:
         """Get an ID that will be allocated later, pre-allocating it now."""
@@ -1137,6 +1578,33 @@ class _EmitContext:
 
     def _has_name(self, name: str) -> bool:
         return name in self._named_ids
+
+    def _is_reduction(self) -> bool:
+        """True for scalar and segmented REDUCTION kernels."""
+        return bool(self.kernel.reduction_var or self.kernel.reduction_array
+                    or self.kernel.reduction_vars)
+
+    def _red_accs(self) -> list:
+        """Accumulator names for a (multi-)scalar reduction kernel."""
+        if self.kernel.reduction_vars:
+            return self.kernel.reduction_vars
+        if self.kernel.reduction_var:
+            return [self.kernel.reduction_var]
+        return []
+
+    def _require_atomic_gate(self):
+        """Spec 9.9: atomics for SCATTER kernels require --gpu-fast-math.
+
+        Extraction (ir_gpu.py) rejects SCATTER kernels to CPU without the
+        flag, so a kernel with atomic_arrays reaching the SPIRV backend
+        without it means the extraction gate was bypassed — fail fast.
+        (Compiler-generated sort-by-GEN kernels do not go through
+        _EmitContext and are unaffected by this gate.)
+        """
+        if not self.gpu_fast_math:
+            raise MCLError(
+                "SCATTER kernel reached the SPIRV backend without "
+                "--gpu-fast-math (extraction gate should have rejected it)")
 
     # ── header ─────────────────────────────────────────────
 
@@ -1155,9 +1623,14 @@ class _EmitContext:
         if self.real_size == 8:
             self._header.append(f"               OpCapability Float64")
             self._header.append(f"               OpCapability Int64")
+        elif self._needs_int64:
+            # HASH/RAND lower to 64-bit integer ops — Int64 is independent
+            # of the float precision mode.
+            self._header.append(f"               OpCapability Int64")
 
-        # Atomic capabilities for scatter kernels
+        # Atomic capabilities for scatter kernels (gated: spec 9.9)
         if k.atomic_arrays:
+            self._require_atomic_gate()
             for arr in k.atomic_arrays:
                 arr_type = self.var_types.get(arr, IRType.REAL)
                 if arr_type == IRType.REAL:
@@ -1193,6 +1666,10 @@ class _EmitContext:
         interface_ids = [self._id(self.id_gl_global_inv)]
         if self._needs_subgroup:
             interface_ids.append(self._id(self.id_gl_subgroup_inv))
+            interface_ids.append(self._id(self.id_gl_subgroup_size))
+        if self._is_reduction():
+            interface_ids.append(self._id(self.id_gl_local_inv))
+            interface_ids.append(self._id(self.id_gl_workgroup))
 
         main_id = self._peek_id("main")
         iface_str = " ".join(interface_ids)
@@ -1239,12 +1716,88 @@ class _EmitContext:
             f"         {self._id(i_val)} = OpIAdd {self._id(self.id_i32)} {self._id(gid_i32)} {self._id(const_1)}")
         self._set_ssa_type(i_val, self.id_i32)
 
-        # Bounds check: i <= N
-        bound_id = self._load_bound(k.loop_bound, pc_member_ids)
+        if self._tiled:
+            # Tiled dispatch: i = gid + 1 + _tile_base; i <= _tile_hi.
+            # _tile_hi is min(tile_base + QTILE, bound), computed on the
+            # host per tile.
+            tile_base = self._load_pc_member("_tile_base", pc_member_ids)
+            i_shifted = self._alloc("i_tiled")
+            self._function.append(
+                f"         {self._id(i_shifted)} = OpIAdd {self._id(self.id_i32)} "
+                f"{self._id(i_val)} {self._id(tile_base)}")
+            self._set_ssa_type(i_shifted, self.id_i32)
+            i_val = i_shifted
+            bound_id = self._load_pc_member("_tile_hi", pc_member_ids)
+        else:
+            # Bounds check: i <= N
+            bound_id = self._load_bound(k.loop_bound, pc_member_ids)
 
         in_bounds = self._alloc()
         self._function.append(
             f"         {self._id(in_bounds)} = OpSLessThanEqual {self._id(self.id_bool)} {self._id(i_val)} {self._id(bound_id)}")
+
+        if self._is_reduction():
+            # REDUCTION: no early exit — every thread in the workgroup
+            # must reach the combine barriers. Out-of-bounds threads run
+            # the body with a clamped index; their value is selected
+            # away after the body.
+            i_sel = self._alloc("i_sel")
+            self._function.append(
+                f"         {self._id(i_sel)} = OpSelect {self._id(self.id_i32)} "
+                f"{self._id(in_bounds)} {self._id(i_val)} {self._id(bound_id)}")
+            self._set_ssa_type(i_sel, self.id_i32)
+
+            idx_0 = self._alloc("idx_0")
+            self._function.append(
+                f"         {self._id(idx_0)} = OpISub {self._id(self.id_i32)} "
+                f"{self._id(i_sel)} {self._id(const_1)}")
+            self._set_ssa_type(idx_0, self.id_i32)
+
+            ssa_map: dict[str, int] = {}
+            ssa_map[k.loop_var] = i_sel
+            zero = self._get_const(IRType.REAL, 0.0)
+            # Seed every accumulator with its additive identity: the
+            # body's accumulate ADDs (0 + expr) yield this thread's
+            # element values. INTEGER accumulators seed with int 0
+            # (converted to REAL for the device combine — f64 integer
+            # sums are exact below 2^53).
+            for acc in self._red_accs():
+                if self.var_types.get(acc) == IRType.INTEGER:
+                    ssa_map[acc] = self._get_const(IRType.INTEGER, 0)
+                else:
+                    ssa_map[acc] = zero
+
+            self._emit_body(k.loop.body, buf_vars, pc_member_ids,
+                            ssa_map, idx_0)
+
+            if k.reduction_array:
+                # Segmented: the LOAD of the accumulator array was
+                # intercepted as identity and the STORE captured the
+                # per-thread value (see _emit_inst).
+                if self._seg_val is None:
+                    raise MCLError(
+                        f"SPIRV: segmented reduction kernel for "
+                        f"'{k.reduction_array}' produced no accumulator "
+                        f"store (extraction should have caught this)")
+                body_val = self._ensure_f64(self._seg_val)
+                vals = [body_val]
+            else:
+                vals = [self._ensure_f64(ssa_map[acc])
+                        for acc in self._red_accs()]
+            sel_vals = []
+            for i, body_val in enumerate(vals):
+                v = self._alloc("reduce_val")
+                self._function.append(
+                    f"         {self._id(v)} = OpSelect {self._id(self.id_real)} "
+                    f"{self._id(in_bounds)} {self._id(body_val)} {self._id(zero)}")
+                self._set_ssa_type(v, self.id_real)
+                sel_vals.append(v)
+
+            self._emit_reduction_combine(sel_vals, bound_id, pc_member_ids)
+
+            self._function.append(f"               OpReturn")
+            self._function.append(f"               OpFunctionEnd")
+            return
 
         body_label = self._alloc("body")
         exit_label = self._alloc("exit")
@@ -1282,23 +1835,230 @@ class _EmitContext:
         self._function.append(f"               OpReturn")
         self._function.append(f"               OpFunctionEnd")
 
+    def _emit_wg_barrier(self):
+        """Workgroup barrier: AcquireRelease | WorkgroupMemory semantics
+        (same scope/semantics constants as the sort-scan kernel)."""
+        scope = self._get_u32_const(2)    # Scope: Workgroup
+        sem = self._get_u32_const(264)    # AcquireRelease(8) | WorkgroupMemory(256)
+        self._function.append(
+            f"               OpControlBarrier {self._id(scope)} "
+            f"{self._id(scope)} {self._id(sem)}")
+
+    def _emit_reduction_combine(self, val_ids: list, bound_id: int,
+                                pc_member_ids: dict | None = None):
+        """Workgroup tree combine of per-thread values in shared memory.
+
+        For each value: partial[lid] = val; for stride = wg/2 .. 1:
+        partial[lid] += partial[lid + stride]; lane 0 writes the group
+        total to _reduce[acc_i * n_groups + WorkgroupId.x] (partials
+        buffer layout [acc][workgroup]; with one accumulator the slot is
+        just WorkgroupId.x — the historical single-accumulator layout).
+        The host performs the final ordered sum across workgroups per
+        accumulator — no atomics, deterministic for a fixed dispatch
+        shape. The shared array is reused per accumulator with a barrier
+        between passes.
+        """
+        # lid = LocalInvocationId.x (u32)
+        lid_vec = self._alloc()
+        self._function.append(
+            f"         {self._id(lid_vec)} = OpLoad {self._id(self.id_v3uint)} "
+            f"{self._id(self.id_gl_local_inv)}")
+        lid = self._alloc("lid")
+        self._function.append(
+            f"         {self._id(lid)} = OpCompositeExtract {self._id(self.id_u32)} "
+            f"{self._id(lid_vec)} 0")
+        self._set_ssa_type(lid, self.id_u32)
+
+        # n_groups = (bound + 255) / 256 — only needed for >1 accumulator
+        # (untiled). Under tiling the slot layout is [tile][acc][group]
+        # with compile-time strides, so no runtime group count is needed.
+        n_groups = None
+        if len(val_ids) > 1 and not self._tiled:
+            c255 = self._get_i32_const(255)
+            c256 = self._get_i32_const(self.WORKGROUP_SIZE)
+            ng0 = self._alloc()
+            self._function.append(
+                f"         {self._id(ng0)} = OpIAdd {self._id(self.id_i32)} "
+                f"{self._id(bound_id)} {self._id(c255)}")
+            n_groups = self._alloc()
+            self._function.append(
+                f"         {self._id(n_groups)} = OpSDiv {self._id(self.id_i32)} "
+                f"{self._id(ng0)} {self._id(c256)}")
+            self._set_ssa_type(n_groups, self.id_i32)
+
+        # wg = WorkgroupId.x (loaded once)
+        wg_vec = self._alloc()
+        self._function.append(
+            f"         {self._id(wg_vec)} = OpLoad {self._id(self.id_v3uint)} "
+            f"{self._id(self.id_gl_workgroup)}")
+        wgid = self._alloc()
+        self._function.append(
+            f"         {self._id(wgid)} = OpCompositeExtract {self._id(self.id_u32)} "
+            f"{self._id(wg_vec)} 0")
+
+        c0 = self._get_u32_const(0)
+        for acc_i, val_id in enumerate(val_ids):
+            # partial[lid] = val
+            p = self._alloc()
+            self._function.append(
+                f"         {self._id(p)} = OpAccessChain {self._id(self.id_ptr_wg_real)} "
+                f"{self._id(self.id_wg_partials)} {self._id(lid)}")
+            self._function.append(
+                f"               OpStore {self._id(p)} {self._id(val_id)}")
+            self._emit_wg_barrier()
+
+            stride = self.WORKGROUP_SIZE // 2
+            while stride >= 1:
+                c_stride = self._get_u32_const(stride)
+                cond = self._alloc()
+                self._function.append(
+                    f"         {self._id(cond)} = OpULessThan {self._id(self.id_bool)} "
+                    f"{self._id(lid)} {self._id(c_stride)}")
+                do_lbl = self._alloc("red_do")
+                merge_lbl = self._alloc("red_merge")
+                self._function.append(
+                    f"               OpSelectionMerge {self._id(merge_lbl)} None")
+                self._function.append(
+                    f"               OpBranchConditional {self._id(cond)} "
+                    f"{self._id(do_lbl)} {self._id(merge_lbl)}")
+                self._function.append(f"     {self._id(do_lbl)} = OpLabel")
+                p0 = self._alloc()
+                self._function.append(
+                    f"         {self._id(p0)} = OpAccessChain {self._id(self.id_ptr_wg_real)} "
+                    f"{self._id(self.id_wg_partials)} {self._id(lid)}")
+                v0 = self._alloc()
+                self._function.append(
+                    f"         {self._id(v0)} = OpLoad {self._id(self.id_real)} {self._id(p0)}")
+                offs = self._alloc()
+                self._function.append(
+                    f"         {self._id(offs)} = OpIAdd {self._id(self.id_u32)} "
+                    f"{self._id(lid)} {self._id(c_stride)}")
+                p1 = self._alloc()
+                self._function.append(
+                    f"         {self._id(p1)} = OpAccessChain {self._id(self.id_ptr_wg_real)} "
+                    f"{self._id(self.id_wg_partials)} {self._id(offs)}")
+                v1 = self._alloc()
+                self._function.append(
+                    f"         {self._id(v1)} = OpLoad {self._id(self.id_real)} {self._id(p1)}")
+                s = self._alloc()
+                self._function.append(
+                    f"         {self._id(s)} = OpFAdd {self._id(self.id_real)} "
+                    f"{self._id(v0)} {self._id(v1)}")
+                self._function.append(
+                    f"               OpStore {self._id(p0)} {self._id(s)}")
+                self._function.append(f"               OpBranch {self._id(merge_lbl)}")
+                self._function.append(f"     {self._id(merge_lbl)} = OpLabel")
+                self._current_block = merge_lbl
+                self._emit_wg_barrier()
+                stride //= 2
+
+            # Lane 0 writes the group total to _reduce[acc_i*n_groups + wgid]
+            is0 = self._alloc()
+            self._function.append(
+                f"         {self._id(is0)} = OpIEqual {self._id(self.id_bool)} "
+                f"{self._id(lid)} {self._id(c0)}")
+            do_lbl = self._alloc("red_write")
+            merge_lbl = self._alloc("red_done")
+            self._function.append(
+                f"               OpSelectionMerge {self._id(merge_lbl)} None")
+            self._function.append(
+                f"               OpBranchConditional {self._id(is0)} "
+                f"{self._id(do_lbl)} {self._id(merge_lbl)}")
+            self._function.append(f"     {self._id(do_lbl)} = OpLabel")
+            p0 = self._alloc()
+            self._function.append(
+                f"         {self._id(p0)} = OpAccessChain {self._id(self.id_ptr_wg_real)} "
+                f"{self._id(self.id_wg_partials)} {self._id(c0)}")
+            v0 = self._alloc()
+            self._function.append(
+                f"         {self._id(v0)} = OpLoad {self._id(self.id_real)} {self._id(p0)}")
+            if self._tiled:
+                # Tiled partials layout: [tile][acc][group], strides are
+                # compile-time (GPT groups per full tile, N_ACC
+                # accumulators), so the device only needs the per-tile
+                # push constant _tile_idx. QTILE is a workgroup multiple,
+                # so tile t group g covers exactly the elements of
+                # untiled group t*GPT+g — the host's ordered combine is
+                # bitwise identical to the untiled one.
+                gpt = self._qtile // self.WORKGROUP_SIZE
+                slot = wgid
+                if acc_i > 0:
+                    ca = self._get_i32_const(acc_i * gpt)
+                    s1 = self._alloc()
+                    self._function.append(
+                        f"         {self._id(s1)} = OpIAdd {self._id(self.id_i32)} "
+                        f"{self._id(ca)} {self._id(wgid)}")
+                    self._set_ssa_type(s1, self.id_i32)
+                    slot = s1
+                tile_idx = self._load_pc_member("_tile_idx", pc_member_ids)
+                ct = self._get_i32_const(len(val_ids) * gpt)
+                t_off = self._alloc()
+                self._function.append(
+                    f"         {self._id(t_off)} = OpIMul {self._id(self.id_i32)} "
+                    f"{self._id(tile_idx)} {self._id(ct)}")
+                s2 = self._alloc()
+                self._function.append(
+                    f"         {self._id(s2)} = OpIAdd {self._id(self.id_i32)} "
+                    f"{self._id(t_off)} {self._id(slot)}")
+                self._set_ssa_type(s2, self.id_i32)
+                slot = s2
+            else:
+                slot = wgid
+                if acc_i > 0:
+                    ci = self._get_i32_const(acc_i)
+                    off = self._alloc()
+                    self._function.append(
+                        f"         {self._id(off)} = OpIMul {self._id(self.id_i32)} "
+                        f"{self._id(ci)} {self._id(n_groups)}")
+                    slot = self._alloc()
+                    self._function.append(
+                        f"         {self._id(slot)} = OpIAdd {self._id(self.id_i32)} "
+                        f"{self._id(off)} {self._id(wgid)}")
+                    self._set_ssa_type(slot, self.id_i32)
+            rp = self._alloc()
+            self._function.append(
+                f"         {self._id(rp)} = OpAccessChain {self._id(self.id_ptr_sb_real)} "
+                f"{self._id(self._reduce_var_id)} {self._id(c0)} {self._id(slot)}")
+            self._function.append(
+                f"               OpStore {self._id(rp)} {self._id(v0)}")
+            self._function.append(f"               OpBranch {self._id(merge_lbl)}")
+            self._function.append(f"     {self._id(merge_lbl)} = OpLabel")
+            self._current_block = merge_lbl
+            # Barrier before the shared array is reused by the next pass.
+            if acc_i + 1 < len(val_ids):
+                self._emit_wg_barrier()
+
     def _load_bound(self, bound: Operand,
                     pc_member_ids: dict[str, tuple[int, int]]) -> int:
         """Load the loop bound value, from push constants or as a constant."""
         if isinstance(bound, IRConst):
-            if self.var_types.get(str(bound.value)) == IRType.REAL:
-                return self._get_const(IRType.INTEGER, int(bound.value))
             return self._get_const(IRType.INTEGER, int(bound.value))
 
         if isinstance(bound, IRRef):
             if bound.name in pc_member_ids:
                 # Load from push constant
                 member_idx, type_id = pc_member_ids[bound.name]
-                return self._load_push_constant(member_idx, type_id, bound.name)
-            # It's a known constant — look up its value
-            return self._get_const(IRType.INTEGER, 0)
+                val = self._load_push_constant(member_idx, type_id, bound.name)
+                # Hoisted bounds temps (e.g. N-1) have no var_types entry
+                # and default to REAL in the push-constant layout — the
+                # i <= N comparison needs i32 (SLessThanEqual on mixed
+                # i32/f64 is invalid SPIR-V; the driver rejects it).
+                if self._is_real_id(val):
+                    conv = self._alloc()
+                    self._function.append(
+                        f"         {self._id(conv)} = OpConvertFToS "
+                        f"{self._id(self.id_i32)} {self._id(val)}")
+                    self._set_ssa_type(conv, self.id_i32)
+                    return conv
+                return val
+            # An unresolvable bound must not silently become 0 — that
+            # disables every thread (bounds check i <= 0) and produces a
+            # silently empty kernel.
+            raise MCLError(
+                f"SPIRV: cannot resolve loop bound '{bound.name}' to a "
+                f"push constant or compile-time constant")
 
-        return self._get_const(IRType.INTEGER, 0)
+        raise MCLError(f"SPIRV: unsupported loop bound operand {bound!r}")
 
     def _load_pc_member(self, name: str, pc_member_ids: dict) -> int:
         """Load a push constant member by name. Returns the SPIR-V value ID."""
@@ -1369,6 +2129,55 @@ class _EmitContext:
 
         return False
 
+    def _splitmix64(self, a: int) -> int:
+        """Emit the splitmix64 finalize on an i32 operand ID (widened to
+        u64). Returns the u64 result ID.
+
+        Constants: Weyl increment = golden-ratio 2^64/phi; both
+        multipliers are Stafford's odd 64-bit constants chosen for
+        maximal avalanche. The full 64-bit output passes PractRand and
+        BigCrush; HASH/RAND use only high bits, whose quality dominates.
+        """
+        u64 = self._u64_type()
+        wide = self._alloc()
+        self._function.append(
+            f"         {self._id(wide)} = OpSConvert {self._id(u64)} {self._id(a)}")
+        x = self._alloc()
+        self._function.append(
+            f"         {self._id(x)} = OpBitcast {self._id(u64)} {self._id(wide)}")
+        gamma = self._get_u64_const("0x9E3779B97F4A7C15")
+        x2 = self._alloc()
+        self._function.append(
+            f"         {self._id(x2)} = OpIAdd {self._id(u64)} {self._id(x)} "
+            f"{self._id(gamma)}")
+        x = x2
+        for shift, mult in ((30, "0xBF58476D1CE4E5B9"),
+                            (27, "0x94D049BB133111EB")):
+            sh = self._alloc()
+            self._function.append(
+                f"         {self._id(sh)} = OpShiftRightLogical {self._id(u64)} "
+                f"{self._id(x)} {self._id(self._get_u32_const(shift))}")
+            xo = self._alloc()
+            self._function.append(
+                f"         {self._id(xo)} = OpBitwiseXor {self._id(u64)} "
+                f"{self._id(x)} {self._id(sh)}")
+            m = self._get_u64_const(mult)
+            y = self._alloc()
+            self._function.append(
+                f"         {self._id(y)} = OpIMul {self._id(u64)} "
+                f"{self._id(xo)} {self._id(m)}")
+            x = y
+        sh = self._alloc()
+        self._function.append(
+            f"         {self._id(sh)} = OpShiftRightLogical {self._id(u64)} "
+            f"{self._id(x)} {self._id(self._get_u32_const(31))}")
+        z = self._alloc()
+        self._function.append(
+            f"         {self._id(z)} = OpBitwiseXor {self._id(u64)} "
+            f"{self._id(x)} {self._id(sh)}")
+        self._set_ssa_type(z, u64)
+        return z
+
     def _emit_inst(self, inst: IRInst, buf_vars: dict[str, int],
                    pc_member_ids: dict[str, tuple[int, int]],
                    ssa_map: dict[str, int], idx_0: int) -> bool:
@@ -1391,6 +2200,14 @@ class _EmitContext:
         # LOAD from array
         if op == Op.LOAD:
             arr = inst.meta.get("array", "")
+            # Segmented reduction: the accumulator read is the additive
+            # identity — this thread's segment total comes from the
+            # workgroup combine, not from memory.
+            if arr == self.kernel.reduction_array:
+                zero = self._get_const(IRType.REAL, 0.0)
+                if inst.result:
+                    ssa_map[inst.result] = zero
+                return False
             var_id = buf_vars.get(arr)
             if var_id is None:
                 self._function.append(f"         ; WARNING: unknown array '{arr}'")
@@ -1398,7 +2215,7 @@ class _EmitContext:
             idx = self._linearize_index(arr, inst.args, pc_member_ids, ssa_map)
 
             # Ping-pong: add read offset for read-write arrays
-            if arr in self.pingpong_arrays and "_pp_rd_offset" in pc_member_ids:
+            if arr in self._k_pp and "_pp_rd_offset" in pc_member_ids:
                 pp_rd = self._load_pc_member("_pp_rd_offset", pc_member_ids)
                 new_idx = self._alloc()
                 self._function.append(
@@ -1420,6 +2237,28 @@ class _EmitContext:
             self._function.append(
                 f"         {self._id(ptr)} = OpAccessChain {self._id(ptr_type)} "
                 f"{self._id(var_id)} {self._id(const_0)} {self._id(idx)}")
+
+            # Atomic fetch-add fusion (slot-claim): this load claims a
+            # slot via one OpAtomicIAdd that returns the old value; the
+            # partner store's increment is emitted here and skipped at
+            # its site. Removes the load-then-atomicAdd race that let
+            # parallel spawns claim the same slot.
+            if id(inst) in self._fetch_add_loads and arr_elem == IRType.INTEGER:
+                delta, _store = self._fetch_add_loads[id(inst)]
+                self._require_atomic_gate()
+                scope = self._get_u32_const(1)
+                sem = self._get_u32_const(0)
+                delta_id = self._get_const(IRType.INTEGER, delta)
+                result = self._alloc()
+                self._function.append(
+                    f"         {self._id(result)} = OpAtomicIAdd "
+                    f"{self._id(self.id_i32)} {self._id(ptr)} "
+                    f"{self._id(scope)} {self._id(sem)} {self._id(delta_id)}")
+                self._set_ssa_type(result, self.id_i32)
+                if inst.result:
+                    ssa_map[inst.result] = result
+                return False
+
             result = self._alloc()
             self._function.append(
                 f"         {self._id(result)} = OpLoad {self._id(elem_type)} {self._id(ptr)}")
@@ -1430,6 +2269,19 @@ class _EmitContext:
 
         # STORE to array
         if op == Op.STORE:
+            # Segmented reduction: suppress the accumulator store and
+            # capture the per-thread value for the combine epilogue.
+            if inst.meta.get("array", "") == self.kernel.reduction_array:
+                self._seg_val = self._resolve(inst.args[0], pc_member_ids,
+                                              ssa_map)
+                return False
+            # Partner store of a fused fetch-add: its increment was already
+            # emitted at the claim load (see _analyze_fetch_adds).
+            if id(inst) in self._fused_stores:
+                self._function.append(
+                    f"         ; store fused into fetch-add above")
+                return False
+
             arr = inst.meta.get("array", "")
             var_id = buf_vars.get(arr)
             if var_id is None:
@@ -1439,7 +2291,7 @@ class _EmitContext:
             idx = self._linearize_index(arr, inst.args[1:], pc_member_ids, ssa_map)
 
             # Ping-pong: add write offset for read-write arrays
-            if arr in self.pingpong_arrays and "_pp_wr_offset" in pc_member_ids:
+            if arr in self._k_pp and "_pp_wr_offset" in pc_member_ids:
                 pp_wr = self._load_pc_member("_pp_wr_offset", pc_member_ids)
                 new_idx = self._alloc()
                 self._function.append(
@@ -1460,8 +2312,9 @@ class _EmitContext:
                 f"         {self._id(ptr)} = OpAccessChain {self._id(ptr_type)} "
                 f"{self._id(var_id)} {self._id(const_0)} {self._id(idx)}")
 
-            # Atomic store for scatter arrays
+            # Atomic store for scatter arrays (gated: spec 9.9)
             if arr in self.kernel.atomic_arrays:
+                self._require_atomic_gate()
                 # The value being stored is the result of a read-modify-write.
                 # For atomicAdd: val = load + delta → emit atomicAdd(ptr, delta)
                 # For atomicOr:  val = load | mask  → emit atomicOr(ptr, mask)
@@ -1602,7 +2455,7 @@ class _EmitContext:
                 ssa_map[inst.result] = result
             return False
 
-        # POW — via GLSL.std.450 Pow (f32 cast required)
+        # POW — via GLSL.std.450 Pow (f32 only in GLSL; f32 cast required)
         if op == Op.POW:
             a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
             b = self._resolve(inst.args[1], pc_member_ids, ssa_map)
@@ -1617,7 +2470,9 @@ class _EmitContext:
                     f"         {self._id(result)} = OpExtInst {self._id(self.id_f32)} "
                     f"{self._id(glsl)} Pow {self._id(a)} {self._id(b)}")
             else:
-                # f64: cast to f32, call, cast back
+                # f64: GLSL.std.450 Pow is 16/32-bit only (verified with
+                # spirv-val) — cast to f32, call, cast back. Covered by the
+                # per-kernel f32-transcendental warning.
                 a32 = self._alloc()
                 self._function.append(
                     f"         {self._id(a32)} = OpFConvert {self._id(self.id_f32)} {self._id(a)}")
@@ -1676,9 +2531,23 @@ class _EmitContext:
             return False
 
         # Math intrinsics via GLSL.std.450
-        if op in GLSL_EXT and op not in (Op.POW, Op.MAX, Op.MIN):
+        if op in GLSL_EXT and op not in (Op.POW, Op.MAX, Op.MIN, Op.ATAN2):
             a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
             glsl = self._named_ids["glsl_ext"]
+
+            # Integer ABS: SAbs with a signed-int signature. FAbs on an
+            # integer operand is a result/operand type mismatch that
+            # spirv-as accepts but the Vulkan driver rejects at pipeline
+            # creation (vkCreateComputePipelines -13).
+            if op == Op.ABS and self._is_int_id(a):
+                result = self._alloc()
+                self._function.append(
+                    f"         {self._id(result)} = OpExtInst {self._id(self.id_i32)} "
+                    f"{self._id(glsl)} SAbs {self._id(a)}")
+                self._set_ssa_type(result, self.id_i32)
+                if inst.result:
+                    ssa_map[inst.result] = result
+                return False
 
             if op in GLSL_F32_ONLY and self.real_size == 8:
                 # Transcendentals at f64: cast f64 -> f32, apply, cast f32 -> f64
@@ -1700,6 +2569,55 @@ class _EmitContext:
                     f"{self._id(glsl)} {GLSL_EXT[op]} {self._id(a)}")
 
             self._set_ssa_type(result, self.id_real)
+            if inst.result:
+                ssa_map[inst.result] = result
+            return False
+
+        # ATAN2 — GLSL.std.450 Atan2(y, x). Transcendental: f32-only in
+        # GLSL, so in f64 mode evaluate f64→f32→f64 (spec Part 9.10; the
+        # compile-time warning is emitted once per kernel by
+        # _emit_kernel_module via _collect_f32_only_ops).
+        if op == Op.ATAN2:
+            a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
+            b = self._resolve(inst.args[1], pc_member_ids, ssa_map)
+            a = self._ensure_f64(a)
+            b = self._ensure_f64(b)
+            glsl = self._named_ids["glsl_ext"]
+            if self.real_size == 4:
+                # f32 mode: convert operands to f32, call directly
+                if self._is_real_id(a) and self._ssa_types.get(a) != self.id_f32:
+                    c = self._alloc()
+                    self._function.append(
+                        f"         {self._id(c)} = OpFConvert {self._id(self.id_f32)} {self._id(a)}")
+                    self._set_ssa_type(c, self.id_f32)
+                    a = c
+                if self._is_real_id(b) and self._ssa_types.get(b) != self.id_f32:
+                    c = self._alloc()
+                    self._function.append(
+                        f"         {self._id(c)} = OpFConvert {self._id(self.id_f32)} {self._id(b)}")
+                    self._set_ssa_type(c, self.id_f32)
+                    b = c
+                result = self._alloc()
+                self._function.append(
+                    f"         {self._id(result)} = OpExtInst {self._id(self.id_f32)} "
+                    f"{self._id(glsl)} Atan2 {self._id(a)} {self._id(b)}")
+                self._set_ssa_type(result, self.id_f32)
+            else:
+                # f64: cast f64 -> f32, apply, cast f32 -> f64
+                a32 = self._alloc()
+                self._function.append(
+                    f"         {self._id(a32)} = OpFConvert {self._id(self.id_f32)} {self._id(a)}")
+                b32 = self._alloc()
+                self._function.append(
+                    f"         {self._id(b32)} = OpFConvert {self._id(self.id_f32)} {self._id(b)}")
+                r32 = self._alloc()
+                self._function.append(
+                    f"         {self._id(r32)} = OpExtInst {self._id(self.id_f32)} "
+                    f"{self._id(glsl)} Atan2 {self._id(a32)} {self._id(b32)}")
+                result = self._alloc()
+                self._function.append(
+                    f"         {self._id(result)} = OpFConvert {self._id(self.id_f64)} {self._id(r32)}")
+                self._set_ssa_type(result, self.id_f64)
             if inst.result:
                 ssa_map[inst.result] = result
             return False
@@ -1959,9 +2877,11 @@ class _EmitContext:
             return False
 
         # RING_PREV / RING_NEXT — subgroup shuffle for ring-neighbor coupling
-        # Uses OpGroupNonUniformShuffle with explicit wrapping index:
-        #   RING_PREV: source = (lane - 1 + 32) % 32
-        #   RING_NEXT: source = (lane + 1) % 32
+        # Uses OpGroupNonUniformShuffle with explicit wrapping index.
+        # The wrap mask is gl_SubgroupSize - 1 (loaded at runtime, B14):
+        #   RING_PREV: source = (lane - 1) mod size = (lane + mask) & mask
+        #   RING_NEXT: source = (lane + 1) mod size = (lane + 1)   & mask
+        # (Subgroup sizes are powers of two, so & (size-1) is a modulo.)
         if op in (Op.RING_PREV, Op.RING_NEXT):
             a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
             is_fp = self._is_real_id(a)
@@ -1974,18 +2894,20 @@ class _EmitContext:
                 f"{self._id(self.id_gl_subgroup_inv)}")
             self._set_ssa_type(lane, self.id_u32)
 
+            # Wrap mask from the real subgroup size (not hardcoded 32)
+            mask = self._load_subgroup_mask()
+
             # Compute wrapped neighbor index
-            const_1 = self._get_u32_const(1)
-            const_31 = self._get_u32_const(31)
             if op == Op.RING_PREV:
-                # (lane + 31) & 31  ≡  (lane - 1 + 32) % 32
+                # (lane + mask) & mask  ≡  (lane - 1) mod size
                 added = self._alloc()
                 self._function.append(
                     f"         {self._id(added)} = OpIAdd {self._id(self.id_u32)} "
-                    f"{self._id(lane)} {self._id(const_31)}")
+                    f"{self._id(lane)} {self._id(mask)}")
                 self._set_ssa_type(added, self.id_u32)
             else:
-                # (lane + 1) & 31
+                # (lane + 1) & mask
+                const_1 = self._get_u32_const(1)
                 added = self._alloc()
                 self._function.append(
                     f"         {self._id(added)} = OpIAdd {self._id(self.id_u32)} "
@@ -1995,7 +2917,7 @@ class _EmitContext:
             source_idx = self._alloc()
             self._function.append(
                 f"         {self._id(source_idx)} = OpBitwiseAnd {self._id(self.id_u32)} "
-                f"{self._id(added)} {self._id(const_31)}")
+                f"{self._id(added)} {self._id(mask)}")
             self._set_ssa_type(source_idx, self.id_u32)
 
             # OpGroupNonUniformShuffle with explicit source lane
@@ -2011,7 +2933,8 @@ class _EmitContext:
             return False
 
         # RING_SHIFT(val, delta) — subgroup shuffle with variable offset
-        # source = (lane + delta) & 31
+        # source = (lane + delta) mod size = (lane + delta) & (size - 1),
+        # with size = gl_SubgroupSize loaded at runtime (B14).
         if op == Op.RING_SHIFT:
             a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
             delta = self._resolve(inst.args[1], pc_member_ids, ssa_map)
@@ -2037,11 +2960,11 @@ class _EmitContext:
                 f"{self._id(lane)} {self._id(delta_u)}")
             self._set_ssa_type(added, self.id_u32)
 
-            const_31 = self._get_u32_const(31)
+            mask = self._load_subgroup_mask()
             source_idx = self._alloc()
             self._function.append(
                 f"         {self._id(source_idx)} = OpBitwiseAnd {self._id(self.id_u32)} "
-                f"{self._id(added)} {self._id(const_31)}")
+                f"{self._id(added)} {self._id(mask)}")
             self._set_ssa_type(source_idx, self.id_u32)
 
             scope = self._get_u32_const(3)
@@ -2146,9 +3069,52 @@ class _EmitContext:
                 ssa_map[inst.result] = result
             return False
 
-        # Fallback
-        self._function.append(f"         ; unhandled op: {op.value}")
-        return False
+        # PRNG intrinsics — splitmix64 finalize in 64-bit integer ops
+        # (see _splitmix64 for constants and statistics notes).
+        if op in (Op.HASH, Op.RAND):
+            a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
+            a = self._ensure_i32(a)
+            z = self._splitmix64(a)
+            u64 = self._u64_type()
+            if op == Op.HASH:
+                # Top 31 bits → non-negative int32 [0, 2^31-1]
+                sh = self._alloc()
+                self._function.append(
+                    f"         {self._id(sh)} = OpShiftRightLogical "
+                    f"{self._id(u64)} {self._id(z)} "
+                    f"{self._id(self._get_u32_const(33))}")
+                result = self._alloc()
+                self._function.append(
+                    f"         {self._id(result)} = OpUConvert "
+                    f"{self._id(self.id_i32)} {self._id(sh)}")
+                self._set_ssa_type(result, self.id_i32)
+            else:
+                # Top 53 bits × 2^-53 → uniform REAL on [0, 1)
+                sh = self._alloc()
+                self._function.append(
+                    f"         {self._id(sh)} = OpShiftRightLogical "
+                    f"{self._id(u64)} {self._id(z)} "
+                    f"{self._id(self._get_u32_const(11))}")
+                f = self._alloc()
+                self._function.append(
+                    f"         {self._id(f)} = OpConvertUToF "
+                    f"{self._id(self.id_real)} {self._id(sh)}")
+                self._set_ssa_type(f, self.id_real)
+                scale = self._get_const(IRType.REAL, 2.0 ** -53)
+                result = self._alloc()
+                self._function.append(
+                    f"         {self._id(result)} = OpFMul "
+                    f"{self._id(self.id_real)} {self._id(f)} {self._id(scale)}")
+                self._set_ssa_type(result, self.id_real)
+            if inst.result:
+                ssa_map[inst.result] = result
+            return False
+
+        # An op with no SPIRV lowering must not silently emit nothing —
+        # its result temp would resolve to garbage downstream.
+        raise MCLError(
+            f"SPIRV: no lowering for IR op '{op.value}' in kernel "
+            f"(source line {self.kernel.source_line})")
 
     def _is_cycle_guard(self, node: IRIf) -> bool:
         """Check if an IF is a guard pattern: IF cond THEN CYCLE (no else).
@@ -2354,9 +3320,11 @@ class _EmitContext:
                 val_id = self._load_push_constant(member_idx, type_id, op.name)
                 ssa_map[op.name] = val_id
                 return val_id
-            # Unknown — emit warning
-            self._function.append(f"         ; WARNING: unresolved ref '{op.name}'")
-            return self._get_const(IRType.REAL, 0.0)
+            # An unresolvable ref must not silently become 0.0 — downstream
+            # uses would compute with a wrong constant.
+            raise MCLError(
+                f"SPIRV: unresolved operand '{op.name}' (not SSA-defined, "
+                f"not a push constant)")
 
         return self._get_const(IRType.INTEGER, 0)
 
@@ -2402,19 +3370,38 @@ class _EmitContext:
             return t == IRType.REAL
         return False
 
+    @staticmethod
+    def _missing_dim(arr: str, d: int):
+        raise MCLError(
+            f"SPIRV: internal error — dimension {d} of '{arr}' has no "
+            f"shape entry (shape validation should have caught this)")
+
     def _linearize_index(self, arr: str, index_args: list,
                          pc_member_ids: dict, ssa_map: dict) -> int:
         """Linearize multi-dimensional array index to 1D.
 
         For 1D: returns the single index directly.
-        For 3D (i, j, k): returns (k-1)*dim1*dim0 + (j-1)*dim0 + (i-1)
-        where dims are from array shape (column-major, Fortran order).
+        Multi-D uses COLUMN-MAJOR (Fortran order) — the LOCKED Ergo array
+        convention (Spec/Ergo_Spec.md Part 3): first index fastest, on
+        BOTH sides of the host/device boundary (CPU codegen emits C arrays
+        with reversed dims to match). Buffers are flat copies, so both
+        sides must agree:
+          2-D (i, j):    (i-1) + dim0*(j-1)
+          3-D (i, j, k): (i-1) + dim0*((j-1) + dim1*(k-1))
+        Measured on RTX 2060 (work/gpu_audit/coalesce_bench): an I-fastest
+        walk over column-major storage coalesces identically to K-fastest
+        over row-major (~550 vs ~520 GB/s); either mismatch costs ~20x.
         """
         if len(index_args) == 1:
             return self._resolve(index_args[0], pc_member_ids, ssa_map)
 
         shape = self.array_shapes.get(arr, ())
         ndims = len(index_args)
+        if len(shape) < ndims:
+            raise MCLError(
+                f"SPIRV: array '{arr}' has shape {shape} but is indexed "
+                f"with {ndims} indices (source line "
+                f"{self.kernel.source_line}) — cannot linearize")
 
         # Convert each index from 1-based to 0-based (ensure i32).
         # IR convention (ir.py:10, ir_builder.py:308/406): operands named
@@ -2440,12 +3427,11 @@ class _EmitContext:
             self._set_ssa_type(zb, self.id_i32)
             zero_based.append(zb)
 
-        # Linearize: column-major (Fortran order)
-        # linear = i0 + dim0*(i1 + dim1*i2)
+        # Linearize: column-major (Fortran order) — the LOCKED convention,
+        # first index fastest: linear = i0 + dim0*(i1 + dim1*i2)
         result = zero_based[0]
-        stride = 1
         for d in range(1, ndims):
-            dim_size = shape[d - 1] if d - 1 < len(shape) else 32
+            dim_size = shape[d - 1] if d - 1 < len(shape) else self._missing_dim(arr, d)
             if isinstance(dim_size, str):
                 # PARAMETER name — resolve via push constants
                 dim_id = self._resolve(IRRef(dim_size, IRType.INTEGER),
@@ -2453,7 +3439,7 @@ class _EmitContext:
             else:
                 dim_id = self._get_const(IRType.INTEGER, int(dim_size))
 
-            # stride *= dim_size (accumulated)
+            # term = zero_based[d] * (product of shape[0..d-1])
             scaled = self._alloc()
             self._function.append(
                 f"         {self._id(scaled)} = OpIMul {self._id(self.id_i32)} "
@@ -2463,7 +3449,7 @@ class _EmitContext:
             # For 3D: also multiply by earlier dims
             if d >= 2:
                 for dd in range(d - 1):
-                    prev_dim = shape[dd] if dd < len(shape) else 32
+                    prev_dim = shape[dd] if dd < len(shape) else self._missing_dim(arr, dd)
                     if isinstance(prev_dim, str):
                         pd_id = self._resolve(IRRef(prev_dim, IRType.INTEGER),
                                               pc_member_ids, ssa_map)

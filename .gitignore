@@ -4,8 +4,8 @@
 !structured/
 !structured/**
 !galaxy_structured.ergo
-!mcl/
-!mcl/**
+!core/
+!core/**
 !Spec/
 !Spec/**
 !tools/

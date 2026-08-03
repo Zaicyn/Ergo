@@ -140,7 +140,7 @@ static void _ergo_bench_report(void) {
 /* ── Limits ──────────────────────────────────────────────── */
 
 #define ERGO_VK_MAX_BUFFERS   64
-#define ERGO_VK_MAX_PIPELINES 16
+#define ERGO_VK_MAX_PIPELINES 64
 #define ERGO_VK_MAX_BINDINGS  32
 #define ERGO_VK_MAX_SWAPCHAIN 4
 
@@ -159,7 +159,11 @@ typedef struct {
     VkPipelineLayout    layout;
     VkDescriptorSetLayout ds_layout;
     VkDescriptorPool    ds_pool;
-    VkDescriptorSet     ds;
+    /* One descriptor set per frame slot (g.cmd_bufs/g.fences index).
+     * Frame N+1's host-side binds write ds[cmd_idx] only, so they never
+     * rewrite a set that frame N's still-pending command buffer
+     * references (WAR hazard, VUID-vkUpdateDescriptorSets-None-03047). */
+    VkDescriptorSet     ds[2];
     VkShaderModule      shader;
     int                 n_buffers;
     size_t              pc_size;
@@ -354,6 +358,12 @@ static uint32_t find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags props
     exit(1);
 }
 
+/* Counters (env-gated reporting via ERGO_PROFILE): compute launches and
+ * queue submit+wait cycles (drains, sync dispatches, transfers). */
+static unsigned long g_launch_count = 0;
+static unsigned long g_submit_count = 0;
+static unsigned long g_drain_count = 0;
+
 static void submit_and_wait(void) {
     VkSubmitInfo si = {0};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -363,6 +373,7 @@ static void submit_and_wait(void) {
     VK_CHECK(vkResetFences(g.device, 1, &g.fence));
     VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.fence));
     VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
+    g_submit_count++;
 }
 
 /* Transfer submit — uses xfer_cmd_buf + xfer_fence.
@@ -379,6 +390,7 @@ static void xfer_submit_and_wait(void) {
     VK_CHECK(vkResetFences(g.device, 1, &g.xfer_fence));
     VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.xfer_fence));
     VK_CHECK(vkWaitForFences(g.device, 1, &g.xfer_fence, VK_TRUE, UINT64_MAX));
+    g_submit_count++;
 }
 
 /* ── Forward declarations for render init ────────────────── */
@@ -812,7 +824,14 @@ int ergo_vk_init_android(void *native_window) {
 /* ── ergo_vk_shutdown ────────────────────────────────────── */
 
 void ergo_vk_profile_report(void) {
-    if (!g.ts_active || g.ts_count == 0) return;
+    if (!g.ts_active) return;
+    fprintf(stderr, "[ergo_vk] total compute launches: %lu\n",
+            g_launch_count);
+    fprintf(stderr, "[ergo_vk] total queue submit+wait cycles: %lu\n",
+            g_submit_count);
+    fprintf(stderr, "[ergo_vk] total frame drains (frame_end submits): %lu\n",
+            g_drain_count);
+    if (g.ts_count == 0) return;
     fprintf(stderr, "\n[ergo_vk] GPU profile (%d frames, avg per frame):\n",
             g.ts_count);
     const char *names[] = {"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1154,6 +1173,43 @@ void ergo_vk_download_at(ErgoVkBuf buf, void *data, size_t offset, size_t size) 
     memcpy(data, g.staging_mapped, size);
 }
 
+/* Download N buffers in ONE transfer submission: all copies are recorded
+ * into a single xfer command buffer (stacked in staging), submitted and
+ * waited once, then scattered to their host destinations. Used by the
+ * coalesced reduction read-back to replace N submit+wait cycles with 1. */
+void ergo_vk_download_multi(const ErgoVkBuf *bufs, void * const *dsts,
+                            const size_t *offsets, const size_t *sizes,
+                            int n) {
+    if (!g.device || n <= 0) return;
+    size_t total = 0;
+    for (int i = 0; i < n; i++) total += sizes[i];
+    ensure_staging(total);
+
+    VkCommandBufferBeginInfo begin = {0};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkResetCommandBuffer(g.xfer_cmd_buf, 0));
+    VK_CHECK(vkBeginCommandBuffer(g.xfer_cmd_buf, &begin));
+
+    size_t staged = 0;
+    for (int i = 0; i < n; i++) {
+        BufSlot *b = &g.bufs[bufs[i]];
+        VkBufferCopy region = { .srcOffset = offsets[i],
+                                .dstOffset = staged, .size = sizes[i] };
+        vkCmdCopyBuffer(g.xfer_cmd_buf, b->buffer, g.staging_buf, 1, &region);
+        staged += sizes[i];
+    }
+
+    VK_CHECK(vkEndCommandBuffer(g.xfer_cmd_buf));
+    xfer_submit_and_wait();
+
+    staged = 0;
+    for (int i = 0; i < n; i++) {
+        memcpy(dsts[i], (const char *)g.staging_mapped + staged, sizes[i]);
+        staged += sizes[i];
+    }
+}
+
 void ergo_vk_upload_at(ErgoVkBuf buf, const void *data, size_t offset, size_t size) {
     if (!g.device) return;
     BufSlot *b = &g.bufs[buf];
@@ -1225,21 +1281,22 @@ ErgoVkPipe ergo_vk_load_shader(const void *spirv, size_t spirv_size,
 
     VkDescriptorPoolSize pool_size = {0};
     pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_size.descriptorCount = (n_buffers > 0) ? n_buffers : 1;
+    pool_size.descriptorCount = (n_buffers > 0) ? n_buffers * 2 : 2;
 
     VkDescriptorPoolCreateInfo dp_ci = {0};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dp_ci.maxSets = 1;
+    dp_ci.maxSets = 2;  /* one descriptor set per frame slot */
     dp_ci.poolSizeCount = 1;
     dp_ci.pPoolSizes = &pool_size;
     VK_CHECK(vkCreateDescriptorPool(g.device, &dp_ci, NULL, &p->ds_pool));
 
+    VkDescriptorSetLayout layouts[2] = { p->ds_layout, p->ds_layout };
     VkDescriptorSetAllocateInfo ds_ai = {0};
     ds_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     ds_ai.descriptorPool = p->ds_pool;
-    ds_ai.descriptorSetCount = 1;
-    ds_ai.pSetLayouts = &p->ds_layout;
-    VK_CHECK(vkAllocateDescriptorSets(g.device, &ds_ai, &p->ds));
+    ds_ai.descriptorSetCount = 2;
+    ds_ai.pSetLayouts = layouts;
+    VK_CHECK(vkAllocateDescriptorSets(g.device, &ds_ai, p->ds));
 
     VkPushConstantRange pc_range = {0};
     pc_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1272,26 +1329,48 @@ ErgoVkPipe ergo_vk_load_shader(const void *spirv, size_t spirv_size,
     return (ErgoVkPipe)slot;
 }
 
-void ergo_vk_bind_buffer(ErgoVkPipe pipe, int binding, ErgoVkBuf buf) {
-    if (!g.device) return;
-    PipeSlot *p = &g.pipes[pipe];
-    BufSlot  *b = &g.bufs[buf];
-    p->bound_bufs[binding] = buf;
-
+/* Write a storage-buffer descriptor into ONE of a pipeline's two
+ * per-frame-slot descriptor sets. */
+static void vk_write_buf_desc(PipeSlot *p, int slot, int binding,
+                              VkBuffer buffer, VkDeviceSize size) {
     VkDescriptorBufferInfo buf_info = {0};
-    buf_info.buffer = b->buffer;
+    buf_info.buffer = buffer;
     buf_info.offset = 0;
-    buf_info.range = b->size;
+    buf_info.range = size;
 
     VkWriteDescriptorSet write = {0};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = p->ds;
+    write.dstSet = p->ds[slot];
     write.dstBinding = binding;
     write.descriptorCount = 1;
     write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     write.pBufferInfo = &buf_info;
 
     vkUpdateDescriptorSets(g.device, 1, &write, 0, NULL);
+}
+
+/* Init-time bind: write BOTH frame slots. Only safe when no command
+ * buffer referencing this pipeline's sets can be in flight — i.e. the
+ * pipeline was just created, or its sets are only ever used by
+ * submit-and-wait dispatches (xfer_cmd_buf), never by frame cmd bufs. */
+static void vk_bind_buf_all_slots(PipeSlot *p, int binding,
+                                  VkBuffer buffer, VkDeviceSize size) {
+    for (int s = 0; s < 2; s++)
+        vk_write_buf_desc(p, s, binding, buffer, size);
+}
+
+void ergo_vk_bind_buffer(ErgoVkPipe pipe, int binding, ErgoVkBuf buf) {
+    if (!g.device) return;
+    PipeSlot *p = &g.pipes[pipe];
+    BufSlot  *b = &g.bufs[buf];
+    p->bound_bufs[binding] = buf;
+
+    /* Write only the CURRENT frame slot's set. The other slot's set may
+     * still be referenced by the previous frame's in-flight cmd buf
+     * (WAR hazard, VUID-vkUpdateDescriptorSets-None-03047). The current
+     * slot is safe: frame_begin already waited for the fence of the
+     * last frame that used it (two frames ago). */
+    vk_write_buf_desc(p, g.cmd_idx, binding, b->buffer, b->size);
 }
 
 void ergo_vk_push_constants(ErgoVkPipe pipe, const void *data, size_t size) {
@@ -1325,13 +1404,14 @@ void ergo_vk_dispatch(ErgoVkPipe pipe, int n_groups) {
     vkCmdBindPipeline(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
                       p->pipeline);
     vkCmdBindDescriptorSets(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            p->layout, 0, 1, &p->ds, 0, NULL);
+                            p->layout, 0, 1, &p->ds[g.cmd_idx], 0, NULL);
 
     if (p->pc_size > 0) {
         vkCmdPushConstants(g.cmd_buf, p->layout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, p->pc_size, p->pc_data);
     }
 
+    g_launch_count++;
     vkCmdDispatch(g.cmd_buf, n_groups, 1, 1);
 
     VK_CHECK(vkEndCommandBuffer(g.cmd_buf));
@@ -1417,11 +1497,12 @@ void ergo_vk_frame_dispatch(ErgoVkPipe pipe, int n_groups) {
     vkCmdBindPipeline(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
                       p->pipeline);
     vkCmdBindDescriptorSets(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            p->layout, 0, 1, &p->ds, 0, NULL);
+                            p->layout, 0, 1, &p->ds[g.cmd_idx], 0, NULL);
     if (p->pc_size > 0) {
         vkCmdPushConstants(g.cmd_buf, p->layout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, p->pc_size, p->pc_data);
     }
+    g_launch_count++;
     vkCmdDispatch(g.cmd_buf, n_groups, 1, 1);
 
     /* Timestamp after dispatch */
@@ -1440,6 +1521,7 @@ void ergo_vk_frame_end(void) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g.cmd_buf;
     VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.fence));
+    g_drain_count++;
     /* Do NOT wait here — next frame_begin waits for this fence. */
 }
 
@@ -3404,7 +3486,12 @@ static void atlas_lazy_init(void) {
     /* Load atlas gen compute shader: 5 SSBOs (4 particle + 1 atlas) + 32B push constants */
     g_atlas_gen_pipe = ergo_vk_load_shader(
         atlas_gen_comp_spv, atlas_gen_comp_spv_size, 5, 32);
-    ergo_vk_bind_buffer(g_atlas_gen_pipe, 4, g_atlas_ssbo);
+    /* Binding 4 is bound once here and never per-frame, so seed both
+     * frame-slot sets (safe: the pipeline was just created — nothing
+     * references its sets yet). */
+    vk_bind_buf_all_slots(&g.pipes[g_atlas_gen_pipe], 4,
+                          g.bufs[g_atlas_ssbo].buffer,
+                          g.bufs[g_atlas_ssbo].size);
 
     /* No image transitions needed — pure SSBO path */
     {
@@ -3468,7 +3555,7 @@ static void atlas_gen_dispatch(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z
     /* Dispatch atlas gen: one thread per particle */
     vkCmdBindPipeline(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline);
     vkCmdBindDescriptorSets(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            p->layout, 0, 1, &p->ds, 0, NULL);
+                            p->layout, 0, 1, &p->ds[g.cmd_idx], 0, NULL);
     if (p->pc_size > 0)
         vkCmdPushConstants(g.xfer_cmd_buf, p->layout,
                            VK_SHADER_STAGE_COMPUTE_BIT, 0, p->pc_size, p->pc_data);
@@ -3632,27 +3719,23 @@ static void meshlet_lazy_init(void) {
     g_meshlet_compute_pipe = ergo_vk_load_shader(
         meshlet_gen_comp_spv, meshlet_gen_comp_spv_size, 9, 96);
 
-    ergo_vk_bind_buffer(g_meshlet_compute_pipe, 4, g_meshlet_tmpl_pos);
-    ergo_vk_bind_buffer(g_meshlet_compute_pipe, 5, g_meshlet_tmpl_idx);
-    /* Output buffers (6,7) bound per-frame for double-buffering */
-    ergo_vk_bind_buffer(g_meshlet_compute_pipe, 6, g_meshlet_out_pos[0]);
-    ergo_vk_bind_buffer(g_meshlet_compute_pipe, 7, g_meshlet_out_nv[0]);
-
-    /* Bind counter buffer (binding 8) — raw VkBuffer, manual descriptor */
+    /* Template bindings (4,5) are bound once here and never per-frame;
+     * output buffers (6,7) are re-bound per-frame for double-buffering.
+     * Seed both frame-slot sets for all of them (safe: the pipeline was
+     * just created — nothing references its sets yet). */
     {
-        VkDescriptorBufferInfo buf_info = {0};
-        buf_info.buffer = g_meshlet_counter_buf;
-        buf_info.offset = 0;
-        buf_info.range = MESHLET_COUNTER_SIZE;
-
-        VkWriteDescriptorSet write = {0};
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = g.pipes[g_meshlet_compute_pipe].ds;
-        write.dstBinding = 8;
-        write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        write.pBufferInfo = &buf_info;
-        vkUpdateDescriptorSets(g.device, 1, &write, 0, NULL);
+        PipeSlot *mp = &g.pipes[g_meshlet_compute_pipe];
+        vk_bind_buf_all_slots(mp, 4, g.bufs[g_meshlet_tmpl_pos].buffer,
+                              g.bufs[g_meshlet_tmpl_pos].size);
+        vk_bind_buf_all_slots(mp, 5, g.bufs[g_meshlet_tmpl_idx].buffer,
+                              g.bufs[g_meshlet_tmpl_idx].size);
+        vk_bind_buf_all_slots(mp, 6, g.bufs[g_meshlet_out_pos[0]].buffer,
+                              g.bufs[g_meshlet_out_pos[0]].size);
+        vk_bind_buf_all_slots(mp, 7, g.bufs[g_meshlet_out_nv[0]].buffer,
+                              g.bufs[g_meshlet_out_nv[0]].size);
+        /* Counter buffer (binding 8) — raw VkBuffer, both slots */
+        vk_bind_buf_all_slots(mp, 8, g_meshlet_counter_buf,
+                              MESHLET_COUNTER_SIZE);
     }
 
     g_meshlet_initialized = 1;
@@ -3675,13 +3758,22 @@ void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     if (meshlet_frame++ < 3)
         fprintf(stderr, "[ergo_vk] Meshlet frame %d\n", meshlet_frame);
 
-    /* Bind grid buffers to compute (bindings 0-3) */
+    /* Bind grid buffers to compute (bindings 0-3). Cached across frames,
+     * so write BOTH frame-slot sets on a cache miss — otherwise the
+     * other slot keeps stale descriptors. Safe here because this
+     * pipeline's sets are only ever referenced by submit-and-wait
+     * xfer_cmd_buf dispatches, never by in-flight frame cmd bufs. */
     static ErgoVkBuf last_grad_x = 0;
     if (last_grad_x != buf_grad_x) {
-        ergo_vk_bind_buffer(g_meshlet_compute_pipe, 0, buf_grad_x);
-        ergo_vk_bind_buffer(g_meshlet_compute_pipe, 1, buf_grad_y);
-        ergo_vk_bind_buffer(g_meshlet_compute_pipe, 2, buf_grad_z);
-        ergo_vk_bind_buffer(g_meshlet_compute_pipe, 3, buf_met_gate);
+        PipeSlot *mp = &g.pipes[g_meshlet_compute_pipe];
+        vk_bind_buf_all_slots(mp, 0, g.bufs[buf_grad_x].buffer,
+                              g.bufs[buf_grad_x].size);
+        vk_bind_buf_all_slots(mp, 1, g.bufs[buf_grad_y].buffer,
+                              g.bufs[buf_grad_y].size);
+        vk_bind_buf_all_slots(mp, 2, g.bufs[buf_grad_z].buffer,
+                              g.bufs[buf_grad_z].size);
+        vk_bind_buf_all_slots(mp, 3, g.bufs[buf_met_gate].buffer,
+                              g.bufs[buf_met_gate].size);
         last_grad_x = buf_grad_x;
     }
 
@@ -3751,7 +3843,7 @@ void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
         vkCmdBindPipeline(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
                           p->pipeline);
         vkCmdBindDescriptorSets(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                p->layout, 0, 1, &p->ds, 0, NULL);
+                                p->layout, 0, 1, &p->ds[g.cmd_idx], 0, NULL);
         if (p->pc_size > 0)
             vkCmdPushConstants(g.xfer_cmd_buf, p->layout,
                                VK_SHADER_STAGE_COMPUTE_BIT, 0,

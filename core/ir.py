@@ -178,6 +178,17 @@ class Op(Enum):
     MAX = "max"
     MIN = "min"
     CLAMP = "clamp"
+    SIGN = "sign"
+
+    # PRNG intrinsics (splitmix64 finalize at 64-bit width; see
+    # ir_codegen._emit_hash_helper for constants and statistics notes)
+    HASH = "hash"           # INTEGER -> INTEGER (non-negative int32)
+    RAND = "rand"           # INTEGER -> REAL (uniform [0, 1), top 53 bits)
+
+    # Whole-array reductions (result = REAL; array names in meta["arrays"],
+    # element count from the compile-time shape — no allocation)
+    DOT_PRODUCT = "dot_product"
+    NORM2 = "norm2"
 
     # Warp ring shuffle (subgroup operations)
     RING_PREV = "ring_prev"   # value from lane-1 neighbor (wraps)
@@ -281,6 +292,13 @@ class IRLoop:
     step: Operand
     body: list  # list of IRBlock | IRIf | IRLoop | IRSelect
     line: int = 0
+    # True when produced by nested-loop linearization (ir_gpu): write
+    # injectivity over the collapsed space was proven at acceptance time
+    # (writes exactly at (I,J)), so extraction must skip the affine
+    # store-index classification — the flattened store index is a
+    # computed column-major linear form (MOD/DIV from the I/J recovery)
+    # that the affine extractor cannot read.
+    linearized: bool = False
 
 
 @dataclass

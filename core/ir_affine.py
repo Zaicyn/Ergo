@@ -145,7 +145,8 @@ def affine_mul(a: AffineExpr, b: AffineExpr) -> AffineExpr | None:
 def extract_affine(name: str, loop_var: str,
                    defs: dict[str, IRInst],
                    invariants: set[str],
-                   depth: int = 0) -> AffineExpr | None:
+                   depth: int = 0,
+                   param_values: dict[str, int] | None = None) -> AffineExpr | None:
     """Extract an AffineExpr for an IR temp by walking its defining instructions.
 
     Returns None if the expression is non-affine (array LOAD, division,
@@ -157,6 +158,11 @@ def extract_affine(name: str, loop_var: str,
         defs: map of temp name → defining IRInst
         invariants: set of loop-invariant names (PARAMETERs, STATIC scalars)
         depth: recursion depth (safety cutoff at 20)
+        param_values: when given, PARAMETERs with known integer values are
+            substituted as constants — this makes affine-by-PARAMETER
+            products (e.g. (J-1)*NX for a strided line source) provable,
+            which symbolic coefficients cannot express. Sound because the
+            affine form is used for classification only, never codegen.
     """
     if depth > 20:
         return None
@@ -167,6 +173,8 @@ def extract_affine(name: str, loop_var: str,
 
     # PARAMETER or loop-invariant scalar
     if name in invariants:
+        if param_values and name in param_values:
+            return AffineExpr({}, param_values[name])
         return AffineExpr({Symbol(name, SymbolKind.PARAMETER): 1}, 0)
 
     # Not a temp and not known → unknown origin
@@ -185,8 +193,10 @@ def extract_affine(name: str, loop_var: str,
 
     # Arithmetic: ADD, SUB, MUL
     if inst.op in (Op.ADD, Op.SUB, Op.MUL):
-        left = _operand_to_affine(inst.args[0], loop_var, defs, invariants, depth)
-        right = _operand_to_affine(inst.args[1], loop_var, defs, invariants, depth)
+        left = _operand_to_affine(inst.args[0], loop_var, defs, invariants, depth,
+                                  param_values)
+        right = _operand_to_affine(inst.args[1], loop_var, defs, invariants, depth,
+                                   param_values)
         if left is None or right is None:
             return None
         if inst.op == Op.ADD:
@@ -198,7 +208,8 @@ def extract_affine(name: str, loop_var: str,
 
     # Unary negation
     if inst.op == Op.NEG:
-        inner = _operand_to_affine(inst.args[0], loop_var, defs, invariants, depth)
+        inner = _operand_to_affine(inst.args[0], loop_var, defs, invariants, depth,
+                                   param_values)
         if inner is None:
             return None
         return affine_neg(inner)
@@ -206,7 +217,8 @@ def extract_affine(name: str, loop_var: str,
     # COPY: trace through
     if inst.op == Op.COPY:
         if len(inst.args) == 1:
-            return _operand_to_affine(inst.args[0], loop_var, defs, invariants, depth)
+            return _operand_to_affine(inst.args[0], loop_var, defs, invariants, depth,
+                                      param_values)
         return None
 
     # Anything else (CALL, STORE, POW, etc.) — non-affine
@@ -216,14 +228,16 @@ def extract_affine(name: str, loop_var: str,
 def _operand_to_affine(op: Operand, loop_var: str,
                        defs: dict[str, IRInst],
                        invariants: set[str],
-                       depth: int) -> AffineExpr | None:
+                       depth: int,
+                       param_values: dict[str, int] | None = None) -> AffineExpr | None:
     """Convert an IR operand to AffineExpr."""
     if isinstance(op, IRConst):
         if op.value is not None and isinstance(op.value, (int, float)):
             return AffineExpr({}, int(op.value))
         return None
     if isinstance(op, IRRef):
-        return extract_affine(op.name, loop_var, defs, invariants, depth + 1)
+        return extract_affine(op.name, loop_var, defs, invariants, depth + 1,
+                              param_values)
     return None
 
 

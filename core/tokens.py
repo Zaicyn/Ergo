@@ -73,6 +73,7 @@ class TT(Enum):
     KW_DATA = auto()
     KW_ELSEIF = auto()
     KW_CYCLE = auto()
+    KW_EXIT = auto()
     KW_STOP = auto()
     KW_WRITE = auto()
     KW_FLUSH = auto()
@@ -117,6 +118,7 @@ KEYWORDS = {
     "DATA": TT.KW_DATA,
     "ELSEIF": TT.KW_ELSEIF,
     "CYCLE": TT.KW_CYCLE,
+    "EXIT": TT.KW_EXIT,
     "STOP": TT.KW_STOP,
     "WRITE": TT.KW_WRITE,
     "FLUSH": TT.KW_FLUSH,

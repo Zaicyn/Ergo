@@ -124,6 +124,12 @@ class CycleStmt:
 
 
 @dataclass
+class ExitStmt:
+    """EXIT — leave the enclosing DO loop entirely (like C 'break')."""
+    pass
+
+
+@dataclass
 class StopStmt:
     """STOP — terminate program."""
     pass
