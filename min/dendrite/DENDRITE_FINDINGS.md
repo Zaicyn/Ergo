@@ -276,3 +276,65 @@ under 10% for a 4000-site cluster on 256² — with the residual oracle
 | Strip analysis | `min/dendrite/analyze_strip.py`, `dbm_strip_compare.png` |
 | GT-BC variants | `min/dendrite/dbm_{radial,strip}_gt*.ergo` (+ `_cap*`) |
 | Growth-law null (§6.1) | `min/dendrite/dbm_*_glaw_st*.ergo` + `dbm_*_st*.out` |
+
+## 9. Inc-3 landed: GPU Jacobi relaxation + elliptic TILE_CLIP
+
+`min/dendrite/dbm_radial_gpu.ergo` ports the DBM solver to the GPU per
+§8: the in-place GS-SOR sweep becomes a Jacobi ping-pong (PHI/PHI2
+alternate; omega=1 — the GS optimal omega~1.976 is unstable under
+Jacobi), the weight map and the TOTW+NCAND reduction extract as GPU
+kernels, and the sweep loop runs under the elliptic TILE_CLIP bound
+(cluster bbox + sweeps-remaining + margin; row-band tiles, NT=8 at
+QT=8192 on 256²; validation sweep every 16 sweeps; warm-up 5 steps).
+Grid is 256² (tile-friendly), SWFIX=384 fixed sweeps/step (no
+convergence test — static loop bounds required for extraction).
+
+Solver-change controls (the fixed-point is the same discrete-harmonic
+field; the iteration and its truncation differ):
+
+| build | seed 12345 | seed 777 | seed 31337 |
+|---|---|---|---|
+| CPU f64 257² GS-SOR (reference) | 1.725 | 1.650 | 1.740 |
+| CPU f64 256² Jacobi-384 (this source) | 1.714 | — | — |
+| CPU f32 256² Jacobi-384 | 1.713 | 1.647 | 1.762 |
+| GPU f32 256² Jacobi-384 (clip) | 1.677 | 1.653 | 1.729 |
+| GPU f32 256² Jacobi-384 (no clip) | 1.714 | — | — |
+
+All GPU runs inside the 1.60–1.75 oracle window; the CPU f32
+control at seed 31337 lands at 1.762 (inside the analyzer's 1.55–1.80
+PASS band, just above the literature window) — the spread is intrinsic
+to the solver change + precision, not a GPU artifact. No systematic
+f32 shift beyond
+run-to-run morphology noise at these seed counts. Residual (CPU
+max-delta sweep after the last solve) is ~1e-3–3e-2 depending on the
+step sampled — the fixed-count Jacobi solve is deliberately
+under-converged vs the SOR TOLG=1e-6 (Jacobi's low-frequency rate is
+~300x SOR's per sweep; converging would cost more than it buys — the
+morphology oracle passes regardless, Laplacian growth weights are
+dominated by the local gradient structure).
+
+Clip soundness: APPROXIMATE regime (not trajectory-exact). The
+"sweeps-remaining" rule is exact only for the not-yet-reached far
+field (the Jacobi front is sharp, 1 site/sweep); clipped tiles also
+freeze their leftover warm-start residual (~1e-3–1e-2) until the next
+validation sweep, so clipped and unclipped runs diverge at the
+trajectory level (D 1.677 vs 1.714 at seed 12345 — both in window).
+Determinism at fixed seed+backend is bitwise (full .out diff clean
+across two runs).
+
+Performance (4000 steps, 256², RTX 2060): GPU ~25.5 s vs ~4 min CPU
+f32/f64 Jacobi-384 and ~10 min CPU f64 GS-SOR 257² — ~9x vs the
+equivalent CPU Jacobi build, ~24x vs the SOR reference. Dispatched
+tile fraction 93–97%: at 256² with NT=8 and SWFIX=384 the clip barely
+engages (SWFIX >> grid radius, so most sweeps can still reach
+everywhere); the speedup is GPU parallelism + batched frames, not
+clipping. Cost accounting (ERGO_PROFILE): ~11.9M per-tile dispatch
+records (~12 s CPU) + ~92k transfer submit/waits (23/step: the
+static-scan downloads of PHI/PHI2/W every step, the reduce readback,
+and the CLUS/MASK/PHI upload after each deposit) — transfers and
+record overhead dominate, GPU compute is trivial at this size.
+Compiler fix that fell out: frame-loop upload scans in
+core/ir_codegen.py now recurse into nested IF/loop bodies (kernels
+inside IF(DONE==0)/IF(sweep parity) had their CPU-deposited arrays
+silently never uploaded — GPU CLUS stayed seed-only); default-path
+--emit-c byte-identical to HEAD on the Inc-1/2 oracle tests.

@@ -1,0 +1,315 @@
+! dbm_radial_gpu.ergo — dielectric breakdown model, GPU Jacobi relaxation
+! with elliptic TILE_CLIP (Increment 3)
+! =====================================================================
+! Same physics as dbm_radial.ergo (same PARAMETERs ETA, D0, CAP, SEED,
+! NSTEPS; same growth law w = max(phi,0)**ETA; same quenched
+! Gibbs-Thomson BC phi_s = D0*(2-m); same phi>=0 clamp), with the
+! in-place Gauss-Seidel SOR replaced by a Jacobi ping-pong form that
+! the GPU extractor accepts (PHI/PHI2 alternate as source/dest —
+! the tests/gpu_clipmap.ergo pattern: stencil reads one array, writes
+! the other at exactly K, branch-free MASK multiply).
+!
+! Differences from the CPU reference (all declared):
+!  1. Jacobi (omega=1) instead of GS-SOR. The GS optimal omega
+!     2/(1+sin(pi/NX)) ~ 1.976 is UNSTABLE under Jacobi (damped Jacobi
+!     requires omega <= 1 for the 5-point Laplacian). The converged
+!     discrete-harmonic solution is identical; only the iteration
+!     differs.
+!  2. FIXED sweep count SWFIX per growth step (no convergence test —
+!     DO WHILE is not extractable; the sweep loop must have static
+!     bounds). The solve is therefore approximate: the relaxation front
+!     advances exactly 1 site/sweep from the newest deposit, so after S
+!     sweeps nothing beyond S sites has moved AT ALL (the elliptic
+!     sharp front, Spec/Ergo_Activity_Bounds.md §4) and the far field
+!     keeps its previous values (dipole tail error ~ eps/S). Residual
+!     stats are reported every 250 steps and at the end (CPU max-delta
+!     sweep, which also forces a PHI download).
+!  3. TILE_CLIP (elliptic activity bound): after a deposit the active
+!     region is the cluster bounding box expanded by (sweeps remaining
+!     this step + CLMARG) — v1 simplification of {r <= min(sweeps,
+!     R(eps))} per the Inc-3 plan. Grid is 256x256 = 65536 = NT*QT with
+!     QT = 8192 = --gpu-tile-size, NT = 8 row-band tiles of 32 rows, so
+!     only the J extent of the active box matters. Warm-up: first WARM
+!     growth steps all tiles on (cold start from the log profile).
+!     Validation sweep (Spec §2 rule 5): every 16th sweep forces all
+!     tiles on. Clip soundness is APPROXIMATE (leftover warm-start
+!     residual freezes in clipped tiles instead of decaying until the
+!     next validation sweep), so the oracle is distribution-level, not
+!     trajectory-level — see DENDRITE_FINDINGS.md §9.
+!  4. f32 on GPU (Spec §6): fjord weights phi~1e-8 sit at the f32
+!     noise floor vs phi~1 fields — a systematic tip bias, not noise.
+!     The CPU f64 dbm_radial.ergo stays the reference oracle; a CPU f32
+!     build of THIS source is the precision control.
+!
+! Extracted GPU kernels (verify with --kernel-report): the two Jacobi
+! sweep kernels, the weight map, and the TOTW+NCAND multi-reduction.
+! The roulette walk and deposit stay CPU (sequential prefix / single
+! site). Per-step transfers: W download for the walk, PHI/CLUS/MASK
+! uploads after each deposit — whole-array 256 KiB each, small vs the
+! sweep cost, so NO deposit batching is used (growth statistics stay
+! identical in form to the CPU version).
+!
+!   python -m core min/dendrite/dbm_radial_gpu.ergo -o dbm_radial_gpu_cpu
+!   python -m core min/dendrite/dbm_radial_gpu.ergo --target spirv --precision f32 --gpu-tile-size 8192 -o dbm_radial_gpu
+!
+! Output format matches dbm_radial.ergo (progress + SNAP blocks) so
+! min/dendrite/analyze_dbm.py applies directly.
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 256, NY = 256
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 4000
+INTEGER, PARAMETER :: SEED = 12345
+REAL, PARAMETER :: ETA = 1.0
+REAL, PARAMETER :: D0 = 0.0
+REAL, PARAMETER :: CAP = 0.0
+INTEGER, PARAMETER :: SWFIX = 384
+INTEGER, PARAMETER :: QT = 8192, NT = 8
+INTEGER, PARAMETER :: CLMARG = 8, WARM = 5
+STATIC REAL :: PHI(NPTS), PHI2(NPTS), MASK(NPTS), CLUS(NPTS), W(NPTS)
+STATIC REAL :: BND(NPTS)
+STATIC INTEGER :: TILE_CLIP(NT)
+REAL :: CX, CY, R, R1, DX, DY, PI
+REAL :: DN, NSUM, TOTW, U, TARGET, CUM, RMAX, RD, PHIB, T
+REAL :: RSDMAX
+INTEGER :: I, J, K, G, SW, KSEL, DONE, NCAND, MASS
+INTEGER :: I0, I1, J0, J1, IXS, JYS, IT, JB0, JB1, SWREM
+INTEGER :: NACT, NSW
+
+PI := ACOS(0.0 - 1.0)
+CX := 0.5 * REAL(NX + 1)
+CY := 0.5 * REAL(NY + 1)
+R1 := 0.5 * REAL(NX) - 2.0
+PHIB := 1.0
+
+! Geometry: outer circle fixed phi=PHIB; interior solves; center seed.
+! (nested loop — stays on CPU, uploaded once)
+DO J = 1, NY
+  DO I = 1, NX
+    K := I + (J - 1) * NX
+    DX := REAL(I) - CX
+    DY := REAL(J) - CY
+    R := SQRT(DX * DX + DY * DY)
+    MASK(K) := 0.0
+    PHI(K) := 1.0
+    PHI2(K) := 1.0
+    CLUS(K) := 0.0
+    BND(K) := 0.0
+    IF (R < R1) THEN
+      MASK(K) := 1.0
+      PHI(K) := LOG(MAX(R, 0.5)) / LOG(R1)
+      PHI2(K) := PHI(K)
+    ENDIF
+    IF (R >= R1) THEN
+      BND(K) := 1.0
+    ENDIF
+  ENDDO
+ENDDO
+K := INT(CX) + (INT(CY) - 1) * NX
+CLUS(K) := 1.0
+MASK(K) := 0.0
+PHI(K) := 0.0
+PHI2(K) := 0.0
+DO IT = 1, NT
+  TILE_CLIP(IT) := 1
+ENDDO
+I0 := INT(CX)
+I1 := INT(CX)
+J0 := INT(CY)
+J1 := INT(CY)
+
+WRITE(*, "dbm_radial  grid %d x %d  R1 %.1f  eta %.2f  d0 %.4f  cap %.0f  seed %d  nsteps %d") &
+  NX, NY, R1, ETA, D0, CAP, SEED, NSTEPS
+
+RMAX := 0.0
+MASS := 1
+T := 0.0
+DONE := 0
+NACT := 0
+NSW := 0
+DO G = 1, NSTEPS
+  IF (DONE == 0) THEN
+
+    ! 1. Jacobi re-solve, SWFIX sweeps, PHI/PHI2 ping-pong. SWFIX is
+    ! even, so the final field is back in PHI.
+    DO SW = 1, SWFIX
+      ! Elliptic clip: active = cluster bbox + (sweeps left + margin).
+      IF (G > WARM) THEN
+        IF (MOD(SW, 16) /= 0) THEN
+          SWREM := SWFIX - SW + CLMARG
+          DO IT = 1, NT
+            JB0 := (IT - 1) * 32 + 1
+            JB1 := IT * 32
+            TILE_CLIP(IT) := 0
+            IF (JB1 >= J0 - SWREM) THEN
+              IF (JB0 <= J1 + SWREM) THEN
+                TILE_CLIP(IT) := 1
+                NACT := NACT + 1
+              ENDIF
+            ENDIF
+          ENDDO
+        ELSE
+          ! validation sweep: all tiles on (Spec §2 rule 5)
+          DO IT = 1, NT
+            TILE_CLIP(IT) := 1
+          ENDDO
+          NACT := NACT + NT
+        ENDIF
+      ELSE
+        NACT := NACT + NT
+      ENDIF
+      NSW := NSW + 1
+      IF (MOD(SW, 2) == 1) THEN
+        DO K = NX + 2, NEND
+          PHI2(K) := MAX(PHI(K) + MASK(K) * (0.25 * (PHI(K - 1) &
+            + PHI(K + 1) + PHI(K - NX) + PHI(K + NX)) - PHI(K)), 0.0)
+        ENDDO
+      ELSE
+        DO K = NX + 2, NEND
+          PHI(K) := MAX(PHI2(K) + MASK(K) * (0.25 * (PHI2(K - 1) &
+            + PHI2(K + 1) + PHI2(K - NX) + PHI2(K + NX)) - PHI2(K)), 0.0)
+        ENDDO
+      ENDIF
+    ENDDO
+    DO IT = 1, NT
+      TILE_CLIP(IT) := 1
+    ENDDO
+
+    ! 2. Candidate weights (GT lives in the cluster BC, not here).
+    DO K = NX + 2, NEND
+      NSUM := CLUS(K - 1) + CLUS(K + 1) + CLUS(K - NX) + CLUS(K + NX)
+      W(K) := (1.0 - CLUS(K)) * MASK(K) * MIN(1.0, NSUM) &
+        * MAX(PHI(K), 0.0) ** ETA
+    ENDDO
+    TOTW := 0.0
+    NCAND := 0
+    DO K = 1, NEND
+      NSUM := CLUS(K - 1) + CLUS(K + 1) + CLUS(K - NX) + CLUS(K + NX)
+      TOTW := TOTW + W(K)
+      NCAND := NCAND + INT((1.0 - CLUS(K)) * MASK(K) * MIN(1.0, NSUM))
+    ENDDO
+
+    ! 3. Roulette pick, one counter-based draw per growth step.
+    KSEL := 0
+    IF (TOTW > 0.0) THEN
+      U := RAND(SEED + G)
+      TARGET := U * TOTW
+      CUM := 0.0
+      DO K = NX + 2, NEND
+        IF (KSEL == 0) THEN
+          CUM := CUM + W(K)
+          IF (CUM >= TARGET) THEN
+            IF (W(K) > 0.0) THEN
+              KSEL := K
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDIF
+
+    ! 4. Deposit; quenched Gibbs-Thomson BC phi_s = D0*(2-m); track
+    !    radius and cluster bounding box; stop flags as in the CPU version.
+    IF (KSEL > 0) THEN
+      NSUM := CLUS(KSEL - 1) + CLUS(KSEL + 1) + CLUS(KSEL - NX) &
+        + CLUS(KSEL + NX)
+      CLUS(KSEL) := 1.0
+      MASK(KSEL) := 0.0
+      PHI(KSEL) := D0 * (2.0 - NSUM)
+      PHI2(KSEL) := D0 * (2.0 - NSUM)
+      MASS := MASS + 1
+      T := T + 1.0 / TOTW
+      IXS := MOD(KSEL - 1, NX) + 1
+      JYS := (KSEL - 1) / NX + 1
+      IF (IXS < I0) THEN
+        I0 := IXS
+      ENDIF
+      IF (IXS > I1) THEN
+        I1 := IXS
+      ENDIF
+      IF (JYS < J0) THEN
+        J0 := JYS
+      ENDIF
+      IF (JYS > J1) THEN
+        J1 := JYS
+      ENDIF
+      DX := REAL(IXS) - CX
+      DY := REAL(JYS) - CY
+      RD := SQRT(DX * DX + DY * DY)
+      RMAX := MAX(RMAX, RD)
+      IF (RMAX > 0.8 * R1) THEN
+        DONE := 1
+      ENDIF
+      IF (CAP > 0.0) THEN
+        PHIB := MAX(1.0 - REAL(MASS) / CAP, 0.0)
+        DO K = 1, NPTS
+          IF (BND(K) > 0.5) THEN
+            PHI(K) := PHIB
+            PHI2(K) := PHIB
+          ENDIF
+        ENDDO
+        IF (PHIB <= 0.0) THEN
+          WRITE(*, "reservoir exhausted at step %d  mass %d  time %.3e") &
+            G, MASS, T
+          DONE := 1
+        ENDIF
+      ENDIF
+    ENDIF
+    IF (TOTW <= 0.0) THEN
+      WRITE(*, "frozen at step %d  mass %d  phib %.4f  (totw=0)") &
+        G, MASS, PHIB
+      DONE := 1
+    ENDIF
+
+    IF (MOD(G, 100) == 0) THEN
+      WRITE(*, "step %d  mass %d  rmax %.1f  totw %.4e  ncand %d  sor %d  phib %.4f  time %.3e") &
+        G, MASS, RMAX, TOTW, NCAND, SWFIX, PHIB, T
+    ENDIF
+    IF (MOD(G, 250) == 0) THEN
+      RSDMAX := 0.0
+      DO K = NX + 2, NEND
+        DN := MASK(K) * (0.25 * (PHI(K - 1) + PHI(K + 1) &
+          + PHI(K - NX) + PHI(K + NX)) - PHI(K))
+        IF (ABS(DN) > RSDMAX) THEN
+          RSDMAX := ABS(DN)
+        ENDIF
+      ENDDO
+      WRITE(*, "resid step %d  maxdelta %.3e") G, RSDMAX
+    ENDIF
+    IF (G == NSTEPS / 2) THEN
+      WRITE(*, "SNAP %d") G
+      DO K = 1, NPTS
+        IF (CLUS(K) > 0.5) THEN
+          WRITE(*, "%d %d") MOD(K - 1, NX) + 1, (K - 1) / NX + 1
+        ENDIF
+      ENDDO
+      WRITE(*, "ENDSNAP")
+    ENDIF
+    IF (DONE == 1) THEN
+      IF (RMAX > 0.8 * R1) THEN
+        WRITE(*, "boundary reached at step %d  rmax %.1f") G, RMAX
+      ENDIF
+    ENDIF
+  ENDIF
+ENDDO
+
+! Final residual report (CPU sweep delta; forces a PHI download).
+RSDMAX := 0.0
+DO K = NX + 2, NEND
+  DN := MASK(K) * (0.25 * (PHI(K - 1) + PHI(K + 1) &
+    + PHI(K - NX) + PHI(K + NX)) - PHI(K))
+  IF (ABS(DN) > RSDMAX) THEN
+    RSDMAX := ABS(DN)
+  ENDIF
+ENDDO
+WRITE(*, "resid final  maxdelta %.3e") RSDMAX
+
+WRITE(*, "SNAP %d") NSTEPS
+DO K = 1, NPTS
+  IF (CLUS(K) > 0.5) THEN
+    WRITE(*, "%d %d") MOD(K - 1, NX) + 1, (K - 1) / NX + 1
+  ENDIF
+ENDDO
+WRITE(*, "ENDSNAP")
+WRITE(*, "dispatched %.2f%%") 100.0 * REAL(NACT) / REAL(NT * NSW)
+WRITE(*, "done  mass %d  rmax %.1f  phib %.4f") MASS, RMAX, PHIB

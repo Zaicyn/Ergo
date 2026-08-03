@@ -12,6 +12,12 @@ STATIC INTEGER array named TILE_CLIP, the host tile loop of every tiled
 non-reduction kernel skips tiles flagged 0 (skipped tile = its output
 elements are not updated this dispatch; stale device values persist —
 soundness is the program's responsibility). See --gpu-tile-size docs.
+
+Frame-loop kernel scans (upload_set / kernel_reads for the end-of-frame
+CPU->GPU sync) recurse into nested IF/loop bodies via
+_collect_kernel_ids — kernels nested inside conditionals (e.g. the DBM
+solver's IF-guarded sweep loops) still get their CPU-dirtied arrays
+uploaded.
 """
 
 from __future__ import annotations
@@ -1182,12 +1188,18 @@ class IRCodeGen:
 
             # Collect arrays ANY frame-loop GPU kernel reads/writes
             if frame_dirty and has_gpu_dispatches:
+                # Recurse into nested IF/loop bodies — kernels are not
+                # necessarily top-level items of the frame body (a flat
+                # scan here silently dropped the upload of CPU-deposited
+                # arrays in the DBM solver, whose kernels sit inside
+                # IF(DONE==0)/IF(sweep parity)).
                 all_kernel_arrays: set[str] = set()
-                for bodyitem in node.body:
-                    if isinstance(bodyitem, IRLoop):
-                        k = self._kernel_by_line.get(bodyitem.line)
-                        if k:
-                            all_kernel_arrays |= k.arrays_read | k.arrays_written
+                _kk_ids: set[int] = set()
+                self._collect_kernel_ids(node.body, _kk_ids)
+                for _kk in _kk_ids:
+                    if _kk in self._kernel_by_id:
+                        all_kernel_arrays |= (self._kernel_by_id[_kk].arrays_read
+                                              | self._kernel_by_id[_kk].arrays_written)
                 upload_set = frame_dirty & all_kernel_arrays
 
             # Rendering (only when --render is active)
@@ -1345,11 +1357,12 @@ class IRCodeGen:
                 # kernel). Only arrays no kernel reads may share the
                 # oracle's gated schedule.
                 kernel_reads: set[str] = set()
-                for bodyitem in node.body:
-                    if isinstance(bodyitem, IRLoop):
-                        k = self._kernel_by_line.get(bodyitem.line)
-                        if k:
-                            kernel_reads |= k.arrays_read
+                # Same nested-body recursion as the upload_set scan above.
+                _kr_ids: set[int] = set()
+                self._collect_kernel_ids(node.body, _kr_ids)
+                for _kr in _kr_ids:
+                    if _kr in self._kernel_by_id:
+                        kernel_reads |= self._kernel_by_id[_kr].arrays_read
                 per_frame = upload_set & kernel_reads
                 oracle_only = upload_set - kernel_reads
                 # Ensure GPU is idle before transfers (idempotent)
