@@ -158,6 +158,17 @@ computed only when queried.
   hyperbolic): snapshot = full tile state + boundary trace; lazy
   queries cost O(t − t_freeze) catch-up (fine if rare), else eager
   stepping with a documented budget.
+- *Affine range remap* (any LINEAR PDE — Laplace, wave, diffusion,
+  Schrödinger): the PDE is invariant under
+  `phi_local = (phi − floor)/(ceiling − floor)` with floor/ceiling from
+  the boundary trace — the same solve runs at full f32 precision in
+  the local window instead of f64. VALIDATED
+  (`min/dendrite/dbm_zoom.ergo`): remapped f32 vs f64 reference in a
+  DBM bay window, max relative error 3.1e-7 vs unremapped 1.5e-3
+  (~4700× better; the unremapped error is tolerance truncation at the
+  global scale — exactly the noise-floor conflation of this section).
+  Boundary-trace error bounds the zoom; remap-back onto the global
+  grid is lossy (analysis-only mode, or low-pass reinsertion).
 
 **Re-entry (thaw).** A frozen tile's envelope can rise again (new
 pulse, cluster growth). The program re-evaluates the same a priori

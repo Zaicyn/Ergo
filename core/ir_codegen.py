@@ -18,6 +18,18 @@ CPU->GPU sync) recurse into nested IF/loop bodies via
 _collect_kernel_ids — kernels nested inside conditionals (e.g. the DBM
 solver's IF-guarded sweep loops) still get their CPU-dirtied arrays
 uploaded.
+
+Dirty-range transfers (Inc-4): 1-D GPU-resident arrays get a runtime
+dirty interval (_rg_lo_ARR/_rg_hi_ARR, 0-based, file-scope) merged at
+every CPU store / ZERO — only executed writes count, so guarded writes
+(e.g. CAP>0 branches) cost no upload when skipped, and point deposits
+upload 4 bytes instead of the whole array. Uploads become a guarded
+ergo_vk_upload_at over the interval; arrays without tracking (multi-dim,
+ping-pong) keep whole-array uploads. Mid-body downloads of arrays whose
+remaining CPU reads all sit under one MOD(G,k)==0 guard are emitted
+inside that guard (e.g. every-250-step residual probes no longer force
+per-step whole-array downloads). Never under-approximates: any
+unanalyzable access falls back to whole-array.
 """
 
 from __future__ import annotations
@@ -291,6 +303,21 @@ class IRCodeGen:
             self._emit_static_var(g, mod)
         if statics:
             self._put_raw("")
+
+        # Dirty-range transfer state (Inc-4): one runtime interval per
+        # tracked (1-D, GPU-resident, non-pp) array. File scope so CPU
+        # subroutines' stores can merge too. [lo,hi] 0-based inclusive;
+        # hi < 0 = no tracked write since last upload.
+        if self.gpu_plan:
+            _rg_arrays = [a for a in self._gpu_arrays()
+                          if self._rg_tracked(a)]
+            if _rg_arrays:
+                self._put_raw("/* runtime dirty intervals (Inc-4) */")
+                for a in _rg_arrays:
+                    kw = "" if self.jit_mode else "static "
+                    self._put_raw(f"{kw}int _rg_lo_{a} = 2147483647, "
+                                  f"_rg_hi_{a} = -1;")
+                self._put_raw("")
 
         # Emit arena BSS if any ALLOC/FREE op is reachable from main or a
         # function body. BSS is zero-filled by the loader; no libc.
@@ -663,6 +690,67 @@ class IRCodeGen:
                 init = self._data_scalar_init(v, self.module)
             self._put(f"{ct} {v.name}{init};")
 
+    # ── runtime dirty-interval tracking (Inc-4) ─────────────
+
+    def _rg_tracked(self, arr: str) -> bool:
+        """True if arr gets runtime dirty-interval tracking: 1-D,
+        GPU-resident, not ping-pong (pp uploads already use upload_at
+        with the wr offset). Anything else keeps whole-array uploads —
+        never under-approximate."""
+        if not self.gpu_plan:
+            return False
+        if arr in getattr(self, '_pp_arrays', set()):
+            return False
+        shape = self._array_shapes.get(arr)
+        return bool(shape) and len(shape) == 1 and arr in self._gpu_arrays()
+
+    def _put_ranged_upload(self, arr: str, shape, sz: str):
+        """Upload only the runtime dirty interval of arr (guarded — no
+        upload at all when no tracked CPU write executed). Untracked
+        arrays get the whole-array upload."""
+        size_expr = " * ".join(self._dim_expr(d) for d in shape)
+        if self._rg_tracked(arr):
+            self._put(f"if (_rg_hi_{arr} >= 0) {{")
+            self.indent += 1
+            self._put(f"ergo_vk_upload_at(d_{arr}, {arr} + _rg_lo_{arr}, "
+                      f"(size_t)_rg_lo_{arr} * {sz}, "
+                      f"(size_t)(_rg_hi_{arr} - _rg_lo_{arr} + 1) * {sz});")
+            self._put(f"_rg_lo_{arr} = 2147483647; _rg_hi_{arr} = -1;")
+            self.indent -= 1
+            self._put("}")
+        else:
+            self._put(f"ergo_vk_upload(d_{arr}, {arr}, {size_expr} * {sz});")
+
+    def _mod_guard_of(self, item, prev_item) -> tuple[str, int] | None:
+        """If item is IRIf whose condition is (MOD(G, k) == 0) computed
+        in the immediately preceding IRBlock, return (G, k). Else None."""
+        if not isinstance(item, IRIf) or not isinstance(prev_item, IRBlock):
+            return None
+        cond = item.condition
+        if not isinstance(cond, IRRef):
+            return None
+        mod_result = None
+        for inst in prev_item.insts:
+            if (inst.result == cond.name and inst.op == Op.EQ
+                    and len(inst.args) == 2):
+                a0, a1 = inst.args
+                if isinstance(a1, IRConst) and a1.value == 0 \
+                        and isinstance(a0, IRRef):
+                    mod_result = a0.name
+                elif isinstance(a0, IRConst) and a0.value == 0 \
+                        and isinstance(a1, IRRef):
+                    mod_result = a1.name
+        if not mod_result:
+            return None
+        for inst in prev_item.insts:
+            if inst.result == mod_result and inst.op == Op.MOD \
+                    and len(inst.args) == 2:
+                a0, a1 = inst.args
+                if isinstance(a0, IRRef) and isinstance(a1, IRConst) \
+                        and isinstance(a1.value, int) and a1.value > 1:
+                    return (a0.name, a1.value)
+        return None
+
     # ── structured body emission ─────────────────────────────
 
     def _emit_body(self, items: list, suppress_final_download: bool = False
@@ -730,13 +818,45 @@ class IRCodeGen:
                         # kernels are device-side, not CPU access)
                         remaining = items[i:]
                         cpu_reads: set[str] = set()
+                        # Guard-aware elision (Inc-4): an array whose
+                        # remaining CPU reads ALL sit under one
+                        # MOD(G,k)==0 guard (e.g. an every-250-steps
+                        # residual probe) is downloaded inside that
+                        # guard, not every frame. Mixed/unguarded reads
+                        # (arr_guard[a] is None) download unconditionally.
+                        # Writes alone do NOT force a download for
+                        # rg-tracked arrays — the ranged upload covers
+                        # the CPU->GPU direction without refreshing the
+                        # host copy, and host staleness only matters for
+                        # reads. Untracked arrays keep the old
+                        # write-triggered download (their whole-array
+                        # upload would clobber GPU-fresh data with a
+                        # partially-stale host copy otherwise).
+                        arr_guard: dict = {}
+                        prev_ri = None
                         for ri in remaining:
                             if isinstance(ri, IRLoop):
                                 k = self._kernel_by_line.get(ri.line)
                                 if k:
+                                    prev_ri = ri
                                     continue  # GPU kernel — skip
-                            self._collect_cpu_array_reads([ri], cpu_reads)
-                            self._collect_cpu_array_writes([ri], cpu_reads)
+                            rd: set[str] = set()
+                            wr: set[str] = set()
+                            self._collect_cpu_array_reads([ri], rd)
+                            self._collect_cpu_array_writes([ri], wr)
+                            g = self._mod_guard_of(ri, prev_ri)
+                            for a in rd:
+                                if a in arr_guard:
+                                    if arr_guard[a] != g:
+                                        arr_guard[a] = None
+                                else:
+                                    arr_guard[a] = g
+                            cpu_reads |= rd
+                            for a in wr - rd:
+                                if not self._rg_tracked(a):
+                                    cpu_reads.add(a)
+                                    arr_guard[a] = None
+                            prev_ri = ri
                         needed = last_dispatch_arrays & cpu_reads
                         if needed:
                             # In batched frame mode, end the GPU command buffer
@@ -762,7 +882,8 @@ class IRCodeGen:
                             self._put("ergo_vk_frame_wait();")
                             pp = getattr(self, '_pp_arrays', set())
                             self._put("/* Download GPU results for CPU access */")
-                            for arr in sorted(needed):
+
+                            def _dl(arr):
                                 shape = self._array_shapes.get(arr)
                                 if shape:
                                     self._body_downloaded.add(arr)
@@ -778,6 +899,21 @@ class IRCodeGen:
                                         self._put(
                                             f"ergo_vk_download(d_{arr}, {arr}, "
                                             f"{size_expr} * {sz});")
+
+                            dl_guards: dict = {}
+                            for arr in sorted(needed):
+                                g = arr_guard.get(arr)
+                                if g is None:
+                                    _dl(arr)
+                                else:
+                                    dl_guards.setdefault(g, []).append(arr)
+                            for (gv, gk) in sorted(dl_guards):
+                                self._put(f"if ({gv} % {gk} == 0) {{")
+                                self.indent += 1
+                                for arr in sorted(dl_guards[(gv, gk)]):
+                                    _dl(arr)
+                                self.indent -= 1
+                                self._put("}")
                             if verify_guard:
                                 self.indent -= 1
                                 self._put("}")
@@ -857,15 +993,27 @@ class IRCodeGen:
                         # Only upload arrays this kernel actually reads
                         needed = (kernel.arrays_read | kernel.arrays_written) & cpu_dirty_arrays
                         if needed:
+                            # Ordering: a synchronous transfer executes
+                            # BEFORE this frame's recorded-but-unsubmitted
+                            # dispatches — wrong if one of those kernels
+                            # WROTE an array being uploaded (the recorded
+                            # write would clobber the upload). Drain only
+                            # on actual overlap (e.g. a CPU write between
+                            # two kernels of the same array).
+                            if (self._batched_frame
+                                    and not self._frame_ended_early
+                                    and (needed & self._frame_gpu_dirty)):
+                                self._put("/* Drain before mid-frame upload */")
+                                self._put("ergo_vk_frame_end();")
+                                self._put("ergo_vk_frame_wait();")
+                                self._put("ergo_vk_frame_begin();")
+                                self._frame_gpu_dirty.clear()
                             self._put("/* Upload CPU-modified arrays to GPU */")
                             for arr in sorted(needed):
                                 shape = self._array_shapes.get(arr)
                                 if shape:
-                                    size_expr = " * ".join(
-                                        self._dim_expr(d) for d in shape)
                                     sz = self._gpu_sizeof(arr)
-                                    self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
-                                              f"{size_expr} * {sz});")
+                                    self._put_ranged_upload(arr, shape, sz)
                         cpu_dirty_arrays -= (kernel.arrays_read | kernel.arrays_written)
                         self._gpu_current |= needed
                     # In batched mode, add barrier before each dispatch
@@ -921,6 +1069,13 @@ class IRCodeGen:
                         fresh = inner_gpu_written - cpu_writes
                         cpu_dirty_arrays -= fresh
                         self._gpu_current |= fresh
+                        # Reset runtime dirty intervals too — otherwise a
+                        # later ranged upload would write the stale host
+                        # range over the kernel results.
+                        for arr in sorted(fresh):
+                            if self._rg_tracked(arr):
+                                self._put(f"_rg_lo_{arr} = 2147483647; "
+                                          f"_rg_hi_{arr} = -1;")
                 # For SPLIT kernels, the suffix upload already synced
                 # CPU-modified arrays to GPU. Clear them from dirty set.
                 if kernel and kernel.is_partial:
@@ -1138,10 +1293,8 @@ class IRCodeGen:
                 for arr in to_upload:
                     shape = self._array_shapes.get(arr)
                     if shape:
-                        size_expr = " * ".join(self._dim_expr(d) for d in shape)
                         sz = self._gpu_sizeof(arr)
-                        self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
-                                  f"{size_expr} * {sz});")
+                        self._put_ranged_upload(arr, shape, sz)
                 self._cpu_dirty -= set(to_upload)
                 self._gpu_current |= set(to_upload)
             # Use runtime _max_frames if DEFAULT_FRAMES is the bound
@@ -1381,8 +1534,7 @@ class IRCodeGen:
                                           f"(size_t)_pp_wr_offset * {sz}, "
                                           f"{size_expr} * {sz});")
                             else:
-                                self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
-                                          f"{size_expr} * {sz});")
+                                self._put_ranged_upload(arr, shape, sz)
                 if oracle_only:
                     verify_meta = self._find_verify_meta(node.body)
                     upload_guard = (verify_meta and
@@ -1405,8 +1557,7 @@ class IRCodeGen:
                                           f"(size_t)_pp_wr_offset * {sz}, "
                                           f"{size_expr} * {sz});")
                             else:
-                                self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
-                                          f"{size_expr} * {sz});")
+                                self._put_ranged_upload(arr, shape, sz)
                     if upload_guard:
                         self.indent -= 1
                         self._put("}")
@@ -1858,6 +2009,16 @@ class IRCodeGen:
             # Column-major: reversed subscripts (see LOAD above).
             indices = self._subscripts(array_name, args[1:])
             self._put(f"{array_name}[{indices}] = {val};")
+            # Dirty-range tracking: merge the written element into the
+            # array's runtime interval. Only EXECUTED writes merge, so
+            # guarded writes are exact, and any index expression works
+            # (no affine analysis needed). 1-D arrays only.
+            if (self.gpu_plan and len(args[1:]) == 1
+                    and self._rg_tracked(array_name)):
+                self._put(f"_rg_lo_{array_name} = ({indices} < _rg_lo_{array_name})"
+                          f" ? {indices} : _rg_lo_{array_name};")
+                self._put(f"_rg_hi_{array_name} = ({indices} > _rg_hi_{array_name})"
+                          f" ? {indices} : _rg_hi_{array_name};")
             return
 
         # ALLOC — bump from file-scope arena (see _emit_arena_decl).
@@ -1928,6 +2089,12 @@ class IRCodeGen:
                 self._put(f"memset({array_name}, 0, _ergo_sz_{array_name});")
             else:
                 self._put(f"memset({array_name}, 0, sizeof({array_name}));")
+            # Dirty-range tracking: ZERO writes the whole array.
+            if self.gpu_plan and self._rg_tracked(array_name):
+                _zs = " * ".join(self._dim_expr(d)
+                                 for d in self._array_shapes[array_name])
+                self._put(f"_rg_lo_{array_name} = 0; "
+                          f"_rg_hi_{array_name} = ({_zs}) - 1;")
             return
 
         # Function call (with return value)
@@ -1999,9 +2166,7 @@ class IRCodeGen:
                                 f"(size_t)_pp_wr_offset * {sz}, "
                                 f"{size_expr} * {sz});")
                         else:
-                            self._put(
-                                f"ergo_vk_upload(d_{arr}, {arr}, "
-                                f"{size_expr} * {sz});")
+                            self._put_ranged_upload(arr, shape, sz)
                 self._gpu_current |= ul_arrays
             # NET hook: send census packet after adaptive census call
             if func == "SIM_CENSUS_ADAPTIVE" and self._has_net:
@@ -3636,6 +3801,31 @@ class IRCodeGen:
         self.indent += 1
         self._put(f"int _G = (({bound}) + 255) / 256;")
         self._put(f"int _NT = (({bound}) + {self._qtile - 1}) / {self._qtile};")
+        # The partials buffer is one contiguous [tile][acc][group] block
+        # — fetch it in ONE transfer when small (a per-(acc,tile)
+        # download costs one submit/wait each, which dominated the DBM
+        # solver's transfer count). VLA capped; large buffers take the
+        # per-tile path.
+        self._put(f"if (_NT * {n_acc * gpt} <= 16384) {{")
+        self.indent += 1
+        self._put(f"{ct} _rall[_NT * {n_acc * gpt}];")
+        self._put(f"ergo_vk_download(d__reduce_{kid}, _rall, "
+                  f"(size_t)_NT * {n_acc * gpt} * sizeof({ct}));")
+        for ai, acc in enumerate(accs):
+            cast = ("(int)" if self._var_types.get(acc)
+                    == IRType.INTEGER else "")
+            self._put(f"for (int _t = 0; _t < _NT; _t++) {{")
+            self.indent += 1
+            self._put(f"int _ng = _G - _t * {gpt}; "
+                      f"if (_ng > {gpt}) _ng = {gpt};")
+            self._put(f"for (int _j = 0; _j < _ng; _j++) "
+                      f"{acc} += {cast}_rall[_t * {n_acc * gpt} + "
+                      f"{ai * gpt} + _j];")
+            self.indent -= 1
+            self._put("}")
+        self.indent -= 1
+        self._put("} else {")
+        self.indent += 1
         self._put(f"{ct} _rtile[{gpt}];")
         for ai, acc in enumerate(accs):
             cast = ("(int)" if self._var_types.get(acc)
@@ -3651,6 +3841,8 @@ class IRCodeGen:
                       f"{acc} += {cast}_rtile[_j];")
             self.indent -= 1
             self._put("}")
+        self.indent -= 1
+        self._put("}")
         self.indent -= 1
         self._put("}")
         self._gpu_current |= kernel.arrays_read
@@ -3758,8 +3950,7 @@ class IRCodeGen:
                               f"(size_t)_pp_wr_offset * {sz}, "
                               f"{size_expr} * {sz});")
                 else:
-                    self._put(f"ergo_vk_upload(d_{arr}, {arr}, "
-                              f"{size_expr} * {sz});")
+                    self._put_ranged_upload(arr, shape, sz)
         # Mark these arrays as GPU-current
         self._gpu_current |= suffix_writes
 

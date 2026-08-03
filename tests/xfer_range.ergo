@@ -1,0 +1,50 @@
+! XFER_RANGE — dirty-range transfer correctness oracle
+! =====================================================================
+! Validates the Inc-4 runtime dirty-interval uploads:
+!  1. POINT VISIBILITY: a CPU scalar write A(MID) := 42 must be visible
+!     to the next GPU kernel (ranged upload must happen).
+!  2. NO LEAK: the CPU host copy of A is STALE everywhere except MID
+!     (no download fires — writes alone don't refresh the host copy for
+!     rg-tracked arrays). A whole-array upload would clobber the GPU's
+!     current values (7.0) with the stale host values (0.0); the ranged
+!     upload must send only [MID,MID], so B(P) stays 7.0 for P /= MID.
+!  3. RANGE WRITE: a CPU loop writing A2(100..199) := 9.0 uploads
+!     exactly that interval — B2 is 3.0 outside, 9.0 inside.
+!
+! CPU:  python -m core tests/xfer_range.ergo -o /tmp/xr_cpu
+! GPU:  python -m core tests/xfer_range.ergo --target spirv --precision f32 -o /tmp/xr_gpu
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 100000, MID = 50000
+STATIC REAL :: A(N), A2(N), B(N), B2(N)
+INTEGER :: K, T
+
+DO DMY = 1, 1
+  DO K = 1, N
+    A(K) := 0.0
+    A2(K) := 0.0
+    B(K) := 0.0
+    B2(K) := 0.0
+  ENDDO
+ENDDO
+
+DO T = 1, 3
+  DO K = 1, N
+    A(K) := 7.0
+    A2(K) := 3.0
+  ENDDO
+  A(MID) := 42.0
+  DO K = 100, 199
+    A2(K) := 9.0
+    IF (K == 100) THEN
+      WRITE(*, "range-write injected (kept on CPU)")
+    ENDIF
+  ENDDO
+  DO K = 1, N
+    B(K) := A(K)
+    B2(K) := A2(K)
+  ENDDO
+ENDDO
+
+WRITE(*, "B1=%.1f BMID=%.1f BNEXT=%.1f") B(1), B(MID), B(MID + 1)
+WRITE(*, "B2_1=%.1f B2_150=%.1f B2_201=%.1f") B2(1), B2(150), B2(201)
