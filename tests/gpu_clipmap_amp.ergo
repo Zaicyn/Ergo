@@ -1,0 +1,169 @@
+! GPU_CLIPMAP_AMP — amplitude-envelope tile clipmap oracle
+! =====================================================================
+! Same wave rig as tests/gpu_clipmap.ergo (flattened 2D leapfrog,
+! off-center Gaussian pulse, zero initial field), but the clip bound is
+! an AMPLITUDE ENVELOPE instead of the L1 cone. NOT bitwise — see
+! oracle below.
+!
+! One program runs TWO field pairs in lockstep:
+!   (U, UN)   — full reference: TILE_CLIP forced to 1 before its
+!               kernels (tiled-full == untiled bitwise for injective
+!               kernels, established in Increment 1)
+!   (U2, UN2) — clipped: TILE_CLIP set from the envelope
+! so the max pointwise error is computed exactly, in-program.
+!
+! Envelope (hyperbolic, 2D geometric spreading + wake):
+!   E(r,t) = MARGIN * PSUM(TR) / SQRT(MAX(r_eucl, R0))
+!   TR  = t - INT(r_L1 / CWAVE)     (retarded time)
+!   PSUM(TR) = sum_{s<=TR} SVH(s)   (retarded CUMULATIVE sum of the
+!            source history — DEVIATION from the originally suggested
+!            retarded VALUE |SV(t-r/c)|: the 2D wave equation has no
+!            Huygens principle, the wake behind the front rings at
+!            ~3e-2 for >>60 steps, and the retarded-value form measured
+!            MAXD = 2.04e-01 vs the 4e-7 oracle. The cumulative sum is
+!            the honest 2D bound: it is zero before the front can
+!            arrive (exact causality) and covers the wake afterwards.)
+!   SVH  = analytic source SV(T) = AMP*EXP(-((T-10)/3)^2), tail-cut at
+!          1e-7 on storage (the neglected tail integral is ~1e-7,
+!          covered by MARGIN; the cut keeps the front edge sharp).
+!   CWAVE = 2.0 cells/step: the stencil's numerical (L1) propagation
+!          rate, 1 cell per half-step — same derivation as the cone
+!          test's 2*T reach. r_L1 (delay) and r_eucl (spreading
+!          denominator, <= r_L1 hence conservative) are per-tile minima.
+!   MARGIN = 4.0 covers modeling error (dispersion precursors, the
+!          tail cut, Euclidean/L1 slack). TOL_ENV = 1e-7, R0 = 4.0.
+!
+! Clip when E < TOL_ENV. Error oracle: MAXD <= TOL_ENV*MARGIN = 4e-7
+! (error-bounded, NOT bitwise: a clipped tile keeps stale values whose
+! magnitude is envelope-bounded, not exactly zero; the validation sweep
+! every 15 steps forces all tiles on for one full step to bound drift,
+! then envelope clipping resumes).
+!
+! QT/NT sizing contract: QT = 8192 = --gpu-tile-size (already a
+! workgroup multiple), NT = NPTS/QT = 40 exactly, same grid as
+! tests/gpu_clipmap.ergo.
+!
+! CPU:     python -m core tests/gpu_clipmap_amp.ergo --precision f32 -o /tmp/amp_cpu
+! CLIPPED: python -m core tests/gpu_clipmap_amp.ergo --target spirv --precision f32 --gpu-tile-size 8192 -o /tmp/amp_gpu
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 640, NY = 512
+INTEGER, PARAMETER :: NPTS = 327680, NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 60
+INTEGER, PARAMETER :: QT = 8192, NT = 40
+INTEGER, PARAMETER :: IXS = 320, IYS = 256, ISRC = 163520
+REAL, PARAMETER :: C2 = 0.25, AMP = 1.0
+REAL, PARAMETER :: CWAVE = 2.0, MARG = 4.0, TOL_ENV = 1.0e-7, R0 = 4.0
+REAL, PARAMETER :: TAIL_CUT = 1.0e-7
+
+STATIC REAL :: U(NPTS), UN(NPTS), U2(NPTS), UN2(NPTS)
+STATIC REAL :: SVH(NSTEPS), PSVH(NSTEPS)
+STATIC INTEGER :: TILE_CLIP(NT)
+REAL :: SV, MAXD, MAXDUN, E, RF
+INTEGER :: K, T, IT, KBEG, KEND, DX, DY, D, TR, NACT
+INTEGER :: DMIN, D2MIN, DD, D2
+
+! Init kept on the CPU (nested loop is not extracted)
+DO DMY = 1, 1
+  DO K = 1, NPTS
+    U(K) := 0.0
+    UN(K) := 0.0
+    U2(K) := 0.0
+    UN2(K) := 0.0
+  ENDDO
+ENDDO
+
+NACT := 0
+DO T = 1, NSTEPS
+  SV := AMP * EXP(0.0 - ((REAL(T) - 10.0) / 3.0) ** 2)
+  IF (SV < TAIL_CUT) THEN
+    SV := 0.0
+  ENDIF
+  SVH(T) := SV
+  IF (T == 1) THEN
+    PSVH(T) := SV
+  ELSE
+    PSVH(T) := PSVH(T - 1) + SV
+  ENDIF
+
+  ! ── Full reference pair: every tile dispatched ──
+  DO IT = 1, NT
+    TILE_CLIP(IT) := 1
+  ENDDO
+  DO K = NX + 2, NEND
+    UN(K) := 2.0 * U(K) - UN(K) &
+      + C2 * (U(K + 1) + U(K - 1) + U(K + NX) + U(K - NX) - 4.0 * U(K))
+  ENDDO
+  UN(ISRC) := UN(ISRC) + SV
+  DO K = NX + 2, NEND
+    U(K) := 2.0 * UN(K) - U(K) &
+      + C2 * (UN(K + 1) + UN(K - 1) + UN(K + NX) + UN(K - NX) - 4.0 * UN(K))
+  ENDDO
+
+  ! ── Envelope clip for the clipped pair ──
+  ! (validation sweep: every 15 steps leave all tiles on)
+  IF (MOD(T, 15) /= 0) THEN
+    DO IT = 1, NT
+      TILE_CLIP(IT) := 0
+      KBEG := (IT - 1) * QT + 1
+      KEND := KBEG + QT - 1
+      DMIN := 999999
+      D2MIN := 99999999
+      DO K = KBEG, KEND
+        DX := MOD(K - 1, NX) - IXS
+        DY := (K - 1) / NX - IYS
+        DD := ABS(DX) + ABS(DY)
+        IF (DD < DMIN) THEN
+          DMIN := DD
+        ENDIF
+        D2 := DX * DX + DY * DY
+        IF (D2 < D2MIN) THEN
+          D2MIN := D2
+        ENDIF
+      ENDDO
+      D := INT(REAL(DMIN) / CWAVE)
+      TR := T - D
+      RF := SQRT(REAL(D2MIN))
+      IF (RF < R0) THEN
+        RF := R0
+      ENDIF
+      E := 0.0
+      IF (TR >= 1) THEN
+        E := MARG * PSVH(TR) / RF
+      ENDIF
+      IF (E >= TOL_ENV) THEN
+        TILE_CLIP(IT) := 1
+        NACT := NACT + 1
+      ENDIF
+    ENDDO
+  ELSE
+    NACT := NACT + NT
+  ENDIF
+  DO K = NX + 2, NEND
+    UN2(K) := 2.0 * U2(K) - UN2(K) &
+      + C2 * (U2(K + 1) + U2(K - 1) + U2(K + NX) + U2(K - NX) - 4.0 * U2(K))
+  ENDDO
+  UN2(ISRC) := UN2(ISRC) + SV
+  DO K = NX + 2, NEND
+    U2(K) := 2.0 * UN2(K) - U2(K) &
+      + C2 * (UN2(K + 1) + UN2(K - 1) + UN2(K + NX) + UN2(K - NX) - 4.0 * UN2(K))
+  ENDDO
+ENDDO
+
+! Max pointwise error over the same clean window as gpu_clipmap.ergo
+! (rows 140..500; excludes the device start-quirk pollution zone).
+MAXD := 0.0
+MAXDUN := 0.0
+DO K = 89601, 320000
+  IF (ABS(U(K) - U2(K)) > MAXD) THEN
+    MAXD := ABS(U(K) - U2(K))
+  ENDIF
+  IF (ABS(UN(K) - UN2(K)) > MAXDUN) THEN
+    MAXDUN := ABS(UN(K) - UN2(K))
+  ENDIF
+ENDDO
+
+WRITE(*, "U0=%.9e U1=%.9e") U(ISRC), U(ISRC + 37)
+WRITE(*, "U2_0=%.9e U2_1=%.9e") U2(ISRC), U2(ISRC + 37)
+WRITE(*, "MAXD=%.9e MAXDUN=%.9e") MAXD, MAXDUN
+WRITE(*, "DISPATCHED=%.2f%%") 100.0 * REAL(NACT) / REAL(NT * NSTEPS)
