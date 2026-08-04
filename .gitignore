@@ -49,6 +49,13 @@
 !Testing/GEO/*.cu
 !Testing/GEO/*.cuh
 
+# allocator/ — F77 reference core + tuning audit (sources only).
+!allocator/
+!allocator/*.f
+!allocator/*.py
+!allocator/*.md
+!allocator/*.ergo
+
 # tests/ — Ergo programs and C harnesses. Same pattern as Testing/:
 # track sources, leave build products and stale regenerable dumps
 # (compiled binaries, .spvasm snapshots) ignored.
