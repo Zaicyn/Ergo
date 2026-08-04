@@ -1,0 +1,178 @@
+! ════════════════════════════════════════════════════════════════
+! winding_s3.ergo — quaternion winding-sum path integral on S^3
+! ════════════════════════════════════════════════════════════════
+!
+! The construction under test (see min/quaternion/QUATERNION_FINDINGS.md):
+!
+!   K_wind(Theta,Tt) = (4 pi i Tc)^(-3/2)
+!                      * sum_n (Theta_n / sin Theta_n) exp(i Theta_n^2/(4 Tc))
+!
+!   Theta_n = Theta + 2 pi n, Tc = Tt - i*EPS (Feynman iepsilon: both
+!   this sum and the spectral sum are conditionally convergent at real
+!   time; the damping makes them absolutely convergent and the Poisson
+!   identity holds exactly for every EPS > 0).
+!
+! Normalization notes (found by the audit, documented in FINDINGS):
+!  - The classical action with Tt = hbar T/2 gives exp(i Theta^2/(4 Tt)),
+!    NOT /(2 Tt)  [S/hbar = d^2/(2 hbar T) = d^2/(4 Tt)].
+!  - The Van Vleck prefactor is (4 pi i Tc)^(-3/2), NOT 1/(2 pi^2)
+!    (the 2 pi^2 is the S^3 area, correct on the spectral side only).
+!  - With these, K_wind = e^(-i Tc) K_spec (curvature phase -Tt).
+!
+! Truncation: PAIRED, n in [-N, N-1] (2N terms). At the antipode
+! (sin Theta_n = 0 for all n) every term is singular and survives only
+! by exact n <-> -n-1 cancellation; a symmetric [-N, N] truncation
+! leaves the n=N term unpaired and diverges there (printed as CAUU).
+!
+! Sign structure: the plain sum (+1 weighting) must match the scalar
+! spectral kernel; the (-1)^n-weighted sum (SGN lines) must NOT — it
+! corresponds to the antiperiodic (spinorial) propagator.
+!
+! Output sections:
+!   GRID  ti N i re im      — Van Vleck-normalized winding sum, 2000-pt grid
+!   SGN   ti i re im        — (-1)^n weighted, N=16, same grid
+!   RAW   ti N i re im      — plan-as-specified formula (1/2pi^2, /2Tt),
+!                             20 probe thetas (normalization-error exhibit)
+!   CAU   ti side k re im   — antipode approach, paired, N=32,
+!                             theta = pi + side * 10^(-k), k=2..6
+!   CAUU  ...               — same with unpaired [-N, N] truncation
+!
+! Determinism: fixed loops, no RNG; two runs are byte-identical.
+
+IMPLICIT NONE
+
+REAL :: EPS, TWO_PI, TH_LO, TH_HI
+REAL :: TTS(3)
+INTEGER :: NS(4)
+DATA TTS / 0.1, 0.25, 0.5 /
+DATA NS / 4, 8, 16, 32 /
+
+INTEGER :: TI, NI, I, NN, K, SIDE, N, NPAIR
+REAL :: TT, TC2, PM, PA, TH, TN, DAMP, PH, A
+REAL :: RE, IM, R2, I2, SNW
+REAL :: PI_VAL, EPSTH
+
+EPS := 0.01
+TWO_PI := 6.283185307179586
+PI_VAL := 3.141592653589793
+TH_LO := 0.05
+TH_HI := TWO_PI - 0.05
+
+! ── GRID + SGN sections ─────────────────────────────────────
+DO TI = 1, 3
+  TT := TTS(TI)
+  TC2 := TT * TT + EPS * EPS
+  ! (4 pi i Tc)^(-3/2): modulus and argument
+  PM := EXP(-0.75 * LOG(TC2)) / (4.0 * PI_VAL * SQRT(4.0 * PI_VAL))
+  PA := -1.5 * ATAN2(TT, EPS)
+  DO NI = 1, 4
+    N := NS(NI)
+    NPAIR := N
+    DO I = 1, 2000
+      TH := TH_LO + REAL(I - 1) * (TH_HI - TH_LO) / 1999.0
+      RE := 0.0
+      IM := 0.0
+      DO NN = -NPAIR, NPAIR - 1
+        TN := TH + TWO_PI * REAL(NN)
+        DAMP := EXP(-EPS * TN * TN / (4.0 * TC2))
+        PH := TN * TN * TT / (4.0 * TC2)
+        A := TN / SIN(TH) * DAMP
+        RE := RE + A * COS(PH)
+        IM := IM + A * SIN(PH)
+      ENDDO
+      R2 := PM * (RE * COS(PA) - IM * SIN(PA))
+      I2 := PM * (RE * SIN(PA) + IM * COS(PA))
+      WRITE(*, "GRID %d %d %d %.17e %.17e") TI, N, I, R2, I2
+    ENDDO
+  ENDDO
+  ! (-1)^n sign-structure variant, N=16
+  N := 16
+  DO I = 1, 2000
+    TH := TH_LO + REAL(I - 1) * (TH_HI - TH_LO) / 1999.0
+    RE := 0.0
+    IM := 0.0
+    DO NN = -N, N - 1
+      TN := TH + TWO_PI * REAL(NN)
+      DAMP := EXP(-EPS * TN * TN / (4.0 * TC2))
+      PH := TN * TN * TT / (4.0 * TC2)
+      SNW := 1.0
+      IF IAND(ABS(NN), 1) = 1 THEN
+        SNW := -1.0
+      ENDIF
+      A := SNW * TN / SIN(TH) * DAMP
+      RE := RE + A * COS(PH)
+      IM := IM + A * SIN(PH)
+    ENDDO
+    R2 := PM * (RE * COS(PA) - IM * SIN(PA))
+    I2 := PM * (RE * SIN(PA) + IM * COS(PA))
+    WRITE(*, "SGN %d %d %.17e %.17e") TI, I, R2, I2
+  ENDDO
+ENDDO
+
+! ── RAW section: plan-as-specified formula (1/2pi^2, exp(i Th^2/(2 Tt))) ──
+! No damping in the printed formula — the plan's literal construction.
+! 20 probe thetas, all (Tt, N) — documents the normalization failure
+! and the non-convergence of the undamped partial sums.
+DO TI = 1, 3
+  TT := TTS(TI)
+  DO NI = 1, 4
+    N := NS(NI)
+    DO I = 1, 20
+      TH := TH_LO + REAL(I - 1) * (TH_HI - TH_LO) / 19.0
+      RE := 0.0
+      IM := 0.0
+      DO NN = -N, N - 1
+        TN := TH + TWO_PI * REAL(NN)
+        PH := TN * TN / (2.0 * TT)
+        A := TN / SIN(TH)
+        RE := RE + A * COS(PH)
+        IM := IM + A * SIN(PH)
+      ENDDO
+      RE := RE / (2.0 * PI_VAL * PI_VAL)
+      IM := IM / (2.0 * PI_VAL * PI_VAL)
+      WRITE(*, "RAW %d %d %d %.17e %.17e") TI, N, I, RE, IM
+    ENDDO
+  ENDDO
+ENDDO
+
+! ── CAU/CAUU sections: antipode approach, Tt loop, N=32 ─────
+DO TI = 1, 3
+  TT := TTS(TI)
+  TC2 := TT * TT + EPS * EPS
+  PM := EXP(-0.75 * LOG(TC2)) / (4.0 * PI_VAL * SQRT(4.0 * PI_VAL))
+  PA := -1.5 * ATAN2(TT, EPS)
+  DO SIDE = -1, 1, 2
+    DO K = 2, 6
+      EPSTH := 10.0 ** (-K)
+      TH := PI_VAL + REAL(SIDE) * EPSTH
+      ! paired [-N, N-1]
+      RE := 0.0
+      IM := 0.0
+      DO NN = -32, 31
+        TN := TH + TWO_PI * REAL(NN)
+        DAMP := EXP(-EPS * TN * TN / (4.0 * TC2))
+        PH := TN * TN * TT / (4.0 * TC2)
+        A := TN / SIN(TH) * DAMP
+        RE := RE + A * COS(PH)
+        IM := IM + A * SIN(PH)
+      ENDDO
+      R2 := PM * (RE * COS(PA) - IM * SIN(PA))
+      I2 := PM * (RE * SIN(PA) + IM * COS(PA))
+      WRITE(*, "CAU %d %d %d %.17e %.17e") TI, SIDE, K, R2, I2
+      ! unpaired [-N, N]
+      RE := 0.0
+      IM := 0.0
+      DO NN = -32, 32
+        TN := TH + TWO_PI * REAL(NN)
+        DAMP := EXP(-EPS * TN * TN / (4.0 * TC2))
+        PH := TN * TN * TT / (4.0 * TC2)
+        A := TN / SIN(TH) * DAMP
+        RE := RE + A * COS(PH)
+        IM := IM + A * SIN(PH)
+      ENDDO
+      R2 := PM * (RE * COS(PA) - IM * SIN(PA))
+      I2 := PM * (RE * SIN(PA) + IM * COS(PA))
+      WRITE(*, "CAUU %d %d %d %.17e %.17e") TI, SIDE, K, R2, I2
+    ENDDO
+  ENDDO
+ENDDO
