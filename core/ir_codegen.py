@@ -3815,11 +3815,26 @@ class IRCodeGen:
                               f"{acc} += {cast}{chunk_var}[_j "
                               f"+ {ai} * _G];")
         else:
-            # Chunk size: 65536 floats (512 KiB stack) per download. Was
-            # 1024 — that made one submit/wait per 8 KiB, which drowned
-            # large partials buffers (the N=19 ED per-tile reduction
-            # issued ~9k transfers per iteration). The combine order is
-            # unchanged, so results are bitwise identical.
+            # One download when the whole [acc][group] partials buffer
+            # is small (contiguous layout) — a per-acc chunked loop
+            # costs one submit/wait per chunk, which dominated the
+            # N=19 ED per-tile reductions. Chunk size 65536 floats
+            # (512 KiB stack); the combine order is unchanged either
+            # way, so results are bitwise identical.
+            if not kernel.reduction_array:
+                self._put(f"if ({len(accs)} * _G <= 131072) {{")
+                self.indent += 1
+                self._put(f"{ct} _rall[{len(accs)} * _G];")
+                self._put(f"ergo_vk_download(d__reduce_{kid}, _rall, "
+                          f"(size_t){len(accs)} * _G * sizeof({ct}));")
+                for ai, acc in enumerate(accs):
+                    cast = ("(int)" if self._var_types.get(acc)
+                            == IRType.INTEGER else "")
+                    self._put(f"for (int _j = 0; _j < _G; _j++) "
+                              f"{acc} += {cast}_rall[_j + {ai} * _G];")
+                self.indent -= 1
+                self._put("} else {")
+                self.indent += 1
             self._put(f"{ct} {chunk_var}[65536];")
             if kernel.reduction_array:
                 self._put("for (int _c = 0; _c < _G; _c += 65536) {")
@@ -3846,6 +3861,9 @@ class IRCodeGen:
                               f"{acc} += {cast}{chunk_var}[_j];")
                     self.indent -= 1
                     self._put("}")
+            if not kernel.reduction_array:
+                self.indent -= 1
+                self._put("}")
         self.indent -= 1
         self._put("}")
 

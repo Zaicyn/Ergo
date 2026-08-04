@@ -136,6 +136,61 @@ cut the B-slice traffic ~2-4× but needs per-tile slot-index push
 constants (the arena-slots-without-rebinds scheme) — deferred; v1
 documents the wall.
 
+## Inc-5: tile scheduling / slice cache (variant `streamed19s`)
+
+The deferral was wrong about needing a compiler feature: slot indices
+are ordinary Ergo INTEGER scalars (per-dispatch push constants since
+Inc-1) and `RA(SLOT*QT + K)` is an affine index the extractor already
+handles. Zero compiler changes for the cache itself.
+
+Schedule construction (offline, baked into DATA tables — runtime is
+table reads): the offline simulator evaluates cache policies with an
+exact Belady model. Findings:
+- Slice identity is the 1-based host start, NOT the tile index — the
+  ±(27·QT−1) wrap-bond slices are shifted one element off tile
+  alignment (bug caught by numpy simulation before any GPU run).
+- A step's remotes are simultaneously resident — victim selection must
+  exclude the current step's needed set (second sim-caught bug).
+- The A/B stride conflict is real: kernel A's sliding window wants
+  canonical tile order; kernel B's reuse spans ±(6..27) tiles want
+  class-blocked (mod 3/9/27) orders. Every schedule that helps B by
+  30%+ wrecks A by 5-9×. Resolution: **variant Y** — move all bonds
+  except the wrap bond (i=N−1) into the A ring (halo 18 slices, ring
+  37·QT), and give B (wrap bond only, refs {d±27}) a tiny Belady arena
+  (C_B=4 slots; 108 misses = the distinct-slice floor — cache hits are
+  impossible at 54-step reuse distance, the arena is a staging area).
+  Canonical order ⇒ reduction combine bitwise-identical to streamed19.
+- Numbers (QT=3^15, NT=81): A-ring 100 slices + B 108 + W fetch 81 =
+  289 slices = 33.2 GB/iter vs 57 GB uncached — **1.72× fewer bytes**
+  (target was 1.5×). VRAM: ring 4.25 + arena 0.46 + WWIN 0.11 +
+  staging 0.13 ≈ 4.95 GB (fits; the 37-slot ring was chosen against
+  maxStorageBufferRange 4.29 GB — 4.25 GB per buffer).
+- Measured wall: 8.0 s/iter vs 9.85 s/iter uncached (1.23×) — the
+  residual is fixed overhead: ~430 transfers + ~160 frame drains per
+  iteration (per-tile fetch/reduction drains serialize host/device),
+  the host normalize pass, and f64 GPU compute. Bytes were cut 1.7×;
+  latency-bound components didn't move. Also landed en route: single-
+  download multi-acc reduction readback (one submit/wait per tile
+  instead of two).
+
+Oracles: N=8 streamed19s full convergence E0 = −2.8591343125 exact
+(CPU and GPU); N=19 mv1 checksums bitwise identical to streamed19 AND
+to the lean CPU reference (c1 = −46554303960.39218, c2 =
+−186217215708.692, probes exact); determinism two runs byte-identical.
+Energy trajectory (streamed19s, 100 iters, ~8 s/iter): E0(50) =
+−6.2803309579, E0(100) = −6.5267461409 (drho 2.0e-3, still converging;
+full convergence at N=19 is multi-hour and out of oracle scope — the
+matvec checksum is the hard oracle). Cross-check: capped CPU power
+iteration (temp-free numba, 2-vector footprint) at iter 1 gives
+E0 = −2.0778282186 vs the GPU's −2.0778282188 — 2e-10 agreement at
+matched iteration (the GPU labels the unnormalized first pass as
+iter 1, so its "iter k" is CPU "iter k-1" for k >= 2).
+
+Ops note addendum: stdout redirected to files is block-buffered — use
+`stdbuf -oL` when a run's progress must be visible mid-flight, and
+always launch with the background-task wrapper (a bare `&` child dies
+with the session turn).
+
 ### Ops note: reference-generation memory
 
 scipy eigsh with default `ncv=20` allocates a 20 × dim Krylov

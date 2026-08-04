@@ -294,6 +294,10 @@ def main():
     elif variant == "streamed19":
         niter = int(sys.argv[3]) if len(sys.argv) > 3 else 300
         sys.stdout.write(streamed19(N, niter))
+    elif variant == "streamed19s":
+        niter = int(sys.argv[3]) if len(sys.argv) > 3 else 300
+        cb = int(sys.argv[4]) if len(sys.argv) > 4 else 24
+        sys.stdout.write(streamed19s(N, niter, cb))
     else:
         sys.exit(f"unknown variant {variant}")
 
@@ -468,6 +472,281 @@ def streamed19(N, niter=300):
         "HW(1), HW(DIM / 2 + 1), HW(DIM)",
         "    ENDIF",
         "    ! V <- HW / NRM (CPU pass; WRITE disqualifier keeps it off GPU)",
+        "    DO K = 1, DIM",
+        "      IF (K == 1) THEN",
+        "        IF (ITER == 999999) THEN",
+        '          WRITE(*, "unreachable") ',
+        "        ENDIF",
+        "      ENDIF",
+        "      V(K) := HW(K) / NRM",
+        "    ENDDO",
+        "    DRHO := ABS(RHO - RHOOLD)",
+        "    RHOOLD := RHO",
+        "    IF (MOD(ITER, 50) == 0) THEN",
+        '      WRITE(*, "iter %d  E0 %.10f  drho %.3e") ITER, RHO + SHIFT, DRHO',
+        "    ENDIF",
+        "    IF (ITER > 1) THEN",
+        "      IF (DRHO < TOLC) THEN",
+        "        CONV := 1",
+        "      ENDIF",
+        "    ENDIF",
+        "  ENDIF",
+        "ENDDO",
+        'WRITE(*, "E0 = %.10f  iters %d") RHO + SHIFT, ITER - 1',
+    ]
+    return "\n".join(L) + "\n"
+
+
+
+
+def build_b_schedule(NT, offs, C):
+    """Offline Belady slot assignment for kernel-B remote slices.
+    Canonical tile order (0..NT-1) so the reduction combine stays
+    bitwise comparable with streamed19. Slice identity is its 1-based
+    host start (the +-27-tile slices are shifted by one element — same
+    tile, different content — so tile index is NOT a valid cache key).
+    A step's remotes are simultaneously resident: victims are never
+    taken from the current step's needed set.
+
+    Returns slots[t] = {offset-index -> slot} (0 = absent, masked out)
+    and stages[t] = [(src0_1based, slot, dst_off, len)].
+    """
+    import bisect
+    big = max(abs(o) for o in offs)
+
+    def key_of(d, o):
+        t = d + o
+        if not (0 <= t < NT):
+            return None
+        shift = (-1 if t > d else 1) if abs(o) == big else 0
+        return t * QT_G + 1 + shift
+
+    uses = {}
+    for d in range(NT):
+        for o in offs:
+            k = key_of(d, o)
+            if k is not None:
+                uses.setdefault(k, []).append(d)
+
+    def next_use(k, after):
+        us = uses[k]
+        i = bisect.bisect_right(us, after)
+        return us[i] if i < len(us) else 10 ** 9
+
+    cache = {}
+    misses = 0
+    slots = [dict() for _ in range(NT)]
+    stages = [[] for _ in range(NT)]
+    for d in range(NT):
+        need = {key_of(d, o) for o in offs} - {None}
+        for oi, o in enumerate(offs):
+            k = key_of(d, o)
+            if k is None:
+                slots[d][oi] = 0
+                continue
+            if k in cache:
+                slots[d][oi] = cache[k]
+                continue
+            misses += 1
+            if len(cache) < C:
+                used = set(cache.values())
+                slot = next(s for s in range(C) if s not in used)
+            else:
+                cand = {kk: s for kk, s in cache.items()
+                        if kk not in need}
+                victim = max(cand, key=lambda kk: next_use(kk, d))
+                slot = cache.pop(victim)
+            cache[k] = slot
+            slots[d][oi] = slot
+            src0 = max(1, k)
+            end = min(k + QT_G - 1, DIM_G)
+            ln = end - src0 + 1
+            if ln > 0:
+                stages[d].append((src0, slot, src0 - k, ln))
+    return slots, stages, misses
+
+
+def streamed19s(N, niter=300, C_B=4):
+    """Slice-cache variant of streamed19 (Inc-5, variant Y).
+
+    Split: kernel A covers diag + bonds i <= N-2 through a ring window
+    VA of 37*QT (halo 18*QT); kernel B covers ONLY the wrap bond
+    i = N-1 (offsets +-(27*QT-1) in tile units) through a C_B-slot
+    arena RA with an offline Belady schedule over canonical tile order
+    (so the reduction combine is bitwise-identical to streamed19).
+    Slot indices are ordinary Ergo INTEGER scalars -> push constants;
+    the schedule is baked into DATA tables. Measured by the offline
+    simulator: B-slice uploads 324 -> 108 per matvec; total traffic
+    ~33 GB/iter vs ~57 GB uncached (1.7x).
+    """
+    global QT_G, DIM_G
+    DIM = 3 ** N
+    QT = 3 ** (N - 4)
+    NT = 81
+    QT_G, DIM_G = QT, DIM
+    WINA = 37 * QT   # ring: tile + halo 18*QT each side (bonds i<=N-2)
+    offs = (-27, 27)
+    slots, stages, misses = build_b_schedule(NT, offs, C_B)
+    maxstg = max(len(s) for s in stages)
+    L = [header(N, "streamed19s",
+                "! Slice-cache variant (Inc-5, variant Y): A-ring covers "
+                "bonds i<=N-2 (37*QT ring); kernel B is the wrap bond "
+                "i=N-1 only, reading a slot arena via a baked Belady "
+                "schedule (canonical tile order -> reduction combine "
+                "bitwise-matches streamed19).")]
+    L += [
+        "IMPLICIT NONE",
+        f"INTEGER, PARAMETER :: N = {N}",
+        f"INTEGER, PARAMETER :: DIM = {DIM}",
+        f"INTEGER, PARAMETER :: QT = {QT}, NT = {NT}",
+        f"INTEGER, PARAMETER :: WINA = {WINA}, CB = {C_B}",
+        f"INTEGER, PARAMETER :: NITER = {niter}",
+        f"REAL, PARAMETER :: SHIFT = {2.0 * N:.1f}, JH = 0.5, TOLC = 1.0e-12",
+        f"STATIC REAL :: V({DIM}), HW({DIM})",
+        f"STATIC REAL :: VA({WINA}), WWIN({QT}), RA({C_B * QT})",
+        "REAL :: RHO, NRM, NRM2T, RHOOLD, DRHO, C1, C2, RHOP, R2",
+        "INTEGER :: K, T, TB, ITER, CONV, Q, SX, SL, DG, J",
+        "INTEGER :: S, A0, A1, SA, SB",
+        f"INTEGER :: {', '.join(f'D{i}' for i in range(N))}",
+        f"STATIC INTEGER :: SA_TAB({NT}), SB_TAB({NT})",
+        f"STATIC INTEGER :: STGN({NT})",
+        f"STATIC INTEGER :: STGS({NT}, {maxstg}), STGD({NT}, {maxstg}), STGL({NT}, {maxstg})",
+    ]
+    def data_arr(name, vals):
+        per = 16
+        lines = [f"DATA {name} / &"]
+        chunks = [vals[i:i+per] for i in range(0, len(vals), per)]
+        for ci, ch in enumerate(chunks):
+            end = " /" if ci == len(chunks) - 1 else ", &"
+            lines.append("  " + ", ".join(str(v) for v in ch) + end)
+        return lines
+    # offs order (-27, +27): SA = -27 slice (term1), SB = +27 (term2)
+    L += data_arr("SA_TAB", [slots[t][0] for t in range(NT)])
+    L += data_arr("SB_TAB", [slots[t][1] for t in range(NT)])
+    stgn = [len(stages[t]) for t in range(NT)]
+    L += data_arr("STGN", stgn)
+    for nm, key in (("STGS", 0), ("STGD", 1), ("STGL", 2)):
+        flat = []
+        for J in range(maxstg):
+            for t in range(NT):
+                if J < len(stages[t]):
+                    op = stages[t][J]
+                    if key == 0:
+                        flat.append(op[0])
+                    elif key == 1:
+                        flat.append(op[1] * QT + 1 + op[2])
+                    else:
+                        flat.append(op[3])
+                else:
+                    flat.append(0)
+        L += data_arr(nm, flat)
+    L += [
+        "",
+        "! deterministic seed (host-only: WRITE disqualifier keeps it off GPU)",
+        "DO K = 1, DIM",
+        "  IF (K == 1) THEN",
+        "    IF (DIM == 999999) THEN",
+        '      WRITE(*, "unreachable") ',
+        "    ENDIF",
+        "  ENDIF",
+        "  V(K) := 0.5 + REAL(MOD(K, 9973)) * 0.0001",
+        "ENDDO",
+        "RHOOLD := 0.0",
+        "CONV := 0",
+        "DO ITER = 1, NITER",
+        "  IF (CONV == 0) THEN",
+        "    RHO := 0.0",
+        "    NRM2T := 0.0",
+        "    DO T = 1, NT",
+        "      TB := (T - 1) * QT",
+        "      ! -- stage A ring (slide; halo 18*QT) --",
+        "      IF (T == 1) THEN",
+        "        DO J = 1, 19",
+        "          CALL VK_STAGE(VA, V, 1 + (J - 1) * QT, 1 + (J - 1) * QT, QT)",
+        "        ENDDO",
+        "      ELSE",
+        "        S := TB + 18 * QT",
+        "        A0 := S + 1",
+        "        IF (A0 + QT - 1 > DIM) THEN",
+        "          A1 := DIM",
+        "        ELSE",
+        "          A1 := S + QT",
+        "        ENDIF",
+        "        IF (A1 >= A0) THEN",
+        "          CALL VK_STAGE(VA, V, A0, MOD(S, WINA) + 1, A1 - A0 + 1)",
+        "        ENDIF",
+        "      ENDIF",
+        "      ! -- stage B slices per baked schedule --",
+        "      DO J = 1, STGN(T)",
+        "        CALL VK_STAGE(RA, V, STGS(T, J), STGD(T, J), STGL(T, J))",
+        "      ENDDO",
+        "      SA := SA_TAB(T)",
+        "      SB := SB_TAB(T)",
+        "      ! -- kernel B: wrap bond i=N-1 from the arena --",
+        "      DO K = 1, QT",
+        "        Q := K - 1 + TB",
+    ]
+    for i in range(N):
+        L.append(f"        D{i} := MOD(Q, 3)")
+        if i < N - 1:
+            L.append("        Q := Q / 3")
+    i, j = N - 1, 0
+    L += [
+        f"        WWIN(K) := 0.0 - JH * REAL(MIN(D{i}, 1) * MIN(2 - D{j}, 1)) * RA(SA * QT + K)",
+        f"        WWIN(K) := WWIN(K) - JH * REAL(MIN(2 - D{i}, 1) * MIN(D{j}, 1)) * RA(SB * QT + K)",
+        "      ENDDO",
+        "      ! -- kernel A: diag + bonds i<=N-2 from the ring, accumulate --",
+        "      DO K = 1, QT",
+        "        Q := K - 1 + TB",
+    ]
+    for i in range(N):
+        L.append(f"        D{i} := MOD(Q, 3)")
+        if i < N - 1:
+            L.append("        Q := Q / 3")
+    dg = " + ".join(f"(D{i} - 1) * (D{i} - 1)" for i in range(N))
+    L.append(f"        DG := {dg}")
+    L.append("        SL := MOD(K + TB - 1 + WINA, WINA) + 1")
+    L.append("        WWIN(K) := WWIN(K) + (REAL(DG) * 0.5 - SHIFT) * VA(SL)")
+    for i in range(N - 1):
+        j = i + 1
+        pi, pj = 3 ** i, 3 ** j
+        L.append(f"        SL := MOD(K + TB - {pi} + {pj} - 1 + WINA, WINA) + 1")
+        L.append(f"        WWIN(K) := WWIN(K) - JH * "
+                 f"REAL(MIN(2 - D{j}, 1) * MIN(D{i}, 1)) * VA(SL)")
+        L.append(f"        SL := MOD(K + TB + {pi} - {pj} - 1 + WINA, WINA) + 1")
+        L.append(f"        WWIN(K) := WWIN(K) - JH * "
+                 f"REAL(MIN(D{j}, 1) * MIN(2 - D{i}, 1)) * VA(SL)")
+    L += [
+        "      ENDDO",
+        "      ! -- per-tile reduction (canonical tile order) --",
+        "      RHOP := 0.0",
+        "      R2 := 0.0",
+      "      DO K = 1, QT",
+        "        SL := MOD(K + TB - 1 + WINA, WINA) + 1",
+        "        RHOP := RHOP + VA(SL) * WWIN(K)",
+        "        R2 := R2 + WWIN(K) * WWIN(K)",
+        "      ENDDO",
+        "      RHO := RHO + RHOP",
+        "      NRM2T := NRM2T + R2",
+        "      CALL VK_FETCH(HW, WWIN, 1, TB + 1, QT)",
+        "    ENDDO",
+        "    NRM := SQRT(NRM2T)",
+        "    IF (ITER == 1) THEN",
+        "      C1 := 0.0",
+        "      C2 := 0.0",
+        "      DO K = 1, DIM",
+        "        IF (K == 1) THEN",
+        "          IF (DIM == 999999) THEN",
+        '            WRITE(*, "unreachable") ',
+        "          ENDIF",
+        "        ENDIF",
+        "        C1 := C1 + HW(K)",
+        "        C2 := C2 + HW(K) * REAL(1 + MOD(K, 7))",
+        "      ENDDO",
+        '      WRITE(*, "mv1 c1=%.17e c2=%.17e") C1, C2',
+        '      WRITE(*, "mv1 w0=%.17e wmid=%.17e wlast=%.17e") '
+        "HW(1), HW(DIM / 2 + 1), HW(DIM)",
+        "    ENDIF",
         "    DO K = 1, DIM",
         "      IF (K == 1) THEN",
         "        IF (ITER == 999999) THEN",
