@@ -1,0 +1,167 @@
+! ════════════════════════════════════════════════════════════════════
+! STAGE0_NULL — AB campaign Stage 0: null + phase-screen control
+! ════════════════════════════════════════════════════════════════════
+! Schroedinger two-packet interferometer (Stage-1 engine: real/imag
+! staggered leapfrog, a = hbar*dt/2m = 0.2, hbar=m=dx=1). Two Gaussian
+! sub-packets launched in phase at (100, 204) and (100, 308), k0=0.3;
+! they interfere downstream; screen = time-gated |psi|^2 along XSCR.
+! No barrier wall (sponge reflections killed the walled version).
+!
+!   CASE 1 (null):          symmetric fringes; peak at center.
+!   CASE 2 (phase screen):  packet 2 launched with hand-imposed phase
+!                           TH0 = 1.0 rad (the stand-in for
+!                           exp(i*q*PHI/hbar)). Oracle: fringes shift
+!                           TH0/(2*pi) periods, envelope UNMOVED.
+!   CASE 3 (V slab):        potential slab V=0.002 over packet 2's
+!                           whole path -> phase delay AND edge-force
+!                           refraction: fringes AND envelope both move
+!                           (classical contrast — this is what AB is
+!                           NOT).
+!
+! Pipeline (used by Stages 2-3): envelope = 1-period boxcar smooth,
+! centroid; fringe peak = parabolic-refined max near the centroid.
+! Reported: shift_env, shift_fringe, DELTA = fringe - envelope.
+!
+!   python -m core min/ab/stage0_null.ergo -o /tmp/stage0 && /tmp/stage0
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 512, NY = 512
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 2600
+INTEGER, PARAMETER :: NSP = 48
+REAL, PARAMETER :: AA = 0.20
+REAL, PARAMETER :: SIG = 14.0
+REAL, PARAMETER :: K0 = 0.3
+INTEGER, PARAMETER :: X0 = 100
+INTEGER, PARAMETER :: Y1 = 204, Y2 = 308
+INTEGER, PARAMETER :: XSCR = 370
+REAL, PARAMETER :: TH0 = 1.0
+REAL, PARAMETER :: VSLAB = 0.002
+
+STATIC REAL :: R(NPTS), I(NPTS)
+STATIC REAL :: ABSORB(NPTS), VV(NPTS)
+STATIC REAL :: SCR(NY)
+REAL :: SV, FR, FI, CEN, ENV, PK, PER
+REAL :: E1, E2, E3, F1, F2, F3
+INTEGER :: K, J, T, CS, JM, JMAX
+
+DO CS = 1, 3
+  DO DMY = 1, 1
+    DO K = 1, NPTS
+      R(K) := 0.0
+      I(K) := 0.0
+      ABSORB(K) := 1.0
+      VV(K) := 0.0
+    ENDDO
+  ENDDO
+  DO J = 1, NY
+    SCR(J) := 0.0
+  ENDDO
+  DO J = 1, NSP
+    SV := 1.0 - 0.35 * (1.0 - REAL(J) / REAL(NSP + 1)) ** 2
+    DO K = 1, NX
+      ABSORB(K + (J - 1) * NX) := ABSORB(K + (J - 1) * NX) * SV
+      ABSORB(K + (NY - J) * NX) := ABSORB(K + (NY - J) * NX) * SV
+    ENDDO
+    DO K = 1, NY
+      ABSORB(J + (K - 1) * NX) := ABSORB(J + (K - 1) * NX) * SV
+      ABSORB(NX - J + 1 + (K - 1) * NX) := ABSORB(NX - J + 1 + (K - 1) * NX) * SV
+    ENDDO
+  ENDDO
+  ! V slab over packet 2's path (case 3): x in [120,340], y in [270,346]
+  IF (CS == 3) THEN
+    DO J = 270, 346
+      DO K = 120, 340
+        VV(K + (J - 1) * NX) := VSLAB
+      ENDDO
+    ENDDO
+  ENDIF
+  ! two sub-packets, in phase (case 2: packet 2 gets TH0 by hand)
+  DO J = 1, NY
+    DO K = 1, NX
+      SV := EXP(0.0 - ((REAL(K - X0) / 30.0) ** 2 &
+        + (REAL(J - Y1) / SIG) ** 2))
+      R(K + (J - 1) * NX) := SV * COS(K0 * REAL(K - X0))
+      I(K + (J - 1) * NX) := SV * SIN(K0 * REAL(K - X0))
+      SV := EXP(0.0 - ((REAL(K - X0) / 30.0) ** 2 &
+        + (REAL(J - Y2) / SIG) ** 2))
+      IF (CS == 2) THEN
+        R(K + (J - 1) * NX) := R(K + (J - 1) * NX) &
+          + SV * COS(K0 * REAL(K - X0) + TH0)
+        I(K + (J - 1) * NX) := I(K + (J - 1) * NX) &
+          + SV * SIN(K0 * REAL(K - X0) + TH0)
+      ELSE
+        R(K + (J - 1) * NX) := R(K + (J - 1) * NX) &
+          + SV * COS(K0 * REAL(K - X0))
+        I(K + (J - 1) * NX) := I(K + (J - 1) * NX) &
+          + SV * SIN(K0 * REAL(K - X0))
+      ENDIF
+    ENDDO
+  ENDDO
+
+  DO T = 1, NSTEPS
+    DO K = NX + 2, NEND
+      I(K) := (I(K) + AA * (R(K + 1) + R(K - 1) + R(K + NX) + R(K - NX) &
+        - 4.0 * R(K)) - VV(K) * R(K)) * ABSORB(K)
+    ENDDO
+    DO K = NX + 2, NEND
+      R(K) := (R(K) - AA * (I(K + 1) + I(K - 1) + I(K + NX) + I(K - NX) &
+        - 4.0 * I(K)) + VV(K) * I(K)) * ABSORB(K)
+    ENDDO
+    IF (T > 1500) THEN
+      DO J = 120, 392
+        K := XSCR + (J - 1) * NX
+        SCR(J) := SCR(J) + R(K) * R(K) + I(K) * I(K)
+      ENDDO
+    ENDIF
+  ENDDO
+
+  ! envelope: boxcar over +-27 rows (~1 period); fringe: refined max
+  CEN := 0.0
+  ENV := 0.0
+  DO J = 170, 342
+    FR := 0.0
+    DO JM = J - 27, J + 27
+      FR := FR + SCR(JM)
+    ENDDO
+    CEN := CEN + FR * REAL(J)
+    ENV := ENV + FR
+  ENDDO
+  CEN := CEN / ENV
+  JM := INT(CEN)
+  FI := -1.0
+  JMAX := JM
+  DO J = JM - 27, JM + 27
+    IF (SCR(J) > FI) THEN
+      FI := SCR(J)
+      JMAX := J
+    ENDIF
+  ENDDO
+  FR := 0.5 * (SCR(JMAX - 1) - SCR(JMAX + 1)) / &
+    (SCR(JMAX - 1) - 2.0 * SCR(JMAX) + SCR(JMAX + 1))
+  PK := REAL(JMAX) + FR
+  IF (CS == 1) THEN
+    E1 := CEN
+    F1 := PK
+  ENDIF
+  IF (CS == 2) THEN
+    E2 := CEN
+    F2 := PK
+  ENDIF
+  IF (CS == 3) THEN
+    E3 := CEN
+    F3 := PK
+  ENDIF
+  WRITE(*, "case %d  envelope %.4f  fringe %.4f") CS, CEN, PK
+ENDDO
+
+! period = lambda*L/d = (2*pi/0.3)*270/104 = 54.3 cells.
+! case 2 oracle: fringe shift = TH0/(2*pi) periods = 8.65 cells,
+! envelope shift ~ 0.
+PER := (2.0 * 3.14159265358979 / K0) * REAL(XSCR - X0) / REAL(Y2 - Y1)
+WRITE(*, "period cells %.2f") PER
+WRITE(*, "case2 env %.3f  fringe %.3f  DELTA %.3f (expect 0, %.2f)") &
+  E2 - E1, F2 - F1, (F2 - F1) - (E2 - E1), TH0 / (2.0 * 3.14159265358979) * PER
+WRITE(*, "case3 env %.3f  fringe %.3f  DELTA %.3f (classical: env moves)") &
+  E3 - E1, F3 - F1, (F3 - F1) - (E3 - E1)

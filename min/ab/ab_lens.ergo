@@ -1,0 +1,356 @@
+! ════════════════════════════════════════════════════════════════════
+! AB_LENS — AB campaign Stage 3: toroidal-coil AB lens (emergence test)
+! ════════════════════════════════════════════════════════════════════
+! (x,z) plane, beam along z. Two tube cross-sections (minor radius RS)
+! at x = 256 +- RL carry a discretized poloidal current J_z; solve
+! Laplace A_z = -J_z (masked in-place GS-SOR, Dirichlet zero frame);
+! Peierls phases on z-links only (A_x omitted: second-order for the
+! paraxial beam — documented). Packet (k0=0.3, wide in x) crosses the
+! torus hole; the wavefront phase phi(x) is measured along a row past
+! the lens and compared against the same-grid prediction
+! phi_pred(x) = (q/hbar) SUM_z A_z(x,z)  (self-consistency check).
+!
+! Cases: 1 = J0 forward, 2 = J0 reversed (polarity flip), 3 = J0=0
+! (null: flat), 4 = conservative A_z = d_z chi with x-uniform chi(z)
+! (phase STEP, zero curvature), 5 = localized bump chi(x,z) (flat).
+!
+!   python -m core min/ab/ab_lens.ergo -o /tmp/ab3 && /tmp/ab3
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 512, NY = 512
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 2800
+INTEGER, PARAMETER :: NSW = 1400
+INTEGER, PARAMETER :: NSP = 48
+REAL, PARAMETER :: AA = 0.20
+REAL, PARAMETER :: K0 = 0.3
+INTEGER, PARAMETER :: RL = 90, RS = 24
+INTEGER, PARAMETER :: Z0 = 60, ZOBS = 300
+REAL, PARAMETER :: PI2 = 6.283185307179586
+
+STATIC REAL :: R(NPTS), I(NPTS)
+STATIC REAL :: ABSORB(NPTS), WALL(NPTS)
+STATIC REAL :: AZ(NPTS), JZ(NPTS), MSK(NPTS)
+STATIC REAL :: CXL(NPTS), SXL(NPTS), CYL(NPTS), SYL(NPTS)
+REAL :: PHI(512), PRD(512), W8(512)
+REAL :: PHA(512, 5), PRA(512, 5)
+REAL :: SV, FR, FI, TH, DX, DY, PS, J0, CHI
+REAL :: C2Q, C4Q, C2P, C4P, MX, DEN, SY, SX2, SX4, SC2, SC4
+REAL :: C2S, C4S
+INTEGER :: K, J, T, CS, SW, IX, NCF
+
+DO CS = 1, 5
+  J0 := 0.005
+  IF (CS == 2) THEN
+    J0 := -0.005
+  ENDIF
+  IF (CS == 3) THEN
+    J0 := 0.0
+  ENDIF
+
+  ! ── J_z source: discretized poloidal loops (mirror circulation so
+  ! the inner walls carry the same J_z direction, like a torus) ──
+  DO DMY = 1, 1
+    DO K = 1, NPTS
+      JZ(K) := 0.0
+      AZ(K) := 0.0
+      MSK(K) := 1.0
+    ENDDO
+  ENDDO
+  IF (CS <= 3) THEN
+    DO K = 1, 360
+      PS := REAL(K) * PI2 / 360.0
+      ! left circle (x = 256-RL): counterclockwise
+      IX := 256 - RL + INT(RS * COS(PS) + 0.5)
+      J := 256 + INT(RS * SIN(PS) + 0.5)
+      JZ(IX + (J - 1) * NX) := J0 * COS(PS)
+      ! right circle (x = 256+RL): clockwise
+      IX := 256 + RL + INT(RS * COS(PS) + 0.5)
+      JZ(IX + (J - 1) * NX) := 0.0 - J0 * COS(PS)
+    ENDDO
+  ENDIF
+  ! conservative controls: A_z = d_z chi directly (no solve)
+  IF (CS == 4) THEN
+    ! x-uniform chi(z): phase step, zero curvature
+    DO J = 2, NY - 1
+      CHI := 0.03 * EXP(0.0 - (REAL(J - 200) / 40.0) ** 2)
+      TH := 0.03 * EXP(0.0 - (REAL(J - 199) / 40.0) ** 2)
+      DO K = 1, NX
+        AZ(K + (J - 1) * NX) := TH - CHI
+      ENDDO
+    ENDDO
+  ENDIF
+  IF (CS == 5) THEN
+    ! localized bump chi(x,z) vanishing at both ends: flat
+    DO J = 2, NY - 1
+      DO K = 1, NX
+        DX := REAL(K - 256) / 60.0
+        CHI := 0.03 * EXP(0.0 - DX * DX &
+          - (REAL(J - 200) / 40.0) ** 2)
+        TH := 0.03 * EXP(0.0 - DX * DX &
+          - (REAL(J - 199) / 40.0) ** 2)
+        AZ(K + (J - 1) * NX) := TH - CHI
+      ENDDO
+    ENDDO
+  ENDIF
+
+  ! ── solve Lap A_z = -J_z (masked GS, zero Dirichlet frame) ──
+  IF (CS <= 3) THEN
+    DO J = 2, NY - 1
+      DO K = 2, NX - 1
+        MSK(K + (J - 1) * NX) := 1.0
+      ENDDO
+    ENDDO
+    DO J = 1, NY
+      MSK(1 + (J - 1) * NX) := 0.0
+      MSK(NX + (J - 1) * NX) := 0.0
+    ENDDO
+    DO K = 1, NX
+      MSK(K) := 0.0
+      MSK(K + (NY - 1) * NX) := 0.0
+    ENDDO
+    DO SW = 1, NSW
+      DO K = NX + 2, NEND
+        AZ(K) := AZ(K) + MSK(K) * (0.25 * (AZ(K + 1) + AZ(K - 1) &
+          + AZ(K + NX) + AZ(K - NX) + JZ(K)) - AZ(K))
+      ENDDO
+    ENDDO
+    ! convergence diagnostic: residual of one extra sweep
+    FR := 0.0
+    DO K = NX + 2, NEND
+      SV := MSK(K) * (0.25 * (AZ(K + 1) + AZ(K - 1) &
+        + AZ(K + NX) + AZ(K - NX) + JZ(K)) - AZ(K))
+      IF (ABS(SV) > FR) THEN
+        FR := ABS(SV)
+      ENDIF
+    ENDDO
+    WRITE(*, "sor resid case %d  maxdelta %.3e") CS, FR
+  ENDIF
+  IF (CS == 1) THEN
+    ! report the solved A_z profile across the hole
+    DO K = 200, 312, 8
+      WRITE(*, "AZP %d %.6e") K, AZ(K + 255 * NX)
+    ENDDO
+  ENDIF
+
+  ! ── z-link Peierls phases from A_z (link midpoint average) ──
+  DO K = 1, NPTS
+    CXL(K) := 1.0
+    SXL(K) := 0.0
+  ENDDO
+  DO J = 1, NY - 1
+    DO K = 1, NX
+      TH := 0.5 * (AZ(K + (J - 1) * NX) + AZ(K + J * NX))
+      CYL(K + (J - 1) * NX) := COS(TH)
+      SYL(K + (J - 1) * NX) := 0.0 - SIN(TH)
+    ENDDO
+  ENDDO
+
+  ! ── packet along z, wide in x, centered in the hole ──
+  DO DMY = 1, 1
+    DO K = 1, NPTS
+      R(K) := 0.0
+      I(K) := 0.0
+      ABSORB(K) := 1.0
+      WALL(K) := 1.0
+    ENDDO
+  ENDDO
+  DO J = 1, NSP
+    SV := 1.0 - 0.35 * (1.0 - REAL(J) / REAL(NSP + 1)) ** 2
+    DO K = 1, NX
+      ABSORB(K + (J - 1) * NX) := ABSORB(K + (J - 1) * NX) * SV
+      ABSORB(K + (NY - J) * NX) := ABSORB(K + (NY - J) * NX) * SV
+    ENDDO
+    DO K = 1, NY
+      ABSORB(J + (K - 1) * NX) := ABSORB(J + (K - 1) * NX) * SV
+      ABSORB(NX - J + 1 + (K - 1) * NX) := ABSORB(NX - J + 1 + (K - 1) * NX) * SV
+    ENDDO
+  ENDDO
+  DO J = 1, NY
+    DO K = 1, NX
+      SV := EXP(0.0 - ((REAL(K - 256) / 70.0) ** 2 &
+        + (REAL(J - Z0) / 25.0) ** 2))
+      R(K + (J - 1) * NX) := SV * COS(K0 * REAL(J - Z0))
+      I(K + (J - 1) * NX) := SV * SIN(K0 * REAL(J - Z0))
+    ENDDO
+  ENDDO
+
+  DO T = 1, NSTEPS
+    DO K = NX + 2, NEND
+      I(K) := (I(K) + AA * ( &
+        CXL(K) * R(K + 1) + CXL(K - 1) * R(K - 1) &
+        + CYL(K) * R(K + NX) + CYL(K - NX) * R(K - NX) - 4.0 * R(K) &
+        - SXL(K) * I(K + 1) + SXL(K - 1) * I(K - 1) &
+        - SYL(K) * I(K + NX) + SYL(K - NX) * I(K - NX))) &
+        * ABSORB(K) * WALL(K)
+    ENDDO
+    DO K = NX + 2, NEND
+      R(K) := (R(K) - AA * ( &
+        SXL(K) * R(K + 1) - SXL(K - 1) * R(K - 1) &
+        + SYL(K) * R(K + NX) - SYL(K - NX) * R(K - NX) &
+        + CXL(K) * I(K + 1) + CXL(K - 1) * I(K - 1) &
+        + CYL(K) * I(K + NX) + CYL(K - NX) * I(K - NX) - 4.0 * I(K))) &
+        * ABSORB(K) * WALL(K)
+    ENDDO
+  ENDDO
+
+  ! ── wavefront phase across the hole at ZOBS; amplitude-weighted ──
+  DO K = 1, NX
+    FR := R(K + (ZOBS - 1) * NX)
+    FI := I(K + (ZOBS - 1) * NX)
+    PHI(K) := ATAN2(FI, FR)
+    W8(K) := FR * FR + FI * FI
+  ENDDO
+  ! unwrap along x (relative to center)
+  DO K = 2, NX
+    TH := PHI(K) - PHI(K - 1)
+    IF (TH > 3.14159265358979) THEN
+      PHI(K) := PHI(K) - PI2
+    ENDIF
+    IF (TH < 0.0 - 3.14159265358979) THEN
+      PHI(K) := PHI(K) + PI2
+    ENDIF
+  ENDDO
+  ! predicted profile: column sum of A_z over the beam path
+  DO K = 1, NX
+    PRD(K) := 0.0
+    DO J = Z0 + 20, ZOBS
+      PRD(K) := PRD(K) + AZ(K + (J - 1) * NX)
+    ENDDO
+  ENDDO
+  ! quadratic+quartic fit over the hole (x in [192,320]), weighted
+  SC2 := 0.0
+  SC4 := 0.0
+  SX2 := 0.0
+  SX4 := 0.0
+  DEN := 0.0
+  DO K = 192, 320
+    DX := REAL(K - 256)
+    SV := W8(K)
+    SX2 := SX2 + SV * DX ** 4
+    SX4 := SX4 + SV * DX ** 6
+    DEN := DEN + SV * DX ** 8
+    SC2 := SC2 + SV * DX * DX * PHI(K)
+    SC4 := SC4 + SV * DX ** 4 * PHI(K)
+  ENDDO
+  SV := SX2 * DEN - SX4 * SX4
+  C2Q := (SC2 * DEN - SC4 * SX4) / SV
+  C4Q := (SX2 * SC4 - SX4 * SC2) / SV
+  ! same fit for the predicted profile
+  SC2 := 0.0
+  SC4 := 0.0
+  SX2 := 0.0
+  SX4 := 0.0
+  DEN := 0.0
+  DO K = 192, 320
+    DX := REAL(K - 256)
+    SV := W8(K)
+    SX2 := SX2 + SV * DX ** 4
+    SX4 := SX4 + SV * DX ** 6
+    DEN := DEN + SV * DX ** 8
+    SC2 := SC2 + SV * DX * DX * PRD(K)
+    SC4 := SC4 + SV * DX ** 4 * PRD(K)
+  ENDDO
+  SV := SX2 * DEN - SX4 * SX4
+  C2P := (SC2 * DEN - SC4 * SX4) / SV
+  C4P := (SX2 * SC4 - SX4 * SC2) / SV
+  DO K = 1, NX
+    PHA(K, CS) := PHI(K)
+    PRA(K, CS) := PRD(K)
+  ENDDO
+  WRITE(*, "case %d  wavefront c2 %.6e c4 %.6e") CS, C2Q, C4Q
+  WRITE(*, "case %d  predicted c2 %.6e c4 %.6e") CS, C2P, C4P
+ENDDO
+
+! ── analysis on DELTA profiles (case minus the J=0 null, case 3) ──
+! self-consistency: c2 of the measured DELTA-phi vs c2 of the
+! predicted DELTA-(sum A_z) profile — should agree in sign and track
+! in magnitude (eikonal approximation; document the ratio).
+DO CS = 1, 5
+  SC2 := 0.0
+  SC4 := 0.0
+  SX2 := 0.0
+  SX4 := 0.0
+  DEN := 0.0
+  DO K = 192, 320
+    DX := REAL(K - 256)
+    SV := W8(K)
+    FR := PHA(K, CS) - PHA(K, 3)
+    SX2 := SX2 + SV * DX ** 4
+    SX4 := SX4 + SV * DX ** 6
+    DEN := DEN + SV * DX ** 8
+    SC2 := SC2 + SV * DX * DX * FR
+    SC4 := SC4 + SV * DX ** 4 * FR
+  ENDDO
+  SV := SX2 * DEN - SX4 * SX4
+  C2Q := (SC2 * DEN - SC4 * SX4) / SV
+  C4Q := (SX2 * SC4 - SX4 * SC2) / SV
+  SC2 := 0.0
+  SC4 := 0.0
+  SX2 := 0.0
+  SX4 := 0.0
+  DEN := 0.0
+  DO K = 192, 320
+    DX := REAL(K - 256)
+    SV := W8(K)
+    FR := PRA(K, CS) - PRA(K, 3)
+    SX2 := SX2 + SV * DX ** 4
+    SX4 := SX4 + SV * DX ** 6
+    DEN := DEN + SV * DX ** 8
+    SC2 := SC2 + SV * DX * DX * FR
+    SC4 := SC4 + SV * DX ** 4 * FR
+  ENDDO
+  SV := SX2 * DEN - SX4 * SX4
+  C2P := (SC2 * DEN - SC4 * SX4) / SV
+  C4P := (SX2 * SC4 - SX4 * SC2) / SV
+  WRITE(*, "DELTA case %d  c2meas %.6e c2pred %.6e  c4meas %.6e c4pred %.6e") &
+    CS, C2Q, C2P, C4Q, C4P
+  C2S := C2Q
+  C4S := C4Q
+  ! window-sensitivity: refit the measured DELTA over the inner hole
+  SC2 := 0.0
+  SC4 := 0.0
+  SX2 := 0.0
+  SX4 := 0.0
+  DEN := 0.0
+  DO K = 216, 296
+    DX := REAL(K - 256)
+    SV := W8(K)
+    FR := PHA(K, CS) - PHA(K, 3)
+    SX2 := SX2 + SV * DX ** 4
+    SX4 := SX4 + SV * DX ** 6
+    DEN := DEN + SV * DX ** 8
+    SC2 := SC2 + SV * DX * DX * FR
+    SC4 := SC4 + SV * DX ** 4 * FR
+  ENDDO
+  SV := SX2 * DEN - SX4 * SX4
+  C2Q := (SC2 * DEN - SC4 * SX4) / SV
+  C4Q := (SX2 * SC4 - SX4 * SC2) / SV
+  WRITE(*, "DELTA-inner case %d  c2meas %.6e  c4meas %.6e") CS, C2Q, C4Q
+  ! quadratic+quartic fit R^2 for the measured DELTA profile
+  SY := 0.0
+  MX := 0.0
+  DO K = 192, 320
+    SV := W8(K)
+    SY := SY + SV * (PHA(K, CS) - PHA(K, 3))
+    MX := MX + SV
+  ENDDO
+  SY := SY / MX
+  SC2 := 0.0
+  DEN := 0.0
+  DO K = 192, 320
+    DX := REAL(K - 256)
+    SV := W8(K)
+    FR := PHA(K, CS) - PHA(K, 3)
+    FI := C2S * DX * DX + C4S * DX ** 4
+    SC2 := SC2 + SV * (FR - FI) ** 2
+    DEN := DEN + SV * (FR - SY) ** 2
+  ENDDO
+  IF (DEN > 1.0e-8) THEN
+    WRITE(*, "R2 case %d  1-SSE/SST = %.6f") CS, 1.0 - SC2 / DEN
+  ELSE
+    WRITE(*, "R2 case %d  n/a (null: |c2|/|c2_lens| = %.2e)") &
+      CS, ABS(C2S) / 5.795947e-04
+  ENDIF
+ENDDO

@@ -1,0 +1,246 @@
+! ════════════════════════════════════════════════════════════════════
+! AB_FLUXLINE — AB campaign Stage 2: flux-line Aharonov-Bohm shift
+! ════════════════════════════════════════════════════════════════════
+! Stage-1 engine + Peierls link phases (staggered leapfrog with the
+! sin terms acting on the SAME field: dI = a(Lc R - Ls I),
+! dR = -a(Ls R + Lc I) — misassignment dilutes the coupling ~40x,
+! caught by the uniform-beta velocity test).
+!
+! Geometry: two packets at rows 204/308, flux line at the center
+! (256,256) on an r=8 absorbing disk (Tonomura shield), screen at
+! x=370. A = (FL/2 pi r) phi-hat, q=hbar=dx=1; link phases are the
+! discrete A.dl; the loop integral around the center is FL exactly
+! (verified in-sim).
+!
+! Cases:
+!   1..9   both packets, FL = (CS-1)*pi/4  -> fringe phasor phase.
+!          Oracle: unwrapped phase steps by pi/4 per case (the AB
+!          phase itself; no period-formula dependence).
+!   10..13 CHANNEL PROBES: packet 1 or 2 alone, FL = 0 or pi;
+!          the field phase at the screen center directly measures the
+!          per-channel Peierls phase accumulation. Oracle:
+!          [ph1(pi)-ph1(0)] - [ph2(pi)-ph2(0)] = +-pi exactly.
+!   14     GAUGE ORACLE: link phases from chi = single-valued bump
+!          (exact discrete gradient; chi vanishes at source/screen):
+!          zero fringe phase change (time-stepping artifact budget
+!          measured separately).
+!   15     periodicity: FL = 2pi pattern phase == FL = 0 (mod 2pi).
+!
+!   python -m core min/ab/ab_fluxline.ergo -o /tmp/ab2 && /tmp/ab2
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 512, NY = 512
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 2200
+INTEGER, PARAMETER :: NSP = 48
+REAL, PARAMETER :: AA = 0.20
+REAL, PARAMETER :: SIG = 14.0
+REAL, PARAMETER :: K0 = 0.3
+INTEGER, PARAMETER :: X0 = 100
+INTEGER, PARAMETER :: Y1 = 204, Y2 = 308
+INTEGER, PARAMETER :: XSCR = 350
+INTEGER, PARAMETER :: XC = 256, YC = 256
+REAL, PARAMETER :: PI2 = 6.283185307179586
+
+STATIC REAL :: R(NPTS), I(NPTS)
+STATIC REAL :: ABSORB(NPTS), WALL(NPTS)
+STATIC REAL :: CXL(NPTS), SXL(NPTS), CYL(NPTS), SYL(NPTS)
+STATIC REAL :: SCR(NY)
+REAL :: PHTAB(15)
+REAL :: SV, FR, FI, TH, DX, DY, R2, CHI
+INTEGER :: K, J, T, CS
+INTEGER :: CH1, CH2
+REAL :: FLV
+
+DO CS = 1, 15
+  FLV := 0.0
+  IF (CS <= 9) THEN
+    FLV := REAL(CS - 1) * 3.14159265358979 / 4.0
+  ENDIF
+  IF (CS == 11) THEN
+    FLV := 3.14159265358979
+  ENDIF
+  IF (CS == 13) THEN
+    FLV := 3.14159265358979
+  ENDIF
+  IF (CS == 15) THEN
+    FLV := PI2
+  ENDIF
+  CH1 := 1
+  CH2 := 1
+  IF (CS == 10) THEN
+    CH2 := 0
+  ENDIF
+  IF (CS == 11) THEN
+    CH2 := 0
+  ENDIF
+  IF (CS == 12) THEN
+    CH1 := 0
+  ENDIF
+  IF (CS == 13) THEN
+    CH1 := 0
+  ENDIF
+
+  DO DMY = 1, 1
+    DO K = 1, NPTS
+      R(K) := 0.0
+      I(K) := 0.0
+      ABSORB(K) := 1.0
+      WALL(K) := 1.0
+    ENDDO
+  ENDDO
+  DO J = 1, NY
+    SCR(J) := 0.0
+  ENDDO
+  DO J = 1, NSP
+    SV := 1.0 - 0.35 * (1.0 - REAL(J) / REAL(NSP + 1)) ** 2
+    DO K = 1, NX
+      ABSORB(K + (J - 1) * NX) := ABSORB(K + (J - 1) * NX) * SV
+      ABSORB(K + (NY - J) * NX) := ABSORB(K + (NY - J) * NX) * SV
+    ENDDO
+    DO K = 1, NY
+      ABSORB(J + (K - 1) * NX) := ABSORB(J + (K - 1) * NX) * SV
+      ABSORB(NX - J + 1 + (K - 1) * NX) := ABSORB(NX - J + 1 + (K - 1) * NX) * SV
+    ENDDO
+  ENDDO
+  ! absorbing disk at the flux line
+  DO J = YC - 8, YC + 8
+    DO K = XC - 8, XC + 8
+      DX := REAL(K - XC)
+      DY := REAL(J - YC)
+      IF (DX * DX + DY * DY < 64.0) THEN
+        WALL(K + (J - 1) * NX) := 0.0
+      ENDIF
+    ENDDO
+  ENDDO
+  ! link phases (identity default)
+  DO J = 1, NY
+    DO K = 1, NX
+      CXL(K + (J - 1) * NX) := 1.0
+      SXL(K + (J - 1) * NX) := 0.0
+      CYL(K + (J - 1) * NX) := 1.0
+      SYL(K + (J - 1) * NX) := 0.0
+    ENDDO
+  ENDDO
+  IF (CS == 14) THEN
+    ! GAUGE ORACLE: chi = 0.5 * bump, theta = exact discrete gradient
+    DO J = 1, NY
+      DO K = 1, NX
+        DX := REAL(K - XC)
+        DY := REAL(J - YC)
+        R2 := DX * DX + DY * DY
+        CHI := 0.5 * EXP(0.0 - R2 / 900.0)
+        TH := 0.5 * EXP(0.0 - (R2 + 2.0 * DX + 1.0) / 900.0)
+        SV := TH - CHI
+        CXL(K + (J - 1) * NX) := COS(SV)
+        SXL(K + (J - 1) * NX) := SIN(SV)
+        CHI := 0.5 * EXP(0.0 - (R2 + 2.0 * DY + 1.0) / 900.0)
+        SV := CHI - 0.5 * EXP(0.0 - R2 / 900.0)
+        CYL(K + (J - 1) * NX) := COS(SV)
+        SYL(K + (J - 1) * NX) := SIN(SV)
+      ENDDO
+    ENDDO
+  ELSE
+    IF (FLV > 0.0) THEN
+      ! flux line: A_phi = FLV/(2 pi r); link = A.dl (link midpoint)
+      TH := FLV / PI2
+      DO J = 2, NY - 1
+        DO K = 2, NX - 1
+          DX := REAL(K - XC) + 0.5
+          DY := REAL(J - YC)
+          R2 := DX * DX + DY * DY
+          IF (R2 > 36.0) THEN
+            SV := (0.0 - TH) * DY / R2
+            CXL(K + (J - 1) * NX) := COS(SV)
+            SXL(K + (J - 1) * NX) := SIN(SV)
+          ENDIF
+          DX := REAL(K - XC)
+          DY := REAL(J - YC) + 0.5
+          R2 := DX * DX + DY * DY
+          IF (R2 > 36.0) THEN
+            SV := TH * DX / R2
+            CYL(K + (J - 1) * NX) := COS(SV)
+            SYL(K + (J - 1) * NX) := SIN(SV)
+          ENDIF
+        ENDDO
+      ENDDO
+    ENDIF
+  ENDIF
+  ! packets
+  DO J = 1, NY
+    DO K = 1, NX
+      IF (CH1 == 1) THEN
+        SV := EXP(0.0 - ((REAL(K - X0) / 30.0) ** 2 &
+          + (REAL(J - Y1) / SIG) ** 2))
+        R(K + (J - 1) * NX) := SV * COS(K0 * REAL(K - X0))
+        I(K + (J - 1) * NX) := SV * SIN(K0 * REAL(K - X0))
+      ENDIF
+      IF (CH2 == 1) THEN
+        SV := EXP(0.0 - ((REAL(K - X0) / 30.0) ** 2 &
+          + (REAL(J - Y2) / SIG) ** 2))
+        R(K + (J - 1) * NX) := R(K + (J - 1) * NX) &
+          + SV * COS(K0 * REAL(K - X0))
+        I(K + (J - 1) * NX) := I(K + (J - 1) * NX) &
+          + SV * SIN(K0 * REAL(K - X0))
+      ENDIF
+    ENDDO
+  ENDDO
+
+  DO T = 1, NSTEPS
+    DO K = NX + 2, NEND
+      I(K) := (I(K) + AA * ( &
+        CXL(K) * R(K + 1) + CXL(K - 1) * R(K - 1) &
+        + CYL(K) * R(K + NX) + CYL(K - NX) * R(K - NX) - 4.0 * R(K) &
+        - SXL(K) * I(K + 1) + SXL(K - 1) * I(K - 1) &
+        - SYL(K) * I(K + NX) + SYL(K - NX) * I(K - NX))) &
+        * ABSORB(K) * WALL(K)
+    ENDDO
+    DO K = NX + 2, NEND
+      R(K) := (R(K) - AA * ( &
+        SXL(K) * R(K + 1) - SXL(K - 1) * R(K - 1) &
+        + SYL(K) * R(K + NX) - SYL(K - NX) * R(K - NX) &
+        + CXL(K) * I(K + 1) + CXL(K - 1) * I(K - 1) &
+        + CYL(K) * I(K + NX) + CYL(K - NX) * I(K - NX) - 4.0 * I(K))) &
+        * ABSORB(K) * WALL(K)
+    ENDDO
+    IF (T > 1500) THEN
+      DO J = 120, 392
+        K := XSCR + (J - 1) * NX
+        SCR(J) := SCR(J) + R(K) * R(K) + I(K) * I(K)
+      ENDDO
+    ENDIF
+  ENDDO
+
+  ! fringe phasor phase (cases 1-9, 14, 15); field phase at screen
+  ! center for channel probes (10-13)
+  FR := 0.0
+  FI := 0.0
+  DO J = 170, 342
+    TH := 6.283185307179586 * REAL(J - 256) / 40.0
+    FR := FR + SCR(J) * COS(TH)
+    FI := FI + SCR(J) * SIN(TH)
+  ENDDO
+  PHTAB(CS) := ATAN2(FI, FR)
+  IF (CS >= 10) THEN
+    IF (CS <= 13) THEN
+      K := XSCR + 255 * NX
+      PHTAB(CS) := ATAN2(I(K), R(K))
+      WRITE(*, "probe case %d  fieldphase %.5f  amp %.4e") &
+        CS, PHTAB(CS), R(K) * R(K) + I(K) * I(K)
+    ENDIF
+  ENDIF
+  WRITE(*, "case %d  phasor %.5f") CS, PHTAB(CS)
+ENDDO
+
+WRITE(*, "AB phasor phases (rad, unwrap by hand):")
+DO CS = 1, 9
+  WRITE(*, "  FL %.4f  ph %.5f  expect %.5f") &
+    REAL(CS - 1) * 3.14159265358979 / 4.0, PHTAB(CS), &
+    REAL(CS - 1) * 3.14159265358979 / 4.0
+ENDDO
+WRITE(*, "channel AB phase: %.5f (expect +-pi=3.14159)") &
+  (PHTAB(11) - PHTAB(10)) - (PHTAB(13) - PHTAB(12))
+WRITE(*, "gauge phasor change: %.5f (expect ~0)") PHTAB(14) - PHTAB(1)
+WRITE(*, "periodicity ph(2pi)-ph(0) mod 2pi: %.5f (expect ~0)") &
+  PHTAB(15) - PHTAB(1)

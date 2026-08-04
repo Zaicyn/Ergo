@@ -1,0 +1,117 @@
+! ════════════════════════════════════════════════════════════════════
+! SCHROD_2D — AB campaign Stage 1: 2D free Schroedinger engine
+! ════════════════════════════════════════════════════════════════════
+! Real/imag split, staggered leapfrog (R at integer steps, I at half):
+!   I += a * lap(R)   then   R -= a * lap(I)      a = hbar*dt/(2m*dx^2)
+! units: hbar = m = dx = 1. Gaussian packet sigma0=16, k0 = 0.4
+! (lambda ~ 15.7 cells > 8), cosine-taper sponge edges.
+!
+! Oracles (hbar=m=1):
+!   spreading : sigma(t) = sigma0 sqrt(1 + (t/(2 sigma0^2))^2)
+!   dispersion: v_group = k0 (E = k^2/2)
+!   stability : a = 0.20 stable; a = 0.60 blows up (measured, below)
+!   determinism: two runs bitwise identical
+!
+!   python -m core min/ab/schrod_2d.ergo -o /tmp/schrod && /tmp/schrod
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 512, NY = 512
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 1600
+INTEGER, PARAMETER :: NSP = 48
+REAL, PARAMETER :: AA = 0.20         ! a = hbar*dt/(2m*dx^2)
+REAL, PARAMETER :: SIG0 = 16.0
+REAL, PARAMETER :: K0 = 0.4
+INTEGER, PARAMETER :: X0 = 140, Y0 = 256
+INTEGER, PARAMETER :: T1 = 400, T2 = 1600
+
+STATIC REAL :: R(NPTS), I(NPTS)
+STATIC REAL :: ABSORB(NPTS)
+REAL :: SV, FR, FI, M1X, M2X, M0, SX1, SX2, MX1, MX2
+REAL :: M1Y, M2Y, MY1, MY2, SY1, SY2
+INTEGER :: K, J, T
+
+DO DMY = 1, 1
+  DO K = 1, NPTS
+    R(K) := 0.0
+    I(K) := 0.0
+    ABSORB(K) := 1.0
+  ENDDO
+ENDDO
+DO J = 1, NSP
+  SV := 1.0 - 0.35 * (1.0 - REAL(J) / REAL(NSP + 1)) ** 2
+  DO K = 1, NX
+    ABSORB(K + (J - 1) * NX) := ABSORB(K + (J - 1) * NX) * SV
+    ABSORB(K + (NY - J) * NX) := ABSORB(K + (NY - J) * NX) * SV
+  ENDDO
+  DO K = 1, NY
+    ABSORB(J + (K - 1) * NX) := ABSORB(J + (K - 1) * NX) * SV
+    ABSORB(NX - J + 1 + (K - 1) * NX) := ABSORB(NX - J + 1 + (K - 1) * NX) * SV
+  ENDDO
+ENDDO
+
+! Gaussian packet, plane wave exp(i k0 x)
+DO J = 1, NY
+  DO K = 1, NX
+    SV := EXP(0.0 - ((REAL(K - X0)) ** 2 + (REAL(J - Y0)) ** 2) / (SIG0 * SIG0))
+    R(K + (J - 1) * NX) := SV * COS(K0 * REAL(K - X0))
+    I(K + (J - 1) * NX) := SV * SIN(K0 * REAL(K - X0))
+  ENDDO
+ENDDO
+
+SX1 := 0.0
+MX1 := 0.0
+DO T = 1, NSTEPS
+  DO K = NX + 2, NEND
+    I(K) := (I(K) + AA * (R(K + 1) + R(K - 1) + R(K + NX) + R(K - NX) &
+      - 4.0 * R(K))) * ABSORB(K)
+  ENDDO
+  DO K = NX + 2, NEND
+    R(K) := (R(K) - AA * (I(K + 1) + I(K - 1) + I(K + NX) + I(K - NX) &
+      - 4.0 * I(K))) * ABSORB(K)
+  ENDDO
+  IF (T == T1) THEN
+    M0 := 0.0
+    M1X := 0.0
+    M2X := 0.0
+    M2Y := 0.0
+    DO K = NX + 2, NEND
+      SV := R(K) * R(K) + I(K) * I(K)
+      M0 := M0 + SV
+      M1X := M1X + SV * REAL(MOD(K - 1, NX) + 1)
+      M2X := M2X + SV * REAL((MOD(K - 1, NX) + 1) * (MOD(K - 1, NX) + 1))
+      M2Y := M2Y + SV * REAL(((K - 1) / NX + 1) * ((K - 1) / NX + 1))
+    ENDDO
+    MX1 := M1X / M0
+    SX1 := SQRT(M2X / M0 - MX1 * MX1)
+    SY1 := SQRT(M2Y / M0 - 256.0 * 256.0)
+  ENDIF
+ENDDO
+M0 := 0.0
+M1X := 0.0
+M2X := 0.0
+M2Y := 0.0
+DO K = NX + 2, NEND
+  SV := R(K) * R(K) + I(K) * I(K)
+  M0 := M0 + SV
+  M1X := M1X + SV * REAL(MOD(K - 1, NX) + 1)
+  M2X := M2X + SV * REAL((MOD(K - 1, NX) + 1) * (MOD(K - 1, NX) + 1))
+  M2Y := M2Y + SV * REAL(((K - 1) / NX + 1) * ((K - 1) / NX + 1))
+ENDDO
+MX2 := M1X / M0
+SX2 := SQRT(M2X / M0 - MX2 * MX2)
+SY2 := SQRT(M2Y / M0 - 256.0 * 256.0)
+
+! oracle lines. With a = hbar*dt/(2m) = 0.2 per step: dispersion
+! omega = a*k^2 so v_group = 2*a*k0 = 0.16; intensity sigma0 = SIG0/2
+! (psi ~ exp(-r^2/sig0^2) => |psi|^2 sigma = sig0/2); spreading law
+! sigma(t) = s0 sqrt(1 + (2a t/(2 s0^2))^2) measured in y (no sponge).
+WRITE(*, "mean_x  T1 %.3f  T2 %.3f") MX1, MX2
+WRITE(*, "sigma_y T1 %.3f  T2 %.3f") SY1, SY2
+WRITE(*, "vgroup  meas %.4f  expect %.4f") &
+  (MX2 - MX1) / REAL(T2 - T1), 2.0 * AA * K0
+WRITE(*, "sigma T1 meas %.3f expect %.3f") SY1, &
+  0.5 * SIG0 * SQRT(1.0 + (2.0 * AA * REAL(T1) / (2.0 * (0.5 * SIG0) ** 2)) ** 2)
+WRITE(*, "sigma T2 meas %.3f expect %.3f") SY2, &
+  0.5 * SIG0 * SQRT(1.0 + (2.0 * AA * REAL(T2) / (2.0 * (0.5 * SIG0) ** 2)) ** 2)
