@@ -198,6 +198,17 @@ All string operations are on fixed-length CHARACTER types. No dynamic allocation
 | CHAR | `CHAR(i: INTEGER) → CHARACTER(LEN=1)` | CHARACTER(LEN=1) | ASCII code to character |
 | ICHAR | `ICHAR(c: CHARACTER(LEN=1)) → INTEGER` | INTEGER | Character to ASCII code |
 
+### Numeric Kind Conversion (INTEGER*8, Inc-2A)
+
+| Function | Signature | Return Type | Semantics |
+|----------|-----------|------------|-----------|
+| INT8 | `INT8(x: numeric) → INTEGER*8` | INTEGER*8 | Explicit widening to 64-bit integer |
+| INT | `INT(x: numeric) → INTEGER` | INTEGER | Truncation toward zero; also the explicit **narrowing** path INTEGER*8 → INTEGER (implicit narrowing is a compile-time error) |
+| REAL | `REAL(x: numeric) → REAL` | REAL | Conversion to REAL (from either integer kind) |
+
+Mixing rules and the CPU-only restriction of INTEGER*8 are specified in
+`Spec/Ergo_Spec.md` Part 3.
+
 ### String Concatenation (Limited, Explicit)
 
 | Function | Signature | Return Type | Semantics |
@@ -457,6 +468,37 @@ CALL ZERO(FLAGS)      ! memset(FLAGS, 0, sizeof(FLAGS))
 - Cannot be used on scalars (use `:= 0` assignment).
 - Cannot be used on ALLOCATABLE arrays that have not been allocated.
 - ZERO is a statement, not an expression: `X := ZERO(A)` is illegal.
+
+### Device Streaming (Inc-2C)
+
+Explicit host↔device slice transfers for out-of-core GPU programs.
+Statement-only, CALL-invoked, in-place, no allocation. Indices are
+1-based element offsets into the respective arrays.
+
+| Function | Signature | Memory | Semantics |
+|----------|-----------|--------|-----------|
+| VK_STAGE | `CALL VK_STAGE(gpu_arr, host_arr, src0, dst0, len)` | host→device | Upload `len` elements from `host_arr(src0..)` to `gpu_arr(dst0..)` |
+| VK_FETCH | `CALL VK_FETCH(host_arr, gpu_arr, src0, dst0, len)` | device→host | Download `len` elements from `gpu_arr(src0..)` to `host_arr(dst0..)` |
+
+**Synchronization contract:** both are frame-draining sync points.
+VK_STAGE drains the recording frame first only when the frame has
+unsubmitted kernel writes that overlap the destination (an upload
+recorded ahead of pending dispatches would otherwise be clobbered).
+VK_FETCH always drains (the data must exist before the copy).
+
+**Residency contract (compile-time):** the device argument of
+VK_STAGE must be GPU-resident and the host argument must NOT be
+GPU-resident (and vice versa for VK_FETCH) — violations are compile
+errors with named diagnostics. Zero host-side array copies: these are
+the only sanctioned path for moving slices between the host arena and
+device buffers in streamed programs.
+
+**CPU lowering:** both lower to memmove, so streamed programs run
+correctly CPU-only (the GPU execution model, `Spec/Ergo_Spec.md`
+§8.8, is an implementation detail).
+
+**Reference:** design + validation in `min/phase_ed/inc2_check.md`
+(N=19 ED gather-window streaming).
 
 ---
 

@@ -67,6 +67,21 @@ REAL :: A(m, n)     ! A(1,1) and A(2,1) are adjacent in memory
 
 ✅ **Base types:** INTEGER, REAL, COMPLEX, LOGICAL, CHARACTER (fixed-length)
 
+✅ **Integer kinds (Inc-2A):** INTEGER (32-bit, C `int`) and INTEGER*8
+(64-bit, C `long long`). Only `*8` is accepted — `INTEGER*4` etc. are
+parse errors. Kind rules follow Fortran:
+- Mixed INTEGER/INTEGER*8 arithmetic → INTEGER*8 (widening wins among
+  integer operands; REAL still wins overall)
+- Implicit narrowing `INTEGER := <INTEGER*8 expr>` → **compile-time
+  error** (use `INT(x)` explicitly)
+- Implicit widening `INTEGER*8 := <INTEGER expr>` is allowed
+- DO loop variables and bounds may be INTEGER*8 (required for 3^N ED
+  state spaces at N ≥ 20, which overflow int32)
+- 1-D arrays of INTEGER*8 are supported
+- INTEGER*8 is **CPU-only**: GPU extraction of any loop touching int64
+  values is rejected with a named diagnostic (the alternative would be
+  silent i32 truncation in push constants / element types)
+
 ✅ **Type coercion:**
 - INTEGER + REAL → REAL (promotion)
 - COMPLEX + anything → COMPLEX
@@ -507,6 +522,84 @@ These rules preserve all constraints from Parts 1-7:
 - No implicit temporaries (register-level intermediates from fusion are not visible at the language level)
 
 **New guarantee:** Parallel execution is an implementation detail. Program semantics are identical to sequential execution unless `--gpu-fast-math` is enabled.
+
+### 8.5 Tiled Dispatch (`--gpu-tile-size`)
+
+With `--gpu-tile-size N` (N>0), an extracted kernel is dispatched in
+tiles over its single device buffer; per-tile push constants
+`_tile_base`/`_tile_hi` shift and bound the iteration space
+(`i = gid + 1 + _tile_base; if (i <= _tile_hi)`).
+
+**Quantization guarantee (locked):** the tile step is quantized to a
+workgroup multiple (`QTILE = max(256, floor(N/256)*256)`), so tile `t`
+group `g` covers exactly the elements of untiled group
+`t·(QTILE/256) + g`. Reduction partials land in `[tile][acc][group]`
+slots and the host ordered combine iterates in the same fixed order as
+the untiled dispatch — **tiled results are bitwise identical to
+untiled results**, for any requested tile size, including remainder
+tiles. Tiling changes dispatch granularity, never numerics.
+
+Segmented reductions and the coalesced multi-reduction readback refuse
+tiling (whole-range dispatch) with a named diagnostic.
+
+### 8.6 TILE_CLIP (Program-Maintained Clipmap)
+
+A `STATIC INTEGER :: TILE_CLIP(NT)` array declared in the program gates
+the tiled host dispatch loop: flag 0 = skip the tile's dispatch (stale
+device values persist), nonzero = dispatch normally. One clip array is
+shared by all tiled kernels (QTILE is uniform); tiles beyond the
+declared size always dispatch. Skipped tiles in a tiled **reduction**
+kernel are unsound (the ordered combine expects every tile's partials),
+so clipping is refused there with a named warning.
+
+Skip semantics are the program's contract: the program must guarantee
+a skipped tile's outputs would not have changed above its own
+tolerance. The framework for sound clip bounds (per solver class) is
+`Spec/Ergo_Activity_Bounds.md`. Oracles: `tests/gpu_clipmap.ergo`
+(bitwise, cone bound), `tests/gpu_clipmap_amp.ergo` (error-bounded,
+amplitude envelope).
+
+### 8.7 Ping-Pong Eligibility
+
+An array is double-buffered (2× device buffer, `_pp_rd_offset` /
+`_pp_wr_offset` push constants injected into index math) only when ALL
+of the following hold (`compute_pingpong_arrays` in `core/ir_gpu.py` —
+single source of truth for backend and host):
+
+- exactly one kernel reads it and that kernel also writes it
+- that kernel is dispatched inside a batched frame loop
+- every other kernel touching it is write-only and runs before that
+  frame loop (init-time)
+- all qualifying arrays share one shape (one global element-offset pair)
+
+Otherwise the array stays single-buffered. Rationale: cross-kernel
+dataflow within a frame under double-buffering reads stale halves —
+the eligibility rule exists precisely to make that failure
+unrepresentable.
+
+### 8.8 Streaming Intrinsics and Transfer Semantics
+
+`CALL VK_STAGE` / `CALL VK_FETCH` (signatures in
+`Spec/Ergo_Intrinsic_Signatures_Complete.md` Category 6) express
+out-of-core streaming in Ergo: explicit host↔device slice transfers
+with zero host-side array copies. Both are frame-draining
+synchronization points (VK_STAGE drains only when the recording frame
+has unsubmitted kernel writes that overlap). CPU builds lower them to
+memmove, so streamed programs remain runnable CPU-only.
+
+**Transfer granularity:** host-side writes to GPU-resident arrays are
+tracked as runtime dirty intervals; uploads transfer only the dirty
+range (`upload_at`). Unanalyzable cases fall back to whole-array
+uploads — never under-approximated. Transfers never change values;
+results are bitwise-identical regardless of transfer granularity.
+
+**Device limits:** `maxStorageBufferRange` is queried at init and
+asserted at buffer creation. Buffers larger than the limit are a
+compile/startup error, not silent UB.
+
+**INTEGER*8 on GPU:** extraction of any loop touching int64 values is
+rejected with a named diagnostic. Index widths: global indices beyond
+i32 are expressed as i32 tile-relative + i64 tile base.
 
 ---
 
