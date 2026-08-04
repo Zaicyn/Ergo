@@ -141,3 +141,75 @@ The F77 port has no residual routine at all.
 4. The triple-XOR residual — the thesis's flagship "algebraically zero"
    metric — cannot see 2/3 of the perturbation channels the allocator
    actually writes.
+
+---
+
+# v4 fixes (new version; v2/v3 files untouched as references)
+
+New files: `allocator/sq4core.f` (F77), `tests/sq4core.ergo` (Ergo),
+`allocator/v4_check.py` (oracles). All drivers run twice,
+byte-identical; `v4_check.py` itself byte-identical across runs.
+Cross-port: F77 v4 vs Ergo v4 agree exactly on the scatter sequence,
+the state hash (-1834187412, also reproduced by the independent Python
+model), fill-cycle occupancies/zones, and the full 512-slot TINVAR
+integer dump. Residuals agree to 4e-8 (F77 gate is REAL*4, Ergo REAL
+is f64 — last-bit differences expected and measured).
+
+## Fix 1 — 8-bin scatter LUT
+
+Bake search over `sq2_viviani_scatter_full(id, total)`, total in
+[17,199] x HOPFQ in [1.50,2.50] (step 0.005): with all-8-bin coverage
+the generator family's worst-case separation ceiling is **1.6875** —
+the old 6-bin LUT's 2.8192 is unreachable with 8 bins. Chosen bake:
+**total=52, HOPFQ=1.97** (HOPFQ kept at the audit-verified optimum;
+among HOPFQ=1.97 ceiling candidates total=52 has the best balance).
+
+New LUT: `6 5 4 0 2 3 4 7 4 6 3 0 1 2 1 0 3 6 4 7 4 3 2 0 4 5 6 5 4 0 2 3`
+(histogram 5,2,4,5,7,3,4,2 per 32 IDs; period-16 symmetry broken).
+
+| metric | old (total=32) | new (total=52) |
+|---|---|---|
+| worst-case adjacent-ID torus separation | 2.8192 | 1.6875 (-40%, family ceiling) |
+| p5 separation | 5.0625 | 4.1544 |
+| mean separation | 11.7280 | 12.6250 (+7.7%) |
+| L2 action E | 5.1039 | 6.3972 |
+| bins used | 6/8 | 8/8 |
+| max occupancy (shell-1 + replication) | 384 | 512 |
+
+Reachability proof (both ports, identical numbers): fill 220 + REP ->
+TTOTAL 400 zone ACTIVE; fill 400 + REP -> 486 OVERDRIVE; fill 470 +
+REP -> 504 DIVIDE. All four zone states now reachable; SQ4VAL=0 after
+every cycle.
+
+## Fix 2 — 3-axis corruption residual (SQ4RES)
+
+Construction: (I+R120+R240) symmetrization about each Cartesian axis,
+residual = max of the three per-axis responses / scale. Justification
+for max: keeps per-axis semantics (each axis must individually vanish
+for a perfect gate) and carries the provable floor — per-axis response
+to a single-vertex perturbation d is 3*|d.axis|/scale, and
+max_a |d.a| >= |d|/sqrt(3), so **response >= sqrt(3)*|d|/scale for ANY
+direction**.
+
+Measured (v4_check.py):
+- unperturbed: exactly 0.0 in F77, Ergo, and the f64 Python replica
+  (each axis) — the cuboctahedron's exact +/- vertex pairs cancel
+  bit-exactly in both precisions;
+- eps=1e-3 along x / y / z at vertex 1: ~3.000e-3 on the responding
+  axis in BOTH ports (the v2 metric answered ~6e-8 = blind for x,y);
+- diagonal (1,1,1)/sqrt(3) * 1e-3: 1.7320508e-3 = the floor case;
+- 1000 random directions: min response 1.7804e-3 >= floor 1.7321e-3
+  (min/floor = 1.028 — no violation);
+- F77 port gains the routine it never had (SQ4RES, REAL*8).
+
+## Port-semantics finding (v4-5)
+
+**Ergo passes scalar subroutine arguments by value** (probe:
+callee-set argument does not propagate). So v3's `CALL SQ3VAL(NBAD)`
+printed a vacuous 0 and `CALL SQ3FAL(I, ERR)` never set ERR — the v3
+"SQ3VAL makes bit-exactness falsifiable" mechanism never actually ran.
+v4 converts output-producing routines to functions
+(`NBAD := SQ4VAL()`, `NCOPY := SQ4REP()`, `ERR := SQ4FAL(I)`); the
+F77 port is by-reference and unaffected. The v3 file is left as-is
+(reference); its remaining checks (hash, TTOTAL, zone) operate on
+globals and are unaffected by the semantics.

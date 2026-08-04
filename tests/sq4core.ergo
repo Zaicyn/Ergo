@@ -1,0 +1,449 @@
+! SQUARAGON V4 CORE - MCL PORT
+! ==============================
+! Torus allocator: 2 shells x 8 bins x 32 ring = 512 slots
+! All state in STATIC declarations. Zero dynamic allocation.
+!
+! v4 changes (from the tuning audit, allocator/TUNING_FINDINGS.md):
+!   V4-1: SCATLT rebaked from sq2_viviani_scatter_full(id, 52),
+!         HOPFQ=1.97 — uses ALL 8 bins (v3's bake used only 6;
+!         bins 1,5 were dead and zones OVERDRIVE/DIVIDE unreachable).
+!         Tradeoff: worst-case adjacent-ID torus separation
+!         2.819 -> 1.688 (generator-family ceiling under 8-bin
+!         coverage); mean separation improves 11.73 -> 12.63.
+!   V4-3: SQ4RES — 3-axis corruption residual (the v2 triple-XOR
+!         residual is exactly 3*|z-centroid|/scale, blind to in-plane
+!         perturbations). Max over the three per-axis (I+R120+R240)
+!         symmetrizations. Floor: >= sqrt(3)*|d|/scale for any
+!         single-vertex perturbation d. Unperturbed gate: exactly 0.
+!         Operates on the STATIC RVTX gate buffer (Ergo idiom:
+!         globals + scalar args).
+!   V4-4: SQ4REP — shell 1 -> shell 2 replication, new to the Ergo
+!         port (v3 had no REP). Writes the shell-2 TINVAR bit-pack so
+!         SQ4VAL stays green after replication.
+!   V4-5: output-producing routines are FUNCTIONS, not subroutines
+!         with output arguments: Ergo passes scalar arguments BY VALUE
+!         (probe: subroutine-set argument does not propagate), so v3's
+!         CALL SQ3VAL(NBAD) / CALL SQ3FAL(I, ERR) outputs never reach
+!         the caller — v3's printed NBAD=0 was vacuous. v4 uses
+!         NBAD := SQ4VAL(), NCOPY := SQ4REP(), ERR := SQ4FAL(I).
+!
+! ── Constants ────────────────────────────────────────────────
+
+STATIC INTEGER :: NBINS = 8
+STATIC INTEGER :: NSHEL = 2
+STATIC INTEGER :: NRING = 32
+STATIC INTEGER :: NSLOT = 512
+STATIC INTEGER :: THBIAS = 384
+STATIC INTEGER :: THWORK = 432
+STATIC INTEGER :: THMAX = 496
+
+! ── Precomputed LUTs ────────────────────────────────────────
+! SCATLT: Viviani scatter — maps (ID & 31) to bin index 0-7
+!   V4-1: 8-bin bake (total=52, HOPFQ=1.97, float32).
+!   Histogram per 32 IDs: 5,2,4,5,7,3,4,2 — all bins live.
+! BINGEO: Viviani geo encoding per bin
+
+STATIC INTEGER :: SCATLT(32)
+DATA SCATLT / 6, 5, 4, 0, 2, 3, 4, 7, 4, 6, 3, 0, 1, 2, 1, 0, 3, 6, 4, 7, 4, 3, 2, 0, 4, 5, 6, 5, 4, 0, 2, 3 /
+
+STATIC INTEGER :: BINGEO(8)
+DATA BINGEO / 228, 104, 0, 104, 228, 104, 0, 104 /
+
+! ── Seed vertices: unit cuboctahedron (V4-3, for SQ4RES) ────
+! Column-major DATA: (x,y,z) per vertex, vertices 1-12 in order.
+
+STATIC REAL :: SEED(3, 12)
+DATA SEED / &
+  0.7071067811865475,  0.7071067811865475, 0.0, &
+  0.7071067811865475, -0.7071067811865475, 0.0, &
+ -0.7071067811865475,  0.7071067811865475, 0.0, &
+ -0.7071067811865475, -0.7071067811865475, 0.0, &
+  0.7071067811865475, 0.0,  0.7071067811865475, &
+  0.7071067811865475, 0.0, -0.7071067811865475, &
+ -0.7071067811865475, 0.0,  0.7071067811865475, &
+ -0.7071067811865475, 0.0, -0.7071067811865475, &
+ 0.0,  0.7071067811865475,  0.7071067811865475, &
+ 0.0,  0.7071067811865475, -0.7071067811865475, &
+ 0.0, -0.7071067811865475,  0.7071067811865475, &
+ 0.0, -0.7071067811865475, -0.7071067811865475 /
+
+! Gate buffer for SQ4RES (filled by SQ4INI)
+STATIC REAL :: RVTX(3, 12)
+
+! ── Torus State ─────────────────────────────────────────────
+
+STATIC INTEGER :: TINVAR(32, 8, 2)
+STATIC INTEGER :: TOCC(32, 8, 2)
+STATIC INTEGER :: TFROZ(32, 8, 2)
+STATIC INTEGER :: TWHEAD(8, 2)
+STATIC INTEGER :: TLEN(8, 2)
+STATIC INTEGER :: TALLOC(8, 2)
+STATIC INTEGER :: TTOTAL = 0
+STATIC INTEGER :: TPHASE = 0
+STATIC INTEGER :: TGEN = 0
+
+! ── SQ4SCT: Viviani scatter (LUT, O(1)) ────────────────────
+! Returns bin index 1-8 for a given ID
+
+INTEGER FUNCTION SQ4SCT(ID)
+  INTEGER :: ID
+  SQ4SCT := SCATLT(MOD(ID - 1, 32) + 1) + 1
+  RETURN SQ4SCT
+END
+
+! ── SQ4FAL: FAST allocate (LUT-only, no gate write) ────────
+! Pure integer hot path: scatter + LUT invariant + rotate.
+! Bit layout (same as v3):
+!   bits  0-4 : gen   (0-31)
+!   bit    8  : shell (0-1)
+!   bits  9-13: seam  (TBITS, even values 0-30)
+!   bits 16-18: bin   (0-7)
+!   bits 24-31: geo   (BINGEO 0-228)
+
+INTEGER FUNCTION SQ4FAL(ID)
+  INTEGER :: ID
+  INTEGER :: BIN, GEN, SHELL, POS
+  INTEGER :: IGEO, IBIN, ISHEL
+  INTEGER :: TBITS
+  INTEGER :: RINV
+
+  SQ4FAL := 0
+  SHELL := 1
+  BIN := SQ4SCT(ID)
+  GEN := TWHEAD(BIN, SHELL)
+
+  IF GEN > 32 THEN
+    SQ4FAL := -1
+    RETURN SQ4FAL
+  ENDIF
+
+  POS := IAND(GEN - 1, 31) + 1
+  IGEO := BINGEO(BIN)
+  IBIN := BIN - 1
+  ISHEL := SHELL - 1
+
+  TBITS := IAND(ISHFT(GEN - 1, 1), 31)
+
+  RINV := ISHFT(IGEO, 24) + ISHFT(IBIN, 16) + ISHFT(TBITS, 9) + &
+          ISHFT(ISHEL, 8) + (GEN - 1)
+
+  TINVAR(GEN, BIN, SHELL) := RINV
+
+  TOCC(GEN, BIN, SHELL) := 1
+  TALLOC(BIN, SHELL) := TALLOC(BIN, SHELL) + 1
+  IF MOD(TALLOC(BIN, SHELL), 4) = 0 THEN
+    TFROZ(GEN, BIN, SHELL) := 1
+  ELSE
+    TFROZ(GEN, BIN, SHELL) := 0
+  ENDIF
+
+  TWHEAD(BIN, SHELL) := GEN + 1
+  TLEN(BIN, SHELL) := TLEN(BIN, SHELL) + 1
+  TTOTAL := TTOTAL + 1
+
+  RETURN SQ4FAL
+END
+
+! ── SQ4TIN: Initialize torus (all slots empty) ──────────────
+
+SUBROUTINE SQ4TIN
+  INTEGER :: I, J, K
+
+  DO K = 1, 2
+    DO J = 1, 8
+      TWHEAD(J, K) := 1
+      TLEN(J, K) := 0
+      TALLOC(J, K) := 0
+      DO I = 1, 32
+        TOCC(I, J, K) := 0
+        TFROZ(I, J, K) := 0
+        TINVAR(I, J, K) := 0
+      ENDDO
+    ENDDO
+  ENDDO
+  TTOTAL := 0
+  TPHASE := 0
+  TGEN := 0
+  RETURN
+END
+
+! ── SQ4REP: Replicate shell 1 to shell 2 (V4-4, NEW) ───────
+! Copies occupancy and writes the shell-2 TINVAR bit-pack, so
+! SQ4VAL stays green after replication. No gate storage in this
+! port, so there is nothing else to copy.
+
+INTEGER FUNCTION SQ4REP()
+  INTEGER :: I, J
+  INTEGER :: IGEO, IBIN, TBITS
+
+  SQ4REP := 0
+  TPHASE := 1
+
+  DO J = 1, 8
+    DO I = 1, 32
+      IF TOCC(I, J, 1) = 1 THEN
+        IGEO := BINGEO(J)
+        IBIN := J - 1
+        TBITS := IAND(ISHFT(I - 1, 1), 31)
+        TINVAR(I, J, 2) := ISHFT(IGEO, 24) + ISHFT(IBIN, 16) + &
+                           ISHFT(TBITS, 9) + ISHFT(1, 8) + (I - 1)
+        TOCC(I, J, 2) := 1
+        TFROZ(I, J, 2) := 0
+        TLEN(J, 2) := TLEN(J, 2) + 1
+        TTOTAL := TTOTAL + 1
+        SQ4REP := SQ4REP + 1
+      ENDIF
+    ENDDO
+    TWHEAD(J, 2) := TWHEAD(J, 1)
+  ENDDO
+
+  TPHASE := 2
+  RETURN SQ4REP
+END
+
+! ── SQ4ZON: Zone for occupancy ──────────────────────────────
+! Returns: 1=COASTING, 2=ACTIVE, 3=OVERDRIVE, 4=DIVIDE
+
+INTEGER FUNCTION SQ4ZON(NOCC)
+  INTEGER :: NOCC
+  IF NOCC < 384 THEN
+    SQ4ZON := 1
+  ELSEIF NOCC < 432 THEN
+    SQ4ZON := 2
+  ELSEIF NOCC < 496 THEN
+    SQ4ZON := 3
+  ELSE
+    SQ4ZON := 4
+  ENDIF
+  RETURN SQ4ZON
+END
+
+! ── SQ4VAL: Validate TINVAR contents ───────────────────────
+! Same discipline as v3: recompute the bit-pack for every
+! occupied slot, expect 0 for unoccupied. After SQ4REP this
+! covers shell 2 as well (V4-4 writes the shell-2 pack).
+
+INTEGER FUNCTION SQ4VAL()
+  INTEGER :: VI, VJ, VK
+  INTEGER :: VBIN, VSHELL, VGEO, VTBITS, EXPECTED, ACTUAL
+
+  SQ4VAL := 0
+  DO VK = 1, 2
+    DO VJ = 1, 8
+      DO VI = 1, 32
+        ACTUAL := TINVAR(VI, VJ, VK)
+        IF TOCC(VI, VJ, VK) = 1 THEN
+          VBIN := VJ - 1
+          VSHELL := VK - 1
+          VGEO := BINGEO(VJ)
+          VTBITS := IAND(ISHFT(VI - 1, 1), 31)
+          EXPECTED := ISHFT(VGEO, 24) + ISHFT(VBIN, 16) + &
+                      ISHFT(VTBITS, 9) + ISHFT(VSHELL, 8) + (VI - 1)
+          IF ACTUAL ≠ EXPECTED THEN
+            SQ4VAL := SQ4VAL + 1
+          ENDIF
+        ELSE
+          IF ACTUAL ≠ 0 THEN
+            SQ4VAL := SQ4VAL + 1
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDDO
+  ENDDO
+  RETURN SQ4VAL
+END
+
+! ── SQ4INI: Fill the RVTX gate buffer at a scale ───────────
+
+SUBROUTINE SQ4INI(SCALE)
+  REAL :: SCALE
+  INTEGER :: I
+  DO I = 1, 12
+    RVTX(1, I) := SEED(1, I) * SCALE
+    RVTX(2, I) := SEED(2, I) * SCALE
+    RVTX(3, I) := SEED(3, I) * SCALE
+  ENDDO
+  RETURN
+END
+
+! ── SQ4RES: 3-axis corruption residual (V4-3, NEW) ─────────
+! (I + R120 + R240) symmetrization about each Cartesian axis;
+! returns the max per-axis residual, normalized by SCALE.
+! Per-axis response to a single-vertex perturbation d is
+! 3*|d.axis|/scale; the max is >= sqrt(3)*|d|/scale for ANY
+! direction. Unperturbed gate: exactly 0 (verified, v4_check.py).
+
+REAL FUNCTION SQ4RES(SCALE)
+  REAL :: SCALE
+  REAL :: C120, S120
+  REAL :: X, Y, Z, X1, Y1, Z1, X2, Y2, Z2
+  REAL :: SX, SY, SZ, RA, RMAX
+  INTEGER :: I, AX
+
+  C120 := -0.5
+  S120 := 0.8660254037844386
+  RMAX := 0.0
+  DO AX = 1, 3
+    SX := 0.0
+    SY := 0.0
+    SZ := 0.0
+    DO I = 1, 12
+      X := RVTX(1, I)
+      Y := RVTX(2, I)
+      Z := RVTX(3, I)
+      IF AX = 1 THEN
+        X1 := X
+        Y1 := C120*Y - S120*Z
+        Z1 := S120*Y + C120*Z
+        X2 := X
+        Y2 := C120*Y + S120*Z
+        Z2 := -S120*Y + C120*Z
+      ELSEIF AX = 2 THEN
+        X1 := C120*X + S120*Z
+        Y1 := Y
+        Z1 := -S120*X + C120*Z
+        X2 := C120*X - S120*Z
+        Y2 := Y
+        Z2 := S120*X + C120*Z
+      ELSE
+        X1 := C120*X - S120*Y
+        Y1 := S120*X + C120*Y
+        Z1 := Z
+        X2 := C120*X + S120*Y
+        Y2 := -S120*X + C120*Y
+        Z2 := Z
+      ENDIF
+      SX := SX + X + X1 + X2
+      SY := SY + Y + Y1 + Y2
+      SZ := SZ + Z + Z1 + Z2
+    ENDDO
+    RA := SQRT(SX*SX + SY*SY + SZ*SZ) / SCALE
+    IF RA > RMAX THEN
+      RMAX := RA
+    ENDIF
+  ENDDO
+  SQ4RES := RMAX
+  RETURN SQ4RES
+END
+
+! ── Test harness ─────────────────────────────────────────────
+
+IMPLICIT NONE
+INTEGER :: I, ERR, ZONE
+INTEGER :: HASH, HI, HJ, HK
+INTEGER :: NBAD, NCOPY
+REAL :: RZERO, RX, RY, RZ, RDIAG
+
+! ── Cycle 1: allocate 400 items via fast path (v3-style block) ──
+
+CALL SQ4TIN
+
+DO I = 1, 400
+  ERR := SQ4FAL(I)
+ENDDO
+
+PRINT TTOTAL
+ZONE := SQ4ZON(TTOTAL)
+PRINT ZONE
+
+NBAD := SQ4VAL()
+PRINT NBAD
+
+! ── State hash (same algorithm as v3 for continuity) ──────
+
+HASH := 166136261
+DO HK = 1, 2
+  DO HJ = 1, 8
+    HASH := IEOR(HASH, TWHEAD(HJ, HK))
+    HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+    HASH := IEOR(HASH, TLEN(HJ, HK))
+    HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+    HASH := IEOR(HASH, TALLOC(HJ, HK))
+    HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+    DO HI = 1, 32
+      HASH := IEOR(HASH, TOCC(HI, HJ, HK))
+      HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+      HASH := IEOR(HASH, TFROZ(HI, HJ, HK))
+      HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+    ENDDO
+  ENDDO
+ENDDO
+HASH := IEOR(HASH, TTOTAL)
+HASH := IEOR(ISHFT(HASH, 13), ISHFT(HASH, -19))
+
+PRINT HASH
+
+! ── V4-1 oracle: scatter sequence + bin coverage ───────────
+
+DO I = 1, 32
+  WRITE(*, "SCT %d %d") I, SQ4SCT(I)
+ENDDO
+
+! ── V4-3 oracle: residual floor demos ──────────────────────
+! Unperturbed, then eps=1e-3 along each axis at vertex 1,
+! then along the (1,1,1)/sqrt3 worst-case direction.
+
+CALL SQ4INI(1.0)
+RZERO := SQ4RES(1.0)
+WRITE(*, "RES_ZERO %.17e") RZERO
+
+RVTX(1, 1) := RVTX(1, 1) + 0.001
+RX := SQ4RES(1.0)
+WRITE(*, "RES_X %.17e") RX
+
+CALL SQ4INI(1.0)
+RVTX(2, 1) := RVTX(2, 1) + 0.001
+RY := SQ4RES(1.0)
+WRITE(*, "RES_Y %.17e") RY
+
+CALL SQ4INI(1.0)
+RVTX(3, 1) := RVTX(3, 1) + 0.001
+RZ := SQ4RES(1.0)
+WRITE(*, "RES_Z %.17e") RZ
+
+CALL SQ4INI(1.0)
+RVTX(1, 1) := RVTX(1, 1) + 0.0005773502691896258
+RVTX(2, 1) := RVTX(2, 1) + 0.0005773502691896258
+RVTX(3, 1) := RVTX(3, 1) + 0.0005773502691896258
+RDIAG := SQ4RES(1.0)
+WRITE(*, "RES_DIAG %.17e") RDIAG
+
+! ── V4-1 oracle: threshold-state reachability ──────────────
+! Three fresh fill+replicate cycles. With 8 live bins the shell-1
+! ceiling is 256, so post-REP occupancy reaches ACTIVE, OVERDRIVE
+! and DIVIDE — all dead under the v2/v3 6-bin LUT.
+
+CALL SQ4TIN
+DO I = 1, 220
+  ERR := SQ4FAL(I)
+ENDDO
+NCOPY := SQ4REP()
+NBAD := SQ4VAL()
+! fill 220 -> ACTIVE (zone 2)
+WRITE(*, "CYC1 %d %d %d %d") TTOTAL, SQ4ZON(TTOTAL), NCOPY, NBAD
+
+CALL SQ4TIN
+DO I = 1, 400
+  ERR := SQ4FAL(I)
+ENDDO
+NCOPY := SQ4REP()
+NBAD := SQ4VAL()
+WRITE(*, "CYC2 %d %d %d %d") TTOTAL, SQ4ZON(TTOTAL), NCOPY, NBAD
+
+CALL SQ4TIN
+DO I = 1, 470
+  ERR := SQ4FAL(I)
+ENDDO
+NCOPY := SQ4REP()
+NBAD := SQ4VAL()
+WRITE(*, "CYC3 %d %d %d %d") TTOTAL, SQ4ZON(TTOTAL), NCOPY, NBAD
+
+! ── Invariant dump for cross-port comparison ───────────────
+
+DO HK = 1, 2
+  DO HJ = 1, 8
+    DO HI = 1, 32
+      WRITE(*, "TINV %d %d %d %d") HI, HJ, HK, TINVAR(HI, HJ, HK)
+    ENDDO
+  ENDDO
+ENDDO
