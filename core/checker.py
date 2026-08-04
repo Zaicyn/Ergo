@@ -16,7 +16,10 @@ from .symbols import SymbolTable, Symbol, FuncSymbol, AllocState
 from .errors import MCLError
 
 
-NUMERIC_TYPES = {"INTEGER", "REAL", "COMPLEX"}
+NUMERIC_TYPES = {"INTEGER", "INTEGER*8", "REAL", "COMPLEX"}
+
+# Integer-family types (Inc-2A: INTEGER*8 = 64-bit, CPU only)
+INT_TYPES = {"INTEGER", "INTEGER*8"}
 
 # Character-family types (string literals have type "STRING")
 CHAR_TYPES = {"CHARACTER", "STRING"}
@@ -27,7 +30,8 @@ INTRINSIC_RETURNS = {
     "ASIN": "REAL", "ACOS": "REAL", "ATAN": "REAL", "ATAN2": "REAL",
     "EXP": "REAL", "LOG": "REAL", "LOG10": "REAL", "SQRT": "REAL",
     "SINH": "REAL", "COSH": "REAL", "TANH": "REAL",
-    "REAL": "REAL", "INT": "INTEGER", "CHAR": "CHARACTER",
+    "REAL": "REAL", "INT": "INTEGER", "INT8": "INTEGER*8",
+    "CHAR": "CHARACTER",
     "ISHFT": "INTEGER", "IEOR": "INTEGER", "IAND": "INTEGER",
     "IOR": "INTEGER", "NOT": "INTEGER",
     "HASH": "INTEGER", "RAND": "REAL",
@@ -66,6 +70,7 @@ INTRINSIC_ARG_RULES = {
     "NOT": (1, 1, "int"),
     "HASH": (1, 1, "int"), "RAND": (1, 1, "int"),
     "REAL": (1, 1, "numeric"), "INT": (1, 1, "numeric"),
+    "INT8": (1, 1, "numeric"),
     "CHAR": (1, 1, "int"),
     # Whole-array reductions also get shape validation in
     # _check_reduction_args (the rules below cover the scalar path).
@@ -84,6 +89,9 @@ def promote(t1: str, t2: str) -> str:
             return "COMPLEX"
         if "REAL" in (t1, t2):
             return "REAL"
+        # Fortran kind promotion: INTEGER*8 wins over default INTEGER
+        if "INTEGER*8" in (t1, t2):
+            return "INTEGER*8"
     return t1
 
 
@@ -499,6 +507,12 @@ class Checker:
                 if not (target_type in NUMERIC_TYPES and value_type in NUMERIC_TYPES):
                     if not (target_type in CHAR_TYPES and value_type in CHAR_TYPES):
                         self._error(f"Cannot assign {value_type} to {target_type}")
+            # Inc-2A: implicit INTEGER*8 -> INTEGER narrowing loses bits —
+            # an error; use INT() (explicit) for deliberate narrowing.
+            if target_type == "INTEGER" and value_type == "INTEGER*8":
+                self._error(
+                    "Implicit narrowing INTEGER*8 -> INTEGER is an error; "
+                    "use INT(expr) for an explicit conversion")
 
         # ── Whole-array ↔ scalar assignment ──
         if isinstance(node.target, ast.Variable):
@@ -564,7 +578,7 @@ class Checker:
                 f"variable — it is a compile-time constant",
                 node.line,
             )
-        if sym and sym.type_name != "INTEGER":
+        if sym and sym.type_name not in INT_TYPES:
             self._error(
                 f"DO loop variable '{node.var}' must be INTEGER, "
                 f"got {sym.type_name}",
@@ -575,7 +589,7 @@ class Checker:
                             (node.end, "end"),
                             (node.step, "step")):
             t = self._infer_type(expr)
-            if t is not None and t != "INTEGER":
+            if t is not None and t not in INT_TYPES:
                 self._error(
                     f"DO loop {label} must be INTEGER, got {t}",
                     node.line,
@@ -915,7 +929,7 @@ class Checker:
                     self._error(f"{name} expects REAL, got {bad}",
                                 self._stmt_line)
             elif kind == "int":
-                bad = next((t for t in known if t != "INTEGER"), None)
+                bad = next((t for t in known if t not in INT_TYPES), None)
                 if bad:
                     self._error(f"{name} expects INTEGER, got {bad}",
                                 self._stmt_line)
@@ -926,14 +940,14 @@ class Checker:
                                 f"got {bad}", self._stmt_line)
             elif kind == "int_or_real":
                 bad = next((t for t in known
-                            if t not in ("INTEGER", "REAL")), None)
+                            if t not in INT_TYPES and t != "REAL"), None)
                 if bad:
                     self._error(f"{name} expects INTEGER or REAL, got {bad}",
                                 self._stmt_line)
             elif kind == "homo":
                 distinct = set(known)
                 if len(distinct) > 1 or (
-                        distinct and not distinct <= {"INTEGER", "REAL"}):
+                        distinct and not distinct <= INT_TYPES | {"REAL"}):
                     got = ", ".join(sorted(distinct))
                     self._error(
                         f"{name} arguments must be all INTEGER or all "

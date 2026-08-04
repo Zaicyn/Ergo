@@ -86,6 +86,7 @@ class Parser:
         """Parse: INTEGER FUNCTION name(...) or REAL FUNCTION name(...)"""
         ret_tok = self._eat(self._cur().type)
         ret_type = ret_tok.value.upper()
+        ret_type = self._maybe_kind_suffix(ret_type, ret_tok.line)
         self._eat(TT.KW_FUNCTION)
         name = self._eat(TT.IDENT).value
         self._eat(TT.LPAREN)
@@ -152,12 +153,26 @@ class Parser:
 
     # ── declarations ─────────────────────────────────────────
 
+    def _maybe_kind_suffix(self, type_name: str, line: int) -> str:
+        """INTEGER*8 kind suffix (64-bit integers, Inc-2A). Only *8 is
+        valid; anything else is a parse error (never silently ignored)."""
+        if type_name == "INTEGER" and self._at(TT.STAR):
+            self._eat(TT.STAR)
+            tok = self._eat(TT.INTEGER_LIT)
+            if tok.value != 8:
+                raise ParseError(
+                    f"Only INTEGER*8 is supported, got INTEGER*{tok.value}",
+                    line, tok.col)
+            return "INTEGER*8"
+        return type_name
+
     def _parse_static_declaration(self) -> ast.Declaration:
         """Parse: STATIC INTEGER :: name(shape), ... or STATIC REAL :: ..."""
         line = self._cur().line
         self._eat(TT.KW_STATIC)
         type_tok = self._eat(self._cur().type)
         type_name = type_tok.value.upper()
+        type_name = self._maybe_kind_suffix(type_name, line)
 
         self._eat(TT.COLONCOLON)
 
@@ -173,6 +188,7 @@ class Parser:
         line = self._cur().line
         type_tok = self._eat(self._cur().type)
         type_name = type_tok.value.upper()
+        type_name = self._maybe_kind_suffix(type_name, line)
 
         allocatable = False
         parameter = False

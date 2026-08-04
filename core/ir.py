@@ -39,6 +39,7 @@ def get_real_precision() -> int:
 class IRType(Enum):
     REAL = "REAL"
     INTEGER = "INTEGER"
+    INT64 = "INT64"        # INTEGER*8 — 64-bit integer (CPU only; no GPU)
     LOGICAL = "LOGICAL"
     CHARACTER = "CHARACTER"
     STRING = "STRING"          # string literal (for format strings)
@@ -49,6 +50,7 @@ class IRType(Enum):
         return {
             IRType.REAL: "float" if _real_precision == 32 else "double",
             IRType.INTEGER: "int",
+            IRType.INT64: "long long",
             IRType.LOGICAL: "int",
             IRType.CHARACTER: "char",
             IRType.STRING: "const char*",
@@ -157,6 +159,7 @@ class Op(Enum):
     # Type conversion
     TO_REAL = "to_real"     # INTEGER -> REAL
     TO_INT = "to_int"       # REAL -> INTEGER
+    TO_INT64 = "to_int64"   # numeric -> INTEGER*8 (explicit INT8())
     TO_CHAR = "to_char"     # INTEGER -> CHARACTER
 
     # Math intrinsics (result = REAL unless noted)

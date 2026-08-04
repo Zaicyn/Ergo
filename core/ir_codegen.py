@@ -50,6 +50,7 @@ def _c_type(t: IRType) -> str:
         return IRType.REAL.c_type  # "float" or "double" per global precision
     return {
         IRType.INTEGER: "int",
+        IRType.INT64: "long long",
         IRType.LOGICAL: "int",
         IRType.CHARACTER: "char",
         IRType.STRING: "const char*",
@@ -59,6 +60,7 @@ def _c_type(t: IRType) -> str:
 # Legacy dict — some code paths still use this directly
 C_TYPE = {
     IRType.INTEGER: "int",
+    IRType.INT64: "long long",
     IRType.LOGICAL: "int",
     IRType.CHARACTER: "char",
     IRType.STRING: "const char*",
@@ -454,6 +456,8 @@ class IRCodeGen:
             return _real_lit(value)
         if t == IRType.INTEGER:
             return str(value)
+        if t == IRType.INT64:
+            return f"{value}LL"
         if t == IRType.LOGICAL:
             return "1" if value else "0"
         return str(value)
@@ -1911,6 +1915,9 @@ class IRCodeGen:
             return
         if op == Op.TO_INT:
             self._put(f"{result} = (int)({self._operand(args[0])});")
+            return
+        if op == Op.TO_INT64:
+            self._put(f"{result} = (long long)({self._operand(args[0])});")
             return
         if op == Op.TO_CHAR:
             self._put(f"{result} = (char)({self._operand(args[0])});")
@@ -4135,12 +4142,14 @@ class IRCodeGen:
                 return "%s"
             return {
                 IRType.INTEGER: "%d", IRType.REAL: "%f",
+                IRType.INT64: "%lld",
                 IRType.LOGICAL: "%d",
             }.get(op.type, "%f")
         if isinstance(op, IRRef):
             t = self._var_types.get(op.name, op.type)
             return {
                 IRType.INTEGER: "%d", IRType.REAL: "%f",
+                IRType.INT64: "%lld",
                 IRType.LOGICAL: "%d", IRType.STRING: "%s",
             }.get(t, "%f")
         return "%f"

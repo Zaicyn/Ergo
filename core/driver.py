@@ -35,6 +35,29 @@ DETERMINISTIC_FLAGS = [
     "-std=c11",
 ]
 
+# large code model: only when static data approaches the 2 GiB BSS reach
+# of the default medium model (R_X86_64_PC32 relocation truncation at
+# link time). Scoped because -mcmodel=large costs ~10-15% host-side
+# address overhead on transfer-heavy binaries (measured on the DBM
+# solver, Inc-4 profiling).
+_LARGE_CMODEL_THRESHOLD = 1 << 30  # bytes of static array data
+
+
+def _static_array_bytes(ir_module) -> int:
+    """Total bytes of STATIC/LOCAL arrays with compile-time int shapes."""
+    from .ir import IRType, get_real_precision
+    real_sz = 4 if get_real_precision() == 32 else 8
+    type_sz = {IRType.REAL: real_sz, IRType.INTEGER: 4, IRType.INT64: 8,
+               IRType.LOGICAL: 4, IRType.CHARACTER: 1}
+    total = 0
+    for v in list(ir_module.globals) + list(ir_module.main_locals):
+        if v.shape and all(isinstance(d, int) for d in v.shape):
+            n = 1
+            for d in v.shape:
+                n *= d
+            total += n * type_sz.get(v.type, real_sz)
+    return total
+
 
 def _apply_param_overrides(tree: ast.Program, param_overrides: dict) -> None:
     """Rewrite matching PARAMETER initializers in the AST.
@@ -167,6 +190,8 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
         runtime_dir = os.path.join(os.path.dirname(__file__), "runtime")
         gcc_flags = (["gcc", "-o", output, c_path] + DETERMINISTIC_FLAGS +
                      ["-lm", f"-I{runtime_dir}"])
+        if _static_array_bytes(ir_module) > _LARGE_CMODEL_THRESHOLD:
+            gcc_flags.append("-mcmodel=large")
         if render:
             # Link against Vulkan runtime for rendering
             vk_host_c = os.path.join(runtime_dir, "vk_host.c")
@@ -337,6 +362,8 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
             "-lm", "-lvulkan",
             f"-I{runtime_dir}",
         ])
+        if _static_array_bytes(ir_module) > _LARGE_CMODEL_THRESHOLD:
+            gcc_flags.append("-mcmodel=large")
         if render:
             gcc_flags.append("-lglfw")
         else:

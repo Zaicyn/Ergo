@@ -9,6 +9,8 @@
  *
  * Headless mode:  compute only (no window, no GLFW).
  * Render mode:    compute + GLFW window + swapchain + present.
+ * Inc-2B: ergo_vk_create_buffer asserts size <= maxStorageBufferRange
+ *   (queried once) — oversized vectors must use gather-window streaming.
  */
 
 #include "ergo_vk.h"
@@ -997,6 +999,27 @@ static void ensure_staging(size_t need) {
 ErgoVkBuf ergo_vk_create_buffer(size_t size) {
     if (!g.device) return 0;  /* CPU-only mode: no GPU buffers */
     if (size == 0) size = 4;  /* guard: 0-byte buffers crash Vulkan drivers */
+    /* Inc-2B: enforce the descriptor-range limit up front. A buffer
+     * larger than maxStorageBufferRange would fail at bind time (or
+     * worse, silently on some drivers) — fail loudly at creation. */
+    {
+        static size_t max_range = 0;
+        if (!max_range) {
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(g.phys_device, &props);
+            max_range = (size_t)props.limits.maxStorageBufferRange;
+            fprintf(stderr, "[ergo_vk] maxStorageBufferRange: %.2f GB\n",
+                    (double)max_range / 1e9);
+        }
+        if (size > max_range) {
+            fprintf(stderr,
+                    "ergo_vk: buffer of %.2f GB exceeds "
+                    "maxStorageBufferRange (%.2f GB) — use the "
+                    "gather-window streaming path (Inc-2B)\n",
+                    (double)size / 1e9, (double)max_range / 1e9);
+            exit(1);
+        }
+    }
     int slot = -1;
     for (int i = 0; i < ERGO_VK_MAX_BUFFERS; i++) {
         if (!g.bufs[i].in_use) { slot = i; break; }

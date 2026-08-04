@@ -1,0 +1,69 @@
+! INT64 — INTEGER*8 (64-bit integer) oracle
+! =====================================================================
+! Ergo INTEGER is 32-bit C int; INTEGER*8 is 64-bit (long long).
+! CPU-only (GPU extraction rejects INTEGER*8 with a named diagnostic).
+!
+! Oracles (all exact integer arithmetic):
+!   3^20 = 3486784401 (> 2^31-1 = 2147483647 — overflows int32)
+!   S = 6e9, M = 1.8e10, D2 = 2571428571 (trunc division), MOD = 3*10^9+?
+!   INT8()/INT()/REAL() round-trips, comparisons, int64 arrays.
+!
+!   python -m core tests/int64.ergo -o /tmp/int64 && /tmp/int64
+
+IMPLICIT NONE
+INTEGER*8 :: BIG, P, S, M, D2, R8
+INTEGER*8 :: TBL(10)
+INTEGER :: I, N
+REAL :: X
+
+! Power past 2^31: 3^20 = 3486784401
+P := 1
+DO I = 1, 20
+  P := P * 3
+ENDDO
+WRITE(*, "3^20 = %lld") P
+
+! Large arithmetic: mixed literal widths, division, MOD
+BIG := 3000000000
+S := BIG + BIG
+M := S * 3
+D2 := M / 7
+R8 := MOD(M, P)
+WRITE(*, "S=%lld M=%lld D2=%lld MOD=%lld") S, M, D2, R8
+
+! Comparisons past 2^31
+IF (M > BIG) THEN
+  WRITE(*, "cmp: M > BIG is true (expected)")
+ENDIF
+IF (BIG > P) THEN
+  WRITE(*, "cmp: BIG > P is WRONG")
+ENDIF
+
+! Mixed INTEGER + INTEGER*8: int64 wins
+N := 5
+S := P + N
+WRITE(*, "P+N=%lld") S
+
+! INT8() explicit conversion (5e12 = 5 * 10^12)
+S := INT8(N) * INT8(1000000) * INT8(1000000)
+WRITE(*, "INT8=%lld") S
+
+! REAL round-trip (3.49e9 is exactly representable in f64)
+X := REAL(P)
+S := INT8(X)
+WRITE(*, "roundtrip=%lld") S
+
+! INT() explicit narrowing (P - 3486784400 = 1)
+N := INT(P - 3486784400)
+WRITE(*, "narrow=%d") N
+
+! int64 array: prefix sums past 2^31
+TBL(1) := 1000000000
+DO I = 2, 10
+  TBL(I) := TBL(I - 1) + 1000000000
+ENDDO
+S := 0
+DO I = 1, 10
+  S := S + TBL(I)
+ENDDO
+WRITE(*, "tblsum=%lld tbl10=%lld") S, TBL(10)

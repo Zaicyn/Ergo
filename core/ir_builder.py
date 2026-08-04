@@ -21,6 +21,7 @@ from .ir import (
 TYPE_MAP = {
     "REAL": IRType.REAL,
     "INTEGER": IRType.INTEGER,
+    "INTEGER*8": IRType.INT64,   # 64-bit integer (Inc-2A, CPU only)
     "LOGICAL": IRType.LOGICAL,
     "CHARACTER": IRType.CHARACTER,
     # STRING appears on string literals (e.g. PRINT "hello") — typing them
@@ -576,6 +577,14 @@ class IRBuilder:
             ))
             return IRRef(t, IRType.INTEGER)
 
+        if upper == "INT8":
+            a = self._lower_expr(node.args[0], block)
+            t = self._fresh_temp()
+            block.insts.append(IRInst(
+                op=Op.TO_INT64, result=t, args=[a], type=IRType.INT64,
+            ))
+            return IRRef(t, IRType.INT64)
+
         if upper == "CHAR":
             a = self._lower_expr(node.args[0], block)
             t = self._fresh_temp()
@@ -826,6 +835,9 @@ class IRBuilder:
             return a
         if IRType.REAL in (a, b):
             return IRType.REAL
+        # Fortran kind promotion: INTEGER*8 wins over default INTEGER
+        if {a, b} <= {IRType.INT64, IRType.INTEGER} and IRType.INT64 in (a, b):
+            return IRType.INT64
         return a
 
     def _const_value(self, node) -> Any:

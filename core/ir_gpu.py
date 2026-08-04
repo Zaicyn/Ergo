@@ -2608,6 +2608,35 @@ def _check_loop(loop: IRLoop, array_shapes: dict, var_types: dict,
     """
     _empty = False, "", set(), set(), set(), set(), LoopDependence.SCATTER, None, set(), None, None, None
 
+    # Inc-2A: 64-bit integers are CPU-only. The backend would silently
+    # treat an INT64 scalar/array as i32 (push constants, element type) —
+    # reject loudly instead (shaders' i64 is reserved for HASH/RAND).
+    def _has_int64(items) -> bool:
+        for it in items:
+            if isinstance(it, IRBlock):
+                for inst in it.insts:
+                    if inst.type == IRType.INT64:
+                        return True
+                    arr = inst.meta.get("array", "") if inst.meta else ""
+                    if arr and var_types.get(arr) == IRType.INT64:
+                        return True
+                    for a in inst.args:
+                        if isinstance(a, IRRef) and a.type == IRType.INT64:
+                            return True
+            elif isinstance(it, (IRLoop, IRWhileLoop)):
+                if _has_int64(it.body):
+                    return True
+            elif isinstance(it, IRIf):
+                if _has_int64(it.then_body):
+                    return True
+                if it.else_body and _has_int64(it.else_body):
+                    return True
+        return False
+    if _has_int64(loop.body):
+        return (False, "INTEGER*8 (int64) is CPU-only — not supported on "
+                "GPU (Inc-2A)", set(), set(), set(), set(),
+                LoopDependence.SCATTER, None, set(), None, None, None)
+
     arrays_read: set[str] = set()
     arrays_written: set[str] = set()
     scalars_read: set[str] = set()
