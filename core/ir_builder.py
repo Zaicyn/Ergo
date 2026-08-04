@@ -797,6 +797,33 @@ class IRBuilder:
                 ))
                 return [block]
 
+        # Streaming intrinsics (Inc-2B N=19): direct host↔device slice
+        # transfers with NO host-side array copy (the Inc-4 ranged path
+        # only covers compiler-tracked dirty arrays; streaming needs
+        # explicit sub-range moves from an arbitrary host array).
+        #   CALL VK_STAGE(gpu_arr, host_arr, src0, dst0, len)
+        #     device[dst0..dst0+len) := host[src0..src0+len)  (1-based)
+        #   CALL VK_FETCH(host_arr, gpu_arr, src0, dst0, len)
+        #     host[dst0..dst0+len) := device[src0..src0+len)
+        uname = node.name.upper()
+        if uname in ("VK_STAGE", "VK_FETCH") and len(node.args) == 5:
+            a_arr, b_arr = node.args[0], node.args[1]
+            if (isinstance(a_arr, ast.Variable) and
+                    isinstance(b_arr, ast.Variable) and
+                    a_arr.name in self._array_shapes and
+                    b_arr.name in self._array_shapes):
+                ops = [self._lower_expr(a, block) for a in node.args[2:]]
+                block.insts.append(IRInst(
+                    op=Op.CALL_VOID, args=ops, type=IRType.VOID,
+                    line=node.line,
+                    meta={"func": uname, "arr_a": a_arr.name,
+                          "arr_b": b_arr.name},
+                ))
+                return [block]
+            from .errors import MCLError
+            raise MCLError(
+                f"{uname}: first two arguments must be declared arrays")
+
         lowered_args = [self._lower_expr(a, block) for a in node.args]
         block.insts.append(IRInst(
             op=Op.CALL_VOID, args=lowered_args, type=IRType.VOID,

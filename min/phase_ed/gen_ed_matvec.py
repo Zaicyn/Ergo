@@ -291,8 +291,206 @@ def main():
         sys.stdout.write(resident(N))
     elif variant == "streamed":
         sys.stdout.write(streamed(N))
+    elif variant == "streamed19":
+        niter = int(sys.argv[3]) if len(sys.argv) > 3 else 300
+        sys.stdout.write(streamed19(N, niter))
     else:
         sys.exit(f"unknown variant {variant}")
+
+
+
+
+def streamed19(N, niter=300):
+    """N=19-class full gather-window streaming (works at any N>=6 for
+    validation; sizes scale as powers of 3).
+
+    Memory (N=19, f64): V/HW host-resident (9.3 GB each); on device:
+      VA   ring window, WINA = 5*QT (halo 2*QT covers bonds i<=N-3)
+      RA17A/B, RA18A/B  remote QT slices for bonds i=N-2, N-1
+      WWIN output tile
+      ~= 1.72 + 1.38 + 0.34 GB = 3.45 GB (fits the 6 GB card;
+      maxStorageBufferRange 4.29 GB asserted per buffer).
+    Ring slot of global g is MOD(g-1,WINA)+1 — no base tracking; per
+    tile the host stages only the advancing QT slice plus 4 remote
+    slices, all via VK_STAGE (no host array copies), then dispatches
+    kernel B (top bonds), kernel A (diag + low bonds, accumulates onto
+    WWIN), the tiled multi-reduction (RHO/NRM2 accumulate in tile
+    order), and VK_FETCHes WWIN into the host HW slice.
+    """
+    DIM = 3 ** N
+    QT = 3 ** (N - 3)
+    NT = 27
+    WINA = 5 * QT
+    L = [header(N, "streamed19",
+                "! Full gather-window streaming (see gen_ed_matvec.py "
+                "docstring):\n! V/HW host-resident; device holds only a "
+                "5*QT ring window (bonds i<=N-3),\n! 4 remote QT slices "
+                "(bonds N-2, N-1) and the QT output window. Host stages\n"
+                "! slices with VK_STAGE / fetches with VK_FETCH "
+                "(frame-draining intrinsics).")]
+    L += [
+        "IMPLICIT NONE",
+        f"INTEGER, PARAMETER :: N = {N}",
+        f"INTEGER, PARAMETER :: DIM = {DIM}",
+        f"INTEGER, PARAMETER :: QT = {QT}, NT = {NT}",
+        f"INTEGER, PARAMETER :: WINA = {WINA}",
+        f"INTEGER, PARAMETER :: NITER = {niter}",
+        f"REAL, PARAMETER :: SHIFT = {2.0 * N:.1f}, JH = 0.5, TOLC = 1.0e-12",
+        f"STATIC REAL :: V({DIM}), HW({DIM})",
+        f"STATIC REAL :: VA({WINA}), WWIN({QT})",
+        f"STATIC REAL :: RA17A({QT}), RA17B({QT}), RA18A({QT}), RA18B({QT})",
+        "REAL :: RHO, NRM, NRM2T, RHOOLD, DRHO, C1, C2, RHOP, R2",
+        "INTEGER :: K, T, TB, ITER, CONV, Q, SX, SL, DG",
+        "INTEGER :: S, A0, A1",
+        f"INTEGER :: {', '.join(f'D{i}' for i in range(N))}",
+        "",
+        "! deterministic seed (host-only: WRITE disqualifier keeps it off GPU)",
+        "DO K = 1, DIM",
+        "  IF (K == 1) THEN",
+        "    IF (DIM == 999999) THEN",
+        '      WRITE(*, "unreachable") ',
+        "    ENDIF",
+        "  ENDIF",
+        "  V(K) := 0.5 + REAL(MOD(K, 9973)) * 0.0001",
+        "ENDDO",
+        "RHOOLD := 0.0",
+        "CONV := 0",
+        "DO ITER = 1, NITER",
+        "  IF (CONV == 0) THEN",
+        "    RHO := 0.0",
+        "    NRM2T := 0.0",
+        "    DO T = 1, NT",
+        "      TB := (T - 1) * QT",
+        "      ! ── stage A ring ──",
+        "      IF (T == 1) THEN",
+        "        CALL VK_STAGE(VA, V, 1, 1, 3 * QT)",
+        "      ELSE",
+        "        S := TB + 2 * QT",
+        "        A0 := S + 1",
+        "        IF (A0 + QT - 1 > DIM) THEN",
+        "          A1 := DIM",
+        "        ELSE",
+        "          A1 := S + QT",
+        "        ENDIF",
+        "        IF (A1 >= A0) THEN",
+        "          CALL VK_STAGE(VA, V, A0, MOD(S, WINA) + 1, A1 - A0 + 1)",
+        "        ENDIF",
+        "      ENDIF",
+        "      ! ── stage B remote slices (top bonds N-2, N-1) ──",
+    ]
+    for name, off in (("RA17A", "6 * QT"), ("RA17B", "0 - 6 * QT"),
+                      ("RA18A", "0 - 9 * QT + 1"), ("RA18B", "9 * QT - 1")):
+        L += [
+            f"      S := TB + {off}",
+            "      A0 := S + 1",
+            "      A1 := S + QT",
+            "      IF (A0 < 1) THEN",
+            "        A0 := 1",
+            "      ENDIF",
+            "      IF (A1 > DIM) THEN",
+            "        A1 := DIM",
+            "      ENDIF",
+            "      IF (A1 >= A0) THEN",
+            f"        CALL VK_STAGE({name}, V, A0, A0 - S, A1 - A0 + 1)",
+            "      ENDIF",
+        ]
+    L += [
+        "      ! ── kernel B: top bonds (i=N-2, i=N-1) from remote slices ──",
+        "      DO K = 1, QT",
+        "        Q := K - 1 + TB",
+    ]
+    for i in range(N):
+        L.append(f"        D{i} := MOD(Q, 3)")
+        if i < N - 1:
+            L.append("        Q := Q / 3")
+    i, j = N - 2, N - 1
+    L += [
+        f"        WWIN(K) := 0.0 - JH * REAL(MIN(D{i}, 1) * MIN(2 - D{j}, 1)) * RA17A(K)",
+        f"        WWIN(K) := WWIN(K) - JH * REAL(MIN(2 - D{i}, 1) * MIN(D{j}, 1)) * RA17B(K)",
+    ]
+    i, j = N - 1, 0
+    L += [
+        f"        WWIN(K) := WWIN(K) - JH * REAL(MIN(D{i}, 1) * MIN(2 - D{j}, 1)) * RA18A(K)",
+        f"        WWIN(K) := WWIN(K) - JH * REAL(MIN(2 - D{i}, 1) * MIN(D{j}, 1)) * RA18B(K)",
+        "      ENDDO",
+        "      ! ── kernel A: diag + bonds i<=N-3 from the ring, accumulate ──",
+        "      DO K = 1, QT",
+        "        Q := K - 1 + TB",
+    ]
+    for i in range(N):
+        L.append(f"        D{i} := MOD(Q, 3)")
+        if i < N - 1:
+            L.append("        Q := Q / 3")
+    dg = " + ".join(f"(D{i} - 1) * (D{i} - 1)" for i in range(N))
+    L.append(f"        DG := {dg}")
+    L.append("        SL := MOD(K + TB - 1 + WINA, WINA) + 1")
+    L.append("        WWIN(K) := WWIN(K) + (REAL(DG) * 0.5 - SHIFT) * VA(SL)")
+    for i in range(N - 2):
+        j = i + 1
+        pi, pj = 3 ** i, 3 ** j
+        for sign, m1, m2 in (("-", i, j), ("+", j, i)):
+            off = f"- {pi} + {pj}" if sign == "-" else f"+ {pi} - {pj}"
+            L.append(f"        SL := MOD(K + TB {off} - 1 + WINA, WINA) + 1")
+            L.append(f"        WWIN(K) := WWIN(K) - JH * "
+                     f"REAL(MIN({'2 - D' + str(j) if sign == '-' else 'D' + str(j)}, 1) * "
+                     f"MIN({'D' + str(i) if sign == '-' else '2 - D' + str(i)}, 1)) * VA(SL)")
+    L += [
+        "      ENDDO",
+        "      ! ── per-tile reduction (RHO/NRM2T accumulate in tile order) ──",
+        "      RHOP := 0.0",
+        "      R2 := 0.0",
+        "      DO K = 1, QT",
+        "        SL := MOD(K + TB - 1 + WINA, WINA) + 1",
+        "        RHOP := RHOP + VA(SL) * WWIN(K)",
+        "        R2 := R2 + WWIN(K) * WWIN(K)",
+        "      ENDDO",
+        "      RHO := RHO + RHOP",
+        "      NRM2T := NRM2T + R2",
+        "      ! ── fetch the tile output to the host ──",
+        "      CALL VK_FETCH(HW, WWIN, 1, TB + 1, QT)",
+        "    ENDDO",
+        "    NRM := SQRT(NRM2T)",
+        "    ! first pass: checksum the raw-seed matvec, then fall through",
+        "    IF (ITER == 1) THEN",
+        "      C1 := 0.0",
+        "      C2 := 0.0",
+        "      DO K = 1, DIM",
+        "        IF (K == 1) THEN",
+        "          IF (DIM == 999999) THEN",
+        '            WRITE(*, "unreachable") ',
+        "          ENDIF",
+        "        ENDIF",
+        "        C1 := C1 + HW(K)",
+        "        C2 := C2 + HW(K) * REAL(1 + MOD(K, 7))",
+        "      ENDDO",
+        '      WRITE(*, "mv1 c1=%.17e c2=%.17e") C1, C2',
+        '      WRITE(*, "mv1 w0=%.17e wmid=%.17e wlast=%.17e") '
+        "HW(1), HW(DIM / 2 + 1), HW(DIM)",
+        "    ENDIF",
+        "    ! V <- HW / NRM (CPU pass; WRITE disqualifier keeps it off GPU)",
+        "    DO K = 1, DIM",
+        "      IF (K == 1) THEN",
+        "        IF (ITER == 999999) THEN",
+        '          WRITE(*, "unreachable") ',
+        "        ENDIF",
+        "      ENDIF",
+        "      V(K) := HW(K) / NRM",
+        "    ENDDO",
+        "    DRHO := ABS(RHO - RHOOLD)",
+        "    RHOOLD := RHO",
+        "    IF (MOD(ITER, 50) == 0) THEN",
+        '      WRITE(*, "iter %d  E0 %.10f  drho %.3e") ITER, RHO + SHIFT, DRHO',
+        "    ENDIF",
+        "    IF (ITER > 1) THEN",
+        "      IF (DRHO < TOLC) THEN",
+        "        CONV := 1",
+        "      ENDIF",
+        "    ENDIF",
+        "  ENDIF",
+        "ENDDO",
+        'WRITE(*, "E0 = %.10f  iters %d") RHO + SHIFT, ITER - 1',
+    ]
+    return "\n".join(L) + "\n"
 
 
 if __name__ == "__main__":

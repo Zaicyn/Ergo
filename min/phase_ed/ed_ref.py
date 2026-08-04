@@ -33,15 +33,21 @@ def SHIFT(N):
 
 
 @njit(parallel=True, cache=True)
-def _matvec(v, out, p3, diag, halfV, halfJ, SH, N):
+def _matvec(v, out, p3, diag_unused, halfV, halfJ, SH, N):
     dim = v.shape[0]
     for x in prange(dim):
-        acc = (diag[x] - SH) * v[x]
         digits = np.empty(N, np.int64)
+        dg = 0
         for i in range(N):
             pi = p3[i]
             d = (x // pi) % 3
             digits[i] = d
+            m = d - 1
+            dg += m * m
+        acc = (dg / 2.0 - SH) * v[x]
+        for i in range(N):
+            pi = p3[i]
+            d = digits[i]
             if d >= 1:
                 acc -= halfV * v[x - pi]
             if d <= 1:
@@ -62,6 +68,8 @@ def _matvec(v, out, p3, diag, halfV, halfJ, SH, N):
 def make(N):
     dim = 3 ** N
     p3 = (3 ** np.arange(N)).astype(np.int64)
+    if dim > 3 ** 17:
+        raise MemoryError("lean path: use make_lean/matvec_lean above N=17")
     idx = np.arange(dim, dtype=np.int64)
     diag = np.zeros(dim)
     for i in range(N):
@@ -69,6 +77,30 @@ def make(N):
         diag += (mi * mi) / 2.0
     V = K_PHASE - B * K_BIAS
     return dim, p3, diag, V / 2.0, J / 2.0
+
+
+@njit(parallel=True, cache=True)
+def _diag_into(buf, p3, N):
+    # diag[x] = sum_i ((d_i-1)^2)/2 computed inline — no idx array
+    # (the naive idx+diag build is 18.6 GB at N=19 and OOMed the host).
+    dim = buf.shape[0]
+    for x in prange(dim):
+        s = 0
+        q = x
+        for i in range(N):
+            m = q % 3 - 1
+            s += m * m
+            q //= 3
+        buf[x] = s / 2.0
+
+
+def make_lean(N, diag_buf):
+    """dim, p3, diag with diag written into the caller's buffer."""
+    dim = 3 ** N
+    p3 = (3 ** np.arange(N)).astype(np.int64)
+    _diag_into(diag_buf, p3, N)
+    V = K_PHASE - B * K_BIAS
+    return dim, p3, diag_buf, V / 2.0, J / 2.0
 
 
 def seed(dim):
@@ -83,11 +115,23 @@ def matvec(N, v):
     return out
 
 
+@njit(cache=True)
+def _checksum_kernel(w):
+    # no temporaries (an arange at N=19 is another 9.3 GB)
+    c1 = 0.0
+    c2 = 0.0
+    for x in range(w.shape[0]):
+        v = w[x]
+        c1 += v
+        c2 += v * (1 + (x + 1) % 7)
+    return c1, c2
+
+
 def checksums(w):
-    x = np.arange(w.shape[0], dtype=np.int64)
+    c1, c2 = _checksum_kernel(w)
     return {
-        "c1": float(w.sum()),
-        "c2": float((w * (1 + (x + 1) % 7)).sum()),
+        "c1": float(c1),
+        "c2": float(c2),
         "w0": float(w[0]),
         "wmid": float(w[w.shape[0] // 2]),
         "wlast": float(w[-1]),
@@ -125,7 +169,7 @@ def main():
     print("wrote min/phase_ed/ed_ref_report.json", flush=True)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and len(sys.argv) == 1:
     main()
 
 
@@ -167,3 +211,35 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "power":
     rep[f"N{N}_E0_power"] = e
     json.dump(rep, open("min/phase_ed/ed_ref_report.json", "w"), indent=1)
     print("updated ed_ref_report.json", flush=True)
+
+
+@njit(parallel=True, cache=True)
+def _seed_into(v):
+    for x in prange(v.shape[0]):
+        v[x] = 0.5 + ((x + 1) % 9973) * 0.0001
+
+
+def checksum_lean(N):
+    # v + out only (2 x 9.3 GB at N=19) — diag and seed computed
+    # in-place (the naive versions allocate ~28 GB of temporaries).
+    dim = 3 ** N
+    v = np.empty(dim)
+    _seed_into(v)
+    out = np.empty(dim)
+    p3 = (3 ** np.arange(N)).astype(np.int64)
+    V = K_PHASE - B * K_BIAS
+    _matvec(v, out, p3, None, V / 2.0, J / 2.0, SHIFT(N), N)
+    return checksums(out)
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "checksum":
+    N = int(sys.argv[2])
+    cs = checksum_lean(N)
+    cs = checksums(w)
+    print(f"N={N} matvec: {cs}", flush=True)
+    rep = {}
+    import os
+    if os.path.exists("min/phase_ed/ed_ref_report.json"):
+        rep = json.load(open("min/phase_ed/ed_ref_report.json"))
+    rep[f"N{N}_matvec"] = cs
+    json.dump(rep, open("min/phase_ed/ed_ref_report.json", "w"), indent=1)

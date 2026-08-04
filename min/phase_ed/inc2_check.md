@@ -93,6 +93,49 @@ upload path from the host vector). i64 tile base needed only at N=20
 streams slices via ergo_vk_upload_at between per-tile dispatches —
 never per-tile buffer binds (bindings stay per-frame-per-pipeline).
 
+## N=19: landed (variant `streamed19` in gen_ed_matvec.py)
+
+Two new statement intrinsics make streaming expressible in Ergo with
+zero host array copies (`core/ir_builder.py`/`ir_codegen.py`,
+checker-registered): `CALL VK_STAGE(gpu_arr, host_arr, src0, dst0,
+len)` (host→device slice) and `CALL VK_FETCH(host_arr, gpu_arr, src0,
+dst0, len)` (device→host). Both are frame-draining sync points
+(VK_STAGE only when the recording frame has unsubmitted kernel writes);
+CPU builds lower them to memmove so streamed programs still run
+CPU-only. Diagnostics: non-GPU-resident device arg or GPU-resident
+host arg are compile errors.
+
+Design (generic N; validated at N=8 against the stage0 oracle):
+- QT = 3^(N−3), NT = 27 tiles. Kernel A (diag + bonds i ≤ N−3) reads a
+  5·QT ring window VA (halo 2·QT); the ring slot of global g is simply
+  MOD(g−1, WINA)+1 — no base tracking; each tile stages only the
+  advancing QT slice (one prime of 3·QT per iteration).
+- Kernel B (bonds i = N−2, N−1; offsets 6·QT and 9·QT−1) reads four
+  remote QT slices staged per tile (the 9·QT−1 offset is absorbed by
+  staging the slice shifted by 1 — no straddle).
+- Per-tile multi-reduction accumulates RHO/NRM2T in tile order (Inc-1
+  combine), then VK_FETCH streams the WWIN tile into host HW.
+- Device total at N=19: 1.72 + 1.38 + 0.34 GB ≈ 3.45 GB — fits with
+  headroom (maxStorageBufferRange 4.29 GB per buffer asserted).
+
+Two runtime fixes fell out of profiling:
+1. **HOST_CACHED staging** (vk_host.c): the staging buffer was
+   HOST_VISIBLE|HOST_COHERENT = write-combined on this driver —
+   measured 0.57 GB/s; memcpy-bound. HOST_CACHED staging measures
+   6.7 GB/s (12×). Every GPU binary prints the choice at startup.
+2. **Reduction readback chunk** 1024 → 65536 floats: the N=19 per-tile
+   reduction issued ~9k submit/waits per iteration (8 KiB chunks);
+   now ~300/iter. Combine order unchanged (bitwise-identical results).
+
+Measured at N=19 (300-iter probe NITER=2): ~11.5 s/iteration —
+57 GB/iter of transfers (B-slices 37 GB dominate) vs ~290 GFLOP/iter:
+arithmetic intensity ~5 flop/byte, deeply transfer-bound on PCIe
+(roofline: f64 compute would need ~30 flop/byte to balance at this
+card's ~200 GFLOP/s FP64). Slice-caching / tile-order scheduling could
+cut the B-slice traffic ~2-4× but needs per-tile slot-index push
+constants (the arena-slots-without-rebinds scheme) — deferred; v1
+documents the wall.
+
 ### Ops note: reference-generation memory
 
 scipy eigsh with default `ncv=20` allocates a 20 × dim Krylov

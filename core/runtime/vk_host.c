@@ -360,6 +360,20 @@ static uint32_t find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags props
     exit(1);
 }
 
+/* Variant with a caller-supplied fallback instead of aborting (Inc-2B
+ * staging HOST_CACHED preference). */
+static uint32_t find_memory_type_or(uint32_t type_bits,
+                                    VkMemoryPropertyFlags props,
+                                    uint32_t fallback) {
+    for (uint32_t i = 0; i < g.mem_props.memoryTypeCount; i++) {
+        if ((type_bits & (1u << i)) &&
+            (g.mem_props.memoryTypes[i].propertyFlags & props) == props) {
+            return i;
+        }
+    }
+    return fallback;
+}
+
 /* Counters (env-gated reporting via ERGO_PROFILE): compute launches and
  * queue submit+wait cycles (drains, sync dispatches, transfers). */
 static unsigned long g_launch_count = 0;
@@ -984,9 +998,24 @@ static void ensure_staging(size_t need) {
     VkMemoryAllocateInfo ai = {0};
     ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize = req.size;
-    ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits,
+    /* Inc-2B: prefer HOST_CACHED for the staging buffer when the driver
+     * offers it — plain memcpy into write-combined host-visible memory
+     * measures ~0.6 GB/s (the ED N=19 streamer was memcpy-bound);
+     * cached staging runs at normal memory bandwidth. Fall back to the
+     * plain VISIBLE|COHERENT type when no cached type matches. */
+    ai.memoryTypeIndex = find_memory_type_or(req.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+        VK_MEMORY_PROPERTY_HOST_CACHED_BIT, -1);
+    if (ai.memoryTypeIndex == (uint32_t)-1) {
+        ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        fprintf(stderr, "[ergo_vk] staging: HOST_CACHED unavailable "
+                "(WC fallback — expect ~0.6 GB/s transfers)\n");
+    } else {
+        fprintf(stderr, "[ergo_vk] staging: HOST_CACHED\n");
+    }
     VK_CHECK(vkAllocateMemory(g.device, &ai, NULL, &g.staging_mem));
     VK_CHECK(vkBindBufferMemory(g.device, g.staging_buf, g.staging_mem, 0));
     VK_CHECK(vkMapMemory(g.device, g.staging_mem, 0, alloc, 0,

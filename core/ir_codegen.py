@@ -2114,6 +2114,70 @@ class IRCodeGen:
         # Subroutine call (void)
         if op == Op.CALL_VOID:
             func = inst.meta.get("func", "?")
+            # Streaming intrinsics (Inc-2B N=19): explicit host↔device
+            # slice transfers. Both are frame sync points: VK_STAGE
+            # drains when the recording frame has unsubmitted kernel
+            # writes (a transfer would otherwise execute before them);
+            # VK_FETCH always drains (the data must exist on device).
+            if func in ("VK_STAGE", "VK_FETCH"):
+                from .errors import MCLError as _MCLErr
+                arr_a = inst.meta["arr_a"]
+                arr_b = inst.meta["arr_b"]
+                a0 = self._operand(args[0])
+                a1 = self._operand(args[1])
+                a2 = self._operand(args[2])
+                if not (self.gpu_plan and self.gpu_plan.kernels):
+                    # CPU build: both arrays are plain host arrays — the
+                    # "transfer" is a memmove (same dst-first signature).
+                    self._put(f"memmove({arr_a} + (({a1}) - 1), "
+                              f"{arr_b} + (({a0}) - 1), "
+                              f"(size_t)({a2}) * sizeof({arr_a}[0]));")
+                    return
+                gpu_set = set(self._gpu_arrays())
+                if func == "VK_STAGE":
+                    gpu_arr, host_arr = arr_a, arr_b
+                else:
+                    gpu_arr, host_arr = arr_b, arr_a
+                if gpu_arr not in gpu_set:
+                    raise _MCLErr(
+                        f"{func}: '{gpu_arr}' is not GPU-resident "
+                        f"(no kernel touches it)")
+                if host_arr in gpu_set:
+                    raise _MCLErr(
+                        f"{func}: '{host_arr}' is GPU-resident — device "
+                        f"buffers are not staged through themselves")
+                sz = self._gpu_sizeof(gpu_arr)
+                a0 = self._operand(args[0])
+                a1 = self._operand(args[1])
+                a2 = self._operand(args[2])
+                # Drain rules (see comment above)
+                if func == "VK_STAGE":
+                    if (self._batched_frame and not self._frame_ended_early
+                            and self._frame_gpu_dirty):
+                        self._put("/* VK_STAGE: drain before transfer */")
+                        self._put("ergo_vk_frame_end();")
+                        self._put("ergo_vk_frame_wait();")
+                        self._put("ergo_vk_frame_begin();")
+                        self._frame_gpu_dirty.clear()
+                    self._put(f"ergo_vk_upload_at(d_{gpu_arr}, {host_arr} "
+                              f"+ (({a0}) - 1), "
+                              f"(size_t)(({a1}) - 1) * {sz}, "
+                              f"(size_t)({a2}) * {sz});")
+                else:
+                    if self._batched_frame and not self._frame_ended_early:
+                        self._put("/* VK_FETCH: drain before download */")
+                        self._put("ergo_vk_frame_end();")
+                        self._put("ergo_vk_frame_wait();")
+                        self._frame_ended_early = True
+                    self._put(f"ergo_vk_download_at(d_{gpu_arr}, {host_arr} "
+                              f"+ (({a1}) - 1), "
+                              f"(size_t)(({a0}) - 1) * {sz}, "
+                              f"(size_t)({a2}) * {sz});")
+                    if self._batched_frame and self._frame_ended_early:
+                        self._put("ergo_vk_frame_begin();")
+                        self._frame_ended_early = False
+                        self._frame_gpu_dirty.clear()
+                return
             a = ", ".join(self._operand(a) for a in args)
             # GPU sync: download arrays before CPU call, upload after.
             # Not gated on _in_frame_loop (D18): a non-inlined subroutine
@@ -3751,11 +3815,16 @@ class IRCodeGen:
                               f"{acc} += {cast}{chunk_var}[_j "
                               f"+ {ai} * _G];")
         else:
-            self._put(f"{ct} {chunk_var}[1024];")
+            # Chunk size: 65536 floats (512 KiB stack) per download. Was
+            # 1024 — that made one submit/wait per 8 KiB, which drowned
+            # large partials buffers (the N=19 ED per-tile reduction
+            # issued ~9k transfers per iteration). The combine order is
+            # unchanged, so results are bitwise identical.
+            self._put(f"{ct} {chunk_var}[65536];")
             if kernel.reduction_array:
-                self._put("for (int _c = 0; _c < _G; _c += 1024) {")
+                self._put("for (int _c = 0; _c < _G; _c += 65536) {")
                 self.indent += 1
-                self._put("int _n = (_G - _c < 1024) ? (_G - _c) : 1024;")
+                self._put("int _n = (_G - _c < 65536) ? (_G - _c) : 65536;")
                 self._put(f"ergo_vk_download_at(d__reduce_{kid}, {chunk_var}, "
                           f"(size_t)_c * sizeof({ct}), _n * sizeof({ct}));")
                 self._put(f"for (int _j = 0; _j < _n; _j++) "
@@ -3767,9 +3836,9 @@ class IRCodeGen:
                 for ai, acc in enumerate(accs):
                     cast = ("(int)" if self._var_types.get(acc)
                             == IRType.INTEGER else "")
-                    self._put("for (int _c = 0; _c < _G; _c += 1024) {")
+                    self._put("for (int _c = 0; _c < _G; _c += 65536) {")
                     self.indent += 1
-                    self._put("int _n = (_G - _c < 1024) ? (_G - _c) : 1024;")
+                    self._put("int _n = (_G - _c < 65536) ? (_G - _c) : 65536;")
                     self._put(f"ergo_vk_download_at(d__reduce_{kid}, "
                               f"{chunk_var}, (size_t)({ai} * _G + _c) * "
                               f"sizeof({ct}), _n * sizeof({ct}));")

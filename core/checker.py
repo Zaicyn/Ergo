@@ -78,7 +78,7 @@ INTRINSIC_ARG_RULES = {
 }
 
 # Intrinsics that are legal as CALL statements
-STATEMENT_INTRINSICS = {"ZERO"}
+STATEMENT_INTRINSICS = {"ZERO", "VK_STAGE", "VK_FETCH"}
 
 
 def promote(t1: str, t2: str) -> str:
