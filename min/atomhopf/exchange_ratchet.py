@@ -97,7 +97,7 @@ def candidates(Z):
                 del c[src]
             c[dst] = c.get(dst, 0) + nmove
             cands.add(tuple(sorted(c.items())))
-    return [dict(c) for c in cands]
+    return [dict(c) for c in sorted(cands)]
 
 
 def energy(cfg, eps, K, P):
@@ -252,7 +252,7 @@ def candidates(Z):
                 del c[src]
             c[dst] = c.get(dst, 0) + nmove
             cands.add(tuple(sorted(c.items())))
-    return [dict(c) for c in cands]
+    return [dict(c) for c in sorted(cands)]
 
 
 def energy(cfg, eps, K, P):

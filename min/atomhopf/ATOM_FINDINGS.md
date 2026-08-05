@@ -231,3 +231,79 @@ and orbitally averaged. Relativity enters only as a residual category
 parameter region — including the full-shell extremes Cu and Pd — and
 that the clean window cannot reach the rest without false positives**,
 is the measured internal-vs-external split of the anomaly census.
+
+---
+
+# Upgraded functional: relativity + correlation vs the anomaly census
+
+`min/atomhopf/relativistic_ratchet.py` (regression gate reproduces the
+committed ratchet exactly with new terms OFF: 98/118 at K=0, committed
+region intact). Accounting note: this section counts **exact-config
+matches**; the committed ratchet's anomaly-set metric let one
+wrong-config anomaly (Nb → 4d⁵5s¹ instead of the actual 4d⁴5s¹) count
+as a catch. Under exact accounting the committed clean catch is
+5/20 {Cr, Cu, Mo, Ag, Pd}; Nb is separately exact-catchable at
+precision 1 at other cells (below). A set-ordering leak in
+`candidates()` (nondeterministic iteration flipped razor-edge ties
+between runs) was found and fixed — `exchange_ratchet.py` now sorts
+candidates; the regression gate re-verifies the committed results
+under the fixed order.
+
+## Per-channel results
+
+**Relativistic channel (computed, not fitted).** First-order
+mass-velocity + Darwin shift, spin-averaged
+(ΔE_rel = (Zα)²E_n/n·[1/(l+½) − 3/4n], Slater-rules Z_eff per
+subshell). Measured effect on the frontier s/d gap: ≤ 4×10⁻⁴ Ha
+(≈ 0.01 eV) even at Au — versus ~1 eV gaps. Verdict: **negligible
+shift, catches nothing new** (same 6/20 at REL=1 as REL=0; it only
+widens the robust region slightly, 10 → 20–30 cells). The honest
+limitation, quantified: the valence relativistic stabilization lives on
+the core-penetrating tail, and Slater's single-exponent Z_eff
+(≈ 4 for Au 6s) misses it — an effect of order 0.04 Ha would need
+Z_eff ≈ 14. The first-order form itself is also at its limit at Z=79
+((Zα)² ≈ 0.33) — documented, not tuned around. Sign fight: relativity
+stabilizes s (Madelung direction) against the anomaly; only Lr's
+7p-vs-6d bracket beats d — but at 10⁻⁴ Ha scale.
+
+**Correlation channel.** Form 1 (closed-shell FULL bonus): penalizes
+the s² → s¹ anomaly moves (s² closure lost) and catches nothing new —
+reported as a working counterexample. (An empty-shell variant cancels
+identically in every configuration — noted in code.) Form 2 (f-count
+penalty, the minimal "delayed f collapse"): La, Ac, Th emerge at
+Cf ≈ 0.7 — **but only together with the whole f-series shifting at
+once** (Nb-wrong, Ce-wrong, Tb/Bk, and W/Sg/Rg companions; at Cf = 1.0
+also Pr, Dy, Pa, Cf). Ce and Pa/U/Np are never separated at any Cf:
+a constant term cannot distinguish the f-series start from its middle.
+That is the irreducible-many-body boundary, stated plainly.
+
+**Fractional-occupation consistency.** Janak-style continuous
+minimization over the same feasible space (channel moves a = s→d,
+b = f→d, ≤ 2 electrons; the feasible set is the union of the two
+channel segments, not their product): **0/118 mismatches** vs the
+discrete argmin. (Three genuine bugs were found and fixed on the way —
+free-energy subshells outside the Madelung config, cross-channel
+product-space leakage, and float-vs-vertex storage — the check earned
+its keep.)
+
+## Final census (exact-config accounting)
+
+- **Exact at precision 1 (contiguous regions): 6/20** —
+  {Cr, Cu, Mo, Nb, Ag, Pd} (union over C ∈ {0, 0.1, 0.25},
+  REL ∈ {0, 1}; extents K ∈ [0.150, 0.325] depending on C).
+- **With structured companions: + Gd, Cm** (Tb/Bk), **+ La, Ac, Th**
+  (f-count flood companions), **+ Au** (W/Sg/Rg companions) —
+  **total internal 12/20**.
+- **Irreducible: 8/20 — Ru, Rh, Ce, Pt, Pa, U, Np, Lr.**
+  Ru/Rh sit below the clean exchange window (1–2K gains inseparable
+  from Co-class false positives); Pt is inseparable from the W-class
+  in every robust region; Ce, Pa, U, Np are f↔d correlation ordering
+  that no single constant term reaches; Lr needs relativistic physics
+  at a scale the computed first-order term under-delivers by ~100×.
+
+Parameter sanity: the relativistic term is computed (no fit);
+correlation scale Cf ≈ 0.7×Δ ≈ 0.7 eV vs the Slater pair-exchange
+J̄(3d) ≈ 0.93 eV — same order, no absurd values.
+
+Determinism: script twice byte-identical, PYTHONHASHSEED-invariant
+(the candidates-sorting fix above was required for this).
