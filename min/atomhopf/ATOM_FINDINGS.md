@@ -116,3 +116,47 @@ the Li III Balmer-α reference is level-derived.
 
 - `min/atomhopf/atom_map.py` — all five items + cross-check.
 - `min/atomhopf/ATOM_FINDINGS.md` — this file.
+
+---
+
+# Census: how many of the 118 ground-state configurations does the map reproduce?
+
+`python min/atomhopf/atom_census.py` (twice, byte-identical; literal
+table baked with citations, no runtime fetching). Three orderings:
+(a) hydrogenic pure geometry (n, then l_sub), (b) Madelung (n+l_sub,
+then n), (c) the curated measured table (Madelung + 20 documented
+anomaly overrides, electron-count asserted per element).
+
+## Headline numbers
+
+- **Geometry-pure (hydrogenic) matches: 27 / 118.** Z=1–18 (H–Ar,
+  before any 3d/4s competition), then Cu(29), Zn(30), Ga–Kr(31–36), and
+  Pd(46) — the Cu and Pd full-shell anomalies coincide with the
+  hydrogenic order, so pure geometry accidentally recovers them.
+- **Madelung (interaction patch) matches: 98 / 118.** Of which 83/102 in
+  the measured range Z=1–102; Z=103–118 are Dirac–Fock predictions that
+  mostly follow Madelung, so 15/16 there is partly circular.
+- **Anomalies (Madelung resisters): 20.**
+
+The 20 resisters (Madelung → actual):
+Cr 3d⁴4s²→3d⁵4s¹; Cu →3d¹⁰4s¹; Nb 4d³5s²→4d⁴5s¹; Mo →4d⁵5s¹;
+Ru →4d⁷5s¹; Rh →4d⁸5s¹; Pd →4d¹⁰5s⁰; Ag →4d¹⁰5s¹;
+Pt 5d⁸6s²→5d⁹6s¹; Au →5d¹⁰6s¹;
+La 4f¹→5d¹4f⁰; Ce 4f²→4f¹5d¹; Gd 4f⁸→4f⁷5d¹;
+Ac 5f¹→6d¹5f⁰; Th 5f²→6d²5f⁰; Pa 5f³→5f²6d¹; U 5f⁴→5f³6d¹;
+Np 5f⁵→5f⁴6d¹; Cm 5f⁸→5f⁷6d¹;
+Lr 6d¹→7p¹ (relativistic-calculation consensus + 2015+ ionization
+measurements; labeled as such).
+
+## Layered verdict
+
+- **Exact spectra:** 1 atom (hydrogen, 5-digit Balmer/Lyman ratios) plus
+  all one-electron ions up to the relativistic ceiling — computed at
+  **Z ≈ 13.7** ((Zα)² correction to Lyα passes 1% at Z=14, Si XIV;
+  through Al XIII the map is exact to better than 1% with reduced mass
+  alone).
+- **Configurations:** 27/118 pure geometry; 98/118 with the Madelung
+  interaction patch; 20 resisters by name (above) — all d/f-block
+  near-degeneracy effects (half/full-shell stabilization and f/d
+  reordering at the series boundaries), i.e. correlation physics the
+  single-electron S³ structure cannot see.
