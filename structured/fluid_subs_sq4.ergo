@@ -1,0 +1,798 @@
+! ════════════════════════════════════════════════════════════════
+! LAYER 3: FLUID SUBROUTINES — SQ4 SCATTER VARIANT
+! ════════════════════════════════════════════════════════════════
+!
+! v4 retest variant (see Spec/Squaragon_Re-Integration_Brief.md role 1
+! and allocator/TUNING_FINDINGS.md). Differences from fluid_subs.ergo:
+!  (a) physics loop skips FLAGS=0 slots (liveness guard — spawn region
+!      is no longer dense);
+!  (b) spawn claims slots through the v4 8-bin Viviani scatter:
+!      BIN = SCATLT((parent ordinal I) & 31), one atomic claim per bin
+!      counter BIN_COUNT(BIN), child lands in bin BIN's contiguous
+!      sub-range of the same MAXPART SoA arrays;
+!  (c) SQ4 shadow state for the Phase-C integrity census.
+! Everything else is byte-identical to fluid_subs.ergo.
+!
+! Everything is a signed accumulator. Decay always runs.
+! Accumulation is the variable. Zero input = pure decay.
+! One path through the kernel. Mode modulates amplitude, not flow.
+
+! ════════════════════════════════════════════════════════════════
+! SQ4 SCATTER STATE (v4 variant)
+! ════════════════════════════════════════════════════════════════
+! SCATLT: v4 8-bin Viviani scatter LUT (bake: scatter_full(id,52),
+! HOPFQ=1.97 — allocator/TUNING_FINDINGS.md). Histogram 5,2,4,5,7,3,4,2.
+! BIN_COUNT: per-bin slot counters (the 8-way atomic claim targets).
+! SQ4_BASE: first spawn slot (= initial NPART). SQ4_BINCAP: per-bin
+! sub-range capacity. SQ4_POKE: Phase-C corruption switch (0=clean).
+
+STATIC INTEGER :: SCATLT(32)
+DATA SCATLT / 6, 5, 4, 0, 2, 3, 4, 7, 4, 6, 3, 0, 1, 2, 1, 0, 3, 6, 4, 7, 4, 3, 2, 0, 4, 5, 6, 5, 4, 0, 2, 3 /
+
+STATIC INTEGER :: BIN_COUNT(8)
+STATIC INTEGER :: SQ4_BASE = 0
+STATIC INTEGER :: SQ4_BINCAP = 0
+STATIC INTEGER :: SQ4_POKE = 0
+
+! Shadow gate for SQ4RES (Phase C): exactly the unit cuboctahedron
+! when the shadow torus is consistent, so SQ4RES = 0 on clean runs.
+STATIC REAL :: G4VTX(3, 12)
+
+! ════════════════════════════════════════════════════════════════
+! PRNG (deterministic, reproducible)
+! ════════════════════════════════════════════════════════════════
+
+REAL FUNCTION RNGF()
+  RNG_STATE := IAND(RNG_STATE * 1103515245 + 12345, 2147483647)
+  RNGF := REAL(IAND(ISHFT(RNG_STATE, -16), 32767)) / 32767.0
+  RETURN RNGF
+END
+
+INTEGER FUNCTION NIBBLE_SIGNED(V)
+  INTEGER :: V, N
+  N := IAND(V, 15)
+  IF N > 7 THEN
+    N := N - 16
+  ENDIF
+  NIBBLE_SIGNED := N
+  RETURN NIBBLE_SIGNED
+END
+
+INTEGER FUNCTION BITCOUNT(N)
+  INTEGER :: N, CNT, B
+  CNT := 0
+  DO B = 0, 7
+    IF IAND(N, ISHFT(1, B)) ≠ 0 THEN
+      CNT := CNT + 1
+    ENDIF
+  ENDDO
+  BITCOUNT := CNT
+  RETURN BITCOUNT
+END
+
+! ════════════════════════════════════════════════════════════════
+! INIT (CPU-only, runs once)
+! ════════════════════════════════════════════════════════════════
+
+SUBROUTINE SIM_INIT(N, CAP, SEED)
+  INTEGER :: N, CAP, SEED
+  INTEGER :: I, GEN, PH
+  REAL :: X, Y, Z, R, S
+  REAL :: THETA_I, R_XZ, V_CIRC, R_CLAMP, INV_RXZ
+
+  NPART := N
+  IF CAP < N THEN
+    CAPACITY := N
+  ELSE
+    CAPACITY := CAP
+  ENDIF
+  RNG_STATE := SEED
+
+  DO I = 1, CAPACITY
+    POS_X(I) := 0.0
+    POS_Y(I) := 0.0
+    POS_Z(I) := 0.0
+    VEL_X(I) := 0.0
+    VEL_Y(I) := 0.0
+    VEL_Z(I) := 0.0
+    OMEGA_NAT(I) := 0.0
+    FLAGS(I) := 0
+  ENDDO
+
+  DO I = 1, N
+    ! Sample within a sphere: draw from cube, normalize if outside
+    X := (RNGF() * 2.0 - 1.0)
+    Y := (RNGF() * 2.0 - 1.0)
+    Z := (RNGF() * 2.0 - 1.0)
+    R := SQRT(X * X + Y * Y + Z * Z)
+    IF R > 1.0 THEN
+      S := RNGF() / R
+      X := X * S
+      Y := Y * S
+      Z := Z * S
+    ENDIF
+    X := X * DISK_OUTER_R
+    Y := Y * DISK_OUTER_R
+    Z := Z * DISK_OUTER_R
+    R := SQRT(X * X + Y * Y + Z * Z)
+    IF R < 1.0 THEN
+      S := 1.0 / R
+      X := X * S
+      Y := Y * S
+      Z := Z * S
+    ENDIF
+
+    POS_X(I) := X
+    POS_Y(I) := Y
+    POS_Z(I) := Z
+
+    THETA_I := ATAN2(Z, X) + SEAM_STEP
+    IF THETA_I ≥ TWO_PI THEN
+      THETA_I := THETA_I - TWO_PI
+    ENDIF
+    IF THETA_I < 0.0 THEN
+      THETA_I := THETA_I + TWO_PI
+    ENDIF
+
+    PH := IAND(INT(THETA_I * REAL(PHASE_MASK) / TWO_PI), PHASE_MASK)
+    GEN := IAND(ISHFT(PH, -10), GEN_MASK) + 1
+
+    R_XZ := SQRT(X * X + Z * Z)
+    V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
+    IF SEED_DIR_MODE = SEED_DIR_TANGENT THEN
+      ! Legacy: Viviani-curve tangent as velocity direction.
+      ! Correct speed, wrong direction → eccentric plunges that
+      ! produce v² < 0.01 transiently → crystallization possible.
+      VEL_X(I) := TANGENT(1, GEN) * V_CIRC
+      VEL_Y(I) := TANGENT(2, GEN) * V_CIRC
+      VEL_Z(I) := TANGENT(3, GEN) * V_CIRC
+    ELSE
+      ! Prograde: clean bound orbits, v · r̂ = 0.
+      INV_RXZ := 1.0 / MAX(R_XZ, 1.0E-4)
+      VEL_X(I) := -Z * INV_RXZ * V_CIRC
+      VEL_Y(I) := 0.0
+      VEL_Z(I) :=  X * INV_RXZ * V_CIRC
+    ENDIF
+
+    R_CLAMP := MAX(R_XZ, 1.0)
+    OMEGA_NAT(I) := 0.1 * (50.0 / R_CLAMP) ** 1.5
+
+    FLAGS(I) := IOR(IOR(PFLAG_ACTIVE, ISHFT(IAND(GEN - 1, GEN_MASK), &
+      GEN_SHIFT)), ISHFT(PH, PHASE_SHIFT))
+  ENDDO
+
+  RETURN
+END
+
+! ════════════════════════════════════════════════════════════════
+! SEED SHELL (CPU-only, runs once)
+! ════════════════════════════════════════════════════════════════
+
+SUBROUTINE SIM_SEED_SHELL()
+  INTEGER :: I, N_SHELL, GEN, PH
+  REAL :: PX, PY, PZ, SHELL_R, THETA_I, R_XZ, V_CIRC, INV_RXZ
+
+  SHELL_R := 50.0
+  IF NPART < 12 THEN
+    N_SHELL := NPART
+  ELSE
+    N_SHELL := 12
+  ENDIF
+
+  DO I = 1, N_SHELL
+    PX := CUBOCT(1, I) * SHELL_R
+    PY := CUBOCT(2, I) * SHELL_R
+    PZ := CUBOCT(3, I) * SHELL_R
+    POS_X(I) := PX
+    POS_Y(I) := PY
+    POS_Z(I) := PZ
+
+    THETA_I := REAL(I - 1) * (TWO_PI / 12.0)
+    PH := IAND(INT(THETA_I * REAL(PHASE_MASK) / TWO_PI), PHASE_MASK)
+    GEN := IAND(ISHFT(PH, -10), GEN_MASK) + 1
+
+    R_XZ := SQRT(PX * PX + PZ * PZ)
+    V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
+    IF SEED_DIR_MODE = SEED_DIR_TANGENT THEN
+      ! Legacy: Viviani-curve tangent as velocity direction.
+      VEL_X(I) := TANGENT(1, GEN) * V_CIRC
+      VEL_Y(I) := TANGENT(2, GEN) * V_CIRC
+      VEL_Z(I) := TANGENT(3, GEN) * V_CIRC
+    ELSE
+      ! Prograde: clean bound orbits, v · r̂ = 0.
+      INV_RXZ := 1.0 / MAX(R_XZ, 1.0E-4)
+      VEL_X(I) := -PZ * INV_RXZ * V_CIRC
+      VEL_Y(I) := 0.0
+      VEL_Z(I) :=  PX * INV_RXZ * V_CIRC
+    ENDIF
+
+    OMEGA_NAT(I) := 0.1
+    FLAGS(I) := IOR(IOR(PFLAG_ACTIVE, ISHFT(IAND(GEN - 1, GEN_MASK), &
+      GEN_SHIFT)), ISHFT(PH, PHASE_SHIFT))
+  ENDDO
+
+  RETURN
+END
+
+! ════════════════════════════════════════════════════════════════
+! PHYSICS + SPAWN — One path. Decay always. Spawn is accumulation.
+! ════════════════════════════════════════════════════════════════
+!
+! Spawn is integrated into the physics pass. Each active particle
+! can produce one child per spawn interval. The child slot comes
+! from an atomic counter (SPAWN_COUNTER(1)). The child's position
+! offset is derived from the parent's state (deterministic hash,
+! no sequential RNG needed).
+!
+! SPAWN_COUNTER(1) is reset to NPART at the start of each spawn frame.
+! Each spawning particle does: SLOT = atomicAdd(SPAWN_COUNTER(1), 1).
+! After the physics pass, NPART = SPAWN_COUNTER(1).
+
+SUBROUTINE SIM_PHYSICS_STEP(DT)
+  REAL :: DT
+  INTEGER :: I, GEN, PH, FMODE, CI, CJ, CK
+  REAL :: PX, PY, PZ, VX, VY, VZ
+  REAL :: R3D_SQ, R3D, INV_R3D, R_SAFE, INV_R
+  REAL :: RX, RY, RZ, GRAVITY
+  REAL :: AX, AY, AZ
+  REAL :: V_SQ, OMEGA
+  REAL :: ENV, RHO, MET_GATE, COUPLING
+  REAL :: DECAY, SPD_SQ
+  REAL :: TANG_X, TANG_Y, TANG_Z, Z_C, FLOW_WG
+  REAL :: CP_X, CP_Y, CP_Z, DX_N, DY_N, DZ_N, D_NODE_SQ
+  REAL :: INV_RXZ, PGX, PGZ
+  REAL :: F_DOT_R, FPX, FPY, FPZ, VIV_MOD
+  REAL :: TX, TY, TZ, BASE_RATE, STEER_R
+  REAL :: INV_SPD_B, INV_T_MAG, TNX, TNY, TNZ
+  REAL :: V_DOT_T, INV_SPD_A, RESCALE
+  REAL :: STRONG
+  REAL :: DRIVE, TARGET, INSTABILITY
+  REAL :: WEAK_DOT_R, WEAK_STR
+  REAL :: OMEGA_PREV, OMEGA_NEXT, DEFICIT, TRANSFER
+  REAL :: DIFF, FLOW_DIR, TRANSFER_FROM_PREV
+  INTEGER :: WINDING, WINDING_ERR
+  REAL :: OMEGA_SUM, OMEGA_MEAN
+  INTEGER :: PH_NEXT, PH_DIFF, PH_ERR
+  REAL :: GDX, GDY, GDZ, GD_R, GTX, GTY, GTZ
+  ! Spawn vars
+  INTEGER :: SLOT, PH_CHILD, GEN_CHILD, SQ4BIN, K
+  REAL :: HASH, SPX, SPY, SPZ, SR_XZ, SV_CIRC
+  ! Crystal lane signature vars
+  INTEGER :: SIG_SLOT
+
+  DO I = 1, NPART
+    ! ── SQ4 variant: skip unclaimed spawn-region slots ────
+    IF FLAGS(I) = 0 THEN
+      CYCLE
+    ENDIF
+
+    ! ── Skip crystallized (off) and ejected (gone) ────────
+    IF IAND(FLAGS(I), IOR(PFLAG_CRYSTAL, PFLAG_EJECTED)) ≠ 0 THEN
+
+      ! ── Crystal lane: collect signature in warp dead time ──
+      ! ~15 ops hidden behind ~300 ops of active-thread physics.
+      ! PFLAG_SIGNED prevents double-collection.
+      IF IAND(FLAGS(I), PFLAG_CRYSTAL) ≠ 0 THEN
+        IF IAND(FLAGS(I), PFLAG_SIGNED) = 0 THEN
+          SIG_SLOT := SIG_COUNT(1) + 1
+          IF SIG_SLOT ≤ SIG_MAX THEN
+            SIG_COUNT(1) := SIG_SLOT
+
+            GEN := IAND(ISHFT(FLAGS(I), -GEN_SHIFT), GEN_MASK) + 1
+            CI := CLAMP(INT(POS_X(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+            CJ := CLAMP(INT(POS_Y(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+            CK := CLAMP(INT(POS_Z(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+
+            ! Load particle state into locals for derived quantities.
+            ! Reuses physics-step locals (PX/PY/PZ/VX/VY/VZ etc.) declared
+            ! at top of subroutine; we're in dead time for crystal warps.
+            PX := POS_X(I)
+            PY := POS_Y(I)
+            PZ := POS_Z(I)
+            VX := VEL_X(I)
+            VY := VEL_Y(I)
+            VZ := VEL_Z(I)
+
+            SIG_OMEGA(SIG_SLOT) := OMEGA_NAT(I)
+            SIG_RHO(SIG_SLOT) := REAL(GRID_DENSITY(CI, CJ, CK)) / 32.0
+            SIG_FMODE(SIG_SLOT) := REAL(FLOW_MODE(GEN))
+            SIG_VMAG(SIG_SLOT) := SQRT(VX*VX + VY*VY + VZ*VZ)
+            SIG_RNORM(SIG_SLOT) := SQRT(PX*PX + PY*PY + PZ*PZ) / DISK_OUTER_R
+            SIG_MGATE(SIG_SLOT) := GRID_MET_GATE(CI, CJ, CK)
+            SIG_ZC(SIG_SLOT) := ABS(Z_COUPLING(GEN))
+            SIG_FW(SIG_SLOT) := ABS(FLOW_W(GEN))
+
+            ! Extended fields (2026-05-14):
+            !   GEN          — raw GEN bin (1..32), recovers identity lost
+            !                  when only |zc| and |fw| are stored.
+            !   ENERGY       — specific orbital energy ½v² − GM/r.
+            !                  Negative = bound; magnitude = depth in well.
+            !   ANG_MOM      — |r × v|. Distinguishes near-circular orbits
+            !                  (high L) from plunge orbits (low L).
+            !   BIN_PRESENCE — bitmask of GEN bins represented in this cell.
+            !                  bitcount → ring coverage (8 = full, 1 = sparse).
+            SIG_GEN(SIG_SLOT) := GEN
+            SIG_ENERGY(SIG_SLOT) := 0.5 * (VX*VX + VY*VY + VZ*VZ) &
+              - BH_MASS / MAX(SQRT(PX*PX + PY*PY + PZ*PZ), 1.0)
+            SIG_ANG_MOM(SIG_SLOT) := SQRT( &
+              (PY*VZ - PZ*VY) * (PY*VZ - PZ*VY) + &
+              (PZ*VX - PX*VZ) * (PZ*VX - PX*VZ) + &
+              (PX*VY - PY*VX) * (PX*VY - PY*VX))
+            SIG_BIN_PRESENCE(SIG_SLOT) := BIN_PRESENCE(CI, CJ, CK)
+
+            FLAGS(I) := IOR(FLAGS(I), PFLAG_SIGNED)
+          ENDIF
+        ENDIF
+      ENDIF
+
+      CYCLE
+    ENDIF
+
+    ! ── Load state ────────────────────────────────────────
+    PX := POS_X(I)
+    PY := POS_Y(I)
+    PZ := POS_Z(I)
+    VX := VEL_X(I)
+    VY := VEL_Y(I)
+    VZ := VEL_Z(I)
+    OMEGA := OMEGA_NAT(I)
+
+    ! ── GEN + mode ────────────────────────────────────────
+    GEN := IAND(ISHFT(FLAGS(I), -GEN_SHIFT), GEN_MASK) + 1
+    PH := IAND(ISHFT(FLAGS(I), -PHASE_SHIFT), PHASE_MASK)
+    FMODE := FLOW_MODE(GEN)
+
+    ! ── 1. GRAVITY (always — the universal downhill) ──────
+    R3D_SQ := PX * PX + PY * PY + PZ * PZ
+    INV_R3D := 1.0 / SQRT(R3D_SQ + 1.0E-8)
+    R3D := R3D_SQ * INV_R3D
+    R_SAFE := MAX(R3D, 1.0)
+    INV_R := MIN(INV_R3D, 1.0)
+
+    RX := PX * INV_R
+    RY := PY * INV_R
+    RZ := PZ * INV_R
+    GRAVITY := BH_MASS * INV_R * INV_R
+
+    AX := -RX * GRAVITY
+    AY := -RY * GRAVITY
+    AZ := -RZ * GRAVITY
+
+    ! ── 2. OMEGA DECAY (always) ───────────────────────────
+    DECAY := 1.0 - OMEGA_DECAY * DT
+    DECAY := DECAY * DECAY * DECAY * DECAY
+    OMEGA := OMEGA * DECAY
+
+    ! ── 3. MODE COUPLING ─────────────────────────────────
+    IF FMODE = 0 THEN
+      COUPLING := 0.0
+    ELSE
+      COUPLING := 1.0
+    ENDIF
+
+    ! ── 4. WAVEGUIDE READ ────────────────────────────────
+    CI := CLAMP(INT(PX / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    CJ := CLAMP(INT(PY / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    CK := CLAMP(INT(PZ / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
+    RHO := REAL(GRID_DENSITY(CI, CJ, CK)) * COUPLING
+
+    ! ── 5. ENVELOPE ──────────────────────────────────────
+    CP_X := CURVE_PT(1, GEN) * R_SAFE
+    CP_Y := CURVE_PT(2, GEN) * R_SAFE
+    CP_Z := CURVE_PT(3, GEN) * R_SAFE
+    DX_N := PX - CP_X
+    DY_N := PY - CP_Y
+    DZ_N := PZ - CP_Z
+    D_NODE_SQ := DX_N * DX_N + DY_N * DY_N + DZ_N * DZ_N
+    ENV := 1.0 / SQRT(1.0 + D_NODE_SQ * INV_R_SCALE_SQ) * COUPLING
+
+    ! ── 6. METABOLIC GATE ────────────────────────────────
+    MET_GATE := GRID_MET_GATE(CI, CJ, CK) * COUPLING
+
+    ! ── 7. LUT GEOMETRY ──────────────────────────────────
+    TANG_X := TANGENT(1, GEN)
+    TANG_Y := TANGENT(2, GEN)
+    TANG_Z := TANGENT(3, GEN)
+    Z_C := Z_COUPLING(GEN)
+    FLOW_WG := FLOW_W(GEN)
+
+    ! ── 8. PROGRADE TANGENT ──────────────────────────────
+    INV_RXZ := 1.0 / SQRT(PX * PX + PZ * PZ + 1.0E-8)
+    PGX := -PZ * INV_RXZ
+    PGZ :=  PX * INV_RXZ
+
+    ! ── 9. VIVIANI MODULATION ────────────────────────────
+    F_DOT_R := TANG_X * RX + TANG_Y * RY + TANG_Z * RZ
+    FPX := TANG_X - F_DOT_R * RX
+    FPY := TANG_Y - F_DOT_R * RY
+    FPZ := TANG_Z - F_DOT_R * RZ
+    VIV_MOD := FPX * PGX + FPZ * PGZ
+
+    TX := PGX * ABS(VIV_MOD) + FPX * 0.1
+    TY := FPY * 0.1
+    TZ := PGZ * ABS(VIV_MOD) + FPZ * 0.1
+
+    ! ── 10. EM STEERING ──────────────────────────────────
+    IF FMODE = 2 THEN
+      BASE_RATE := 0.02
+    ELSE
+      BASE_RATE := 0.002
+    ENDIF
+    STEER_R := BASE_RATE * ENV
+
+    SPD_SQ := VX * VX + VY * VY + VZ * VZ
+    INV_SPD_B := 1.0 / SQRT(SPD_SQ + 1.0E-8)
+
+    INV_T_MAG := 1.0 / SQRT(TX * TX + TY * TY + TZ * TZ + 1.0E-8)
+    TNX := TX * INV_T_MAG
+    TNY := TY * INV_T_MAG
+    TNZ := TZ * INV_T_MAG
+
+    V_DOT_T := VX * TNX + VY * TNY + VZ * TNZ
+    VX := VX - (VX - V_DOT_T * TNX) * STEER_R
+    VY := VY - (VY - V_DOT_T * TNY) * STEER_R
+    VZ := VZ - (VZ - V_DOT_T * TNZ) * STEER_R
+
+    INV_SPD_A := 1.0 / SQRT(VX * VX + VY * VY + VZ * VZ + 1.0E-8)
+    RESCALE := INV_SPD_A / INV_SPD_B
+    VX := VX * RESCALE
+    VY := VY * RESCALE
+    VZ := VZ * RESCALE
+
+    ! ── 11. STRONG CHANNEL ───────────────────────────────
+    STRONG := Z_C * GRAVITY * 0.1 * COUPLING
+    AX := AX + RX * STRONG
+    AY := AY + RY * STRONG
+    AZ := AZ + RZ * STRONG
+
+    ! ── 12. WEAK CHANNEL ─────────────────────────────────
+    IF FMODE = 2 THEN
+      WEAK_DOT_R := CURVE_PT(1, GEN) * RX + &
+        CURVE_PT(2, GEN) * RY + CURVE_PT(3, GEN) * RZ
+      WEAK_STR := ABS(FLOW_WG) * GRAVITY * 0.05
+      AX := AX + (CURVE_PT(1, GEN) - WEAK_DOT_R * RX) * WEAK_STR
+      AY := AY + (CURVE_PT(2, GEN) - WEAK_DOT_R * RY) * WEAK_STR
+      AZ := AZ + (CURVE_PT(3, GEN) - WEAK_DOT_R * RZ) * WEAK_STR
+    ENDIF
+
+    ! ── 13. DENSITY SIPHON ───────────────────────────────
+    GDX := GRID_GRAD_X(CI, CJ, CK)
+    GDY := GRID_GRAD_Y(CI, CJ, CK)
+    GDZ := GRID_GRAD_Z(CI, CJ, CK)
+    GD_R := GDX * RX + GDY * RY + GDZ * RZ
+    GTX := GDX - GD_R * RX
+    GTY := GDY - GD_R * RY
+    GTZ := GDZ - GD_R * RZ
+    AX := AX + GTX * RHO * ENV * DENSITY_FORCE_SCALE
+    AY := AY + GTY * RHO * ENV * DENSITY_FORCE_SCALE
+    AZ := AZ + GTZ * RHO * ENV * DENSITY_FORCE_SCALE
+
+    ! ── 14. VELOCITY ACCUMULATION ────────────────────────
+    VX := VX + AX * DT
+    VY := VY + AY * DT
+    VZ := VZ + AZ * DT
+
+    V_SQ := VX * VX + VY * VY + VZ * VZ
+    IF V_SQ ≥ 1.0E24 THEN
+      CYCLE
+    ENDIF
+
+    ! ── 15. OMEGA ACCUMULATION ───────────────────────────
+    ! OMEGA_BASE is always present — the background metabolic rate.
+    ! DRIVE (field coupling) is zero for COAST (RHO already zero).
+    ! The base prevents total omega collapse — particles maintain
+    ! enough energy to orbit. Without it, everything crystallizes.
+    DRIVE := RHO * ENV * MET_GATE
+    TARGET := OMEGA_BASE + DRIVE * OMEGA_GAIN
+    OMEGA := OMEGA + (TARGET - OMEGA) * OMEGA_RESPONSE * DT
+    INSTABILITY := MAX(OMEGA - 0.4, 0.0)
+    OMEGA := OMEGA + INSTABILITY * INSTABILITY * 0.5 * DT
+    IF OMEGA > OMEGA_MAX THEN
+      OMEGA := OMEGA_MAX
+    ENDIF
+    IF OMEGA < 0.0 THEN
+      OMEGA := 0.0
+    ENDIF
+
+    ! ── 15.5. RING COUPLING (topological, not spatial) ────
+    ! Phase lock: restoring toward reference Viviani spacing.
+    ! PH_ERR is signed wrap-around: values > half-range are negative.
+    PH_NEXT := RING_NEXT(PH)
+    PH_DIFF := IAND(PH_NEXT - PH + PHASE_MASK + 1, PHASE_MASK)
+    PH_ERR := PH_DIFF - SEAM_STEP_PH
+    ! Signed wrap: if error > half phase range, subtract full range
+    IF PH_ERR > 16383 THEN
+      PH_ERR := PH_ERR - 32768
+    ENDIF
+    IF PH_ERR < -16383 THEN
+      PH_ERR := PH_ERR + 32768
+    ENDIF
+    ! Normalize to [-1, 1] and apply as gentle OMEGA correction
+    OMEGA := OMEGA - REAL(PH_ERR) * (1.0 / 16384.0) * K_PHASE_LOCK * DT
+
+    ! Re-clamp after phase lock
+    IF OMEGA > OMEGA_MAX THEN
+      OMEGA := OMEGA_MAX
+    ENDIF
+    IF OMEGA < 0.0 THEN
+      OMEGA := 0.0
+    ENDIF
+
+    ! ── 15.6. ZERO-SUM METABOLIC EXCHANGE (ring, not spatial) ─
+    ! Each thread computes a signed forward transfer to RING_NEXT.
+    ! RING_PREV retrieves what the previous thread sent TO us.
+    ! Conservation: thread I loses TRANSFER, thread I+1 gains it.
+    ! FLOW_WG gates direction: positive = forward, negative = backward.
+    ! Zero FLOW_WG (poles GEN 1,17) = no exchange = reflecting boundary.
+    OMEGA_NEXT := RING_NEXT(OMEGA)
+    DIFF := (OMEGA - OMEGA_NEXT) * OMEGA_EXCHANGE_RATE
+    FLOW_DIR := FLOW_WG
+
+    ! Gate: only allow flow in the FLOW_W direction
+    IF FLOW_DIR > 0.0 THEN
+      TRANSFER := MAX(DIFF, 0.0) * ABS(Z_C) * DT
+    ELSEIF FLOW_DIR < 0.0 THEN
+      TRANSFER := MIN(DIFF, 0.0) * ABS(Z_C) * DT
+    ELSE
+      TRANSFER := 0.0
+    ENDIF
+
+    ! Cap transfer to prevent over-drain
+    TRANSFER := MAX(TRANSFER, -OMEGA * 0.5)
+    TRANSFER := MIN(TRANSFER, OMEGA * 0.5)
+
+    ! Apply: lose what we send forward, gain what PREV sent to us
+    OMEGA := OMEGA - TRANSFER
+    TRANSFER_FROM_PREV := RING_PREV(TRANSFER)
+    OMEGA := OMEGA + TRANSFER_FROM_PREV
+
+    ! Final clamp
+    IF OMEGA > OMEGA_MAX THEN
+      OMEGA := OMEGA_MAX
+    ENDIF
+    IF OMEGA < 0.0 THEN
+      OMEGA := 0.0
+    ENDIF
+
+    ! ── 15.7. TOPOLOGICAL CHARGE STABILIZATION ───────────────
+    ! Measure warp-level winding number Q and correct toward Q = 1.
+    ! Q = sum(PH_DIFF) / (PHASE_MASK+1). For Q=1: total = 32768.
+    ! Only applies to complete rings (MET_GATE = 1.5 → all 8 gen bins).
+    ! Butterfly reduction: all lanes converge to same sum after 5 rounds.
+    IF MET_GATE > 1.49 THEN
+      WINDING := PH_DIFF
+      WINDING := WINDING + RING_SHIFT(WINDING, 16)
+      WINDING := WINDING + RING_SHIFT(WINDING, 8)
+      WINDING := WINDING + RING_SHIFT(WINDING, 4)
+      WINDING := WINDING + RING_SHIFT(WINDING, 2)
+      WINDING := WINDING + RING_SHIFT(WINDING, 1)
+
+      ! Error from Q = 1 target (32 segments × 1024 = 32768)
+      WINDING_ERR := WINDING - (PHASE_MASK + 1)
+
+      ! Correct OMEGA proportionally — gentle global restoring force
+      OMEGA := OMEGA - REAL(WINDING_ERR) * (1.0 / 32768.0) * K_WINDING * DT
+
+      ! Clamp after winding correction
+      IF OMEGA > OMEGA_MAX THEN
+        OMEGA := OMEGA_MAX
+      ENDIF
+      IF OMEGA < 0.0 THEN
+        OMEGA := 0.0
+      ENDIF
+    ENDIF
+
+    ! ── 15.8. RING SPILLOVER (collective collapse) ───────────
+    ! When mean OMEGA across the warp drops below OMEGA_CRITICAL,
+    ! the ring has lost coherence. Hammer OMEGA down to accelerate
+    ! dissolution — natural physics (decay, drift to COAST) does
+    ! the rest. Only complete rings (MET_GATE > 1.49) can spill.
+    IF MET_GATE > 1.49 THEN
+      OMEGA_SUM := OMEGA
+      OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 16)
+      OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 8)
+      OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 4)
+      OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 2)
+      OMEGA_SUM := OMEGA_SUM + RING_SHIFT(OMEGA_SUM, 1)
+      OMEGA_MEAN := OMEGA_SUM * (1.0 / 32.0)
+
+      IF OMEGA_MEAN < OMEGA_CRITICAL THEN
+        OMEGA := OMEGA * SPILL_DECAY
+      ENDIF
+    ENDIF
+
+    ! ── 16. POSITION ACCUMULATION ────────────────────────
+    POS_X(I) := PX + VX * DT
+    POS_Y(I) := PY + VY * DT
+    POS_Z(I) := PZ + VZ * DT
+    VEL_X(I) := VX
+    VEL_Y(I) := VY
+    VEL_Z(I) := VZ
+    OMEGA_NAT(I) := OMEGA
+
+    ! ── 17. THRESHOLD OBSERVATIONS ───────────────────────
+
+    ! Nova
+    IF OMEGA > OMEGA_NOVA_THRESH .AND. RHO > RHO_NOVA_THRESH THEN
+      FLAGS(I) := IOR(FLAGS(I), PFLAG_NOVA)
+      FLAGS(I) := IAND(FLAGS(I), NOT(PFLAG_ACTIVE))
+      VEL_X(I) := VX + TANGENT(1, GEN) * BLAST_MULT
+      VEL_Y(I) := VY + TANGENT(2, GEN) * BLAST_MULT
+      VEL_Z(I) := VZ + TANGENT(3, GEN) * BLAST_MULT
+    ENDIF
+
+    ! Crystal
+    SPD_SQ := VX * VX + VY * VY + VZ * VZ
+    IF OMEGA < OMEGA_CRYSTAL_THRESH .AND. SPD_SQ < 0.01 THEN
+      FLAGS(I) := IOR(FLAGS(I), PFLAG_CRYSTAL)
+    ENDIF
+
+    ! ── 18. SPAWN (continuous, rate-based) ──────────────
+    ! SPAWN_RATE is a probability per particle per frame.
+    ! Deterministic: hash of (index × phase) changes each frame
+    ! because phase advances. At rate=0.01, ~1% of active particles
+    ! spawn per frame. Smooth growth, no bursts. Zero = natural skip.
+    HASH := REAL(IAND((I * 1103515245 + GEN * 2654435) + 12345, &
+      65535)) / 65536.0
+    IF HASH < SPAWN_RATE .AND. IAND(FLAGS(I), PFLAG_ACTIVE) ≠ 0 THEN
+      ! SQ4 scatter claim: bin from the v4 LUT over the parent ordinal,
+      ! one atomic claim on that bin's counter. No global hot counter.
+      SQ4BIN := SCATLT(IAND(I - 1, 31) + 1) + 1
+      IF BIN_COUNT(SQ4BIN) < SQ4_BINCAP THEN
+        ! canonical slot-claim pattern (fuses to one OpAtomicIAdd):
+        K := BIN_COUNT(SQ4BIN) + 1
+        BIN_COUNT(SQ4BIN) := BIN_COUNT(SQ4BIN) + 1
+        SLOT := SQ4_BASE + (SQ4BIN - 1) * SQ4_BINCAP + K
+
+        ! Child phase = parent + seam step
+        PH_CHILD := IAND(IAND(ISHFT(FLAGS(I), -PHASE_SHIFT), &
+          PHASE_MASK) + SEAM_STEP_PH, PHASE_MASK)
+        GEN_CHILD := IAND(ISHFT(PH_CHILD, -10), GEN_MASK) + 1
+
+        ! Deterministic offset from parent index (replaces RNG)
+        ! Hash: scramble index with large prime (fits signed int32)
+        HASH := REAL(IAND(I * 1103515245 + 12345, 65535)) / 65536.0
+        SPX := PX + (HASH - 0.5) * 2.0
+        SPY := PY + (HASH * 0.7 - 0.35) * 0.5
+        SPZ := PZ + (HASH * 1.3 - 0.65) * 2.0
+
+        SR_XZ := SQRT(SPX * SPX + SPZ * SPZ)
+        SV_CIRC := SQRT(BH_MASS / MAX(SR_XZ, 1.0))
+
+        POS_X(SLOT) := SPX
+        POS_Y(SLOT) := SPY
+        POS_Z(SLOT) := SPZ
+        VEL_X(SLOT) := TANGENT(1, GEN_CHILD) * SV_CIRC
+        VEL_Y(SLOT) := TANGENT(2, GEN_CHILD) * SV_CIRC
+        VEL_Z(SLOT) := TANGENT(3, GEN_CHILD) * SV_CIRC
+        OMEGA_NAT(SLOT) := 0.1 * (50.0 / MAX(SR_XZ, 1.0)) ** 1.5
+        FLAGS(SLOT) := IOR(IOR(PFLAG_ACTIVE, &
+          ISHFT(IAND(GEN_CHILD - 1, GEN_MASK), GEN_SHIFT)), &
+          ISHFT(PH_CHILD, PHASE_SHIFT))
+      ENDIF
+    ENDIF
+  ENDDO
+
+  RETURN
+END
+
+
+! ════════════════════════════════════════════════════════════════
+! SQ4RES — 3-axis corruption residual (from tests/sq4core.ergo)
+! ════════════════════════════════════════════════════════════════
+! Operates on the STATIC G4VTX gate buffer (Ergo idiom: globals +
+! scalar args; scalar subroutine args are by value — use a function).
+
+REAL FUNCTION SQ4RES(SCALE)
+  REAL :: SCALE
+  REAL :: C120, S120
+  REAL :: X, Y, Z, X1, Y1, Z1, X2, Y2, Z2
+  REAL :: SX, SY, SZ, RA, RMAX
+  INTEGER :: I, AX
+
+  C120 := -0.5
+  S120 := 0.8660254037844386
+  RMAX := 0.0
+  DO AX = 1, 3
+    SX := 0.0
+    SY := 0.0
+    SZ := 0.0
+    DO I = 1, 12
+      X := G4VTX(1, I)
+      Y := G4VTX(2, I)
+      Z := G4VTX(3, I)
+      IF AX = 1 THEN
+        X1 := X
+        Y1 := C120*Y - S120*Z
+        Z1 := S120*Y + C120*Z
+        X2 := X
+        Y2 := C120*Y + S120*Z
+        Z2 := -S120*Y + C120*Z
+      ELSEIF AX = 2 THEN
+        X1 := C120*X + S120*Z
+        Y1 := Y
+        Z1 := -S120*X + C120*Z
+        X2 := C120*X - S120*Z
+        Y2 := Y
+        Z2 := S120*X + C120*Z
+      ELSE
+        X1 := C120*X - S120*Y
+        Y1 := S120*X + C120*Y
+        Z1 := Z
+        X2 := C120*X + S120*Y
+        Y2 := -S120*X + C120*Y
+        Z2 := Z
+      ENDIF
+      SX := SX + X + X1 + X2
+      SY := SY + Y + Y1 + Y2
+      SZ := SZ + Z + Z1 + Z2
+    ENDDO
+    RA := SQRT(SX*SX + SY*SY + SZ*SZ) / SCALE
+    IF RA > RMAX THEN
+      RMAX := RA
+    ENDIF
+  ENDDO
+  SQ4RES := RMAX
+  RETURN SQ4RES
+END
+
+! ════════════════════════════════════════════════════════════════
+! SIM_SQ4_SHADOW — Phase C integrity census (CPU, at census intervals)
+! ════════════════════════════════════════════════════════════════
+! Independent check of the scatter claim path: count live slots per
+! bin sub-range from the downloaded FLAGS array and compare against
+! the GPU-reported BIN_COUNT. Then encode the per-slot deltas into
+! the shadow gate (z-imprint on vertex (slot mod 12)) and measure
+! SQ4RES. Clean run: all deltas 0 -> gate is the exact cuboctahedron
+! -> residual exactly 0. SQ4_POKE=1 simulates a poked slot invariant
+! (one count corrupted at census frame 5) -> residual >= sqrt(3)*|d|.
+!
+! Prints:  SQ4SHADOW <frame> <max|delta|> <total deltas>
+!          SQ4RES    <frame> <residual>
+
+SUBROUTINE SIM_SQ4_SHADOW(FRAME)
+  INTEGER :: FRAME
+  INTEGER :: B, K, S, LIVE, D, TOT, V
+  REAL :: R
+
+  ! Reset shadow gate to the exact unit cuboctahedron
+  DO V = 1, 12
+    G4VTX(1, V) := CUBOCT(1, V)
+    G4VTX(2, V) := CUBOCT(2, V)
+    G4VTX(3, V) := CUBOCT(3, V)
+  ENDDO
+
+  TOT := 0
+  DO B = 1, 8
+    LIVE := 0
+    DO K = 1, SQ4_BINCAP
+      S := SQ4_BASE + (B - 1) * SQ4_BINCAP + K
+      IF FLAGS(S) ≠ 0 THEN
+        LIVE := LIVE + 1
+      ENDIF
+    ENDDO
+    D := LIVE - BIN_COUNT(B)
+    IF SQ4_POKE ≠ 0 THEN
+      IF FRAME = 5 THEN
+        IF B = 3 THEN
+          D := D + 1
+        ENDIF
+      ENDIF
+    ENDIF
+    IF D ≠ 0 THEN
+      ! One delta per mismatching bin: imprint z of the bin's vertex
+      V := IAND(B - 1, 11) + 1
+      G4VTX(3, V) := G4VTX(3, V) + REAL(D) * 0.001
+      IF D < 0 THEN
+        TOT := TOT - D
+      ELSE
+        TOT := TOT + D
+      ENDIF
+    ENDIF
+  ENDDO
+
+  R := SQ4RES(1.0)
+  WRITE(*, "SQ4SHADOW %d %d") FRAME, TOT
+  WRITE(*, "SQ4RES %d %.17e") FRAME, R
+  RETURN
+END

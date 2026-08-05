@@ -1,0 +1,41 @@
+! ════════════════════════════════════════════════════════════════
+! MAIN_SQ4FLAT — flat-counter reference harness (live spawn)
+! ════════════════════════════════════════════════════════════════
+!
+! Reference for the SQ4 retest: original modules (fluid_subs.ergo
+! untouched — flat SPAWN_COUNTER claim) + the spawn-growth wiring the
+! shipped main.ergo lacks (NPART := SPAWN_COUNTER(1) every SYNC_EVERY
+! frames) + end-of-run census. Without the sync, spawn in the shipped
+! sim is write-only: children land at slots > NPART and are never
+! processed (see structured/SQ4_INTEGRATION.md).
+
+IMPLICIT NONE
+
+INTEGER :: FRAME, SYNC_EVERY, NFRAMES
+
+SYNC_EVERY := 10
+NFRAMES := DEFAULT_FRAMES
+
+CALL SIM_INIT(DEFAULT_N, MAXPART, 42)
+CALL SIM_SEED_SHELL()
+
+PRINT NPART
+
+SPAWN_COUNTER(1) := NPART
+
+DO FRAME = 1, NFRAMES
+  CALL CLEAR_GRID()
+  CALL SCATTER_GRID()
+  CALL STENCIL_GRID()
+  CALL SIM_PHYSICS_STEP(DEFAULT_DT)
+
+  IF MOD(FRAME, SYNC_EVERY) = 0 THEN
+    NPART := SPAWN_COUNTER(1)
+  ENDIF
+ENDDO
+
+NPART := SPAWN_COUNTER(1)
+PRINT NPART
+
+CALL DOWNLOAD_PARTICLES()
+CALL SIM_CENSUS_REPORT(NPART, NFRAMES)

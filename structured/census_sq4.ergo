@@ -1,0 +1,75 @@
+! ════════════════════════════════════════════════════════════════
+! CENSUS — SQ4 variant: FLAGS=0 liveness guard + bin-count report
+! ════════════════════════════════════════════════════════════════
+! Same metrics as census.ergo, but the spawn region is sparse under
+! the SQ4 scatter layout: unclaimed slots (FLAGS=0) are skipped.
+
+SUBROUTINE SIM_CENSUS_REPORT(COUNT, FRAME)
+  INTEGER :: COUNT, FRAME
+  INTEGER :: I, B, BIN
+  REAL :: OMEGA_SUM, OMEGA_MEAN, OMEGA_PEAK
+  INTEGER :: PEAK_BIN, TOTAL
+
+  PRINT FRAME
+  PRINT COUNT
+
+  DO B = 1, 20
+    CENSUS_OMEGA_HIST(B) := 0
+  ENDDO
+  CENSUS_STATE_COUNT(1) := 0
+  CENSUS_STATE_COUNT(2) := 0
+  CENSUS_STATE_COUNT(3) := 0
+  CENSUS_STATE_COUNT(4) := 0
+
+  DO I = 1, COUNT
+    ! SQ4 variant: skip unclaimed slots
+    IF FLAGS(I) = 0 THEN
+      CYCLE
+    ENDIF
+    BIN := CLAMP(INT(OMEGA_NAT(I) * 10.0), 0, 19) + 1
+    CENSUS_OMEGA_HIST(BIN) := CENSUS_OMEGA_HIST(BIN) + 1
+
+    IF IAND(FLAGS(I), PFLAG_CRYSTAL) ≠ 0 THEN
+      CENSUS_STATE_COUNT(2) := CENSUS_STATE_COUNT(2) + 1
+    ELSEIF IAND(FLAGS(I), IOR(PFLAG_NOVA, PFLAG_EJECTED)) ≠ 0 THEN
+      CENSUS_STATE_COUNT(4) := CENSUS_STATE_COUNT(4) + 1
+    ELSEIF IAND(FLAGS(I), PFLAG_ACTIVE) ≠ 0 THEN
+      CENSUS_STATE_COUNT(1) := CENSUS_STATE_COUNT(1) + 1
+    ELSE
+      CENSUS_STATE_COUNT(3) := CENSUS_STATE_COUNT(3) + 1
+    ENDIF
+  ENDDO
+
+  PRINT CENSUS_STATE_COUNT(1)
+  PRINT CENSUS_STATE_COUNT(2)
+  PRINT CENSUS_STATE_COUNT(3)
+  PRINT CENSUS_STATE_COUNT(4)
+
+  OMEGA_SUM := 0.0
+  TOTAL := 0
+  OMEGA_PEAK := 0.0
+  PEAK_BIN := 1
+  DO B = 1, 20
+    OMEGA_SUM := OMEGA_SUM + REAL(CENSUS_OMEGA_HIST(B)) * (REAL(B - 1) * 0.1 + 0.05)
+    TOTAL := TOTAL + CENSUS_OMEGA_HIST(B)
+    IF CENSUS_OMEGA_HIST(B) > INT(OMEGA_PEAK) THEN
+      OMEGA_PEAK := REAL(CENSUS_OMEGA_HIST(B))
+      PEAK_BIN := B
+    ENDIF
+  ENDDO
+  IF TOTAL > 0 THEN
+    OMEGA_MEAN := OMEGA_SUM / REAL(TOTAL)
+  ELSE
+    OMEGA_MEAN := 0.0
+  ENDIF
+
+  PRINT OMEGA_MEAN
+  PRINT PEAK_BIN
+  PRINT TOTAL
+
+  DO B = 1, 20
+    PRINT CENSUS_OMEGA_HIST(B)
+  ENDDO
+
+  RETURN
+END

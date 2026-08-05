@@ -1,0 +1,74 @@
+! ════════════════════════════════════════════════════════════════
+! MAIN_SQ4 — SQ4 scatter-variant harness
+! ════════════════════════════════════════════════════════════════
+!
+! Differences from main.ergo:
+!  - wires spawn growth: NPART tracks the scatter high-water mark,
+!    synced every SYNC_EVERY frames (the shipped main.ergo never
+!    updates NPART from SPAWN_COUNTER — spawn there is write-only;
+!    see structured/SQ4_INTEGRATION.md);
+!  - no VERIFY oracle (built with --no-verify; physics uses GPU-only
+!    RING intrinsics);
+!  - per-bin spawn-count report + Phase-C SQ4RES shadow at censuses.
+!
+! Note: the NPART high-water covers the initial dense region plus the
+! scatter spawn region up to the highest claimed slot. Unclaimed slots
+! inside the walk are skipped by the FLAGS=0 liveness guard.
+
+IMPLICIT NONE
+
+INTEGER :: FRAME, B, HW, BHI, SYNC_EVERY, NFRAMES
+
+SYNC_EVERY := 10
+NFRAMES := DEFAULT_FRAMES
+
+CALL SIM_INIT(DEFAULT_N, MAXPART, 42)
+CALL SIM_SEED_SHELL()
+
+PRINT NPART
+
+! SQ4 scatter spawn geometry
+SPAWN_COUNTER(1) := NPART
+SQ4_BASE := NPART
+SQ4_BINCAP := (CAPACITY - SQ4_BASE) / 8
+DO B = 1, 8
+  BIN_COUNT(B) := 0
+ENDDO
+
+DO FRAME = 1, NFRAMES
+  CALL CLEAR_GRID()
+  CALL SCATTER_GRID()
+  CALL STENCIL_GRID()
+  CALL SIM_PHYSICS_STEP(DEFAULT_DT)
+
+  IF MOD(FRAME, SYNC_EVERY) = 0 THEN
+    HW := SQ4_BASE
+    DO B = 1, 8
+      BHI := SQ4_BASE + (B - 1) * SQ4_BINCAP + BIN_COUNT(B)
+      IF BHI > HW THEN
+        HW := BHI
+      ENDIF
+    ENDDO
+    NPART := HW
+  ENDIF
+ENDDO
+
+! Final sync + readback + census
+HW := SQ4_BASE
+DO B = 1, 8
+  BHI := SQ4_BASE + (B - 1) * SQ4_BINCAP + BIN_COUNT(B)
+  IF BHI > HW THEN
+    HW := BHI
+  ENDIF
+ENDDO
+NPART := HW
+
+PRINT NPART
+WRITE(*, "BINCAP %d") SQ4_BINCAP
+DO B = 1, 8
+  WRITE(*, "BINCOUNT %d %d") B, BIN_COUNT(B)
+ENDDO
+
+CALL DOWNLOAD_PARTICLES()
+CALL SIM_CENSUS_REPORT(NPART, NFRAMES)
+CALL SIM_SQ4_SHADOW(NFRAMES)
