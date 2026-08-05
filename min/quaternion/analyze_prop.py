@@ -67,7 +67,7 @@ def load_wind(out, tag):
                 key = (int(p[1]), int(p[2]))       # (ti, N)
                 idx = int(p[3])
                 val = float(p[4]) + 1j * float(p[5])
-            elif tag == "SGN":
+            elif tag in ("SGN", "W4S", "W4P"):
                 key = int(p[1])                    # ti
                 idx = int(p[2])
                 val = float(p[3]) + 1j * float(p[4])

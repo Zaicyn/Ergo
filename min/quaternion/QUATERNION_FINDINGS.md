@@ -115,3 +115,81 @@ the classical cycloid side was the hopfion test (min/hopfion/).
   (`prop_err_theta.png`, `prop_err_lmax.png`, `prop_phase.png`,
   `prop_fringe.png`).
 - `min/quaternion/QUATERNION_FINDINGS.md` — this file.
+
+---
+
+# Spinor extension — the double-cover signature
+
+Extension of the validated S³ study: same kernels, same iε prescription,
+paired truncation [−N, N−1]. New binary sections W4S/W4P (scalar/spinor
+winding sums on the 2π-shifted grid, plus T̃=π/2 grid-1 sections);
+`spectral_ref.py` gains `k_spec_spinor` (half-integer momenta
+k = m + ½); `analyze_spinor.py` drives the oracles. Regression: all
+prior output sections of the binary are byte-identical, and
+`analyze_prop.py` stdout is unchanged.
+
+## Antiperiodicity oracle (the gate) — PASS
+
+Pointwise ratios K(Θ+2π)/K(Θ) on the matched 2000-pt grids, masked
+|K| > 1%·max, N=16, T̃ ∈ {0.1, 0.25, 0.5}:
+
+| side | ratio | median dev | p95 | max |
+|---|---|---|---|---|
+| winding scalar | +1 | 1.3–1.9e-15 | ≤2.7e-14 | ≤4.5e-13 |
+| winding spinor | −1 | 4.9–21.5e-15 | ≤2.2e-13 | ≤7.3e-13 |
+| spectral scalar | +1 | ~5e-15 | — | ≤1.2e-12 |
+| spectral spinor | −1 | ~1–2e-14 | — | ≤7.3e-13 |
+
+Winding-vs-spectral agreement on the shifted grid: max rel err
+2.1e-13 / 7.0e-13 (scalar), 2.5e-15 / 1.0e-15 (spinor). Construction
+topology == spectrum topology, both covers.
+
+**The measured double-cover signature, in one sentence:** going once
+around the classical path (Θ → Θ+2π) leaves the scalar propagator
+invariant and flips the spinor propagator's sign — K_s(Θ+2π) = +K_s(Θ),
+K_sp(Θ+2π) = −K_sp(Θ) — pointwise, to truncation noise, identically in
+the winding-sum construction and in the energy spectrum.
+
+## DeepSeek claims audit
+
+- **Berry-π at the antipode — SURVIVES (it is a parity theorem, and the
+  numbers show it exactly).** K_s is symmetric and K_sp antisymmetric
+  under δ ↦ −δ about Θ=π (each half-integer-k term is odd), so
+  arg(K_sp/K_s) flips by exactly π across the antipode. Measured
+  flanking-window phase differences: |flip − π| = 0–4.4e-16 at
+  T̃ = 0.1/0.25/0.5 and 1.7e-10 at T̃=π/2 (revival), where the flanking
+  phases are ±π/2 (±1.5944/−1.5472). Caveat measured, not assumed: at
+  T̃=π/2 the spinor amplitude near the antipode is suppressed 4.45e-04
+  (vs 2.9e-02 at the other T̃) — the flip there is between near-zero
+  amplitudes.
+- **Fringe shift — SURVIVES (exactly half a fringe).** |K|² fringe
+  peaks near the antipode, scalar vs spinor: T̃=0.1: shift
+  0.102–0.109 vs half the fringe spacing 0.104; T̃=0.25: 0.26–0.30 vs
+  0.282. Mechanism is exact: the n=−1 winding carries a (−1) sign in
+  the spinor sum, swapping constructive ↔ destructive interference.
+  Note |K_sp|² itself is 2π-periodic (the sign squares away); the
+  signature lives in the *positions* of the fringes.
+- **Cycloid mapping — NULL, as expected.** Under Θ := x/a the cycloid
+  cusp x=2πa lands on Θ=2π, which is an S³ conjugate point by shared
+  2π periodicity alone (no dynamics). The S³ antipode caustic (Θ=π)
+  maps to θ=π — the cycloid's smooth arch bottom, not a caustic. And
+  the kernel's fringe structure moves with T̃ (spacing ≈ 2T̃), while any
+  cycloid-mapped feature is T̃-invariant — no dynamical alignment beyond
+  coincidence.
+
+## Revival spectra (data, no claims)
+
+|K_s|² and |K_sp|² at Θ=π/3 over T̃ ∈ (0, 4π), from the validated
+kernels (`spinor_revival.png`): both reach max |K|² = 0.759 but at
+different times (scalar T̃=10.88, spinor T̃=1.88); both ≈ 0 at T̃=π/2
+(0.0000 / 0.0008). The two statistics give interferometrically distinct
+revival patterns — the measurable contrast between covers.
+
+## Determinism
+
+Binary twice byte-identical; analyzer twice byte-identical; prior
+sections and `analyze_prop.py` output unchanged (regression).
+
+Files: `winding_s3.ergo` (extended, W4S/W4P + T̃=π/2 sections),
+`spectral_ref.py` (`k_spec_spinor`, `theta_grid2`), `analyze_spinor.py`
+(new), `spinor_berry.png`, `spinor_revival.png`.

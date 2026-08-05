@@ -42,9 +42,9 @@
 IMPLICIT NONE
 
 REAL :: EPS, TWO_PI, TH_LO, TH_HI
-REAL :: TTS(3)
+REAL :: TTS(4)
 INTEGER :: NS(4)
-DATA TTS / 0.1, 0.25, 0.5 /
+DATA TTS / 0.1, 0.25, 0.5, 1.5707963267948966 /
 DATA NS / 4, 8, 16, 32 /
 
 INTEGER :: TI, NI, I, NN, K, SIDE, N, NPAIR
@@ -175,4 +175,91 @@ DO TI = 1, 3
       WRITE(*, "CAUU %d %d %d %.17e %.17e") TI, SIDE, K, R2, I2
     ENDDO
   ENDDO
+ENDDO
+
+! ── SPINOR EXTENSION (4pi mode) ─────────────────────────────
+! Double-cover signature sections. Grid2 = grid1 + 2*pi. Paired
+! truncation [-N, N-1], N=16, same iepsilon prescription.
+!   W4S ti i re im   — scalar (+1) winding sum on grid2
+!   W4P ti i re im   — spinor (-1)^n winding sum on grid2
+!   (grid1 scalar/spinor come from GRID N=16 and SGN sections)
+!   ti=4 is Tt = pi/2 (revival time; grid1 GRID/SGN lines added too)
+!
+! Scalar:  K(Theta+2pi) = +K(Theta)   (single-valued on SO(3))
+! Spinor:  K(Theta+2pi) = -K(Theta)   (the double-cover signature)
+
+DO TI = 1, 4
+  TT := TTS(TI)
+  TC2 := TT * TT + EPS * EPS
+  PM := EXP(-0.75 * LOG(TC2)) / (4.0 * PI_VAL * SQRT(4.0 * PI_VAL))
+  PA := -1.5 * ATAN2(TT, EPS)
+  N := 16
+  DO I = 1, 2000
+    TH := TH_LO + REAL(I - 1) * (TH_HI - TH_LO) / 1999.0 + TWO_PI
+    RE := 0.0
+    IM := 0.0
+    R2 := 0.0
+    I2 := 0.0
+    DO NN = -N, N - 1
+      TN := TH + TWO_PI * REAL(NN)
+      DAMP := EXP(-EPS * TN * TN / (4.0 * TC2))
+      PH := TN * TN * TT / (4.0 * TC2)
+      A := TN / SIN(TH) * DAMP
+      RE := RE + A * COS(PH)
+      IM := IM + A * SIN(PH)
+      SNW := 1.0
+      IF IAND(ABS(NN), 1) = 1 THEN
+        SNW := -1.0
+      ENDIF
+      A := SNW * TN / SIN(TH) * DAMP
+      R2 := R2 + A * COS(PH)
+      I2 := I2 + A * SIN(PH)
+    ENDDO
+    A := RE
+    RE := PM * (RE * COS(PA) - IM * SIN(PA))
+    IM := PM * (A * SIN(PA) + IM * COS(PA))
+    WRITE(*, "W4S %d %d %.17e %.17e") TI, I, RE, IM
+    A := R2
+    R2 := PM * (R2 * COS(PA) - I2 * SIN(PA))
+    I2 := PM * (A * SIN(PA) + I2 * COS(PA))
+    WRITE(*, "W4P %d %d %.17e %.17e") TI, I, R2, I2
+  ENDDO
+ENDDO
+
+! ti=4 (Tt=pi/2) grid1 scalar + spinor (for the Berry-ratio audit)
+TI := 4
+TT := TTS(TI)
+TC2 := TT * TT + EPS * EPS
+PM := EXP(-0.75 * LOG(TC2)) / (4.0 * PI_VAL * SQRT(4.0 * PI_VAL))
+PA := -1.5 * ATAN2(TT, EPS)
+N := 16
+DO I = 1, 2000
+  TH := TH_LO + REAL(I - 1) * (TH_HI - TH_LO) / 1999.0
+  RE := 0.0
+  IM := 0.0
+  R2 := 0.0
+  I2 := 0.0
+  DO NN = -N, N - 1
+    TN := TH + TWO_PI * REAL(NN)
+    DAMP := EXP(-EPS * TN * TN / (4.0 * TC2))
+    PH := TN * TN * TT / (4.0 * TC2)
+    A := TN / SIN(TH) * DAMP
+    RE := RE + A * COS(PH)
+    IM := IM + A * SIN(PH)
+    SNW := 1.0
+    IF IAND(ABS(NN), 1) = 1 THEN
+      SNW := -1.0
+    ENDIF
+    A := SNW * TN / SIN(TH) * DAMP
+    R2 := R2 + A * COS(PH)
+    I2 := I2 + A * SIN(PH)
+  ENDDO
+  A := RE
+  RE := PM * (RE * COS(PA) - IM * SIN(PA))
+  IM := PM * (A * SIN(PA) + IM * COS(PA))
+  WRITE(*, "GRID %d %d %d %.17e %.17e") TI, N, I, RE, IM
+  A := R2
+  R2 := PM * (R2 * COS(PA) - I2 * SIN(PA))
+  I2 := PM * (A * SIN(PA) + I2 * COS(PA))
+  WRITE(*, "SGN %d %d %.17e %.17e") TI, I, R2, I2
 ENDDO

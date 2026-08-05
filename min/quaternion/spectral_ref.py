@@ -59,6 +59,25 @@ def converge(theta, Tt, eps=EPS, tol=TOL, lstart=LSTART):
         Kprev = K
 
 
+def theta_grid2():
+    """grid1 + 2*pi (the 4pi-mode second cover)."""
+    return theta_grid() + 2.0 * np.pi
+
+
+def k_spec_spinor(theta, Tt, Lmax, eps=EPS):
+    """Antiperiodic (spinor) spectral kernel: half-integer momenta
+    k = l+1 = m + 1/2 (Poisson with the (-1)^n twist shifts the
+    momentum lattice by 1/2). Validated to 2e-15 against the (-1)^n
+    winding sum in the S^3 propagator study."""
+    Tc = Tt - 1j * eps
+    th = np.asarray(theta, dtype=float)
+    m = np.arange(0, Lmax + 1)
+    k = m + 0.5
+    amp = k * np.exp(-1j * (k * k - 1.0) * Tc)
+    S = np.sin(np.outer(k, th)) / np.sin(th)
+    return (S * amp[:, None]).sum(axis=0) / (2.0 * np.pi ** 2)
+
+
 def main():
     th = theta_grid()
     with open("min/quaternion/spec_ref.txt", "w") as f:
