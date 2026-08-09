@@ -1,0 +1,251 @@
+! ════════════════════════════════════════════════════════════════════
+! H2P — H2+ handshake solver: 3D imaginary-time Schroedinger in
+! position space, flattened masked stencil (fdtd/DBM idiom).
+! ════════════════════════════════════════════════════════════════════
+!
+!   d psi / d tau = (1/2) nabla^2 psi - V psi,  normalized per step.
+!   V = -1/r_L - 1/r_R  (exact Coulomb: even N puts no cell center on
+!   a nucleus, so V is finite everywhere on the grid; SOFT is a 1e-12
+!   guard only. Soft-core variant documented in the findings: a=0.15
+!   costs +4.3e-2 Ha on the H atom — unusable; exact-Coulomb grid
+!   error ~dx^2, extrapolated in analyze_handshake.py).
+!   Parity selection by initial packet symmetry (z -> -z); imaginary
+!   time preserves parity => sigma_g (even) / sigma_u (odd) ground
+!   states of each sector.
+!
+! Sections:
+!   ATOM  — single-center oracle (H atom) on the production grid.
+!   SCAN  — E_sigma(R) for both parities over the baked R list,
+!           with CONV checkpoints (convergence) and OVL lines
+!           (Stage-3 handshake overlaps: separated-atom symmetric/
+!           antisymmetric 1s_L +/- 1s_R combos vs united-atom He+
+!           1s/2s/2p at the midpoint).
+!
+! Grid: cubic box [-BOX, BOX]^3, NX^3 flat, Dirichlet faces via the
+! BOUND mask (face cells are never used by interior stencils — the
+! mask zeroes them and they stay zero).
+!
+! Determinism: fixed loops, no RNG; two runs byte-identical.
+! Compile from repo root: python -m core min/handshake/h2p.ergo -o <bin>
+! ════════════════════════════════════════════════════════════════════
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 128
+REAL, PARAMETER :: BOX = 16.0
+INTEGER, PARAMETER :: NPTS = 2097152   ! 128^3
+INTEGER, PARAMETER :: NXY = 16384      ! NX*NX
+INTEGER, PARAMETER :: NSTEPS = 2500
+REAL, PARAMETER :: DTAU = 0.008        ! <= dx^2/6 = 0.0104
+REAL, PARAMETER :: SOFT = 1.0e-12      ! Coulomb softening: ~exact 1/r
+                                      ! (even N puts no cell center on a
+                                      ! nucleus; nearest is dx*sqrt(3)/2)
+
+! R list (bohr) for the scan
+STATIC REAL :: RLIST(10)
+DATA RLIST / 0.2, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0 /
+
+STATIC REAL :: PSI(NPTS), PSIN(NPTS), V(NPTS)
+STATIC INTEGER :: BND(NPTS)
+
+REAL :: DX, DX2, IDX2, DV, X, Y, Z, R, RZ, RL, RR
+REAL :: LAP, NRM, T_KE, V_PE, E_TOT
+REAL :: FL, FR, FS, FA, F1S, F2S, F2P
+REAL :: NFS, NFA, NF1, NF2, NF3
+REAL :: O1, O2, O3, O4, O5
+INTEGER :: I, J, K, IR, IP, T, IC, JC, KC
+
+DX := 2.0 * BOX / REAL(NX)
+DX2 := DX * DX
+IDX2 := 1.0 / DX2
+DV := DX * DX * DX
+
+! ── potential + boundary mask (single center at origin first;
+!    two centers re-set per R in the scan) ──────────────────
+DO K = 1, NPTS
+  BND(K) := 0
+  V(K) := 0.0
+ENDDO
+DO KC = 2, NX - 1
+  Z := -BOX + (REAL(KC) - 0.5) * DX
+  DO JC = 2, NX - 1
+    Y := -BOX + (REAL(JC) - 0.5) * DX
+    DO IC = 2, NX - 1
+      K := IC + (JC - 1) * NX + (KC - 1) * NXY
+      BND(K) := 1
+    ENDDO
+  ENDDO
+ENDDO
+
+! ═════════════════════════════════════════════════════════════
+! ATOM oracle: single center at origin
+! ═════════════════════════════════════════════════════════════
+DO K = 1, NPTS
+  KC := 1 + (K - 1) / NXY
+  JC := 1 + MOD((K - 1) / NX, NX)
+  IC := 1 + MOD(K - 1, NX)
+  X := -BOX + (REAL(IC) - 0.5) * DX
+  Y := -BOX + (REAL(JC) - 0.5) * DX
+  Z := -BOX + (REAL(KC) - 0.5) * DX
+  R := SQRT(X * X + Y * Y + Z * Z)
+  V(K) := -1.0 / SQRT(R * R + SOFT * SOFT)
+  PSI(K) := EXP(-R * R)
+ENDDO
+NRM := 0.0
+DO K = 1, NPTS
+  NRM := NRM + PSI(K) * PSI(K) * DV
+ENDDO
+NRM := SQRT(NRM)
+DO K = 1, NPTS
+  PSI(K) := PSI(K) / NRM
+ENDDO
+
+DO T = 1, NSTEPS
+  DO K = NXY + 2, NPTS - NXY - 1
+    LAP := (PSI(K - 1) + PSI(K + 1) + PSI(K - NX) + PSI(K + NX) &
+      + PSI(K - NXY) + PSI(K + NXY) - 6.0 * PSI(K)) * IDX2
+    PSIN(K) := (PSI(K) + DTAU * (0.5 * LAP - V(K) * PSI(K))) &
+      * REAL(BND(K))
+  ENDDO
+  NRM := 0.0
+  DO K = 1, NPTS
+    NRM := NRM + PSIN(K) * PSIN(K) * DV
+  ENDDO
+  NRM := SQRT(NRM)
+  DO K = 1, NPTS
+    PSI(K) := PSIN(K) / NRM
+  ENDDO
+  IF MOD(T, 500) == 0 THEN
+    T_KE := 0.0
+    V_PE := 0.0
+    DO K = NXY + 2, NPTS - NXY - 1
+      LAP := (PSI(K - 1) + PSI(K + 1) + PSI(K - NX) + PSI(K + NX) &
+        + PSI(K - NXY) + PSI(K + NXY) - 6.0 * PSI(K)) * IDX2
+      T_KE := T_KE - 0.5 * PSI(K) * LAP * DV
+      V_PE := V_PE + V(K) * PSI(K) * PSI(K) * DV
+    ENDDO
+    E_TOT := T_KE + V_PE
+    WRITE(*, "ATOM %d %.10e %.10e %.10e") T, T_KE, V_PE, E_TOT
+  ENDIF
+ENDDO
+
+! ═════════════════════════════════════════════════════════════
+! SCAN: E_sigma(R) for both parities + Stage-3 overlaps
+! ═════════════════════════════════════════════════════════════
+DO IR = 1, 10
+  R := RLIST(IR)
+  RZ := 0.5 * R
+  DO IP = 1, 2
+    R := RLIST(IR)
+    RZ := 0.5 * R
+    ! rebuild V with two centers; init packet with parity IP
+    ! IP=1: sigma_g (even z->-z), IP=2: sigma_u (odd)
+    DO K = 1, NPTS
+      KC := 1 + (K - 1) / NXY
+      JC := 1 + MOD((K - 1) / NX, NX)
+      IC := 1 + MOD(K - 1, NX)
+      X := -BOX + (REAL(IC) - 0.5) * DX
+      Y := -BOX + (REAL(JC) - 0.5) * DX
+      Z := -BOX + (REAL(KC) - 0.5) * DX
+      RL := SQRT(X * X + Y * Y + (Z - RZ) * (Z - RZ))
+      RR := SQRT(X * X + Y * Y + (Z + RZ) * (Z + RZ))
+      V(K) := -1.0 / SQRT(RL * RL + SOFT * SOFT) &
+        - 1.0 / SQRT(RR * RR + SOFT * SOFT)
+      IF IP == 1 THEN
+        PSI(K) := EXP(-(RL * RL)) + EXP(-(RR * RR))
+      ELSE
+        PSI(K) := EXP(-(RL * RL)) - EXP(-(RR * RR))
+      ENDIF
+      PSI(K) := PSI(K) * REAL(BND(K))
+    ENDDO
+    NRM := 0.0
+    DO K = 1, NPTS
+      NRM := NRM + PSI(K) * PSI(K) * DV
+    ENDDO
+    NRM := SQRT(NRM)
+    DO K = 1, NPTS
+      PSI(K) := PSI(K) / NRM
+    ENDDO
+
+    DO T = 1, NSTEPS
+      DO K = NXY + 2, NPTS - NXY - 1
+        LAP := (PSI(K - 1) + PSI(K + 1) + PSI(K - NX) + PSI(K + NX) &
+          + PSI(K - NXY) + PSI(K + NXY) - 6.0 * PSI(K)) * IDX2
+        PSIN(K) := (PSI(K) + DTAU * (0.5 * LAP - V(K) * PSI(K))) &
+          * REAL(BND(K))
+      ENDDO
+      NRM := 0.0
+      DO K = 1, NPTS
+        NRM := NRM + PSIN(K) * PSIN(K) * DV
+      ENDDO
+      NRM := SQRT(NRM)
+      DO K = 1, NPTS
+        PSI(K) := PSIN(K) / NRM
+      ENDDO
+      IF MOD(T, 500) == 0 THEN
+        T_KE := 0.0
+        V_PE := 0.0
+        DO K = NXY + 2, NPTS - NXY - 1
+          LAP := (PSI(K - 1) + PSI(K + 1) + PSI(K - NX) + PSI(K + NX) &
+            + PSI(K - NXY) + PSI(K + NXY) - 6.0 * PSI(K)) * IDX2
+          T_KE := T_KE - 0.5 * PSI(K) * LAP * DV
+          V_PE := V_PE + V(K) * PSI(K) * PSI(K) * DV
+        ENDDO
+        E_TOT := T_KE + V_PE
+        WRITE(*, "CONV %.2f %d %d %.10e") R, IP, T, E_TOT
+      ENDIF
+    ENDDO
+
+    WRITE(*, "E %.2f %d %.10e %.10e %.10e") R, IP, T_KE, V_PE, E_TOT
+
+    ! ── Stage-3 overlaps ─────────────────────────────────
+    NFS := 0.0
+    NFA := 0.0
+    NF1 := 0.0
+    NF2 := 0.0
+    NF3 := 0.0
+    O1 := 0.0
+    O2 := 0.0
+    O3 := 0.0
+    O4 := 0.0
+    O5 := 0.0
+    DO K = 1, NPTS
+      KC := 1 + (K - 1) / NXY
+      JC := 1 + MOD((K - 1) / NX, NX)
+      IC := 1 + MOD(K - 1, NX)
+      X := -BOX + (REAL(IC) - 0.5) * DX
+      Y := -BOX + (REAL(JC) - 0.5) * DX
+      Z := -BOX + (REAL(KC) - 0.5) * DX
+      RL := SQRT(X * X + Y * Y + (Z - RZ) * (Z - RZ))
+      RR := SQRT(X * X + Y * Y + (Z + RZ) * (Z + RZ))
+      R := SQRT(X * X + Y * Y + Z * Z)
+      FL := EXP(-RL)
+      FR := EXP(-RR)
+      FS := FL + FR
+      FA := FL - FR
+      F1S := EXP(-2.0 * R)
+      F2S := (1.0 - R) * EXP(-R)
+      F2P := 2.0 * Z * EXP(-R)
+      NFS := NFS + FS * FS * DV
+      NFA := NFA + FA * FA * DV
+      NF1 := NF1 + F1S * F1S * DV
+      NF2 := NF2 + F2S * F2S * DV
+      NF3 := NF3 + F2P * F2P * DV
+      O1 := O1 + PSI(K) * FS * DV
+      O2 := O2 + PSI(K) * FA * DV
+      O3 := O3 + PSI(K) * F1S * DV
+      O4 := O4 + PSI(K) * F2S * DV
+      O5 := O5 + PSI(K) * F2P * DV
+    ENDDO
+    O1 := O1 / SQRT(NFS)
+    O2 := O2 / SQRT(NFA)
+    O3 := O3 / SQRT(NF1)
+    O4 := O4 / SQRT(NF2)
+    O5 := O5 / SQRT(NF3)
+    WRITE(*, "OVL %.2f %d %.8f %.8f %.8f %.8f %.8f") &
+      RLIST(IR), IP, O1, O2, O3, O4, O5
+  ENDDO
+ENDDO
+
+WRITE(*, "DONE")
+STOP
