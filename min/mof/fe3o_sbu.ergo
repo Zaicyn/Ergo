@@ -1,0 +1,351 @@
+! ════════════════════════════════════════════════════════════════════
+! FE3O SBU — MOF-235 oxo-centered Fe3 trimer (trimer PME port)
+! ════════════════════════════════════════════════════════════════════
+!
+! Spin sector: 3 x S=5/2 Fe(III), H = -2J sum Si.Sj, J = -25 cm^-1
+! (AF). The equilateral trimer is exactly E(S_T) = -J [S_T(S_T+1)
+! - 3 s(s+1)], multiplicities from fe3o_ed.py (ED oracle, 216 states).
+!
+!   LADDER — multiplet energies + degeneracies (structure oracle)
+!   CANON  — canonical chi_mT / mu_eff per Fe vs T (Boltzmann sums)
+!   PME    — Pauli master equation over the 8 multiplet levels, bath
+!            transitions adjacent S_T with detailed balance. Steady
+!            state must equal CANON (the "PME ladder vs ED ladder"
+!            oracle: disagreement => PME wrong).
+!   MV     — the trimer_pme port: 8 charge states of the mixed-valence
+!            Fe3 (bit i = Fe2+ on site i), on-site EPS0, capacitive W.
+!            TWO baths at different chemical potentials, mirroring
+!            trimer_pme's substrate + tip:
+!              SUBSTRATE: all 3 sites, coupling GS, MU_S = 0;
+!              GATE:      site 3 only, coupling GT = 0.1 (weaker),
+!                         MU_T = +60 meV (the bias that drives the
+!                         kinetic trap — the electron piles at the
+!                         gate vertex when the intervalence channel
+!                         is closed).
+!            Intervalence transfer channel G_IT swept 1e-6..1 (the
+!            G_HOP porosity ablation analog; hop rate G_IT*f(DE) —
+!            DB-correct, see note in the rates section).
+!            LAM = vibronic stabilization of site 1 (EPS1 = EPS0-LAM).
+!            Measured per G_IT: N=1 site probabilities P1A/P1B/P1C,
+!            DELOC = 1 - sum p_i^2, and I_GATE (net current through
+!            the gate — the I_TIP analog: delocalization opens
+!            conduction through the SBU).
+!
+! Mixed-valence parameters are ASSUMED (flagged): EPS0 = -50 meV
+! (intervalence), W = 50 meV (charge repulsion), KT = 26 meV (300 K),
+! LAM = 5 meV (vibronic stabilization of site 1). BDC linkers are
+! coupling channels only (documented simplification).
+!
+! Compile from repo root: python -m core min/mof/fe3o_sbu.ergo -o <bin>
+! Determinism: fixed loops, no RNG, run twice byte-identical.
+! ════════════════════════════════════════════════════════════════════
+
+PARAMETER REAL :: J_CM = -25.0        ! cm^-1, H = -2J Si.Sj
+PARAMETER REAL :: KB_CM = 0.69503     ! k_B, cm^-1/K
+PARAMETER REAL :: G_LANDE = 2.0
+PARAMETER REAL :: CHI_CONST = 1.500592 ! NA (g muB)^2 / kB for g=2 (cgs)
+
+! multiplet level structure: S_T = (I-1)+1/2, I = 1..8
+! degeneracy of level I = MULT(I) * (2 S_T + 1)
+STATIC INTEGER :: MULT(8)
+DATA MULT / 2, 4, 6, 5, 4, 3, 2, 1 /
+
+! temperature grid (12 points, matches fe3o_ref.txt CHI rows)
+STATIC REAL :: TGRID(12)
+DATA TGRID / 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 125.0, 150.0, &
+  175.0, 200.0, 250.0 /
+
+! spin-PME bath
+PARAMETER REAL :: G0 = 0.01           ! bath rate unit (arb.)
+PARAMETER REAL :: DT_SPIN = 5.0       ! Euler step (max rate 0.075)
+PARAMETER INTEGER :: NSPIN = 4000     ! -> t = 20000 >> tau
+
+! mixed-valence parameters (ASSUMED — see header)
+PARAMETER REAL :: EPS0 = 30.0         ! intervalence on-site (meV); set
+                                      ! ABOVE MU_S so the substrate only
+                                      ! removes (trimer_pme structure:
+                                      ! in via gate, out via substrate)
+PARAMETER REAL :: W_COUL = 50.0       ! charge-charge coupling (meV)
+PARAMETER REAL :: KT = 26.0           ! 300 K (meV)
+PARAMETER REAL :: LAM = 5.0           ! vibronic pinning on site 1 (meV)
+PARAMETER REAL :: GS = 1.0            ! substrate coupling (rate unit)
+PARAMETER REAL :: GT = 0.5            ! gate coupling (GT < GS, tip-like)
+PARAMETER REAL :: MU = 0.0            ! substrate chemical potential MU_S
+PARAMETER REAL :: MU_T = 150.0        ! gate chemical potential (bias, meV)
+PARAMETER REAL :: DT_MV = 0.05
+PARAMETER INTEGER :: NMV = 1000000  ! -> t = 50000 (deep-trap converged)
+
+STATIC REAL :: EN(8), DEG(8)
+STATIC REAL :: P(8), PNEW(8)
+STATIC REAL :: E_MV(8), RS(8, 8), RH(8, 8)
+STATIC REAL :: ST_S
+
+INTEGER :: I, K, S, SP, SA, SB, S0, N1, N2, N3, IG
+REAL :: T, Z, CHI, MU_F, X1, X2, G_IT, RATE, DE, W1, W2, W3
+REAL :: P1A, P1B, P1C, DELOC
+
+! ════════════════════════════════════════════════════════════════════
+! LADDER + CANON
+! ════════════════════════════════════════════════════════════════════
+
+DO I = 1, 8
+  ST_S := REAL(I) - 0.5
+  EN(I) := -J_CM * (ST_S * (ST_S + 1.0) - 26.25)
+  DEG(I) := REAL(MULT(I)) * (2.0 * ST_S + 1.0)
+  WRITE(*, "LADDER %d %.4f %.10f %d") I, ST_S, EN(I), MULT(I)
+ENDDO
+
+DO K = 1, 12
+  T := TGRID(K)
+  Z := 0.0
+  X2 := 0.0
+  DO I = 1, 8
+    X1 := DEG(I) * EXP(-(EN(I) - EN(1)) / (KB_CM * T))
+    Z := Z + X1
+    ST_S := REAL(I) - 0.5
+    X2 := X2 + X1 * ST_S * (ST_S + 1.0) / 3.0
+  ENDDO
+  CHI := CHI_CONST * X2 / Z
+  MU_F := 2.828 * SQRT(CHI / 3.0)
+  WRITE(*, "CANON %.1f %.10f %.10f") T, CHI, MU_F
+ENDDO
+
+! ════════════════════════════════════════════════════════════════════
+! PME — Pauli master equation over multiplet levels
+! ════════════════════════════════════════════════════════════════════
+! Rates (detailed balance by construction):
+!   down: R(i -> i-1) = G0 * S_i
+!   up:   R(i-1 -> i) = G0 * S_i * (DEG(i)/DEG(i-1)) * exp(-D/kT)
+! with D = EN(i) - EN(i-1) = -2J*S_i. Steady:
+! P_i propto DEG(i) exp(-EN(i)/kT)  (verified against CANON).
+! The whole Boltzmann factor sits in the up rate (max rate = G0*7.5
+! = 0.075), keeping the Euler integrator stable at all T.
+
+DO K = 1, 12
+  T := TGRID(K)
+  ! init uniform
+  DO I = 1, 8
+    P(I) := 0.125
+  ENDDO
+  DO S = 1, NSPIN
+    DO I = 1, 8
+      PNEW(I) := P(I)
+    ENDDO
+    DO I = 2, 8
+      ST_S := REAL(I) - 0.5
+      DE := EN(I) - EN(I - 1)
+      RATE := G0 * ST_S
+      PNEW(I) := PNEW(I) - DT_SPIN * RATE * P(I)
+      PNEW(I - 1) := PNEW(I - 1) + DT_SPIN * RATE * P(I)
+      RATE := G0 * ST_S * (DEG(I) / DEG(I - 1)) &
+        * EXP(-DE / (KB_CM * T))
+      PNEW(I - 1) := PNEW(I - 1) - DT_SPIN * RATE * P(I - 1)
+      PNEW(I) := PNEW(I) + DT_SPIN * RATE * P(I - 1)
+    ENDDO
+    DO I = 1, 8
+      P(I) := PNEW(I)
+    ENDDO
+  ENDDO
+  X2 := 0.0
+  Z := 0.0
+  DO I = 1, 8
+    ST_S := REAL(I) - 0.5
+    X2 := X2 + P(I) * ST_S * (ST_S + 1.0) / 3.0
+    Z := Z + P(I)
+  ENDDO
+  CHI := CHI_CONST * X2 / Z
+  MU_F := 2.828 * SQRT(CHI / 3.0)
+  ! also dump steady-state populations for the DB check
+  DO I = 1, 8
+    WRITE(*, "PMEPOP %.1f %d %.10f") T, I, P(I)
+  ENDDO
+  WRITE(*, "PME %.1f %.10f %.10f") T, CHI, MU_F
+ENDDO
+
+! ════════════════════════════════════════════════════════════════════
+! MV — mixed-valence charge-state PME (the trimer_pme port)
+! ════════════════════════════════════════════════════════════════════
+! 8 states: bit i = Fe2+ on site i. Site energies: EPS0, site 1 pinned
+! by LAM. E = sum eps_i n_i + W sum n_i n_j. Reservoir add/remove via
+! Fermi; intervalence hop a -> b at rate G_IT * f(-DE).
+
+DO IG = 0, 7
+  G_IT := (0.000001) * (10.0 ** IG)   ! 1e-6 .. 10 (trap -> delocalized)
+
+  ! energies
+  DO S = 1, 8
+    S0 := S - 1
+    N1 := IAND(S0, 1)
+    N2 := IAND(ISHFT(S0, -1), 1)
+    N3 := IAND(ISHFT(S0, -2), 1)
+    E_MV(S) := (EPS0 - LAM) * REAL(N1) + EPS0 * REAL(N2) &
+      + EPS0 * REAL(N3) &
+      + W_COUL * REAL(N1 * N2 + N1 * N3 + N2 * N3)
+  ENDDO
+
+  ! reservoir rates: SUBSTRATE on every site (GS, MU_S=0);
+  ! GATE bath on site 3 only (GT, MU_T)
+  DO S = 1, 8
+    DO SP = 1, 8
+      RS(S, SP) := 0.0
+      RH(S, SP) := 0.0
+    ENDDO
+  ENDDO
+  DO S = 1, 8
+    S0 := S - 1
+    DO SA = 1, 3
+      SP := IEOR(S0, ISHFT(1, SA - 1)) + 1
+      DE := E_MV(SP) - E_MV(S)
+      IF IAND(S0, ISHFT(1, SA - 1)) == 0 THEN
+        ! substrate add: GS * f(DE - MU_S)
+        X1 := DE - MU
+        IF X1 / KT > 50.0 THEN
+          X2 := 0.0
+        ELSEIF X1 / KT < -50.0 THEN
+          X2 := 1.0
+        ELSE
+          X2 := 1.0 / (1.0 + EXP(X1 / KT))
+        ENDIF
+        RS(S, SP) := RS(S, SP) + GS * X2
+        IF SA == 3 THEN
+          ! gate add: GT * f(DE - MU_T)
+          X1 := DE - MU_T
+          IF X1 / KT > 50.0 THEN
+            X2 := 0.0
+          ELSEIF X1 / KT < -50.0 THEN
+            X2 := 1.0
+          ELSE
+            X2 := 1.0 / (1.0 + EXP(X1 / KT))
+          ENDIF
+          RS(S, SP) := RS(S, SP) + GT * X2
+        ENDIF
+      ELSE
+        ! substrate remove: GS * (1 - f(-DE - MU_S))
+        X1 := 0.0 - DE - MU
+        IF X1 / KT > 50.0 THEN
+          X2 := 0.0
+        ELSEIF X1 / KT < -50.0 THEN
+          X2 := 1.0
+        ELSE
+          X2 := 1.0 / (1.0 + EXP(X1 / KT))
+        ENDIF
+        RS(S, SP) := RS(S, SP) + GS * (1.0 - X2)
+        IF SA == 3 THEN
+          ! gate remove: GT * (1 - f(-DE - MU_T))
+          X1 := 0.0 - DE - MU_T
+          IF X1 / KT > 50.0 THEN
+            X2 := 0.0
+          ELSEIF X1 / KT < -50.0 THEN
+            X2 := 1.0
+          ELSE
+            X2 := 1.0 / (1.0 + EXP(X1 / KT))
+          ENDIF
+          RS(S, SP) := RS(S, SP) + GT * (1.0 - X2)
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! intervalence hops a -> b, rate G_IT * f(DE)  (DE = E(to) - E(from);
+  ! f(DE) = 1/(1+exp(DE/kT)): downhill fast, uphill suppressed
+  ! exp(-DE/kT). NOTE: the porosity channel in min/trimer_pme.ergo
+  ! uses f(-DE) with the comment "detailed-balance preserving" —
+  ! that form favors UPHILL moves (anti-Boltzmann); f(DE) is the
+  ! DB-correct form (verified: PME steady == canonical Boltzmann).
+  DO S = 1, 8
+    S0 := S - 1
+    DO SA = 1, 3
+      DO SB = 1, 3
+        IF SA /= SB THEN
+          IF IAND(S0, ISHFT(1, SA - 1)) /= 0 THEN
+            IF IAND(S0, ISHFT(1, SB - 1)) == 0 THEN
+              SP := IEOR(IEOR(S0, ISHFT(1, SA - 1)), &
+                         ISHFT(1, SB - 1)) + 1
+              DE := E_MV(SP) - E_MV(S)
+              X1 := DE
+              IF X1 / KT > 50.0 THEN
+                X2 := 0.0
+              ELSEIF X1 / KT < -50.0 THEN
+                X2 := 1.0
+              ELSE
+                X2 := 1.0 / (1.0 + EXP(X1 / KT))
+              ENDIF
+              RH(S, SP) := RH(S, SP) + G_IT * X2
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDDO
+  ENDDO
+
+  ! integrate to steady state
+  DO S = 1, 8
+    P(S) := 0.125
+  ENDDO
+  DO S = 1, NMV
+    DO SP = 1, 8
+      PNEW(SP) := P(SP)
+    ENDDO
+    DO SA = 1, 8
+      DO SB = 1, 8
+        RATE := RS(SA, SB) + RH(SA, SB)
+        IF RATE /= 0.0 THEN
+          PNEW(SA) := PNEW(SA) - DT_MV * RATE * P(SA)
+          PNEW(SB) := PNEW(SB) + DT_MV * RATE * P(SA)
+        ENDIF
+      ENDDO
+    ENDDO
+    DO SA = 1, 8
+      P(SA) := PNEW(SA)
+    ENDDO
+  ENDDO
+
+  ! measure: net gate current (gate-bath adds minus removes at site 3)
+  W3 := 0.0
+  DO S = 1, 8
+    S0 := S - 1
+    IF IAND(S0, ISHFT(1, 2)) == 0 THEN
+      SP := IEOR(S0, ISHFT(1, 2)) + 1
+      DE := E_MV(SP) - E_MV(S)
+      X1 := DE - MU_T
+      IF X1 / KT > 50.0 THEN
+        X2 := 0.0
+      ELSEIF X1 / KT < -50.0 THEN
+        X2 := 1.0
+      ELSE
+        X2 := 1.0 / (1.0 + EXP(X1 / KT))
+      ENDIF
+      W3 := W3 + P(S) * GT * X2
+    ELSE
+      SP := IEOR(S0, ISHFT(1, 2)) + 1
+      DE := E_MV(SP) - E_MV(S)
+      X1 := 0.0 - DE - MU_T
+      IF X1 / KT > 50.0 THEN
+        X2 := 0.0
+      ELSEIF X1 / KT < -50.0 THEN
+        X2 := 1.0
+      ELSE
+        X2 := 1.0 / (1.0 + EXP(X1 / KT))
+      ENDIF
+      W3 := W3 - P(S) * GT * (1.0 - X2)
+    ENDIF
+  ENDDO
+
+  ! measure: N=1 sector site probabilities (states 2,3,5)
+  W1 := P(2) + P(3) + P(5)
+  IF W1 > 1.0e-12 THEN
+    P1A := P(2) / W1
+    P1B := P(3) / W1
+    P1C := P(5) / W1
+  ELSE
+    P1A := 0.0
+    P1B := 0.0
+    P1C := 0.0
+  ENDIF
+  DELOC := 1.0 - (P1A * P1A + P1B * P1B + P1C * P1C)
+  WRITE(*, "MV %.1E %.4f %.4f %.4f %.4f %.6f %.4f") &
+    G_IT, P1A, P1B, P1C, DELOC, W3, W1
+ENDDO
+
+WRITE(*, "DONE")
+STOP
