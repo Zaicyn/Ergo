@@ -134,3 +134,14 @@ would want the sparse/ED-engine route).
 - `min/mof/mof235_framework.py` — Stage-2 2-SBU ED + oracles.
 - `min/mof/mof5_geometry.py` — Stage-3 geometric model.
 - `min/mof/MOF_FINDINGS.md` — this file.
+
+## Postscript — trimer_pme.ergo rate inversion FIXED
+
+The flagged anti-Boltzmann porosity channel (`FERMI(0.0 - DE)` favoring
+uphill hops) is fixed in `min/trimer_pme.ergo` (`FERMI(DE)`); the
+original is preserved as `min/trimer_pme_orig.ergo`. Rate-level oracle:
+with the tip over site 1 (E2 = −29.25, E3 = −59.65 meV), the fixed
+RH(2,3) = 1.0 / RH(3,2) = 0 (downhill favored) vs the original's exact
+inverse. Behavioral effect at G_HOP = 1.0: trapped w_singlet drains to
+~0.006–0.009 (was ~0.019–0.028 with the inverted channel). Conclusions
+drawn from the original POROSITY ablation should be re-evaluated.

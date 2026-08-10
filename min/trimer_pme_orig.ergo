@@ -30,12 +30,10 @@
 ! trapped manifold = the "w component" in redirect language).
 !
 ! POROSITY ABLATION: G_HOP adds a weak direct inter-site channel
-! (electron moves site a -> b, rate G_HOP * f(DE), detailed-balance
-! preserving — CORRECTED: was f(-DE), which favored uphill hops
-! (anti-Boltzmann; caught during the MOF campaign, see
-! min/mof/MOF_FINDINGS.md). The paper's model has G_HOP ~ 0; sweeping
-! it tests whether the trapped population drains and the NDC washes
-! out when the "forbidden" transitions become porous.
+! (electron moves site a -> b, rate G_HOP * f(-DE), detailed-balance
+! preserving). The paper's model has G_HOP ~ 0; sweeping it tests
+! whether the trapped population drains and the NDC washes out when
+! the "forbidden" transitions become porous.
 !
 ! ════════════════════════════════════════════════════════════════════
 
@@ -332,8 +330,7 @@ SUBROUTINE COMPUTE_RATES()
   ENDDO
 
   ! Direct inter-site hops (porosity): electron moves SA -> SB.
-  ! Rate G_HOP * f(DE) preserves detailed balance:
-  !   f(DE)/f(-DE) = exp(-DE/KT)  [was f(-DE) = anti-Boltzmann]
+  ! Rate G_HOP * f(-DE) preserves detailed balance with the bath.
   DO S = 1, 8
     S0 := S - 1
     DO SA = 1, 3
@@ -344,7 +341,7 @@ SUBROUTINE COMPUTE_RATES()
               SP := IEOR(IEOR(S0, ISHFT(1, SA - 1)), &
                          ISHFT(1, SB - 1)) + 1
               DE := ENERGY(SP) - ENERGY(S)
-              RH(S, SP) := RH(S, SP) + G_HOP * FERMI(DE)
+              RH(S, SP) := RH(S, SP) + G_HOP * FERMI(0.0 - DE)
             ENDIF
           ENDIF
         ENDIF
