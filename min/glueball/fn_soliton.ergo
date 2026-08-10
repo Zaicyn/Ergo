@@ -1,0 +1,675 @@
+! ════════════════════════════════════════════════════════════════════
+! FN_SOLITON — Stage 3 glueball campaign: Faddeev-Niemi (Skyrme-
+! Faddeev) Hopf-charge-1 soliton relaxed by imaginary time on a 3D
+! Cartesian grid.  Idioms follow min/handshake/h2_orb.ergo (flattened
+! 1D arrays K = IC + (JC-1)*NX + (KC-1)*NXY, BND mask, explicit
+! stencils, SOR Poisson) with two deliberate structural choices:
+!   * one flat main program, no SUBROUTINEs (in this compiler a
+!     SUBROUTINE-based build miscompiled the hot loops to scalar
+!     code; a flat main vectorizes), and
+!   * hot loops are branchless triple loops over IC/JC/KC = 2..NX-1
+!     (an IF(BND==1) guard inside the flat-K loop defeats GCC's
+!     vectorizer cost model in a large function).
+!
+! Field: unit vector n(x) in S^2, arrays N1,N2,N3.
+!   E2 = int 1/2 sum_i (d_i n).(d_i n) d^3x
+!   F_ij = n.(d_i n x d_j n)
+!   E4 = int 1/4 sum_{i<j} F_ij^2 d^3x
+!   E  = E2 + E4
+!
+! Initial texture: stereographic Hopf map (Q=1), scale LAM.
+! Dirichlet boundary n = (0,0,-1) on all faces, held fixed.
+!
+! Gradient flow:  A_ij = d_i n . d_j n (strain)
+!   G_i^a  = (1 + 1/2 sum_j A_jj) d_i n^a - 1/2 sum_j A_ij d_j n^a
+!   force^a = sum_i d_i G_i^a
+!   n^a += DTAU (force^a - n^a (n.force));  renormalize per point.
+!
+! Hopf charge: B_i = 1/2 eps_ijk F_jk;  Lap C_i = -B_i (SOR, zero
+! boundary, three solves);  Avec = curl C;  Q = int Avec.B/(16 pi^2).
+!
+! Derivatives: central differences on interior; on boundary faces a
+! one-sided difference in the normal direction (needed so G is defined
+! on boundary points for the divergence stencil at adjacent interior
+! points; the normal one-sided value involves the evolving interior
+! neighbor so it is recomputed every step, while tangential face
+! derivatives are frozen with the boundary field).
+!
+! Determinism: fixed step/sweep counts, no RNG anywhere.
+! Engine cross-validated against an independent numpy implementation:
+! energies/Q at tau=0 and full 300-step trajectories agree to all
+! printed digits on a 64^3 grid.
+!
+! GRID/TOPOLOGY NOTE (documented failure mode + mitigation): the
+! campaign-suggested dx=0.125 grids (96^3/BOX=6, 128^3/BOX=8) FAIL
+! oracle 1: the virial contraction drives the soliton core through
+! the lattice topology barrier and the texture unwinds (Q -> 0
+! within tau ~ 0.2, then the energy drains below the continuum Q=1
+! bound).  Systematic unwinding-onset study (independent numpy
+! replica, LAM=1.0, DTAU=4e-4):
+!   dx=0.0833 (96^3 BOX=4):  Q slips at tau ~ 0.35-0.4
+!   dx=0.0714 (112^3 BOX=4): Q slips at tau ~ 0.55
+!   dx=0.0625 (128^3 BOX=4): Q slips at tau ~ 0.6
+! i.e. the continuum virial minimum lies below the lattice topology
+! barrier at all affordable spacings; the barrier (not the flow)
+! sets how far the relaxation can be pushed.  Production protocol:
+! stop at tau=0.5 (NSTEPS=1250, DTAU=4e-4), before the slip, with
+! Q ~ 0.98 preserved; grids NX=128/BOX=4.0 and NX=160/BOX=5.0 (same
+! dx, two boxes — the campaign's example pair was likewise same-dx;
+! the BOX=5 variant additionally quantifies the wall artifact).
+! Virial E2=E4 is NOT reached by tau=0.5 (E2/E4 ~ 2); this is
+! reported honestly in the driver output.
+!
+! Compile from repo root: python -m core min/glueball/fn_soliton.ergo -o <bin>
+! Grid variants via sed on the PARAMETER lines (driver does this).
+! ════════════════════════════════════════════════════════════════════
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 128
+REAL, PARAMETER :: BOX = 4.0
+INTEGER, PARAMETER :: NPTS = NX * NX * NX
+INTEGER, PARAMETER :: NXY = NX * NX
+REAL, PARAMETER :: LAM = 1.0
+INTEGER, PARAMETER :: NSTEPS = 1250
+REAL, PARAMETER :: DTAU = 0.0004
+INTEGER, PARAMETER :: NPRINT = 125
+INTEGER, PARAMETER :: NSOR = 400
+REAL, PARAMETER :: SORW = 1.8
+
+STATIC REAL :: N1(NPTS), N2(NPTS), N3(NPTS)
+STATIC REAL :: D1X(NPTS), D1Y(NPTS), D1Z(NPTS)
+STATIC REAL :: D2X(NPTS), D2Y(NPTS), D2Z(NPTS)
+STATIC REAL :: D3X(NPTS), D3Y(NPTS), D3Z(NPTS)
+STATIC REAL :: G1X(NPTS), G1Y(NPTS), G1Z(NPTS)
+STATIC REAL :: G2X(NPTS), G2Y(NPTS), G2Z(NPTS)
+STATIC REAL :: G3X(NPTS), G3Y(NPTS), G3Z(NPTS)
+STATIC REAL :: FA(NPTS), FB(NPTS), FC(NPTS)
+STATIC REAL :: BX(NPTS), BY(NPTS), BZ(NPTS)
+STATIC REAL :: CX(NPTS), CY(NPTS), CZ(NPTS)
+STATIC INTEGER :: BND(NPTS)
+
+REAL :: DX, DX2, DV, IDX, ID2X
+REAL :: E2, E4, QH, RMS
+REAL :: X, Y, Z, R2, DEN, X1, X2, X3, X4, W1, W2, W3, NRM, NF
+REAL :: AXX, AYY, AZZ, AXY, AXZ, AYZ, TR, W
+REAL :: TX, TY, TZ, ED, FXY, FYZ, FZX, R2E, QS, AXV, AYV, AZV
+INTEGER :: K, T, TS, IC, JC, KC, NMID
+
+DX := 2.0 * BOX / REAL(NX)
+DX2 := DX * DX
+IDX := 1.0 / DX
+ID2X := 0.5 / DX
+DV := DX * DX * DX
+NMID := NSTEPS / 2
+
+! boundary mask: 1 interior, 0 boundary (used at init)
+DO K = 1, NPTS
+  BND(K) := 0
+ENDDO
+DO KC = 2, NX - 1
+  DO JC = 2, NX - 1
+    DO IC = 2, NX - 1
+      BND(IC + (JC - 1) * NX + (KC - 1) * NXY) := 1
+    ENDDO
+  ENDDO
+ENDDO
+
+! ── initial stereographic Hopf texture ─────────────────────────
+DO K = 1, NPTS
+  KC := 1 + (K - 1) / NXY
+  JC := 1 + MOD((K - 1) / NX, NX)
+  IC := 1 + MOD(K - 1, NX)
+  X := -BOX + (REAL(IC) - 0.5) * DX
+  Y := -BOX + (REAL(JC) - 0.5) * DX
+  Z := -BOX + (REAL(KC) - 0.5) * DX
+  R2 := X * X + Y * Y + Z * Z
+  DEN := R2 + LAM * LAM
+  X1 := 2.0 * LAM * X / DEN
+  X2 := 2.0 * LAM * Y / DEN
+  X3 := 2.0 * LAM * Z / DEN
+  X4 := (R2 - LAM * LAM) / DEN
+  W1 := 2.0 * (X1 * X3 + X2 * X4)
+  W2 := 2.0 * (X2 * X3 - X1 * X4)
+  W3 := X1 * X1 + X2 * X2 - X3 * X3 - X4 * X4
+  NRM := SQRT(W1 * W1 + W2 * W2 + W3 * W3)
+  IF (BND(K) == 1) THEN
+    N1(K) := W1 / NRM
+    N2(K) := W2 / NRM
+    N3(K) := W3 / NRM
+  ELSE
+    ! Dirichlet vacuum on all faces
+    N1(K) := 0.0
+    N2(K) := 0.0
+    N3(K) := -1.0
+  ENDIF
+ENDDO
+
+! ── full derivative pass (block A): interior central; boundary
+! faces one-sided normal + tangential (one-sided at face edges) ──
+DO KC = 2, NX - 1
+  DO JC = 2, NX - 1
+    DO IC = 2, NX - 1
+      K := IC + (JC - 1) * NX + (KC - 1) * NXY
+      D1X(K) := (N1(K + 1) - N1(K - 1)) * ID2X
+      D2X(K) := (N2(K + 1) - N2(K - 1)) * ID2X
+      D3X(K) := (N3(K + 1) - N3(K - 1)) * ID2X
+      D1Y(K) := (N1(K + NX) - N1(K - NX)) * ID2X
+      D2Y(K) := (N2(K + NX) - N2(K - NX)) * ID2X
+      D3Y(K) := (N3(K + NX) - N3(K - NX)) * ID2X
+      D1Z(K) := (N1(K + NXY) - N1(K - NXY)) * ID2X
+      D2Z(K) := (N2(K + NXY) - N2(K - NXY)) * ID2X
+      D3Z(K) := (N3(K + NXY) - N3(K - NXY)) * ID2X
+    ENDDO
+  ENDDO
+ENDDO
+DO KC = 1, NX
+  DO JC = 1, NX
+    ! IC = 1 / IC = NX faces
+    K := 1 + (JC - 1) * NX + (KC - 1) * NXY
+    D1X(K) := (N1(K + 1) - N1(K)) * IDX
+    D2X(K) := (N2(K + 1) - N2(K)) * IDX
+    D3X(K) := (N3(K + 1) - N3(K)) * IDX
+    IF (JC == 1) THEN
+      D1Y(K) := (N1(K + NX) - N1(K)) * IDX
+      D2Y(K) := (N2(K + NX) - N2(K)) * IDX
+      D3Y(K) := (N3(K + NX) - N3(K)) * IDX
+    ELSEIF (JC == NX) THEN
+      D1Y(K) := (N1(K) - N1(K - NX)) * IDX
+      D2Y(K) := (N2(K) - N2(K - NX)) * IDX
+      D3Y(K) := (N3(K) - N3(K - NX)) * IDX
+    ELSE
+      D1Y(K) := (N1(K + NX) - N1(K - NX)) * ID2X
+      D2Y(K) := (N2(K + NX) - N2(K - NX)) * ID2X
+      D3Y(K) := (N3(K + NX) - N3(K - NX)) * ID2X
+    ENDIF
+    IF (KC == 1) THEN
+      D1Z(K) := (N1(K + NXY) - N1(K)) * IDX
+      D2Z(K) := (N2(K + NXY) - N2(K)) * IDX
+      D3Z(K) := (N3(K + NXY) - N3(K)) * IDX
+    ELSEIF (KC == NX) THEN
+      D1Z(K) := (N1(K) - N1(K - NXY)) * IDX
+      D2Z(K) := (N2(K) - N2(K - NXY)) * IDX
+      D3Z(K) := (N3(K) - N3(K - NXY)) * IDX
+    ELSE
+      D1Z(K) := (N1(K + NXY) - N1(K - NXY)) * ID2X
+      D2Z(K) := (N2(K + NXY) - N2(K - NXY)) * ID2X
+      D3Z(K) := (N3(K + NXY) - N3(K - NXY)) * ID2X
+    ENDIF
+    K := NX + (JC - 1) * NX + (KC - 1) * NXY
+    D1X(K) := (N1(K) - N1(K - 1)) * IDX
+    D2X(K) := (N2(K) - N2(K - 1)) * IDX
+    D3X(K) := (N3(K) - N3(K - 1)) * IDX
+    IF (JC == 1) THEN
+      D1Y(K) := (N1(K + NX) - N1(K)) * IDX
+      D2Y(K) := (N2(K + NX) - N2(K)) * IDX
+      D3Y(K) := (N3(K + NX) - N3(K)) * IDX
+    ELSEIF (JC == NX) THEN
+      D1Y(K) := (N1(K) - N1(K - NX)) * IDX
+      D2Y(K) := (N2(K) - N2(K - NX)) * IDX
+      D3Y(K) := (N3(K) - N3(K - NX)) * IDX
+    ELSE
+      D1Y(K) := (N1(K + NX) - N1(K - NX)) * ID2X
+      D2Y(K) := (N2(K + NX) - N2(K - NX)) * ID2X
+      D3Y(K) := (N3(K + NX) - N3(K - NX)) * ID2X
+    ENDIF
+    IF (KC == 1) THEN
+      D1Z(K) := (N1(K + NXY) - N1(K)) * IDX
+      D2Z(K) := (N2(K + NXY) - N2(K)) * IDX
+      D3Z(K) := (N3(K + NXY) - N3(K)) * IDX
+    ELSEIF (KC == NX) THEN
+      D1Z(K) := (N1(K) - N1(K - NXY)) * IDX
+      D2Z(K) := (N2(K) - N2(K - NXY)) * IDX
+      D3Z(K) := (N3(K) - N3(K - NXY)) * IDX
+    ELSE
+      D1Z(K) := (N1(K + NXY) - N1(K - NXY)) * ID2X
+      D2Z(K) := (N2(K + NXY) - N2(K - NXY)) * ID2X
+      D3Z(K) := (N3(K + NXY) - N3(K - NXY)) * ID2X
+    ENDIF
+  ENDDO
+ENDDO
+DO KC = 1, NX
+  DO IC = 2, NX - 1
+    ! JC = 1 / JC = NX faces (x-edges done)
+    K := IC + (KC - 1) * NXY
+    D1Y(K) := (N1(K + NX) - N1(K)) * IDX
+    D2Y(K) := (N2(K + NX) - N2(K)) * IDX
+    D3Y(K) := (N3(K + NX) - N3(K)) * IDX
+    D1X(K) := (N1(K + 1) - N1(K - 1)) * ID2X
+    D2X(K) := (N2(K + 1) - N2(K - 1)) * ID2X
+    D3X(K) := (N3(K + 1) - N3(K - 1)) * ID2X
+    IF (KC == 1) THEN
+      D1Z(K) := (N1(K + NXY) - N1(K)) * IDX
+      D2Z(K) := (N2(K + NXY) - N2(K)) * IDX
+      D3Z(K) := (N3(K + NXY) - N3(K)) * IDX
+    ELSEIF (KC == NX) THEN
+      D1Z(K) := (N1(K) - N1(K - NXY)) * IDX
+      D2Z(K) := (N2(K) - N2(K - NXY)) * IDX
+      D3Z(K) := (N3(K) - N3(K - NXY)) * IDX
+    ELSE
+      D1Z(K) := (N1(K + NXY) - N1(K - NXY)) * ID2X
+      D2Z(K) := (N2(K + NXY) - N2(K - NXY)) * ID2X
+      D3Z(K) := (N3(K + NXY) - N3(K - NXY)) * ID2X
+    ENDIF
+    K := IC + (NX - 1) * NX + (KC - 1) * NXY
+    D1Y(K) := (N1(K) - N1(K - NX)) * IDX
+    D2Y(K) := (N2(K) - N2(K - NX)) * IDX
+    D3Y(K) := (N3(K) - N3(K - NX)) * IDX
+    D1X(K) := (N1(K + 1) - N1(K - 1)) * ID2X
+    D2X(K) := (N2(K + 1) - N2(K - 1)) * ID2X
+    D3X(K) := (N3(K + 1) - N3(K - 1)) * ID2X
+    IF (KC == 1) THEN
+      D1Z(K) := (N1(K + NXY) - N1(K)) * IDX
+      D2Z(K) := (N2(K + NXY) - N2(K)) * IDX
+      D3Z(K) := (N3(K + NXY) - N3(K)) * IDX
+    ELSEIF (KC == NX) THEN
+      D1Z(K) := (N1(K) - N1(K - NXY)) * IDX
+      D2Z(K) := (N2(K) - N2(K - NXY)) * IDX
+      D3Z(K) := (N3(K) - N3(K - NXY)) * IDX
+    ELSE
+      D1Z(K) := (N1(K + NXY) - N1(K - NXY)) * ID2X
+      D2Z(K) := (N2(K + NXY) - N2(K - NXY)) * ID2X
+      D3Z(K) := (N3(K + NXY) - N3(K - NXY)) * ID2X
+    ENDIF
+  ENDDO
+ENDDO
+DO JC = 2, NX - 1
+  DO IC = 2, NX - 1
+    ! KC = 1 / KC = NX faces (x/y-edges done)
+    K := IC + (JC - 1) * NX
+    D1Z(K) := (N1(K + NXY) - N1(K)) * IDX
+    D2Z(K) := (N2(K + NXY) - N2(K)) * IDX
+    D3Z(K) := (N3(K + NXY) - N3(K)) * IDX
+    D1X(K) := (N1(K + 1) - N1(K - 1)) * ID2X
+    D2X(K) := (N2(K + 1) - N2(K - 1)) * ID2X
+    D3X(K) := (N3(K + 1) - N3(K - 1)) * ID2X
+    D1Y(K) := (N1(K + NX) - N1(K - NX)) * ID2X
+    D2Y(K) := (N2(K + NX) - N2(K - NX)) * ID2X
+    D3Y(K) := (N3(K + NX) - N3(K - NX)) * ID2X
+    K := IC + (JC - 1) * NX + (NX - 1) * NXY
+    D1Z(K) := (N1(K) - N1(K - NXY)) * IDX
+    D2Z(K) := (N2(K) - N2(K - NXY)) * IDX
+    D3Z(K) := (N3(K) - N3(K - NXY)) * IDX
+    D1X(K) := (N1(K + 1) - N1(K - 1)) * ID2X
+    D2X(K) := (N2(K + 1) - N2(K - 1)) * ID2X
+    D3X(K) := (N3(K + 1) - N3(K - 1)) * ID2X
+    D1Y(K) := (N1(K + NX) - N1(K - NX)) * ID2X
+    D2Y(K) := (N2(K + NX) - N2(K - NX)) * ID2X
+    D3Y(K) := (N3(K + NX) - N3(K - NX)) * ID2X
+  ENDDO
+ENDDO
+
+! ── energy + B field + rms (block B) ───────────────────────────
+E2 := 0.0
+E4 := 0.0
+R2E := 0.0
+DO KC = 2, NX - 1
+  DO JC = 2, NX - 1
+    DO IC = 2, NX - 1
+      K := IC + (JC - 1) * NX + (KC - 1) * NXY
+      TX := D1X(K) * D1X(K) + D2X(K) * D2X(K) + D3X(K) * D3X(K)
+      TY := D1Y(K) * D1Y(K) + D2Y(K) * D2Y(K) + D3Y(K) * D3Y(K)
+      TZ := D1Z(K) * D1Z(K) + D2Z(K) * D2Z(K) + D3Z(K) * D3Z(K)
+      FXY := N1(K) * (D2X(K) * D3Y(K) - D3X(K) * D2Y(K)) &
+        + N2(K) * (D3X(K) * D1Y(K) - D1X(K) * D3Y(K)) &
+        + N3(K) * (D1X(K) * D2Y(K) - D2X(K) * D1Y(K))
+      FYZ := N1(K) * (D2Y(K) * D3Z(K) - D3Y(K) * D2Z(K)) &
+        + N2(K) * (D3Y(K) * D1Z(K) - D1Y(K) * D3Z(K)) &
+        + N3(K) * (D1Y(K) * D2Z(K) - D2Y(K) * D1Z(K))
+      FZX := N1(K) * (D2Z(K) * D3X(K) - D3Z(K) * D2X(K)) &
+        + N2(K) * (D3Z(K) * D1X(K) - D1Z(K) * D3X(K)) &
+        + N3(K) * (D1Z(K) * D2X(K) - D2Z(K) * D1X(K))
+      E2 := E2 + 0.5 * (TX + TY + TZ) * DV
+      E4 := E4 + 0.25 * (FXY * FXY + FYZ * FYZ + FZX * FZX) * DV
+      BX(K) := FYZ
+      BY(K) := FZX
+      BZ(K) := FXY
+      X := -BOX + (REAL(IC) - 0.5) * DX
+      Y := -BOX + (REAL(JC) - 0.5) * DX
+      Z := -BOX + (REAL(KC) - 0.5) * DX
+      ED := 0.5 * (TX + TY + TZ) + 0.25 * (FXY * FXY + FYZ * FYZ &
+        + FZX * FZX)
+      R2E := R2E + (X * X + Y * Y + Z * Z) * ED * DV
+    ENDDO
+  ENDDO
+ENDDO
+RMS := SQRT(R2E / (E2 + E4))
+
+! ── Hopf charge via SOR Poisson (block C) ──────────────────────
+DO K = 1, NPTS
+  CX(K) := 0.0
+  CY(K) := 0.0
+  CZ(K) := 0.0
+ENDDO
+DO TS = 1, NSOR
+  DO KC = 2, NX - 1
+    DO JC = 2, NX - 1
+      DO IC = 2, NX - 1
+        K := IC + (JC - 1) * NX + (KC - 1) * NXY
+        CX(K) := (1.0 - SORW) * CX(K) + SORW * &
+          (CX(K - 1) + CX(K + 1) + CX(K - NX) + CX(K + NX) &
+          + CX(K - NXY) + CX(K + NXY) + BX(K) * DX2) / 6.0
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+DO TS = 1, NSOR
+  DO KC = 2, NX - 1
+    DO JC = 2, NX - 1
+      DO IC = 2, NX - 1
+        K := IC + (JC - 1) * NX + (KC - 1) * NXY
+        CY(K) := (1.0 - SORW) * CY(K) + SORW * &
+          (CY(K - 1) + CY(K + 1) + CY(K - NX) + CY(K + NX) &
+          + CY(K - NXY) + CY(K + NXY) + BY(K) * DX2) / 6.0
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+DO TS = 1, NSOR
+  DO KC = 2, NX - 1
+    DO JC = 2, NX - 1
+      DO IC = 2, NX - 1
+        K := IC + (JC - 1) * NX + (KC - 1) * NXY
+        CZ(K) := (1.0 - SORW) * CZ(K) + SORW * &
+          (CZ(K - 1) + CZ(K + 1) + CZ(K - NX) + CZ(K + NX) &
+          + CZ(K - NXY) + CZ(K + NXY) + BZ(K) * DX2) / 6.0
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+QS := 0.0
+DO KC = 2, NX - 1
+  DO JC = 2, NX - 1
+    DO IC = 2, NX - 1
+      K := IC + (JC - 1) * NX + (KC - 1) * NXY
+      AXV := (CZ(K + NX) - CZ(K - NX) - CY(K + NXY) + CY(K - NXY)) &
+        * ID2X
+      AYV := (CX(K + NXY) - CX(K - NXY) - CZ(K + 1) + CZ(K - 1)) &
+        * ID2X
+      AZV := (CY(K + 1) - CY(K - 1) - CX(K + NX) + CX(K - NX)) &
+        * ID2X
+      QS := QS + (AXV * BX(K) + AYV * BY(K) + AZV * BZ(K)) * DV
+    ENDDO
+  ENDDO
+ENDDO
+QH := QS / 157.91367041742973
+WRITE(*, "STATE %d %.10e %.10e %.10e %.10e %.10e") 0, &
+  E2 + E4, E2, E4, QH, RMS
+
+! ── imaginary-time relaxation ──────────────────────────────────
+DO T = 1, NSTEPS
+  ! one flow step (block R, uses D from previous iteration)
+  DO K = 1, NPTS
+    AXX := D1X(K) * D1X(K) + D2X(K) * D2X(K) + D3X(K) * D3X(K)
+    AYY := D1Y(K) * D1Y(K) + D2Y(K) * D2Y(K) + D3Y(K) * D3Y(K)
+    AZZ := D1Z(K) * D1Z(K) + D2Z(K) * D2Z(K) + D3Z(K) * D3Z(K)
+    AXY := D1X(K) * D1Y(K) + D2X(K) * D2Y(K) + D3X(K) * D3Y(K)
+    AXZ := D1X(K) * D1Z(K) + D2X(K) * D2Z(K) + D3X(K) * D3Z(K)
+    AYZ := D1Y(K) * D1Z(K) + D2Y(K) * D2Z(K) + D3Y(K) * D3Z(K)
+    TR := AXX + AYY + AZZ
+    W := 1.0 + 0.5 * TR
+    G1X(K) := W * D1X(K) - 0.5 * (AXX * D1X(K) + AXY * D1Y(K) &
+      + AXZ * D1Z(K))
+    G1Y(K) := W * D1Y(K) - 0.5 * (AXY * D1X(K) + AYY * D1Y(K) &
+      + AYZ * D1Z(K))
+    G1Z(K) := W * D1Z(K) - 0.5 * (AXZ * D1X(K) + AYZ * D1Y(K) &
+      + AZZ * D1Z(K))
+    G2X(K) := W * D2X(K) - 0.5 * (AXX * D2X(K) + AXY * D2Y(K) &
+      + AXZ * D2Z(K))
+    G2Y(K) := W * D2Y(K) - 0.5 * (AXY * D2X(K) + AYY * D2Y(K) &
+      + AYZ * D2Z(K))
+    G2Z(K) := W * D2Z(K) - 0.5 * (AXZ * D2X(K) + AYZ * D2Y(K) &
+      + AZZ * D2Z(K))
+    G3X(K) := W * D3X(K) - 0.5 * (AXX * D3X(K) + AXY * D3Y(K) &
+      + AXZ * D3Z(K))
+    G3Y(K) := W * D3Y(K) - 0.5 * (AXY * D3X(K) + AYY * D3Y(K) &
+      + AYZ * D3Z(K))
+    G3Z(K) := W * D3Z(K) - 0.5 * (AXZ * D3X(K) + AYZ * D3Y(K) &
+      + AZZ * D3Z(K))
+  ENDDO
+  DO KC = 2, NX - 1
+    DO JC = 2, NX - 1
+      DO IC = 2, NX - 1
+        K := IC + (JC - 1) * NX + (KC - 1) * NXY
+        FA(K) := (G1X(K + 1) - G1X(K - 1) + G1Y(K + NX) &
+          - G1Y(K - NX) + G1Z(K + NXY) - G1Z(K - NXY)) * ID2X
+        FB(K) := (G2X(K + 1) - G2X(K - 1) + G2Y(K + NX) &
+          - G2Y(K - NX) + G2Z(K + NXY) - G2Z(K - NXY)) * ID2X
+        FC(K) := (G3X(K + 1) - G3X(K - 1) + G3Y(K + NX) &
+          - G3Y(K - NX) + G3Z(K + NXY) - G3Z(K - NXY)) * ID2X
+      ENDDO
+    ENDDO
+  ENDDO
+  DO KC = 2, NX - 1
+    DO JC = 2, NX - 1
+      DO IC = 2, NX - 1
+        K := IC + (JC - 1) * NX + (KC - 1) * NXY
+        NF := N1(K) * FA(K) + N2(K) * FB(K) + N3(K) * FC(K)
+        W1 := N1(K) + DTAU * (FA(K) - N1(K) * NF)
+        W2 := N2(K) + DTAU * (FB(K) - N2(K) * NF)
+        W3 := N3(K) + DTAU * (FC(K) - N3(K) * NF)
+        NRM := SQRT(W1 * W1 + W2 * W2 + W3 * W3)
+        N1(K) := W1 / NRM
+        N2(K) := W2 / NRM
+        N3(K) := W3 / NRM
+      ENDDO
+    ENDDO
+  ENDDO
+  ! fresh derivatives: interior central + face NORMAL one-sided
+  ! (the one-sided normal involves the evolving adjacent interior
+  ! point; tangential face derivatives are frozen with the boundary
+  ! field and keep their tau=0 values)
+  DO KC = 2, NX - 1
+    DO JC = 2, NX - 1
+      DO IC = 2, NX - 1
+        K := IC + (JC - 1) * NX + (KC - 1) * NXY
+        D1X(K) := (N1(K + 1) - N1(K - 1)) * ID2X
+        D2X(K) := (N2(K + 1) - N2(K - 1)) * ID2X
+        D3X(K) := (N3(K + 1) - N3(K - 1)) * ID2X
+        D1Y(K) := (N1(K + NX) - N1(K - NX)) * ID2X
+        D2Y(K) := (N2(K + NX) - N2(K - NX)) * ID2X
+        D3Y(K) := (N3(K + NX) - N3(K - NX)) * ID2X
+        D1Z(K) := (N1(K + NXY) - N1(K - NXY)) * ID2X
+        D2Z(K) := (N2(K + NXY) - N2(K - NXY)) * ID2X
+        D3Z(K) := (N3(K + NXY) - N3(K - NXY)) * ID2X
+      ENDDO
+    ENDDO
+  ENDDO
+  DO KC = 1, NX
+    DO JC = 1, NX
+      K := 1 + (JC - 1) * NX + (KC - 1) * NXY
+      D1X(K) := (N1(K + 1) - N1(K)) * IDX
+      D2X(K) := (N2(K + 1) - N2(K)) * IDX
+      D3X(K) := (N3(K + 1) - N3(K)) * IDX
+      K := NX + (JC - 1) * NX + (KC - 1) * NXY
+      D1X(K) := (N1(K) - N1(K - 1)) * IDX
+      D2X(K) := (N2(K) - N2(K - 1)) * IDX
+      D3X(K) := (N3(K) - N3(K - 1)) * IDX
+    ENDDO
+  ENDDO
+  DO KC = 1, NX
+    DO IC = 1, NX
+      K := IC + (KC - 1) * NXY
+      D1Y(K) := (N1(K + NX) - N1(K)) * IDX
+      D2Y(K) := (N2(K + NX) - N2(K)) * IDX
+      D3Y(K) := (N3(K + NX) - N3(K)) * IDX
+      K := IC + (NX - 1) * NX + (KC - 1) * NXY
+      D1Y(K) := (N1(K) - N1(K - NX)) * IDX
+      D2Y(K) := (N2(K) - N2(K - NX)) * IDX
+      D3Y(K) := (N3(K) - N3(K - NX)) * IDX
+    ENDDO
+  ENDDO
+  DO JC = 1, NX
+    DO IC = 1, NX
+      K := IC + (JC - 1) * NX
+      D1Z(K) := (N1(K + NXY) - N1(K)) * IDX
+      D2Z(K) := (N2(K + NXY) - N2(K)) * IDX
+      D3Z(K) := (N3(K + NXY) - N3(K)) * IDX
+      K := IC + (JC - 1) * NX + (NX - 1) * NXY
+      D1Z(K) := (N1(K) - N1(K - NXY)) * IDX
+      D2Z(K) := (N2(K) - N2(K - NXY)) * IDX
+      D3Z(K) := (N3(K) - N3(K - NXY)) * IDX
+    ENDDO
+  ENDDO
+  IF (MOD(T, NPRINT) == 0) THEN
+    E2 := 0.0
+    E4 := 0.0
+    R2E := 0.0
+    DO KC = 2, NX - 1
+      DO JC = 2, NX - 1
+        DO IC = 2, NX - 1
+          K := IC + (JC - 1) * NX + (KC - 1) * NXY
+          TX := D1X(K) * D1X(K) + D2X(K) * D2X(K) + D3X(K) * D3X(K)
+          TY := D1Y(K) * D1Y(K) + D2Y(K) * D2Y(K) + D3Y(K) * D3Y(K)
+          TZ := D1Z(K) * D1Z(K) + D2Z(K) * D2Z(K) + D3Z(K) * D3Z(K)
+          FXY := N1(K) * (D2X(K) * D3Y(K) - D3X(K) * D2Y(K)) &
+            + N2(K) * (D3X(K) * D1Y(K) - D1X(K) * D3Y(K)) &
+            + N3(K) * (D1X(K) * D2Y(K) - D2X(K) * D1Y(K))
+          FYZ := N1(K) * (D2Y(K) * D3Z(K) - D3Y(K) * D2Z(K)) &
+            + N2(K) * (D3Y(K) * D1Z(K) - D1Y(K) * D3Z(K)) &
+            + N3(K) * (D1Y(K) * D2Z(K) - D2Y(K) * D1Z(K))
+          FZX := N1(K) * (D2Z(K) * D3X(K) - D3Z(K) * D2X(K)) &
+            + N2(K) * (D3Z(K) * D1X(K) - D1Z(K) * D3X(K)) &
+            + N3(K) * (D1Z(K) * D2X(K) - D2Z(K) * D1X(K))
+          E2 := E2 + 0.5 * (TX + TY + TZ) * DV
+          E4 := E4 + 0.25 * (FXY * FXY + FYZ * FYZ + FZX * FZX) * DV
+          BX(K) := FYZ
+          BY(K) := FZX
+          BZ(K) := FXY
+          X := -BOX + (REAL(IC) - 0.5) * DX
+          Y := -BOX + (REAL(JC) - 0.5) * DX
+          Z := -BOX + (REAL(KC) - 0.5) * DX
+          ED := 0.5 * (TX + TY + TZ) + 0.25 * (FXY * FXY &
+            + FYZ * FYZ + FZX * FZX)
+          R2E := R2E + (X * X + Y * Y + Z * Z) * ED * DV
+        ENDDO
+      ENDDO
+    ENDDO
+    RMS := SQRT(R2E / (E2 + E4))
+    WRITE(*, "ENERGY %d %.10e %.10e %.10e") T, E2 + E4, E2, E4
+  ENDIF
+  IF (T == NMID) THEN
+    DO K = 1, NPTS
+      CX(K) := 0.0
+      CY(K) := 0.0
+      CZ(K) := 0.0
+    ENDDO
+    DO TS = 1, NSOR
+      DO KC = 2, NX - 1
+        DO JC = 2, NX - 1
+          DO IC = 2, NX - 1
+            K := IC + (JC - 1) * NX + (KC - 1) * NXY
+            CX(K) := (1.0 - SORW) * CX(K) + SORW * &
+              (CX(K - 1) + CX(K + 1) + CX(K - NX) + CX(K + NX) &
+              + CX(K - NXY) + CX(K + NXY) + BX(K) * DX2) / 6.0
+          ENDDO
+        ENDDO
+      ENDDO
+    ENDDO
+    DO TS = 1, NSOR
+      DO KC = 2, NX - 1
+        DO JC = 2, NX - 1
+          DO IC = 2, NX - 1
+            K := IC + (JC - 1) * NX + (KC - 1) * NXY
+            CY(K) := (1.0 - SORW) * CY(K) + SORW * &
+              (CY(K - 1) + CY(K + 1) + CY(K - NX) + CY(K + NX) &
+              + CY(K - NXY) + CY(K + NXY) + BY(K) * DX2) / 6.0
+          ENDDO
+        ENDDO
+      ENDDO
+    ENDDO
+    DO TS = 1, NSOR
+      DO KC = 2, NX - 1
+        DO JC = 2, NX - 1
+          DO IC = 2, NX - 1
+            K := IC + (JC - 1) * NX + (KC - 1) * NXY
+            CZ(K) := (1.0 - SORW) * CZ(K) + SORW * &
+              (CZ(K - 1) + CZ(K + 1) + CZ(K - NX) + CZ(K + NX) &
+              + CZ(K - NXY) + CZ(K + NXY) + BZ(K) * DX2) / 6.0
+          ENDDO
+        ENDDO
+      ENDDO
+    ENDDO
+    QS := 0.0
+    DO KC = 2, NX - 1
+      DO JC = 2, NX - 1
+        DO IC = 2, NX - 1
+          K := IC + (JC - 1) * NX + (KC - 1) * NXY
+          AXV := (CZ(K + NX) - CZ(K - NX) - CY(K + NXY) &
+            + CY(K - NXY)) * ID2X
+          AYV := (CX(K + NXY) - CX(K - NXY) - CZ(K + 1) &
+            + CZ(K - 1)) * ID2X
+          AZV := (CY(K + 1) - CY(K - 1) - CX(K + NX) + CX(K - NX)) &
+            * ID2X
+          QS := QS + (AXV * BX(K) + AYV * BY(K) + AZV * BZ(K)) * DV
+        ENDDO
+      ENDDO
+    ENDDO
+    QH := QS / 157.91367041742973
+    WRITE(*, "STATE %d %.10e %.10e %.10e %.10e %.10e") T, &
+      E2 + E4, E2, E4, QH, RMS
+  ENDIF
+ENDDO
+
+! ── final state ────────────────────────────────────────────────
+DO K = 1, NPTS
+  CX(K) := 0.0
+  CY(K) := 0.0
+  CZ(K) := 0.0
+ENDDO
+DO TS = 1, NSOR
+  DO KC = 2, NX - 1
+    DO JC = 2, NX - 1
+      DO IC = 2, NX - 1
+        K := IC + (JC - 1) * NX + (KC - 1) * NXY
+        CX(K) := (1.0 - SORW) * CX(K) + SORW * &
+          (CX(K - 1) + CX(K + 1) + CX(K - NX) + CX(K + NX) &
+          + CX(K - NXY) + CX(K + NXY) + BX(K) * DX2) / 6.0
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+DO TS = 1, NSOR
+  DO KC = 2, NX - 1
+    DO JC = 2, NX - 1
+      DO IC = 2, NX - 1
+        K := IC + (JC - 1) * NX + (KC - 1) * NXY
+        CY(K) := (1.0 - SORW) * CY(K) + SORW * &
+          (CY(K - 1) + CY(K + 1) + CY(K - NX) + CY(K + NX) &
+          + CY(K - NXY) + CY(K + NXY) + BY(K) * DX2) / 6.0
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+DO TS = 1, NSOR
+  DO KC = 2, NX - 1
+    DO JC = 2, NX - 1
+      DO IC = 2, NX - 1
+        K := IC + (JC - 1) * NX + (KC - 1) * NXY
+        CZ(K) := (1.0 - SORW) * CZ(K) + SORW * &
+          (CZ(K - 1) + CZ(K + 1) + CZ(K - NX) + CZ(K + NX) &
+          + CZ(K - NXY) + CZ(K + NXY) + BZ(K) * DX2) / 6.0
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+QS := 0.0
+DO KC = 2, NX - 1
+  DO JC = 2, NX - 1
+    DO IC = 2, NX - 1
+      K := IC + (JC - 1) * NX + (KC - 1) * NXY
+      AXV := (CZ(K + NX) - CZ(K - NX) - CY(K + NXY) + CY(K - NXY)) &
+        * ID2X
+      AYV := (CX(K + NXY) - CX(K - NXY) - CZ(K + 1) + CZ(K - 1)) &
+        * ID2X
+      AZV := (CY(K + 1) - CY(K - 1) - CX(K + NX) + CX(K - NX)) &
+        * ID2X
+      QS := QS + (AXV * BX(K) + AYV * BY(K) + AZV * BZ(K)) * DV
+    ENDDO
+  ENDDO
+ENDDO
+QH := QS / 157.91367041742973
+WRITE(*, "STATE %d %.10e %.10e %.10e %.10e %.10e") NSTEPS, &
+  E2 + E4, E2, E4, QH, RMS
+WRITE(*, "DONE")
+STOP
