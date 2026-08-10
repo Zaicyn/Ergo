@@ -1,0 +1,285 @@
+! ════════════════════════════════════════════════════════════════════
+! H2_ORB — H2 two-electron engine: 6 two-center orbitals (imaginary
+! time with Gram-Schmidt deflation) + two-electron integrals (ij|kl)
+! via SOR Poisson solves on orbital product densities.
+! ════════════════════════════════════════════════════════════════════
+!
+! Orbitals (gerade/ungerade under z -> -z; the x-multiplied ones are
+! pi_x-type, so the set mixes sigma and pi symmetry):
+!   1 sg: e1+e2        2 pg: x(e1+e2)     3 sg: z(e1-e2)
+!   1 su: e1-e2        2 pu: x(e1-e2)     3 su: z(e1+e2)
+! Each produced by imaginary-time propagation, orthogonalized against
+! all previously converged orbitals every sweep (deflation).
+!
+! Two-electron integrals (ij|kl) = int phi_ij rho_kl dV with
+! Laplace phi_ij = -4 pi rho_ij via SOR on the masked stencil,
+! boundary values from monopole + dipole moments of rho_ij.
+!
+! Determinism: fixed sweep/step counts, no RNG; twice byte-identical.
+! Compile from repo root: python -m core min/handshake/h2_orb.ergo -o <bin>
+! ════════════════════════════════════════════════════════════════════
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 128
+REAL, PARAMETER :: BOX = 16.0
+INTEGER, PARAMETER :: NPTS = 2097152
+INTEGER, PARAMETER :: NXY = 16384
+INTEGER, PARAMETER :: NORB = 6
+INTEGER, PARAMETER :: NSTEPS = 2000
+REAL, PARAMETER :: DTAU = 0.008
+INTEGER, PARAMETER :: NSOR = 400
+REAL, PARAMETER :: SORW = 1.8
+
+STATIC REAL :: RLIST(7)
+DATA RLIST / 0.5, 1.0, 1.401, 2.0, 3.0, 4.0, 6.0 /
+
+STATIC REAL :: PSI(NPTS, 6), PSIN(NPTS), V(NPTS), RHO(NPTS), PHI(NPTS)
+STATIC INTEGER :: BND(NPTS)
+STATIC REAL :: OVL(6, 6), DIP(3), QP(3)
+
+REAL :: DX, DX2, IDX2, DV, X, Y, Z, R, RZ, RL, RR
+REAL :: LAP, NRM, T_KE, V_PE, E_TOT, OV, RF, DF
+INTEGER :: I, J, K, IR, IO, JO, T, IC, JC, KC, IJ, KL
+
+DX := 2.0 * BOX / REAL(NX)
+DX2 := DX * DX
+IDX2 := 1.0 / DX2
+DV := DX * DX * DX
+
+! boundary mask
+DO K = 1, NPTS
+  BND(K) := 0
+ENDDO
+DO KC = 2, NX - 1
+  DO JC = 2, NX - 1
+    DO IC = 2, NX - 1
+      BND(IC + (JC - 1) * NX + (KC - 1) * NXY) := 1
+    ENDDO
+  ENDDO
+ENDDO
+
+DO IR = 1, 7
+  R := RLIST(IR)
+  RZ := 0.5 * R
+  ! two-center potential
+  DO K = 1, NPTS
+    KC := 1 + (K - 1) / NXY
+    JC := 1 + MOD((K - 1) / NX, NX)
+    IC := 1 + MOD(K - 1, NX)
+    X := -BOX + (REAL(IC) - 0.5) * DX
+    Y := -BOX + (REAL(JC) - 0.5) * DX
+    Z := -BOX + (REAL(KC) - 0.5) * DX
+    RL := SQRT(X * X + Y * Y + (Z - RZ) * (Z - RZ))
+    RR := SQRT(X * X + Y * Y + (Z + RZ) * (Z + RZ))
+    V(K) := -1.0 / RL - 1.0 / RR
+  ENDDO
+
+  ! ── orbital production with deflation ─────────────────────
+  DO IO = 1, NORB
+    ! initial packet per orbital type
+    DO K = 1, NPTS
+      KC := 1 + (K - 1) / NXY
+      JC := 1 + MOD((K - 1) / NX, NX)
+      IC := 1 + MOD(K - 1, NX)
+      X := -BOX + (REAL(IC) - 0.5) * DX
+      Y := -BOX + (REAL(JC) - 0.5) * DX
+      Z := -BOX + (REAL(KC) - 0.5) * DX
+      RL := SQRT(X * X + Y * Y + (Z - RZ) * (Z - RZ))
+      RR := SQRT(X * X + Y * Y + (Z + RZ) * (Z + RZ))
+      IF IO == 1 THEN
+        PSIN(K) := EXP(-(RL * RL)) + EXP(-(RR * RR))
+      ENDIF
+      IF IO == 2 THEN
+        PSIN(K) := EXP(-(RL * RL)) - EXP(-(RR * RR))
+      ENDIF
+      IF IO == 3 THEN
+        PSIN(K) := X * (EXP(-(RL * RL)) + EXP(-(RR * RR)))
+      ENDIF
+      IF IO == 4 THEN
+        PSIN(K) := X * (EXP(-(RL * RL)) - EXP(-(RR * RR)))
+      ENDIF
+      IF IO == 5 THEN
+        PSIN(K) := Z * (EXP(-(RL * RL)) - EXP(-(RR * RR)))
+      ENDIF
+      IF IO == 6 THEN
+        PSIN(K) := Z * (EXP(-(RL * RL)) + EXP(-(RR * RR)))
+      ENDIF
+      PSIN(K) := PSIN(K) * REAL(BND(K))
+    ENDDO
+
+    DO T = 1, NSTEPS
+      ! orthogonalize against converged orbitals (Gram-Schmidt)
+      DO JO = 1, IO - 1
+        OV := 0.0
+        DO K = 1, NPTS
+          OV := OV + PSIN(K) * PSI(K, JO) * DV
+        ENDDO
+        DO K = 1, NPTS
+          PSIN(K) := PSIN(K) - OV * PSI(K, JO)
+        ENDDO
+      ENDDO
+      ! normalize
+      NRM := 0.0
+      DO K = 1, NPTS
+        NRM := NRM + PSIN(K) * PSIN(K) * DV
+      ENDDO
+      NRM := SQRT(NRM)
+      DO K = 1, NPTS
+        PSIN(K) := PSIN(K) / NRM
+      ENDDO
+      ! imaginary-time step
+      DO K = NXY + 2, NPTS - NXY - 1
+        LAP := (PSIN(K - 1) + PSIN(K + 1) + PSIN(K - NX) + PSIN(K + NX) &
+          + PSIN(K - NXY) + PSIN(K + NXY) - 6.0 * PSIN(K)) * IDX2
+        PSIN(K) := (PSIN(K) + DTAU * (0.5 * LAP - V(K) * PSIN(K))) &
+          * REAL(BND(K))
+      ENDDO
+    ENDDO
+
+    ! final deflation + normalization: the last imaginary-time step
+    ! undoes both (renormalizes and reintroduces lower-orbital
+    ! admixture); without this the stored orbital has norm != 1 and
+    ! h_i / (ij|kl) come out scaled by norm / norm^2
+    DO JO = 1, IO - 1
+      OV := 0.0
+      DO K = 1, NPTS
+        OV := OV + PSIN(K) * PSI(K, JO) * DV
+      ENDDO
+      DO K = 1, NPTS
+        PSIN(K) := PSIN(K) - OV * PSI(K, JO)
+      ENDDO
+    ENDDO
+    NRM := 0.0
+    DO K = 1, NPTS
+      NRM := NRM + PSIN(K) * PSIN(K) * DV
+    ENDDO
+    NRM := SQRT(NRM)
+    DO K = 1, NPTS
+      PSIN(K) := PSIN(K) / NRM
+    ENDDO
+
+    ! store + energy
+    T_KE := 0.0
+    V_PE := 0.0
+    DO K = NXY + 2, NPTS - NXY - 1
+      PSI(K, IO) := PSIN(K)
+      LAP := (PSIN(K - 1) + PSIN(K + 1) + PSIN(K - NX) + PSIN(K + NX) &
+        + PSIN(K - NXY) + PSIN(K + NXY) - 6.0 * PSIN(K)) * IDX2
+      T_KE := T_KE - 0.5 * PSIN(K) * LAP * DV
+      V_PE := V_PE + V(K) * PSIN(K) * PSIN(K) * DV
+    ENDDO
+    E_TOT := T_KE + V_PE
+    WRITE(*, "ORB %.2f %d %.10e %.10e %.10e") R, IO, T_KE, V_PE, E_TOT
+  ENDDO
+
+  ! final orthonormalization check (diagnostics)
+  DO IO = 1, NORB
+    DO JO = 1, NORB
+      OV := 0.0
+      DO K = 1, NPTS
+        OV := OV + PSI(K, IO) * PSI(K, JO) * DV
+      ENDDO
+      OVL(IO, JO) := OV
+    ENDDO
+  ENDDO
+  DO IO = 1, NORB
+    WRITE(*, "OVLMAT %.2f %d %.6e %.6e %.6e") R, IO, &
+      OVL(IO, IO), OVL(IO, 1), OVL(IO, NORB)
+  ENDDO
+
+  ! ── two-electron integrals via SOR Poisson ────────────────
+  DO IO = 1, NORB
+    DO JO = IO, NORB
+      ! product density
+      DO K = 1, NPTS
+        RHO(K) := PSI(K, IO) * PSI(K, JO)
+      ENDDO
+      ! multipoles for boundary
+      DO KL = 1, 3
+        QP(KL) := 0.0
+      ENDDO
+      OV := 0.0
+      DO K = 1, NPTS
+        KC := 1 + (K - 1) / NXY
+        JC := 1 + MOD((K - 1) / NX, NX)
+        IC := 1 + MOD(K - 1, NX)
+        X := -BOX + (REAL(IC) - 0.5) * DX
+        Y := -BOX + (REAL(JC) - 0.5) * DX
+        Z := -BOX + (REAL(KC) - 0.5) * DX
+        OV := OV + RHO(K) * DV
+        QP(1) := QP(1) + X * RHO(K) * DV
+        QP(2) := QP(2) + Y * RHO(K) * DV
+        QP(3) := QP(3) + Z * RHO(K) * DV
+      ENDDO
+      ! init PHI = boundary multipole on faces, zero inside
+      DO K = 1, NPTS
+        KC := 1 + (K - 1) / NXY
+        JC := 1 + MOD((K - 1) / NX, NX)
+        IC := 1 + MOD(K - 1, NX)
+        X := -BOX + (REAL(IC) - 0.5) * DX
+        Y := -BOX + (REAL(JC) - 0.5) * DX
+        Z := -BOX + (REAL(KC) - 0.5) * DX
+        IF (IC == 1) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSEIF (IC == NX) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSEIF (JC == 1) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSEIF (JC == NX) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSEIF (KC == 1) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSEIF (KC == NX) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSE
+          PHI(K) := 0.0
+        ENDIF
+      ENDDO
+      ! SOR sweep: phi(K) = (1-w) phi(K) + w * (sum6 + 4 pi rho dx^2)/6
+      DO T = 1, NSOR
+        DO K = NXY + 2, NPTS - NXY - 1
+          IF (BND(K) == 1) THEN
+            PHI(K) := (1.0 - SORW) * PHI(K) + SORW * &
+              (PHI(K - 1) + PHI(K + 1) + PHI(K - NX) + PHI(K + NX) &
+              + PHI(K - NXY) + PHI(K + NXY) &
+              + 12.566370614359 * RHO(K) * DX2) / 6.0
+          ENDIF
+        ENDDO
+      ENDDO
+      ! integrals (io jo | k l ) = int PHI * PSI(k) PSI(l) dV
+      DO KL = 1, NORB
+        DO IJ = KL, NORB
+          OV := 0.0
+          DO K = 1, NPTS
+            OV := OV + PHI(K) * PSI(K, KL) * PSI(K, IJ) * DV
+          ENDDO
+          WRITE(*, "INT %.2f %d %d %d %d %.10e") R, IO, JO, KL, IJ, OV
+        ENDDO
+      ENDDO
+    ENDDO
+  ENDDO
+  ! ── ionic-content integrals: THETA(i,j) = int sigma_i Theta(z<0) sigma_j
+  DO IO = 1, NORB
+    DO JO = IO, NORB
+      OV := 0.0
+      DO K = 1, NPTS
+        KC := 1 + (K - 1) / NXY
+        Z := -BOX + (REAL(KC) - 0.5) * DX
+        IF (Z < 0.0) THEN
+          OV := OV + PSI(K, IO) * PSI(K, JO) * DV
+        ENDIF
+      ENDDO
+      WRITE(*, "THETA %.2f %d %d %.10e") R, IO, JO, OV
+    ENDDO
+  ENDDO
+ENDDO
+
+WRITE(*, "DONE")
+STOP
