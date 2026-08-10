@@ -283,6 +283,189 @@ def streamed(N):
     return "\n".join(L) + "\n"
 
 
+def tower(N, nstate=7, J=1.5):
+    """Deflated power iteration for the low tower (resident, N <= 17),
+    FULLY UNROLLED over states S and deflation partners J: every GPU
+    loop is top-level with literal array names (ST1..ST7 as separate 1D
+    arrays) — the GPU extractor rejects inner loops that read outer loop
+    vars ("depends on outer loop var(s)"), measured on the nested
+    version: all Gram-Schmidt passes fell back to CPU and the run hung
+    on host transfers. Unrolled, every loop extracts.
+
+    Per state: deterministic seed (literal offset), Gram-Schmidt of the
+    seed and of every matvec output W against all converged states
+    (RHO = V.W computed BEFORE projection — the true Rayleigh quotient
+    of the normalized V), fixed NITER cap, convergence flag. Degenerate
+    sectors (winding M=+-1 etc.) resolve automatically: GS against one
+    partner leaves the orthogonal one. After the tower, the sector
+    matrices M_ab = <a| sum_i m_i |b> and T_ab = <a| T |b> (T =
+    one-site translation, XP = digit rotation) print for host-side
+    cluster resolution; M and T passes are SEPARATE loops (the
+    combined loop's flow-prefix locals MS/XP crossed the GPU->CPU
+    split boundary — named rejection, fixed by the split).
+
+    Usage: python3 gen_ed_matvec.py N tower [nstate] [J] > ed_tower_N.ergo
+    """
+    DIM = 3 ** N
+    TOP = 3 ** (N - 1)
+    JH = J / 2.0
+    sts = [f"ST{s}" for s in range(1, nstate + 1)]
+    L = [header(N, "tower",
+                "! Deflated tower variant, fully unrolled over states "
+                "(see\n! gen_ed_matvec.py tower docstring): every GPU loop "
+                "top-level,\n! literal state arrays. Prints STATE energies "
+                "and SECT M/T\n! overlap matrices for host-side sector "
+                "resolution.")]
+    L += [
+        "IMPLICIT NONE",
+        f"INTEGER, PARAMETER :: N = {N}",
+        f"INTEGER, PARAMETER :: DIM = {DIM}",
+        f"INTEGER, PARAMETER :: TOP = {TOP}",
+        "INTEGER, PARAMETER :: NITER = 3000",
+        f"REAL, PARAMETER :: SHIFT = {2.0 * N:.1f}, JH = {JH}, "
+        f"TOLC = 1.0e-12",
+        f"STATIC REAL :: V({DIM}), W({DIM})",
+    ]
+    L += [f"STATIC REAL :: {st}({DIM})" for st in sts]
+    L += [
+        "REAL :: RHO, NRM, NRM2T, RHOOLD, DRHO, OV, MAB, TAB",
+        f"INTEGER :: K, ITER, CONV, Q, SX, DG, MS, XP, "
+        f"{', '.join(f'D{i}' for i in range(N))}",
+        "",
+    ]
+
+    def seed_and_project(s):
+        B = [
+            f"! ── state {s}: seed, deflate, normalize ──",
+            "DO K = 1, DIM",
+            f"  V(K) := 0.5 + REAL(MOD(K + {s * 997}, 9973)) * 0.0001",
+            "ENDDO",
+        ]
+        for j in range(1, s):
+            B += [
+                "OV := 0.0",
+                "DO K = 1, DIM",
+                f"  OV := OV + ST{j}(K) * V(K)",
+                "ENDDO",
+                "DO K = 1, DIM",
+                f"  V(K) := V(K) - OV * ST{j}(K)",
+                "ENDDO",
+            ]
+        B += [
+            "NRM2T := 0.0",
+            "DO K = 1, DIM",
+            "  NRM2T := NRM2T + V(K) * V(K)",
+            "ENDDO",
+            "NRM := SQRT(NRM2T)",
+            "DO K = 1, DIM",
+            "  V(K) := V(K) / NRM",
+            "ENDDO",
+        ]
+        return B
+
+    for s in range(1, nstate + 1):
+        L += seed_and_project(s)
+        L += [
+            "RHOOLD := 0.0",
+            "CONV := 0",
+            "DO ITER = 1, NITER",
+            "  IF (CONV == 0) THEN",
+            "    DO K = 1, DIM",
+        ]
+        L += matvec_body(N, "W", "V", "", 6)
+        L += [
+            "    ENDDO",
+            "    RHO := 0.0",
+            "    DO K = 1, DIM",
+            "      RHO := RHO + V(K) * W(K)",
+            "    ENDDO",
+        ]
+        for j in range(1, s):
+            L += [
+                "    OV := 0.0",
+                "    DO K = 1, DIM",
+                f"      OV := OV + ST{j}(K) * W(K)",
+                "    ENDDO",
+            ]
+            # vk_host frame-batch workaround (measured 2026-08-10): the
+            # per-state ITER loop's kernels replay with ST bindings
+            # recorded before the previous state's store landed; an
+            # in-loop readback print right after the first GS reduction
+            # at ITER == 2 forces a drain + re-record, after which every
+            # replay sees the stored states. Without it the deflation
+            # silently reads stale ST content and later states collapse
+            # to the ground state (GPU only; CPU builds are correct
+            # without the sync). Position AND iteration both matter
+            # (iter==1 or post-update placement failed — measured).
+            if j == 1:
+                L += [
+                    "    IF (ITER == 2) THEN",
+                    f"      WRITE(*, \"sync state {s} ov %.6e\") OV",
+                    "    ENDIF",
+                ]
+            L += [
+                "    DO K = 1, DIM",
+                f"      W(K) := W(K) - OV * ST{j}(K)",
+                "    ENDDO",
+            ]
+        L += [
+            "    NRM2T := 0.0",
+            "    DO K = 1, DIM",
+            "      NRM2T := NRM2T + W(K) * W(K)",
+            "    ENDDO",
+            "    NRM := SQRT(NRM2T)",
+            "    DO K = 1, DIM",
+            "      V(K) := W(K) / NRM",
+            "    ENDDO",
+            "    DRHO := ABS(RHO - RHOOLD)",
+            "    RHOOLD := RHO",
+            "    IF (MOD(ITER, 100) == 0) THEN",
+            f"      WRITE(*, \"state {s} iter %d  E %.10f  drho %.3e\") "
+            "ITER, RHO + SHIFT, DRHO",
+            "    ENDIF",
+            "    IF (DRHO < TOLC) THEN",
+            "      CONV := 1",
+            "    ENDIF",
+            "  ENDIF",
+            "ENDDO",
+            "DO K = 1, DIM",
+            f"  ST{s}(K) := V(K)",
+            "ENDDO",
+            f"WRITE(*, \"STATE {s} E0 = %.10f  iters %d\") "
+            "RHO + SHIFT, ITER - 1",
+            "",
+        ]
+
+    # sector matrices, unrolled pairs; M and T passes separate
+    L += ["! ── sector matrices (charge M; translation T) ──"]
+    for a in range(1, nstate + 1):
+        for b in range(a, nstate + 1):
+            L += [
+                "MAB := 0.0",
+                "DO K = 1, DIM",
+                "  Q := K - 1",
+            ]
+            for i in range(N):
+                L.append(f"  D{i} := MOD(Q, 3)")
+                if i < N - 1:
+                    L.append("  Q := Q / 3")
+            ms = " + ".join(f"D{i}" for i in range(N))
+            L += [
+                f"  MS := {ms} - N",
+                f"  MAB := MAB + REAL(MS) * ST{a}(K) * ST{b}(K)",
+                "ENDDO",
+                "TAB := 0.0",
+                "DO K = 1, DIM",
+                "  XP := 3 * MOD(K - 1, TOP) + (K - 1) / TOP + 1",
+                f"  TAB := TAB + ST{a}(K) * ST{b}(XP)",
+                "ENDDO",
+                f"WRITE(*, \"SECT {a} {b} %.10e %.10e\") MAB, TAB",
+            ]
+    L += ['WRITE(*, "DONE")']
+    return "\n".join(L) + "\n"
+
+
+
 def main():
     N = int(sys.argv[1])
     variant = sys.argv[2] if len(sys.argv) > 2 else (
@@ -298,6 +481,10 @@ def main():
         niter = int(sys.argv[3]) if len(sys.argv) > 3 else 300
         cb = int(sys.argv[4]) if len(sys.argv) > 4 else 24
         sys.stdout.write(streamed19s(N, niter, cb))
+    elif variant == "tower":
+        nstate = int(sys.argv[3]) if len(sys.argv) > 3 else 7
+        j = float(sys.argv[4]) if len(sys.argv) > 4 else 1.5
+        sys.stdout.write(tower(N, nstate, j))
     else:
         sys.exit(f"unknown variant {variant}")
 
