@@ -27,8 +27,20 @@ C_TYPE = {
     "INTEGER": "int",
     "INTEGER*8": "long long",
     "LOGICAL": "int",
-    "COMPLEX": "double _Complex",
 }
+
+
+def _c_type_checked(type_name: str) -> str:
+    """A3: COMPLEX refuses on BOTH backends with the same named error
+    (the legacy `double _Complex` lowering was never validated — silent
+    divergence from the IR path, which raises)."""
+    if type_name == "COMPLEX":
+        raise MCLError(
+            "COMPLEX is not supported by the legacy backend either "
+            "(both backends refuse until COMPLEX is specified and "
+            "validated — previously legacy silently lowered to "
+            "double _Complex).")
+    return C_TYPE.get(type_name, "double")
 
 RELOP_MAP = {
     "<": "<", ">": ">", "=": "==",
@@ -200,7 +212,7 @@ class CodeGen:
                 self._last_line_directive = node.line
 
     def _c_type(self, type_name: str) -> str:
-        return C_TYPE.get(type_name, "double")
+        return _c_type_checked(type_name)
 
     # ── PARAMETER declarations (file scope, const) ────────────
 

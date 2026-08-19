@@ -565,6 +565,26 @@ class Checker:
                     self._error(f"Undefined array '{arr_name}' in SORT_BY_GEN",
                                 node.line)
 
+    def _expr_mentions_array(self, e) -> bool:
+        """True if the expression references a shape-bearing name
+        (used for the no-array-expressions teaching error, R1)."""
+        if isinstance(e, ast.Variable):
+            sym = self.symtab.lookup(e.name)
+            return bool(sym and sym.shape is not None)
+        if isinstance(e, ast.CallOrSubscript):
+            if e.name in set(self.symtab.functions):
+                return any(self._expr_mentions_array(a) for a in e.args)
+            return True  # array subscript
+        for v in getattr(e, "__dict__", {}).values():
+            if isinstance(v, list):
+                if any(self._expr_mentions_array(it) for it in v
+                       if hasattr(it, "__dict__")):
+                    return True
+            elif hasattr(v, "__dict__") and not isinstance(v, str):
+                if self._expr_mentions_array(v):
+                    return True
+        return False
+
     def _check_assign(self, node: ast.AssignStmt):
         # Reject assignment to PARAMETER (whole or a subscripted element)
         if isinstance(node.target, (ast.Variable, ast.CallOrSubscript)):
@@ -578,6 +598,19 @@ class Checker:
 
         target_type = self._infer_type(node.target)
         value_type = self._infer_type(node.value)
+
+        # R1: a subroutine used as a function (its "value" is VOID)
+        if value_type == "VOID" and isinstance(node.value,
+                                               ast.CallOrSubscript):
+            fsym = self.symtab.lookup_func(node.value.name)
+            if fsym and fsym.is_subroutine:
+                self._error(
+                    f"'{node.value.name}' is a SUBROUTINE — it returns "
+                    f"nothing; call it with CALL {node.value.name}(...) "
+                    f"(results come back through by-reference arguments)",
+                    getattr(node, 'line', 0),
+                )
+                return
 
         if target_type and value_type:
             if target_type != value_type:
@@ -596,11 +629,21 @@ class Checker:
             tsym = self.symtab.lookup(node.target.name)
             if (tsym and tsym.shape is not None and value_type is not None
                     and not self._is_array_valued(node.value)):
-                self._error(
-                    f"Cannot assign scalar value to array '{node.target.name}' "
-                    f"— use an explicit loop or CALL ZERO",
-                    getattr(node, 'line', 0),
-                )
+                if self._expr_mentions_array(node.value):
+                    self._error(
+                        f"no array expressions in Ergo "
+                        f"('{node.target.name} := <array expression>') — "
+                        f"write an explicit DO loop over the elements "
+                        f"(the language never makes hidden temporaries)",
+                        getattr(node, 'line', 0),
+                    )
+                else:
+                    self._error(
+                        f"Cannot assign scalar value to array "
+                        f"'{node.target.name}' — use an explicit loop or "
+                        f"CALL ZERO",
+                        getattr(node, 'line', 0),
+                    )
             elif tsym and tsym.shape is None and self._is_array_valued(node.value):
                 self._error(
                     f"Cannot assign array value to scalar '{node.target.name}'",
@@ -707,6 +750,19 @@ class Checker:
                         node.line)
         for arg in node.args:
             self._infer_type(arg)
+        # R1/spec Part 7: STATIC arrays as arguments are against the
+        # aliasing rule — extremely common in the existing corpus, so
+        # this TEACHES (warning) rather than breaks the build.
+        for arg in node.args:
+            if isinstance(arg, ast.Variable):
+                sym = self.symtab.lookup(arg.name)
+                if sym and getattr(sym, "is_static", False) and \
+                        sym.shape is not None:
+                    self._warn(
+                        f"STATIC array '{arg.name}' passed as an "
+                        f"argument violates the spec Part 7 aliasing "
+                        f"rule — subroutines are meant to access STATIC "
+                        f"state directly by name", node.line)
 
     # ── A1: recursion guard for hoisted locals ───────────────
 

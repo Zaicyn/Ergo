@@ -373,6 +373,20 @@ DO I = 1, N
 ENDDO
 ```
 
+**Why (R6 — the rationale, for the numpy/MATLAB/Fortran-90 reader):**
+an array expression forces the compiler to choose between fusing
+(which changes semantics when arrays alias) and materializing a
+temporary — and a temporary is a hidden allocation, which this
+language does not do, ever. Every allocation in Ergo is visible:
+STATIC arrays, the ALLOCATABLE arena, or nothing. The explicit loop
+is not a workaround for a missing feature; it is the feature. It
+makes exactly the stores you wrote, in the order you wrote them —
+auditable, vectorizable by the C backend, and bit-reproducible by
+construction. Physics stencils want explicit loops anyway; the only
+thing the array expression bought was brevity, and brevity is not
+worth a compiler that can accidentally become slow or silently
+change your numerics.
+
 Ergo supports two loop forms: counted (`DO I = A, B`) and conditional
 (`DO WHILE condition`). Both support `CYCLE` (continue) and `EXIT` (break).
 DO WHILE conditions must be boolean — no truthy integers.

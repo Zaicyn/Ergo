@@ -206,6 +206,13 @@ class Parser:
                     self._cur().line, self._cur().col,
                 )
 
+        if not self._at(TT.COLONCOLON):
+            raise ParseError(
+                f"declarations need '::' — write "
+                f"'{type_name} :: name' (got "
+                f"'{self._cur().value}')",
+                self._cur().line, self._cur().col,
+            )
         self._eat(TT.COLONCOLON)
 
         variables = []
@@ -360,6 +367,22 @@ class Parser:
         # Declaration (inside function body)
         if self._at(*TYPE_KEYWORDS):
             return self._parse_declaration()
+        # Friendly errors for the two END-shaped beginner mistakes
+        if self._at(TT.KW_END):
+            nxt = self._peek()
+            if nxt.type in (TT.KW_DO, TT.KW_IF) or \
+                    (nxt.type == TT.IDENT and
+                     nxt.value.upper() in ("DO", "IF")):
+                raise ParseError(
+                    "ENDDO / ENDIF are one word in Ergo — "
+                    "'END DO' / 'END IF' do not parse",
+                    self._cur().line, self._cur().col,
+                )
+            raise ParseError(
+                "Ergo has no PROGRAM/END wrapper — a bare END is not a "
+                "program terminator; just end the file",
+                self._cur().line, self._cur().col,
+            )
         # Assignment: ident := expr  OR  ident(args) := expr
         return self._parse_assignment()
 
@@ -373,6 +396,13 @@ class Parser:
         line = self._cur().line
         self._eat(TT.KW_IF)
         cond = self._parse_expression()
+        if not self._at(TT.KW_THEN):
+            raise ParseError(
+                "single-line IF is not supported in Ergo — write "
+                "IF (cond) THEN / ENDIF with statements on their own "
+                "lines (THEN is required)",
+                self._cur().line, self._cur().col,
+            )
         self._eat(TT.KW_THEN)
         self._eat_newline()
         self._skip_newlines()
@@ -563,6 +593,12 @@ class Parser:
         line = self._cur().line
         self._eat(TT.KW_PRINT)
         val = self._parse_expression()
+        if self._at(TT.COMMA):
+            raise ParseError(
+                "PRINT takes ONE expression — use WRITE(*, \"fmt\") "
+                "with a format string for multiple values",
+                self._cur().line, self._cur().col,
+            )
         self._eat_newline()
         return ast.PrintStmt(val, line=line)
 
@@ -650,6 +686,13 @@ class Parser:
         line = self._cur().line
         target = self._parse_expression()
         if not self._match(TT.ASSIGN):
+            if isinstance(target, ast.BinaryOp) and \
+                    target.op in ("=", "=="):
+                raise ParseError(
+                    "assignment is ':=' in Ergo — bare '=' is a "
+                    "comparison, and a comparison is not assignable",
+                    line, self._cur().col,
+                )
             raise ParseError(
                 f"Expected ':=' in assignment, got {self._cur().type.name}",
                 self._cur().line, self._cur().col,

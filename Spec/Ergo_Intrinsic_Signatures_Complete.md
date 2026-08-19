@@ -7,6 +7,12 @@ This is the authoritative list of every built-in function in Ergo. Each entry sp
 - **Shape propagation:** How input shapes determine output shape
 - **Memory:** Caller allocates, stack return, or error
 - **Semantics:** What it does
+- **Status (A3, 2026-08-13):** implementation status — `CPU+GPU`
+  (both backends; GPU transcendental note in Ergo_Spec.md §9.10),
+  `CPU` (host only), `GPU` (device kernels; a CPU fallback is noted
+  where one exists), `planned` (named compile-time error today),
+  `removed`. This column is the answer to "wait, does X exist?" — a
+  feature that exists but isn't ruled here is a bug in this document.
 
 This is used by the compiler's type checker to:
 1. Validate argument types
@@ -21,43 +27,43 @@ All of these take one or more numeric scalars and return a scalar. No allocation
 
 ### Trigonometric Functions
 
-| Function | Signature | Return Type | Semantics |
-|----------|-----------|------------|-----------|
-| SIN | `SIN(x: REAL) → REAL` | REAL | Sine in radians |
-| COS | `COS(x: REAL) → REAL` | REAL | Cosine in radians |
-| TAN | `TAN(x: REAL) → REAL` | REAL | Tangent in radians |
-| ASIN | `ASIN(x: REAL) → REAL` | REAL | Arcsine, result in [-π/2, π/2] |
-| ACOS | `ACOS(x: REAL) → REAL` | REAL | Arccosine, result in [0, π] |
-| ATAN | `ATAN(x: REAL) → REAL` | REAL | Arctangent, result in [-π/2, π/2] |
-| ATAN2 | `ATAN2(y: REAL, x: REAL) → REAL` | REAL | Two-argument arctangent. Result in [-π, π]. Handles quadrants correctly. |
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| SIN | `SIN(x: REAL) → REAL` | REAL | Sine in radians | CPU+GPU |
+| COS | `COS(x: REAL) → REAL` | REAL | Cosine in radians | CPU+GPU |
+| TAN | `TAN(x: REAL) → REAL` | REAL | Tangent in radians | CPU+GPU |
+| ASIN | `ASIN(x: REAL) → REAL` | REAL | Arcsine, result in [-π/2, π/2] | CPU+GPU |
+| ACOS | `ACOS(x: REAL) → REAL` | REAL | Arccosine, result in [0, π] | CPU+GPU |
+| ATAN | `ATAN(x: REAL) → REAL` | REAL | Arctangent, result in [-π/2, π/2] | CPU+GPU |
+| ATAN2 | `ATAN2(y: REAL, x: REAL) → REAL` | REAL | Two-argument arctangent. Result in [-π, π]. Handles quadrants correctly. | CPU+GPU |
 
 ### Exponential & Logarithmic
 
-| Function | Signature | Return Type | Semantics |
-|----------|-----------|------------|-----------|
-| EXP | `EXP(x: REAL) → REAL` | REAL | e^x |
-| LOG | `LOG(x: REAL) → REAL` | REAL | Natural logarithm (ln) |
-| LOG10 | `LOG10(x: REAL) → REAL` | REAL | Base-10 logarithm |
-| SQRT | `SQRT(x: REAL) → REAL` | REAL | Square root. x must be ≥ 0. |
-| SQRT | `SQRT(z: COMPLEX) → COMPLEX` | COMPLEX | Complex square root |
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| EXP | `EXP(x: REAL) → REAL` | REAL | e^x | CPU+GPU |
+| LOG | `LOG(x: REAL) → REAL` | REAL | Natural logarithm (ln) | CPU+GPU |
+| LOG10 | `LOG10(x: REAL) → REAL` | REAL | Base-10 logarithm | CPU+GPU |
+| SQRT | `SQRT(x: REAL) → REAL` | REAL | Square root. x must be ≥ 0. | CPU+GPU |
+| SQRT | `SQRT(z: COMPLEX) → COMPLEX` | COMPLEX | Complex square root | planned (both backends raise, A3) |
 
 ### Hyperbolic Functions
 
-| Function | Signature | Return Type | Semantics |
-|----------|-----------|------------|-----------|
-| SINH | `SINH(x: REAL) → REAL` | REAL | Hyperbolic sine |
-| COSH | `COSH(x: REAL) → REAL` | REAL | Hyperbolic cosine |
-| TANH | `TANH(x: REAL) → REAL` | REAL | Hyperbolic tangent |
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| SINH | `SINH(x: REAL) → REAL` | REAL | Hyperbolic sine | CPU+GPU |
+| COSH | `COSH(x: REAL) → REAL` | REAL | Hyperbolic cosine | CPU+GPU |
+| TANH | `TANH(x: REAL) → REAL` | REAL | Hyperbolic tangent | CPU+GPU |
 
 ### Absolute Value & Sign
 
-| Function | Signature | Return Type | Semantics |
-|----------|-----------|------------|-----------|
-| ABS | `ABS(x: REAL) → REAL` | REAL | Absolute value of real |
-| ABS | `ABS(x: INTEGER) → INTEGER` | INTEGER | Absolute value of integer |
-| ABS | `ABS(z: COMPLEX) → REAL` | REAL | Magnitude of complex number: sqrt(real²+imag²) |
-| SIGN | `SIGN(x: REAL, y: REAL) → REAL` | REAL | Return \|x\| with sign of y |
-| SIGN | `SIGN(x: INTEGER, y: INTEGER) → INTEGER` | INTEGER | Return \|x\| with sign of y |
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| ABS | `ABS(x: REAL) → REAL` | REAL | Absolute value of real | CPU+GPU |
+| ABS | `ABS(x: INTEGER) → INTEGER` | INTEGER | Absolute value of integer | CPU+GPU |
+| ABS | `ABS(z: COMPLEX) → REAL` | REAL | Magnitude of complex number: sqrt(real²+imag²) | planned (both backends raise, A3) |
+| SIGN | `SIGN(x: REAL, y: REAL) → REAL` | REAL | Return \|x\| with sign of y | CPU+GPU |
+| SIGN | `SIGN(x: INTEGER, y: INTEGER) → INTEGER` | INTEGER | Return \|x\| with sign of y | CPU+GPU |
 
 ### Exponentiation Edge Cases
 
@@ -80,14 +86,14 @@ All of these take one or more numeric scalars and return a scalar. No allocation
 
 **Rule:** The INTEGER**negative error applies only when both operands are INTEGER type. COMPLEX exponentiation with negative exponents is always allowed.
 
-| Function | Signature | Return Type | Semantics |
-|----------|-----------|------------|-----------|
-| MOD | `MOD(a: INTEGER, b: INTEGER) → INTEGER` | INTEGER | Remainder: sign of dividend (a). a MOD b = a - INT(a/b) * b |
-| MOD | `MOD(a: REAL, b: REAL) → REAL` | REAL | Remainder: sign of dividend (a) |
-| MAX | `MAX(a: REAL, b: REAL, ...) → REAL` | REAL | Maximum of arguments (variadic, 2+ args) |
-| MAX | `MAX(a: INTEGER, b: INTEGER, ...) → INTEGER` | INTEGER | Maximum of arguments (variadic, 2+ args) |
-| MIN | `MIN(a: REAL, b: REAL, ...) → REAL` | REAL | Minimum of arguments (variadic, 2+ args) |
-| MIN | `MIN(a: INTEGER, b: INTEGER, ...) → INTEGER` | INTEGER | Minimum of arguments (variadic, 2+ args) |
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| MOD | `MOD(a: INTEGER, b: INTEGER) → INTEGER` | INTEGER | Remainder: sign of dividend (a). a MOD b = a - INT(a/b) * b | CPU+GPU |
+| MOD | `MOD(a: REAL, b: REAL) → REAL` | REAL | Remainder: sign of dividend (a) | CPU+GPU |
+| MAX | `MAX(a: REAL, b: REAL, ...) → REAL` | REAL | Maximum of arguments (variadic, 2+ args) | CPU+GPU |
+| MAX | `MAX(a: INTEGER, b: INTEGER, ...) → INTEGER` | INTEGER | Maximum of arguments (variadic, 2+ args) | CPU+GPU |
+| MIN | `MIN(a: REAL, b: REAL, ...) → REAL` | REAL | Minimum of arguments (variadic, 2+ args) | CPU+GPU |
+| MIN | `MIN(a: INTEGER, b: INTEGER, ...) → INTEGER` | INTEGER | Minimum of arguments (variadic, 2+ args) | CPU+GPU |
 
 ### Random Number Generation
 
@@ -103,10 +109,10 @@ Pure functions of their seed argument — no hidden state; chaining
 state advance), and counter-based use `RAND(SEED + I)` gives independent
 per-index variates.
 
-| Function | Signature | Return Type | Semantics |
-|----------|-----------|------------|-----------|
-| HASH | `HASH(seed: INTEGER) → INTEGER` | INTEGER | splitmix64(seed) top 31 bits → non-negative int32 in [0, 2^31-1] |
-| RAND | `RAND(seed: INTEGER) → REAL` | REAL | splitmix64(seed) top 53 bits × 2^-53 → uniform on [0, 1), exact in f64 |
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| HASH | `HASH(seed: INTEGER) → INTEGER` | INTEGER | splitmix64(seed) top 31 bits → non-negative int32 in [0, 2^31-1] | CPU+GPU |
+| RAND | `RAND(seed: INTEGER) → REAL` | REAL | splitmix64(seed) top 53 bits × 2^-53 → uniform on [0, 1), exact in f64 | CPU+GPU |
 
 Measured on 100k samples (tests/prng.ergo): mean 0.4991, variance
 0.0836, lag-1..8 autocorrelation |r| < 0.005, conditional mean 0.4987,
@@ -114,12 +120,12 @@ conditional max 0.99999.
 
 ### Complex Number Operations
 
-| Function | Signature | Return Type | Semantics |
-|----------|-----------|------------|-----------|
-| CMPLX | `CMPLX(real: REAL, imag: REAL) → COMPLEX` | COMPLEX | Construct complex from real and imaginary parts |
-| REAL | `REAL(z: COMPLEX) → REAL` | REAL | Extract real component of complex |
-| AIMAG | `AIMAG(z: COMPLEX) → REAL` | REAL | Extract imaginary component of complex |
-| CONJG | `CONJG(z: COMPLEX) → COMPLEX` | COMPLEX | Complex conjugate: real - imag\*i |
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| CMPLX | `CMPLX(real: REAL, imag: REAL) → COMPLEX` | COMPLEX | Construct complex from real and imaginary parts | planned (both backends raise, A3) |
+| REAL | `REAL(z: COMPLEX) → REAL` | REAL | Extract real component of complex | planned (both backends raise, A3) |
+| AIMAG | `AIMAG(z: COMPLEX) → REAL` | REAL | Extract imaginary component of complex | planned (both backends raise, A3) |
+| CONJG | `CONJG(z: COMPLEX) → COMPLEX` | COMPLEX | Complex conjugate: real - imag\*i | planned (both backends raise, A3) |
 
 ---
 
@@ -129,18 +135,18 @@ These consume arrays and return scalar results. Input arrays must be pre-allocat
 
 ### Vector Reduction Functions
 
-| Function | Signature | Memory | Shape Constraint | Semantics |
-|----------|-----------|--------|-----------------|-----------|
-| SUM | `SUM(a: REAL(:)) → REAL` | Stack | a is 1D | Sum all elements: Σ a[i] |
-| SUM | `SUM(a: INTEGER(:)) → INTEGER` | Stack | a is 1D | Sum all elements |
-| PRODUCT | `PRODUCT(a: REAL(:)) → REAL` | Stack | a is 1D | Product all elements: Π a[i] |
-| PRODUCT | `PRODUCT(a: INTEGER(:)) → INTEGER` | Stack | a is 1D | Product all elements |
-| DOT_PRODUCT | `DOT_PRODUCT(a: REAL(:), b: REAL(:)) → REAL` | Stack | a.shape == b.shape, both 1D | Dot product: Σ a[i] * b[i] |
-| NORM2 | `NORM2(a: REAL(:)) → REAL` | Stack | a is 1D | Euclidean norm: sqrt(Σ a[i]²) |
-| MAXVAL | `MAXVAL(a: REAL(:)) → REAL` | Stack | a is 1D | Maximum element |
-| MAXVAL | `MAXVAL(a: INTEGER(:)) → INTEGER` | Stack | a is 1D | Maximum element |
-| MINVAL | `MINVAL(a: REAL(:)) → REAL` | Stack | a is 1D | Minimum element |
-| MINVAL | `MINVAL(a: INTEGER(:)) → INTEGER` | Stack | a is 1D | Minimum element |
+| Function | Signature | Memory | Shape Constraint | Semantics | Status |
+|----------|-----------|--------|-----------------|-----------|--------|
+| SUM | `SUM(a: REAL(:)) → REAL` | Stack | a is 1D | Sum all elements: Σ a[i] | CPU+GPU |
+| SUM | `SUM(a: INTEGER(:)) → INTEGER` | Stack | a is 1D | Sum all elements | CPU+GPU |
+| PRODUCT | `PRODUCT(a: REAL(:)) → REAL` | Stack | a is 1D | Product all elements: Π a[i] | CPU+GPU |
+| PRODUCT | `PRODUCT(a: INTEGER(:)) → INTEGER` | Stack | a is 1D | Product all elements | CPU+GPU |
+| DOT_PRODUCT | `DOT_PRODUCT(a: REAL(:), b: REAL(:)) → REAL` | Stack | a.shape == b.shape, both 1D | Dot product: Σ a[i] * b[i] | CPU+GPU |
+| NORM2 | `NORM2(a: REAL(:)) → REAL` | Stack | a is 1D | Euclidean norm: sqrt(Σ a[i]²) | CPU+GPU |
+| MAXVAL | `MAXVAL(a: REAL(:)) → REAL` | Stack | a is 1D | Maximum element | CPU+GPU |
+| MAXVAL | `MAXVAL(a: INTEGER(:)) → INTEGER` | Stack | a is 1D | Maximum element | CPU+GPU |
+| MINVAL | `MINVAL(a: REAL(:)) → REAL` | Stack | a is 1D | Minimum element | CPU+GPU |
+| MINVAL | `MINVAL(a: INTEGER(:)) → INTEGER` | Stack | a is 1D | Minimum element | CPU+GPU |
 
 ---
 
@@ -150,31 +156,31 @@ These consume array(s) and produce array results. **Caller must pre-allocate out
 
 ### Matrix Operations
 
-| Function | Signature | Input Shapes | Output Shape | Compile-Time Check? | Semantics |
-|----------|-----------|--------------|--------------|-------------------|-----------|
-| MATMUL | `MATMUL(A: REAL(:,:), B: REAL(:,:)) → REAL(:,:)` | A(m,n), B(n,p) | (m, p) | Yes, if m,n,p known | Matrix multiply. Requires A.shape[1] == B.shape[0] |
-| TRANSPOSE | `TRANSPOSE(A: REAL(:,:)) → REAL(:,:)` | A(m, n) | (n, m) | Yes, if m,n known | Matrix transpose |
-| RESHAPE | `RESHAPE(A: REAL(:), shape: INTEGER(:)) → REAL(:)` | A(any), shape=[d1,d2,...] | Product of shape args | Yes, if shape is constant | Reshape A into new layout. Total elements must match. |
+| Function | Signature | Input Shapes | Output Shape | Compile-Time Check? | Semantics | Status |
+|----------|-----------|--------------|--------------|-------------------|-----------|--------|
+| MATMUL | `MATMUL(A: REAL(:,:), B: REAL(:,:)) → REAL(:,:)` | A(m,n), B(n,p) | (m, p) | Yes, if m,n,p known | Matrix multiply. Requires A.shape[1] == B.shape[0] | CPU |
+| TRANSPOSE | `TRANSPOSE(A: REAL(:,:)) → REAL(:,:)` | A(m, n) | (n, m) | Yes, if m,n known | Matrix transpose | CPU |
+| RESHAPE | `RESHAPE(A: REAL(:), shape: INTEGER(:)) → REAL(:)` | A(any), shape=[d1,d2,...] | Product of shape args | Yes, if shape is constant | Reshape A into new layout. Total elements must match. | CPU |
 
 ### Element-Wise Operations (Caller-Allocated Output)
 
-| Function | Signature | Input Shapes | Output Shape | Semantics |
-|----------|-----------|--------------|--------------|-----------|
-| SQRT | `SQRT(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise square root |
-| EXP | `EXP(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise exponential |
-| LOG | `LOG(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise natural logarithm |
-| SIN | `SIN(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise sine |
-| COS | `COS(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise cosine |
-| ABS | `ABS(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise absolute value |
+| Function | Signature | Input Shapes | Output Shape | Semantics | Status |
+|----------|-----------|--------------|--------------|-----------|--------|
+| SQRT | `SQRT(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise square root | CPU+GPU |
+| EXP | `EXP(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise exponential | CPU+GPU |
+| LOG | `LOG(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise natural logarithm | CPU+GPU |
+| SIN | `SIN(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise sine | CPU+GPU |
+| COS | `COS(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise cosine | CPU+GPU |
+| ABS | `ABS(A: REAL(:)) → REAL(:)` | A(n) | (n) | Element-wise absolute value | CPU+GPU |
 
 **Note:** When applied to arrays, these functions are element-wise. Output shape matches input shape.
 
 ### Multi-Dimensional Reductions (Advanced, Optional for Phase 1)
 
-| Function | Signature | Semantics |
-|----------|-----------|-----------|
-| SUM | `SUM(A: REAL(:,:), dim: INTEGER) → REAL(:)` | Sum along dimension (advanced) |
-| MAXVAL | `MAXVAL(A: REAL(:,:), dim: INTEGER) → REAL(:)` | Max along dimension (advanced) |
+| Function | Signature | Semantics | Status |
+|----------|-----------|-----------|--------|
+| SUM | `SUM(A: REAL(:,:), dim: INTEGER) → REAL(:)` | Sum along dimension (advanced) | CPU+GPU |
+| MAXVAL | `MAXVAL(A: REAL(:,:), dim: INTEGER) → REAL(:)` | Max along dimension (advanced) | CPU+GPU |
 
 **Note:** These are omitted from Phase 1 to keep the spec simple. Implement later if needed.
 
@@ -186,34 +192,34 @@ All string operations are on fixed-length CHARACTER types. No dynamic allocation
 
 ### String Query
 
-| Function | Signature | Return Type | Semantics |
-|----------|-----------|------------|-----------|
-| LEN | `LEN(s: CHARACTER(*)) → INTEGER` | INTEGER | Length of string (fixed-length, so deterministic) |
-| INDEX | `INDEX(s: CHARACTER(*), substr: CHARACTER(*)) → INTEGER` | INTEGER | Position of first occurrence of substr in s, or 0 if not found |
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| LEN | `LEN(s: CHARACTER(*)) → INTEGER` | INTEGER | Length of string (fixed-length, so deterministic) | CPU+GPU |
+| INDEX | `INDEX(s: CHARACTER(*), substr: CHARACTER(*)) → INTEGER` | INTEGER | Position of first occurrence of substr in s, or 0 if not found | CPU+GPU |
 
 ### Type Conversion
 
-| Function | Signature | Return Type | Semantics |
-|----------|-----------|------------|-----------|
-| CHAR | `CHAR(i: INTEGER) → CHARACTER(LEN=1)` | CHARACTER(LEN=1) | ASCII code to character |
-| ICHAR | `ICHAR(c: CHARACTER(LEN=1)) → INTEGER` | INTEGER | Character to ASCII code |
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| CHAR | `CHAR(i: INTEGER) → CHARACTER(LEN=1)` | CHARACTER(LEN=1) | ASCII code to character | CPU |
+| ICHAR | `ICHAR(c: CHARACTER(LEN=1)) → INTEGER` | INTEGER | Character to ASCII code | CPU |
 
 ### Numeric Kind Conversion (INTEGER*8, Inc-2A)
 
-| Function | Signature | Return Type | Semantics |
-|----------|-----------|------------|-----------|
-| INT8 | `INT8(x: numeric) → INTEGER*8` | INTEGER*8 | Explicit widening to 64-bit integer |
-| INT | `INT(x: numeric) → INTEGER` | INTEGER | Truncation toward zero; also the explicit **narrowing** path INTEGER*8 → INTEGER (implicit narrowing is a compile-time error) |
-| REAL | `REAL(x: numeric) → REAL` | REAL | Conversion to REAL (from either integer kind) |
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| INT8 | `INT8(x: numeric) → INTEGER*8` | INTEGER*8 | Explicit widening to 64-bit integer | CPU+GPU |
+| INT | `INT(x: numeric) → INTEGER` | INTEGER | Truncation toward zero; also the explicit **narrowing** path INTEGER*8 → INTEGER (implicit narrowing is a compile-time error) | CPU+GPU |
+| REAL | `REAL(x: numeric) → REAL` | REAL | Conversion to REAL (from either integer kind) | CPU+GPU |
 
 Mixing rules and the CPU-only restriction of INTEGER*8 are specified in
 `Spec/Ergo_Spec.md` Part 3.
 
 ### String Concatenation (Limited, Explicit)
 
-| Function | Signature | Return Type | Semantics |
-|----------|-----------|------------|-----------|
-| CONCAT | `CONCAT(s1: CHARACTER(*), s2: CHARACTER(*)) → CHARACTER(*)` | CHARACTER(*) | Concatenate two strings. **Caller must declare result with adequate length.** |
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| CONCAT | `CONCAT(s1: CHARACTER(*), s2: CHARACTER(*)) → CHARACTER(*)` | CHARACTER(*) | Concatenate two strings. **Caller must declare result with adequate length.** | CPU |
 
 **Usage Example:**
 ```
@@ -238,12 +244,12 @@ These are less common but useful for advanced array operations.
 
 ### Array Inspection
 
-| Function | Signature | Return Type | Memory | Semantics |
-|----------|-----------|------------|--------|-----------|
-| SIZE | `SIZE(A: REAL(:)) → INTEGER` | INTEGER | Stack | Total number of elements |
-| SIZE | `SIZE(A: REAL(:,:), dim: INTEGER) → INTEGER` | INTEGER | Stack | Size along dimension dim |
-| RANK | `RANK(A: REAL(:,:)) → INTEGER` | INTEGER | Stack | Number of dimensions (rank). E.g., RANK of 3D array is 3. |
-| SHAPE | `SHAPE(A: REAL(:,:)) → INTEGER(:)` | INTEGER(:) | Caller-allocated | Return array of dimensions. **Caller must pre-allocate with size = RANK(A).** |
+| Function | Signature | Return Type | Memory | Semantics | Status |
+|----------|-----------|------------|--------|-----------|--------|
+| SIZE | `SIZE(A: REAL(:)) → INTEGER` | INTEGER | Stack | Total number of elements | CPU (compile-time) |
+| SIZE | `SIZE(A: REAL(:,:), dim: INTEGER) → INTEGER` | INTEGER | Stack | Size along dimension dim | CPU (compile-time) |
+| RANK | `RANK(A: REAL(:,:)) → INTEGER` | INTEGER | Stack | Number of dimensions (rank). E.g., RANK of 3D array is 3. | CPU (compile-time) |
+| SHAPE | `SHAPE(A: REAL(:,:)) → INTEGER(:)` | INTEGER(:) | Caller-allocated | Return array of dimensions. **Caller must pre-allocate with size = RANK(A).** | CPU (compile-time) |
 
 **Example (SIZE - stack return):**
 ```
@@ -378,7 +384,7 @@ But these are backend concerns. From Ergo's perspective, they're simple function
 ## Intrinsic Summary Table (Cheat Sheet)
 
 | Category | Examples | Memory Behavior |
-|----------|----------|-----------------|
+|----------|----------|-----------------|--------|
 | Scalar math | SIN, COS, EXP, SQRT, ABS, MOD, MAX | Stack return, no allocation |
 | Vector reduction | SUM, PRODUCT, DOT_PRODUCT, NORM2 | Stack return (scalar), input pre-allocated |
 | Array operations | MATMUL, TRANSPOSE, RESHAPE, SQRT (on array) | Output pre-allocated by caller |
@@ -429,9 +435,9 @@ No return value. No allocation. Deterministic, platform-portable behavior.
 
 ### Array Zeroing
 
-| Function | Signature | Memory | Semantics |
-|----------|-----------|--------|-----------|
-| ZERO | `CALL ZERO(A)` — A is any declared array | In-place | Zero all elements of A |
+| Function | Signature | Memory | Semantics | Status |
+|----------|-----------|--------|-----------|--------|
+| ZERO | `CALL ZERO(A)` — A is any declared array | In-place | Zero all elements of A | CPU+GPU |
 
 **Codegen contract:** `CALL ZERO(A)` always emits `memset(A, 0, sizeof(A))`.
 
@@ -475,10 +481,10 @@ Explicit host↔device slice transfers for out-of-core GPU programs.
 Statement-only, CALL-invoked, in-place, no allocation. Indices are
 1-based element offsets into the respective arrays.
 
-| Function | Signature | Memory | Semantics |
-|----------|-----------|--------|-----------|
-| VK_STAGE | `CALL VK_STAGE(gpu_arr, host_arr, src0, dst0, len)` | host→device | Upload `len` elements from `host_arr(src0..)` to `gpu_arr(dst0..)` |
-| VK_FETCH | `CALL VK_FETCH(host_arr, gpu_arr, src0, dst0, len)` | device→host | Download `len` elements from `gpu_arr(src0..)` to `host_arr(dst0..)` |
+| Function | Signature | Memory | Semantics | Status |
+|----------|-----------|--------|-----------|--------|
+| VK_STAGE | `CALL VK_STAGE(gpu_arr, host_arr, src0, dst0, len)` | host→device | Upload `len` elements from `host_arr(src0..)` to `gpu_arr(dst0..)` | GPU (+CPU memmove) |
+| VK_FETCH | `CALL VK_FETCH(host_arr, gpu_arr, src0, dst0, len)` | device→host | Download `len` elements from `gpu_arr(src0..)` to `host_arr(dst0..)` | GPU (+CPU memmove) |
 
 **Synchronization contract:** both are frame-draining sync points.
 VK_STAGE drains the recording frame first only when the frame has
@@ -522,3 +528,55 @@ These can be added later without breaking the core language.
 
 **The compiler now has everything needed to type-check intrinsic calls and verify shape compatibility on assignment.**
 
+---
+
+## Category 7: Warp Subgroup Intrinsics (GPU-only)
+
+Subgroup shuffle/ballot operations for extracted GPU kernels. **Status:
+GPU-only, and hard-coded to a 32-lane subgroup** — on GPUs with a
+different wavefront width the semantics are wrong, and there is no CPU
+lowering (the CPU front end does not know these names; a program using
+them compiles for `--target spirv` only). Portability landmine by
+construction; use only in kernels written for 32-lane NVIDIA subgroups.
+
+| Function | Signature | Return Type | Semantics | Status |
+|----------|-----------|------------|-----------|--------|
+| RING_PREV | `RING_PREV(x: REAL) → REAL` | REAL | value from the lane−1 neighbor (wraps within the 32-lane subgroup) | GPU-only (32-lane) |
+| RING_NEXT | `RING_NEXT(x: REAL) → REAL` | REAL | value from the lane+1 neighbor (wraps) | GPU-only (32-lane) |
+| RING_SHIFT | `RING_SHIFT(x: REAL, delta: INTEGER) → REAL` | REAL | value from lane+delta (wraps) | GPU-only (32-lane) |
+| RING_BROADCAST | `RING_BROADCAST(x: REAL, lane: INTEGER) → REAL` | REAL | broadcast one lane's value to the subgroup | GPU-only (32-lane) |
+| WARP_BALLOT | `WARP_BALLOT(pred) → mask` | INTEGER | ballot across the subgroup | GPU-only (32-lane) |
+| WARP_BALLOT_COUNT | `WARP_BALLOT_COUNT(pred) → INTEGER` | INTEGER | popcount of the ballot | GPU-only (32-lane) |
+| WARP_BALLOT_PREFIX | `WARP_BALLOT_PREFIX(pred) → INTEGER` | INTEGER | exclusive prefix popcount | GPU-only (32-lane) |
+| WARP_BROADCAST_FIRST | `WARP_BROADCAST_FIRST(...) → REAL` | REAL | first active lane's value | GPU-only (32-lane) |
+
+Oracle: `tests/gpu_ring_shuffle.ergo`.
+
+---
+
+## The VERIFY Directive (statement, not an intrinsic)
+
+Syntax (parser `_parse_verify`):
+
+```
+VERIFY arr1, arr2, ... ORACLE n [EVERY m] [TOL t] [NET "host:port" [GPU k]]
+```
+
+Semantics (IR backend, `_emit_verify`): a CPU **oracle shadow state**.
+The first `n` elements of each listed array are mirrored into CPU
+shadow arrays at first call and evolved independently by the CPU each
+frame with the same physics; every `m` frames (default 1) the GPU
+state is sampled and compared against the shadow within relative
+tolerance `t` (default 1e-6), reporting divergence on stderr. `NET`
+sends the checkpoint over UDP to an oracle host (`GPU k` selects the
+client identity). `ERGO_NO_VERIFY=1` disables the oracle at runtime;
+`--no-verify` omits it at compile time (required for programs whose
+physics uses GPU-only intrinsics, since the CPU shadow copy cannot
+contain them). Downloads/uploads around the checkpoint are guard-aware
+(Inc-4): on non-oracle frames no transfer happens when `m > 1`.
+
+**Status:** CPU oracle for GPU programs (that is its purpose);
+documented 2026-08-13 (A3) — it was parsed and working but unruled.
+| Construct | Kind | Semantics | Status |
+|-----------|------|-----------|--------|
+| VERIFY | statement directive | CPU shadow-state oracle for GPU programs | CPU+GPU (oracle is host-side) |

@@ -7,11 +7,12 @@ the harness flags as NEW-DIVERGENCE is a bug to burn down.
 
 ## Standing divergences (by design or documented debt)
 
-1. **COMPLEX.** IR path raises a clean error (F6); legacy lowers to
-   `double _Complex` with unvalidated numerics. A corpus program using
-   COMPLEX reports BUILD-DIVERGE (IR raises) — expected until COMPLEX
-   is specified and implemented properly. No corpus program uses
-   COMPLEX today.
+1. **COMPLEX.** Both backends now raise a clean named error (batch 3:
+   legacy previously lowered to `double _Complex` with unvalidated
+   numerics; that silent divergence is closed). A corpus program using
+   COMPLEX fails to build on both paths — expected until COMPLEX is
+   specified and implemented properly. No corpus program uses COMPLEX
+   today.
 2. **Ring intrinsics (RING_PREV/NEXT/SHIFT).** GPU-only, hard-coded
    32-lane assumption, absent from the CPU front end. A CPU-corpus
    program using them fails to build on both paths — excluded from the
