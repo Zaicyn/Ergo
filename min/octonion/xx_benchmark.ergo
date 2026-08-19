@@ -1,0 +1,184 @@
+! xx_benchmark.ergo -- Vanilla XX chain ground state energy
+! Simple Lanczos ED to establish baseline energy scale
+! No geometric dressing, no fiber twist, just: H = J * sum_i (S_i^x S_{i+1}^x + S_i^y S_{i+1}^y)
+! Run: python -m core xx_benchmark.ergo -o /tmp/xxb && /tmp/xxb
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 12, NIT = 150, DIM = 4096
+STATIC REAL :: QR(150,4096), QI(150,4096)
+STATIC REAL :: AL(150), BE(150), A(150,150), V(150,150)
+STATIC REAL :: WR(4096), WI(4096), RR(4096), RI(4096), YV(150)
+REAL :: PI, JJ, BETA, ALJ, CR, CI, NRM, XR, XI, AR, AI, EMN, OFF, TAU, TT, C, AKP, AKQ, APK, AQR, VKP, VKQ
+INTEGER :: I, J, K, P, Q, S, IT, T, BI, BJ, I0, NSW
+
+PI := 3.14159265358979323846
+JJ := 200.0
+
+! Initialize Lanczos with state |010101...> (alternating, Neel-like)
+! In binary for N=12: 010101010101 = 0x555 = 1365
+DO S = 1, DIM
+   QR(1,S) := 0.0
+   QI(1,S) := 0.0
+ENDDO
+QR(1,1366) := 1.0  ! State 1365 (binary 010101010101, i.e., alternating)
+BETA := 0.0
+
+DO IT = 1, NIT
+   ! H action: H|psi> where H = J * sum_i (S_i^x S_{i+1}^x + S_i^y S_{i+1}^y)
+   DO S = 1, DIM
+      WR(S) := 0.0
+      WI(S) := 0.0
+   ENDDO
+   
+   DO S = 1, DIM
+      XR := QR(IT,S)
+      XI := QI(IT,S)
+      
+      ! XX coupling: only when spins differ at neighboring sites
+      DO I = 1, N
+         BI := IAND(ISHFT(S-1,I-1),1)
+         J := I+1
+         IF (I == N) THEN
+            J := 1
+         ENDIF
+         BJ := IAND(ISHFT(S-1,J-1),1)
+         IF (BI /= BJ) THEN
+            ! Flip both spins I and J
+            T := IEOR(IEOR(S-1, ISHFT(1,I-1)), ISHFT(1,J-1)) + 1
+            ! Pure XX coupling (no field, no geometry)
+            AR := -JJ/2.0
+            AI := 0.0
+            WR(T) := WR(T) + AR*XR - AI*XI
+            WI(T) := WI(T) + AR*XI + AI*XR
+         ENDIF
+      ENDDO
+   ENDDO
+   
+   ! alpha
+   ALJ := 0.0
+   DO S = 1, DIM
+      ALJ := ALJ + QR(IT,S)*WR(S) + QI(IT,S)*WI(S)
+   ENDDO
+   AL(IT) := ALJ
+   
+   IF (IT <= 3) THEN
+      WRITE(*,"('IT=%d ALJ=%.15e')") IT, ALJ
+   ENDIF
+   
+   DO S = 1, DIM
+      WR(S) := WR(S) - ALJ*QR(IT,S)
+      WI(S) := WI(S) - ALJ*QI(IT,S)
+   ENDDO
+   
+   IF (IT > 1) THEN
+      DO S = 1, DIM
+         WR(S) := WR(S) - BETA*QR(IT-1,S)
+         WI(S) := WI(S) - BETA*QI(IT-1,S)
+      ENDDO
+   ENDIF
+   
+   ! Full reorthogonalization
+   DO K = 1, IT
+      CR := 0.0
+      CI := 0.0
+      DO S = 1, DIM
+         CR := CR + QR(K,S)*WR(S) + QI(K,S)*WI(S)
+         CI := CI + QR(K,S)*WI(S) - QI(K,S)*WR(S)
+      ENDDO
+      DO S = 1, DIM
+         WR(S) := WR(S) - CR*QR(K,S) + CI*QI(K,S)
+         WI(S) := WI(S) - CR*QI(K,S) - CI*QR(K,S)
+      ENDDO
+   ENDDO
+   
+   NRM := 0.0
+   DO S = 1, DIM
+      NRM := NRM + WR(S)*WR(S) + WI(S)*WI(S)
+   ENDDO
+   BETA := SQRT(NRM)
+   
+   IF (IT <= 3) THEN
+      WRITE(*,"('IT=%d BETA=%.15e')") IT, BETA
+   ENDIF
+   
+   IF (IT < NIT) THEN
+      BE(IT) := BETA
+      DO S = 1, DIM
+         QR(IT+1,S) := WR(S)/BETA
+         QI(IT+1,S) := WI(S)/BETA
+      ENDDO
+   ENDIF
+ENDDO
+
+! Solve tridiagonal with Jacobi
+DO P = 1, NIT
+   DO Q = 1, NIT
+      A(P,Q) := 0.0
+      V(P,Q) := 0.0
+   ENDDO
+   A(P,P) := AL(P)
+   V(P,P) := 1.0
+ENDDO
+DO P = 1, NIT-1
+   A(P,P+1) := BE(P)
+   A(P+1,P) := BE(P)
+ENDDO
+
+DO NSW = 1, 200
+   OFF := 0.0
+   DO P = 1, NIT
+      DO Q = 1, NIT
+         OFF := OFF + A(P,Q)*A(P,Q)
+      ENDDO
+      OFF := OFF - A(P,P)*A(P,P)
+   ENDDO
+   OFF := SQRT(OFF)
+   IF (OFF >= 1.0e-14) THEN
+      DO P = 1, NIT-1
+         DO Q = P+1, NIT
+            IF (ABS(A(P,Q)) > 1.0e-16) THEN
+               TAU := (A(Q,Q)-A(P,P))/(2.0*A(P,Q))
+               IF (TAU /= 0.0) THEN
+                  TT := SIGN(1.0,TAU)/(ABS(TAU)+SQRT(1.0+TAU*TAU))
+               ELSE
+                  TT := 1.0
+               ENDIF
+               C := 1.0/SQRT(1.0+TT*TT)
+               DO K = 1, NIT
+                  AKP := A(K,P)
+                  AKQ := A(K,Q)
+                  A(K,P) := C*AKP - TT*AKQ
+                  A(K,Q) := TT*AKP + C*AKQ
+               ENDDO
+               DO K = 1, NIT
+                  APK := A(P,K)
+                  AQR := A(Q,K)
+                  A(P,K) := C*APK - TT*AQR
+                  A(Q,K) := TT*APK + C*AQR
+               ENDDO
+               DO K = 1, NIT
+                  VKP := V(K,P)
+                  VKQ := V(K,Q)
+                  V(K,P) := C*VKP - TT*VKQ
+                  V(K,Q) := TT*VKP + C*VKQ
+               ENDDO
+            ENDIF
+         ENDDO
+      ENDDO
+   ENDIF
+ENDDO
+
+! Find ground state
+EMN := A(1,1)
+I0 := 1
+DO P = 2, NIT
+   IF (A(P,P) < EMN) THEN
+      EMN := A(P,P)
+      I0 := P
+   ENDIF
+ENDDO
+
+WRITE(*,"('XX Benchmark (N=12, J=200, h=0):')")
+WRITE(*,"('Ground state energy: %.17e')") EMN
+WRITE(*,"('Expected (approx): -1200 to -1400 range')")
+WRITE(*,"('Ratio to viviani EA (-2601.87): %.3f')") EMN / (-2601.87)

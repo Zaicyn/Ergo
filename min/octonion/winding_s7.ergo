@@ -1,0 +1,291 @@
+! winding_s7.ergo -- Stage B: truncated zonal propagator on S^7 (+ S^3 control)
+! Run: python -m core min/<dir>/winding_s7.ergo -o /tmp/ws7 && /tmp/ws7
+!
+! Physics: K_N(T,g) = sum_{l=0}^{N-1} d_l R_l(g) e^{-i E_l T}  (re/im REAL
+! accumulators, house style), with S^n data
+!   E_l = l(l+n-1)/2   (Laplacian eigenvalue, R=1)
+!   d_l = (2l+n-1)(l+n-2)! / (l! (n-1)!)   (degeneracy, f64 recurrence)
+!   R_l = C_l^lam(cos g) / C_l^lam(1),  lam = (n-1)/2  (Gegenbauer recurrence)
+! S^3 control (lam=1) reduces to sin((l+1)g)/((l+1) sin g) -- the kernel form
+! already validated in QUATERNION_FINDINGS (checked in mirror: agrees 3e-17).
+!
+! What this run establishes (Stage B oracle set):
+!   1. K7/K3 sample rows: BYTE-EXACT vs mirror oracles below (same op order).
+!   2. Revival identity: T=2pi gives e^{-i 2pi E_l} = (-1)^l, so
+!      K(2pi, g) = K(0, pi-g) as an exact arithmetic identity at fixed
+!      truncation -- REV7A/REV7B and REV3A/REV3B must agree to ~1e-4 on a
+!      1e4 scale (roundoff of the truncated series).
+!   3. Exact 4pi periodicity: K(4pi) = K(0) (E_l integers -> closed orbit).
+!   4. Sampled phase winding over [0,4pi] at NT=4096: DIAGNOSTIC ONLY.
+!      The sampled curve is closed, so the count is always an integer, but
+!      at NT=8192 the mirror gives DIFFERENT integers (-1467/-1630): the
+!      fastest modes alias under any fixed grid. This is the S^7 incarnation
+!      of the S^3 truncation lesson -- do not read topology into the sampled
+!      winding without a paired-truncation-style fix. Flagged, not resolved.
+!
+! Implementation notes: no scalar SUBROUTINE args at all (bug A6: write-back
+! broken, read-in unverified) -- the n=7 and n=3 blocks are inline. Arrays
+! STATIC per house rule. ATAN2 fed REALs.
+! v2 fix (2026-08-12): DP recurrence used raw 1-based L -- off-by-one vs the
+! mirror's 0-based l (engine ran it exactly as written; DP7 ratio came out
+! 70/16=4.375 instead of 8). Fixed with LL := L-1. Gegenbauer loop was
+! already aligned (RP tables matched mirror byte-exact). Oracles unchanged:
+! they were generated from the correct mirror tables.
+!
+! MIRROR ORACLES (sandbox, gcc-order-equivalent f64, N=64, GAMMA=0.7):
+!   WIND7 2.15000000000000057e+02   MAXK7 3.06483569470940391e+05
+!   WIND3 2.10000000000001108e+02   MAXK3 9.08775805768089413e+02
+!   REV7A  1.23005424714689034e+04 -4.25608746913002747e-08
+!   REV7B  1.23005424714683868e+04  0.00000000000000000e+00
+!   REV3A -4.89612705348802564e+01 -2.50587382717713248e-11
+!   REV3B -4.89612705348806614e+01  0.00000000000000000e+00
+!   K7 rows (IT, re, im), every 256 of 0..4096:
+!     0    -5.99600363312200934e+04  0.00000000000000000e+00
+!     256   2.06892745214066876e+05 -1.39130683046296472e+04
+!     512  -1.93526670742182578e+04  4.47707985565403578e+03
+!     768   1.71089732174524805e+05  2.18899447349291440e+04
+!     1024 -2.38297469298772448e+04 -3.61302894013641198e+04
+!     1280  1.98915868783788086e+05  2.18899447350291412e+04
+!     1536 -2.83068267855108170e+04  4.47707985571962126e+03
+!     1792  1.63112855744258093e+05 -1.39130683046201375e+04
+!     2048  1.23005424714689034e+04 -4.25608746913002747e-08
+!     2304  1.63112855744307686e+05  1.39130683047485909e+04
+!     2560 -2.83068267855160520e+04 -4.47707985576958890e+03
+!     2816  1.98915868783828279e+05 -2.18899447343393294e+04
+!     3072 -2.38297469298607757e+04  3.61302894014117919e+04
+!     3328  1.71089732174574659e+05 -2.18899447350936898e+04
+!     3584 -1.93526670742730712e+04 -4.47707985568072036e+03
+!     3840  2.06892745214051334e+05  1.39130683052389722e+04
+!     4096 -5.99600363312200934e+04 -7.19162464270066721e-08
+!   K3 rows:
+!     0    -5.44162015719845300e+01  0.00000000000000000e+00
+!     256   3.28417486258065594e+02  4.37379664107015600e+01
+!     512  -5.14595850878454542e+00  4.65427775446111838e+01
+!     768   3.56126105523448132e+02  1.60293471454333769e+01
+!     1024 -5.16887360533979177e+01 -2.72746551859916053e+00
+!     1280  2.68650172701927659e+02  1.60293471453872129e+01
+!     1536 -9.82315135980397827e+01  4.65427775446563885e+01
+!     1792  2.96358791967411435e+02  4.37379664108316959e+01
+!     2048 -4.89612705348802564e+01 -2.50587382717713248e-11
+!     2304  2.96358791967425304e+02 -4.37379664104676351e+01
+!     2560 -9.82315135979026479e+01 -4.65427775449629024e+01
+!     2816  2.68650172702102225e+02 -1.60293471445539240e+01
+!     3072 -5.16887360535805556e+01  2.72746551851460595e+00
+!     3328  3.56126105523326828e+02 -1.60293471458230457e+01
+!     3584 -5.14595850884610684e+00 -4.65427775445268637e+01
+!     3840  3.28417486258176780e+02 -4.37379664097527510e+01
+!     4096 -5.44162015719845300e+01 -3.25961137759239986e-10
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 64, NT = 4096
+STATIC REAL :: DP(64), RP(64), RP2(64)
+REAL :: PI, GAMMA, X, LAM, C0, C1, C2, A0, A1, A2
+REAL :: T, PH, W, RE, IM, MAG, MAXK, PHA, PREV, D, WIND
+INTEGER :: NV, L, LL, IT
+
+PI := 3.14159265358979323846
+GAMMA := 0.7
+
+! ================= S^7 =================
+NV := 7
+X := COS(GAMMA)
+LAM := (NV-1)/2.0
+C0 := 1.0
+A0 := 1.0
+C1 := 2.0*LAM*X
+A1 := 2.0*LAM
+DP(1) := 1.0
+RP(1) := 1.0
+RP(2) := C1/A1
+DO L = 1, N-1
+   LL := L-1
+   DP(L+1) := DP(L)*(2.0*LL+NV+1.0)*(LL+NV-1.0)/((LL+1.0)*(2.0*LL+NV-1.0))
+ENDDO
+DO L = 2, N-1
+   C2 := (2.0*(L+LAM-1.0)*X*C1 - (L+2.0*LAM-2.0)*C0)/L
+   A2 := (2.0*(L+LAM-1.0)*A1 - (L+2.0*LAM-2.0)*A0)/L
+   RP(L+1) := C2/A2
+   C0 := C1
+   C1 := C2
+   A0 := A1
+   A1 := A2
+ENDDO
+
+WIND := 0.0
+MAXK := 0.0
+PREV := 0.0
+DO IT = 0, NT
+   T := 4.0*PI*IT/NT
+   RE := 0.0
+   IM := 0.0
+   DO L = 1, N
+      LL := L-1
+      PH := -0.5*(LL*(LL+NV-1))*T
+      W := DP(L)*RP(L)
+      RE := RE + W*COS(PH)
+      IM := IM + W*SIN(PH)
+   ENDDO
+   MAG := SQRT(RE*RE+IM*IM)
+   IF (MAG > MAXK) THEN
+      MAXK := MAG
+   ENDIF
+   PHA := ATAN2(IM, RE)
+   IF (IT > 0) THEN
+      D := PHA - PREV
+      IF (D > PI) THEN
+         D := D - 2.0*PI
+      ENDIF
+      IF (D < -PI) THEN
+         D := D + 2.0*PI
+      ENDIF
+      WIND := WIND + D
+   ENDIF
+   PREV := PHA
+   IF (MOD(IT,256) = 0) THEN
+      WRITE(*,"('K7 %d %.17e %.17e')") IT, RE, IM
+   ENDIF
+ENDDO
+WRITE(*,"('WIND7 %.17e')") WIND/(2.0*PI)
+WRITE(*,"('MAXK7 %.17e')") MAXK
+
+! revival pair: K(2pi, gamma) vs K(0, pi-gamma)
+T := 2.0*PI
+RE := 0.0
+IM := 0.0
+DO L = 1, N
+   LL := L-1
+   PH := -0.5*(LL*(LL+NV-1))*T
+   W := DP(L)*RP(L)
+   RE := RE + W*COS(PH)
+   IM := IM + W*SIN(PH)
+ENDDO
+WRITE(*,"('REV7A %.17e %.17e')") RE, IM
+! tables at -cos(gamma)
+X := -COS(GAMMA)
+C0 := 1.0
+A0 := 1.0
+C1 := 2.0*LAM*X
+A1 := 2.0*LAM
+RP2(1) := 1.0
+RP2(2) := C1/A1
+DO L = 2, N-1
+   C2 := (2.0*(L+LAM-1.0)*X*C1 - (L+2.0*LAM-2.0)*C0)/L
+   A2 := (2.0*(L+LAM-1.0)*A1 - (L+2.0*LAM-2.0)*A0)/L
+   RP2(L+1) := C2/A2
+   C0 := C1
+   C1 := C2
+   A0 := A1
+   A1 := A2
+ENDDO
+T := 0.0
+RE := 0.0
+IM := 0.0
+DO L = 1, N
+   LL := L-1
+   PH := -0.5*(LL*(LL+NV-1))*T
+   W := DP(L)*RP2(L)
+   RE := RE + W*COS(PH)
+   IM := IM + W*SIN(PH)
+ENDDO
+WRITE(*,"('REV7B %.17e %.17e')") RE, IM
+
+! ================= S^3 control =================
+NV := 3
+X := COS(GAMMA)
+LAM := (NV-1)/2.0
+C0 := 1.0
+A0 := 1.0
+C1 := 2.0*LAM*X
+A1 := 2.0*LAM
+DP(1) := 1.0
+RP(1) := 1.0
+RP(2) := C1/A1
+DO L = 1, N-1
+   LL := L-1
+   DP(L+1) := DP(L)*(2.0*LL+NV+1.0)*(LL+NV-1.0)/((LL+1.0)*(2.0*LL+NV-1.0))
+ENDDO
+DO L = 2, N-1
+   C2 := (2.0*(L+LAM-1.0)*X*C1 - (L+2.0*LAM-2.0)*C0)/L
+   A2 := (2.0*(L+LAM-1.0)*A1 - (L+2.0*LAM-2.0)*A0)/L
+   RP(L+1) := C2/A2
+   C0 := C1
+   C1 := C2
+   A0 := A1
+   A1 := A2
+ENDDO
+
+WIND := 0.0
+MAXK := 0.0
+PREV := 0.0
+DO IT = 0, NT
+   T := 4.0*PI*IT/NT
+   RE := 0.0
+   IM := 0.0
+   DO L = 1, N
+      LL := L-1
+      PH := -0.5*(LL*(LL+NV-1))*T
+      W := DP(L)*RP(L)
+      RE := RE + W*COS(PH)
+      IM := IM + W*SIN(PH)
+   ENDDO
+   MAG := SQRT(RE*RE+IM*IM)
+   IF (MAG > MAXK) THEN
+      MAXK := MAG
+   ENDIF
+   PHA := ATAN2(IM, RE)
+   IF (IT > 0) THEN
+      D := PHA - PREV
+      IF (D > PI) THEN
+         D := D - 2.0*PI
+      ENDIF
+      IF (D < -PI) THEN
+         D := D + 2.0*PI
+      ENDIF
+      WIND := WIND + D
+   ENDIF
+   PREV := PHA
+   IF (MOD(IT,256) = 0) THEN
+      WRITE(*,"('K3 %d %.17e %.17e')") IT, RE, IM
+   ENDIF
+ENDDO
+WRITE(*,"('WIND3 %.17e')") WIND/(2.0*PI)
+WRITE(*,"('MAXK3 %.17e')") MAXK
+
+T := 2.0*PI
+RE := 0.0
+IM := 0.0
+DO L = 1, N
+   LL := L-1
+   PH := -0.5*(LL*(LL+NV-1))*T
+   W := DP(L)*RP(L)
+   RE := RE + W*COS(PH)
+   IM := IM + W*SIN(PH)
+ENDDO
+WRITE(*,"('REV3A %.17e %.17e')") RE, IM
+X := -COS(GAMMA)
+C0 := 1.0
+A0 := 1.0
+C1 := 2.0*LAM*X
+A1 := 2.0*LAM
+RP2(1) := 1.0
+RP2(2) := C1/A1
+DO L = 2, N-1
+   C2 := (2.0*(L+LAM-1.0)*X*C1 - (L+2.0*LAM-2.0)*C0)/L
+   A2 := (2.0*(L+LAM-1.0)*A1 - (L+2.0*LAM-2.0)*A0)/L
+   RP2(L+1) := C2/A2
+   C0 := C1
+   C1 := C2
+   A0 := A1
+   A1 := A2
+ENDDO
+T := 0.0
+RE := 0.0
+IM := 0.0
+DO L = 1, N
+   LL := L-1
+   PH := -0.5*(LL*(LL+NV-1))*T
+   W := DP(L)*RP2(L)
+   RE := RE + W*COS(PH)
+   IM := IM + W*SIN(PH)
+ENDDO
+WRITE(*,"('REV3B %.17e %.17e')") RE, IM

@@ -1,0 +1,327 @@
+! oct_cd_battery_v2.ergo -- Cayley-Dickson algebra battery, Stage A (revised)
+! Run: python -m core min/<dir>/oct_cd_battery_v2.ergo -o /tmp/ocb2 && /tmp/ocb2
+!
+! Revision history (v1 -> v2):
+!   v1 TABLE matched the mirror byte-exact (64/64) but every battery metric
+!   landed at the f64 floor, incl. NONASSOC (engine 4.44e-16 vs mirror 8.44).
+!   Probes 1-5 isolated the cause:
+!     * RAND is healthy (literal/variable/expression args, combined or split
+!       loops all fine) -- the v1 header's RNG worry is RETRACTED.
+!     * OMUL on generic nested calls matches sandbox oracles to 15 digits.
+!     * THE BUG: scalar (non-array) SUBROUTINE dummy args are lowered
+!       pass-by-value with no copy-out (probe5: SET42 -> 0.0). v1's OMAXD
+!       and ASSOC8 returned their results through scalar DEV -> callers
+!       always saw stale/zero values. The algebra was never wrong; the
+!       harness was blind.
+!   v2 workaround: scalar outputs travel home in 1-element arrays (DD(1)).
+!   When the compiler fix lands (emit scalar dummies as pointers), this file
+!   can be reverted to scalar out-args -- the oracles below still apply.
+!
+! What this tests (octonions via CD from R):
+!   TABLE     e_i . e_j for all 64 pairs        -> byte-exact vs mirror oracle
+!   NORM      |XY|^2 = |X|^2 |Y|^2              -> f64 floor
+!   ALT       X(XY)=(XX)Y, (XY)Y=X(YY)          -> f64 floor
+!   NONASSOC  (XY)Z != X(YZ)                    -> O(1)   <-- THE POINT
+!   ARTIN     assoc. over {X,Y,XY} = 0          -> f64 floor
+!   MOUFANG   (XY)(ZX) = X((YZ)X)               -> f64 floor
+!   ANTIAUTO  conj(XY) = conj(Y) conj(X)        -> f64 floor
+!   INVERSE   X . conj(X)/|X|^2 = 1             -> f64 floor
+!
+! ORACLES:
+!   TABLE: 64 lines, byte-exact against mirror (unchanged from v1, which
+!     your engine already matched; e.g. 'TABLE 2 3 4 1', 'TABLE 3 2 4 -1',
+!     'TABLE 2 5 6 1', 'TABLE 3 5 7 1', 'TABLE 5 6 -3 1', 'TABLE 6 5 3 1',
+!     'TABLE 7 8 -1 1', 'TABLE 8 7 1 1').
+!   Battery metrics: pattern-oracle, not byte-exact. Your RAND mapping
+!   differs from spec splitmix64 (probe 1), so the exact draws differ from
+!   the mirror's. Expected with ANY healthy RNG:
+!     NORM/ALT/ARTIN/MOUFANG/ANTIAUTO/INVERSE: f64 floor (~1e-17..1e-14)
+!     NONASSOC: max O(1), mean O(1). Mirror with spec draws: max 8.44,
+!     mean 3.06 -- expect the same magnitude with your draws.
+!     If NONASSOC is again at floor -> something else is broken; paste it.
+!     If NONASSOC is O(1) -> STAGE A PASSES: ergo has real octonions.
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: NDRAWS = 2000
+
+REAL :: X(8), Y(8), Z(8), T1(8), T2(8), T3(8), D(8)
+REAL :: WW(8,3), WA(8), WB(8), WC(8)
+REAL :: E1(8), E2(8), E3(8)
+REAL :: MXNORM, MXALT, MXNON, MXART, MXMOU, MXANTI, MXINV
+REAL :: SUMNON, NX2, NY2, NXY, DN, DA, DEV, SS
+REAL :: DD(1)
+INTEGER :: T, K, M, I, J, BASE, IA, IB, IC, K2, SG
+
+! ---------------- TABLE: basis products ----------------
+DO I = 1, 8
+   DO J = 1, 8
+      DO K = 1, 8
+         E1(K) := 0.0
+         E2(K) := 0.0
+      ENDDO
+      E1(I) := 1.0
+      E2(J) := 1.0
+      CALL OMUL(E1, E2, E3)
+      K2 := 0
+      SG := 0
+      DO M = 1, 8
+         IF (ABS(E3(M)) > 0.5) THEN
+            K2 := M
+            SG := 1
+            IF (E3(M) < 0.0) THEN
+               SG := -1
+            ENDIF
+         ENDIF
+      ENDDO
+      WRITE(*,"('TABLE %d %d %d %d')") I, J, K2, SG
+   ENDDO
+ENDDO
+
+! ---------------- battery ----------------
+MXNORM := 0.0
+MXALT := 0.0
+MXNON := 0.0
+MXART := 0.0
+MXMOU := 0.0
+MXANTI := 0.0
+MXINV := 0.0
+SUMNON := 0.0
+
+DO T = 1, NDRAWS
+   BASE := 1000003 + (T-1)*64
+   DO K = 1, 8
+      X(K) := 2.0*RAND(BASE+K-1) - 1.0
+      Y(K) := 2.0*RAND(BASE+K+7) - 1.0
+      Z(K) := 2.0*RAND(BASE+K+15) - 1.0
+   ENDDO
+
+   NX2 := 0.0
+   NY2 := 0.0
+   DO K = 1, 8
+      NX2 := NX2 + X(K)*X(K)
+      NY2 := NY2 + Y(K)*Y(K)
+   ENDDO
+
+   ! NORM: |XY|^2 vs |X|^2 |Y|^2
+   CALL OMUL(X, Y, T1)
+   NXY := 0.0
+   DO K = 1, 8
+      NXY := NXY + T1(K)*T1(K)
+   ENDDO
+   DN := ABS(NXY - NX2*NY2) / (NX2*NY2)
+   IF (DN > MXNORM) THEN
+      MXNORM := DN
+   ENDIF
+
+   ! ALT: X(XY) - (XX)Y
+   CALL OMUL(X, Y, T1)
+   CALL OMUL(X, T1, T2)
+   CALL OMUL(X, X, T3)
+   CALL OMUL(T3, Y, T1)
+   CALL OMAXD(T2, T1, DD)
+   DA := DD(1)
+   IF (DA > MXALT) THEN
+      MXALT := DA
+   ENDIF
+   ! ALT: (XY)Y - X(YY)
+   CALL OMUL(X, Y, T1)
+   CALL OMUL(T1, Y, T2)
+   CALL OMUL(Y, Y, T3)
+   CALL OMUL(X, T3, T1)
+   CALL OMAXD(T2, T1, DD)
+   DA := DD(1)
+   IF (DA > MXALT) THEN
+      MXALT := DA
+   ENDIF
+
+   ! NONASSOC witness: (XY)Z - X(YZ)
+   CALL OMUL(X, Y, T1)
+   CALL OMUL(T1, Z, T2)
+   CALL OMUL(Y, Z, T1)
+   CALL OMUL(X, T1, T3)
+   CALL OMAXD(T2, T3, DD)
+   DA := DD(1)
+   SUMNON := SUMNON + DA
+   IF (DA > MXNON) THEN
+      MXNON := DA
+   ENDIF
+
+   ! ARTIN: associators over {X, Y, XY}
+   CALL OMUL(X, Y, T1)
+   DO K = 1, 8
+      WW(K,1) := X(K)
+      WW(K,2) := Y(K)
+      WW(K,3) := T1(K)
+   ENDDO
+   DO IA = 1, 3
+      DO IB = 1, 3
+         DO IC = 1, 3
+            DO K = 1, 8
+               WA(K) := WW(K,IA)
+               WB(K) := WW(K,IB)
+               WC(K) := WW(K,IC)
+            ENDDO
+            CALL ASSOC8(WA, WB, WC, DD)
+            DEV := DD(1)
+            IF (DEV > MXART) THEN
+               MXART := DEV
+            ENDIF
+         ENDDO
+      ENDDO
+   ENDDO
+
+   ! MOUFANG: (XY)(ZX) - X((YZ)X)
+   CALL OMUL(X, Y, T1)
+   CALL OMUL(Z, X, T2)
+   CALL OMUL(T1, T2, T3)
+   CALL OMUL(Y, Z, T1)
+   CALL OMUL(T1, X, T2)
+   CALL OMUL(X, T2, T1)
+   CALL OMAXD(T3, T1, DD)
+   DA := DD(1)
+   IF (DA > MXMOU) THEN
+      MXMOU := DA
+   ENDIF
+
+   ! ANTIAUTO: conj(XY) - conj(Y)conj(X)
+   CALL OMUL(X, Y, T1)
+   CALL OCNJ(T1, T2)
+   CALL OCNJ(Y, T1)
+   CALL OCNJ(X, T3)
+   CALL OMUL(T1, T3, T1)
+   CALL OMAXD(T2, T1, DD)
+   DA := DD(1)
+   IF (DA > MXANTI) THEN
+      MXANTI := DA
+   ENDIF
+
+   ! INVERSE: X . conj(X)/|X|^2 - 1   (inline, was already correct in v1)
+   CALL OCNJ(X, T1)
+   DO K = 1, 8
+      T1(K) := T1(K)/NX2
+   ENDDO
+   CALL OMUL(X, T1, T2)
+   T2(1) := T2(1) - 1.0
+   DA := 0.0
+   DO K = 1, 8
+      SS := ABS(T2(K))
+      IF (SS > DA) THEN
+         DA := SS
+      ENDIF
+   ENDDO
+   IF (DA > MXINV) THEN
+      MXINV := DA
+   ENDIF
+
+ENDDO
+
+WRITE(*,"('NORM maxreldev %.17e')") MXNORM
+WRITE(*,"('ALT maxabsdev %.17e')") MXALT
+WRITE(*,"('NONASSOC max %.17e mean %.17e')") MXNON, SUMNON/NDRAWS
+WRITE(*,"('ARTIN maxabsdev %.17e')") MXART
+WRITE(*,"('MOUFANG maxabsdev %.17e')") MXMOU
+WRITE(*,"('ANTIAUTO maxabsdev %.17e')") MXANTI
+WRITE(*,"('INVERSE maxabsdev %.17e')") MXINV
+
+! ============================================================
+! library: Cayley-Dickson products and helpers
+! ============================================================
+
+SUBROUTINE QMU4(A, B, C)
+   ! quaternion product on 4-blocks via complex CD pairs
+   ! A = (z,w): z = A1+iA2, w = A3+iA4
+   IMPLICIT NONE
+   REAL :: A(4), B(4), C(4)
+   REAL :: ZR0, ZR1, CW0, CW1, WZ0, WZ1, WC0, WC1
+   ZR0 := A(1)*B(1) - A(2)*B(2)
+   ZR1 := A(1)*B(2) + A(2)*B(1)
+   CW0 := B(3)*A(3) + B(4)*A(4)
+   CW1 := B(3)*A(4) - B(4)*A(3)
+   WZ0 := B(3)*A(1) - B(4)*A(2)
+   WZ1 := B(3)*A(2) + B(4)*A(1)
+   WC0 := A(3)*B(1) + B(2)*A(4)
+   WC1 := -B(2)*A(3) + A(4)*B(1)
+   C(1) := ZR0 - CW0
+   C(2) := ZR1 - CW1
+   C(3) := WZ0 + WC0
+   C(4) := WZ1 + WC1
+END
+
+SUBROUTINE OMUL(A, B, C)
+   ! octonion product: A=(p,q), B=(r,s) ->
+   ! C = (p r - conj(s) q, s p + q conj(r))
+   IMPLICIT NONE
+   REAL :: A(8), B(8), C(8)
+   REAL :: P(4), R(4), S(4), CS(4), CR(4)
+   REAL :: PR(4), CSQ(4), SP(4), QCR(4)
+   INTEGER :: I
+   DO I = 1, 4
+      P(I) := A(I)
+      R(I) := B(I)
+      S(I) := B(I+4)
+   ENDDO
+   CALL QMU4(P, R, PR)
+   CS(1) := S(1)
+   CS(2) := -S(2)
+   CS(3) := -S(3)
+   CS(4) := -S(4)
+   DO I = 1, 4
+      R(I) := A(I+4)
+   ENDDO
+   CALL QMU4(CS, R, CSQ)
+   DO I = 1, 4
+      P(I) := B(I+4)
+      R(I) := A(I)
+   ENDDO
+   CALL QMU4(P, R, SP)
+   CR(1) := B(1)
+   CR(2) := -B(2)
+   CR(3) := -B(3)
+   CR(4) := -B(4)
+   DO I = 1, 4
+      P(I) := A(I+4)
+   ENDDO
+   CALL QMU4(P, CR, QCR)
+   DO I = 1, 4
+      C(I) := PR(I) - CSQ(I)
+      C(I+4) := SP(I) + QCR(I)
+   ENDDO
+END
+
+SUBROUTINE OCNJ(A, C)
+   IMPLICIT NONE
+   REAL :: A(8), C(8)
+   INTEGER :: I
+   C(1) := A(1)
+   DO I = 2, 8
+      C(I) := -A(I)
+   ENDDO
+END
+
+SUBROUTINE OMAXD(A, B, DD)
+   ! max |A-B| componentwise, returned in DD(1)
+   ! (scalar out-arg workaround: probe5 showed scalar dummies don't copy out)
+   IMPLICIT NONE
+   REAL :: A(8), B(8), DD(1)
+   REAL :: SS
+   INTEGER :: I
+   DD(1) := 0.0
+   DO I = 1, 8
+      SS := ABS(A(I) - B(I))
+      IF (SS > DD(1)) THEN
+         DD(1) := SS
+      ENDIF
+   ENDDO
+END
+
+SUBROUTINE ASSOC8(A, B, C, DD)
+   ! |(AB)C - A(BC)|, max component, returned in DD(1)
+   IMPLICIT NONE
+   REAL :: A(8), B(8), C(8), DD(1)
+   REAL :: T1(8), T2(8), T3(8)
+   CALL OMUL(A, B, T1)
+   CALL OMUL(T1, C, T2)
+   CALL OMUL(B, C, T1)
+   CALL OMUL(A, T1, T3)
+   CALL OMAXD(T2, T3, DD)
+END

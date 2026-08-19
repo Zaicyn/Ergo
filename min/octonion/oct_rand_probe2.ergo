@@ -1,0 +1,47 @@
+! oct_rand_probe2.ergo -- does RAND mis-lower EXPRESSION arguments?
+! Run: python -m core min/<dir>/oct_rand_probe2.ergo -o /tmp/orp2 && /tmp/orp2
+!
+! Probe 1 showed: RAND(literal) and RAND(variable) vary fine, but the mapping
+! is not spec splitmix64. Battery used RAND(BASE+K-1) style expressions and
+! behaved as if every draw in a triple returned the same value.
+! This probe separates "hash mapping differs" from "expression args broken":
+!
+!   PLAIN  RAND(K)                    -- variable arg (known good)
+!   EXP0   RAND(K+0)                  -- trivially-equal expression
+!   EXP7   RAND(K+7)                  -- battery Y-style offset expression
+!   BATX   RAND(1000003+(T-1)*64+K-1) -- exact battery X seeds, T=1, K=1..8
+!
+! Verdict key:
+!   - EXP0 equals PLAIN, EXP7/BATX vary distinctly -> arg lowering fine;
+!     the hash itself just differs from spec (paste output, I re-mirror).
+!   - EXP0/EXP7/BATX all equal PLAIN (i.e., offset ignored) or all equal
+!     each other within a row -> expression arguments are dropped/mis-lowered
+!     -> compiler bug; battery workaround: evaluate seed into a variable
+!     first (SD := BASE+K-1; RAND(SD)) until fixed.
+
+IMPLICIT NONE
+INTEGER :: K, SD
+REAL :: R
+
+WRITE(*,"('PLAIN vs EXP0 vs EXP7')")
+DO K = 1, 5
+   R := RAND(K)
+   WRITE(*,"('PLAIN %d %.17e')") K, R
+   R := RAND(K+0)
+   WRITE(*,"('EXP0  %d %.17e')") K, R
+   R := RAND(K+7)
+   WRITE(*,"('EXP7  %d %.17e')") K, R
+ENDDO
+
+WRITE(*,"('battery X seeds for T=1: expect 8 distinct values')")
+DO K = 1, 8
+   R := RAND(1000003+K-1)
+   WRITE(*,"('BATX  %d %.17e')") K, R
+ENDDO
+
+WRITE(*,"('same seeds via variable (workaround check)')")
+DO K = 1, 8
+   SD := 1000003+K-1
+   R := RAND(SD)
+   WRITE(*,"('BATV  %d %.17e')") K, R
+ENDDO

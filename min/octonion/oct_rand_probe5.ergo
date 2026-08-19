@@ -1,0 +1,58 @@
+! oct_rand_probe5.ergo -- minimal scalar dummy-arg write-back isolation
+! Run: python -m core min/<dir>/oct_rand_probe5.ergo -o /tmp/orp5 && /tmp/orp5
+!
+! Probe 4 verdict: OMUL perfect (T2,T3,XY all matched oracles to 15 digits)
+! but OMAXD's DEV came home as exactly 0.0. Three possible breakpoints:
+!   (a) scalar dummy-arg write-back (X := value never reaches caller)
+!   (b) scalar dummy-arg read-in (X+1 reads garbage/0)
+!   (c) block IF on scalars inside a SUBROUTINE never fires
+! Each test below isolates one. Oracles:
+!   SET42 -> 4.2e+01 if write-back works, else 0
+!   ADD1  -> 2.0 if read+write both work
+!   DMAX2 -> 2.5 if IF-inside-subroutine + write-back work
+
+IMPLICIT NONE
+REAL :: DA, DB
+REAL :: A(2), B(2)
+
+DA := 0.0
+CALL SET42(DA)
+WRITE(*,"('SET42 %.17e')") DA
+
+DA := 1.0
+CALL ADD1(DA)
+WRITE(*,"('ADD1 %.17e')") DA
+
+A(1) := 0.0
+A(2) := 0.0
+B(1) := 0.0
+B(2) := 2.5
+DB := 0.0
+CALL DMAX2(A, B, DB)
+WRITE(*,"('DMAX2 %.17e')") DB
+
+SUBROUTINE SET42(X)
+   IMPLICIT NONE
+   REAL :: X
+   X := 42.0
+END
+
+SUBROUTINE ADD1(X)
+   IMPLICIT NONE
+   REAL :: X
+   X := X + 1.0
+END
+
+SUBROUTINE DMAX2(A, B, DEV)
+   IMPLICIT NONE
+   REAL :: A(2), B(2), DEV
+   REAL :: SS
+   INTEGER :: I
+   DEV := 0.0
+   DO I = 1, 2
+      SS := ABS(A(I) - B(I))
+      IF (SS > DEV) THEN
+         DEV := SS
+      ENDIF
+   ENDDO
+END

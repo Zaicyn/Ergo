@@ -1,0 +1,57 @@
+! oct_rand_probe.ergo -- RNG diagnostic after oct_cd_battery battery mismatch
+! Run: python -m core min/<dir>/oct_rand_probe.ergo -o /tmp/orp && /tmp/orp
+!
+! Background: the battery run's TABLE matched the mirror byte-exact (algebra OK)
+! but every associator-type metric landed at the f64 floor, which for true
+! octonion multiplication means X,Y,Z all lived in a one-generator subalgebra
+! (Artin). That happens if RAND(seed) ignores its seed (constant output).
+!
+! This probe prints RAND at 5 seeds, RAND at 2 big seeds, and a HASH-chain
+! sequence S := HASH(S) read out through RAND(S) (avoids printing 64-bit ints).
+! Oracles below are the spec'd splitmix64, RAND = (sm64(seed)>>11) * 2^-53.
+!
+! ORACLES (spec):
+!   RAND(1)  = 3.38166601271989720e-01
+!   RAND(2)  = 8.58676468773563295e-01
+!   RAND(3)  = 1.18459637716185839e-01
+!   RAND(4)  = 7.17352937081465414e-01
+!   RAND(5)  = 7.13857724737619215e-01
+!   RAND(1000003)    = 7.57773723230491858e-01
+!   RAND(123456789)  = 9.45747842112950710e-01
+!   chain S:=HASH(S) from 1, RAND(S):
+!     4.79309918605587693e-01
+!     4.44500175370210804e-01
+!     4.07155975883598198e-01
+!     8.08145206644515612e-01
+!     1.90777263838973643e-01
+!
+! Verdict key:
+!   (a) all RAND(k) equal          -> RAND ignores seed (compiler bug);
+!                                     workaround: re-seed via HASH chain.
+!   (b) RAND(k) vary, none match   -> different mapping than spec; battery
+!                                     oracles need re-mirroring to your RAND.
+!   (c) RAND matches spec exactly  -> bug is in my battery seeding; re-issue.
+
+IMPLICIT NONE
+INTEGER :: K, S
+REAL :: R
+
+WRITE(*,"('RAND small seeds')")
+DO K = 1, 5
+   R := RAND(K)
+   WRITE(*,"('RAND %d %.17e')") K, R
+ENDDO
+
+WRITE(*,"('RAND big seeds')")
+R := RAND(1000003)
+WRITE(*,"('RAND %.17e')") R
+R := RAND(123456789)
+WRITE(*,"('RAND %.17e')") R
+
+WRITE(*,"('HASH chain read via RAND(S)')")
+S := 1
+DO K = 1, 5
+   S := HASH(S)
+   R := RAND(S)
+   WRITE(*,"('CHAIN %d %.17e')") K, R
+ENDDO

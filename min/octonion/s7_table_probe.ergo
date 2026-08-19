@@ -1,0 +1,67 @@
+! s7_table_probe.ergo -- dump DP/RP tables exactly as winding_s7 builds them
+! Run: python -m core min/<dir>/s7_table_probe.ergo -o /tmp/stp && /tmp/stp
+!
+! winding_s7 engine rows are structurally perfect (revival exact, periodic,
+! symmetric) but all weights differ from the mirror -- DP and/or RP tables
+! diverge. This prints every table entry for both n=7 and n=3; paste all
+! 128 lines and I'll diff against the mirror tables to find the culprit.
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 64
+STATIC REAL :: DP(64), RP(64)
+REAL :: GAMMA, X, LAM, C0, C1, C2, A0, A1, A2
+INTEGER :: NV, L
+
+GAMMA := 0.7
+
+NV := 7
+X := COS(GAMMA)
+LAM := (NV-1)/2.0
+C0 := 1.0
+A0 := 1.0
+C1 := 2.0*LAM*X
+A1 := 2.0*LAM
+DP(1) := 1.0
+RP(1) := 1.0
+RP(2) := C1/A1
+DO L = 1, N-1
+   DP(L+1) := DP(L)*(2.0*L+NV+1.0)*(L+NV-1.0)/((L+1.0)*(2.0*L+NV-1.0))
+ENDDO
+DO L = 2, N-1
+   C2 := (2.0*(L+LAM-1.0)*X*C1 - (L+2.0*LAM-2.0)*C0)/L
+   A2 := (2.0*(L+LAM-1.0)*A1 - (L+2.0*LAM-2.0)*A0)/L
+   RP(L+1) := C2/A2
+   C0 := C1
+   C1 := C2
+   A0 := A1
+   A1 := A2
+ENDDO
+DO L = 1, N
+   WRITE(*,"('T7 %d %.17e %.17e')") L, DP(L), RP(L)
+ENDDO
+
+NV := 3
+X := COS(GAMMA)
+LAM := (NV-1)/2.0
+C0 := 1.0
+A0 := 1.0
+C1 := 2.0*LAM*X
+A1 := 2.0*LAM
+DP(1) := 1.0
+RP(1) := 1.0
+RP(2) := C1/A1
+DO L = 1, N-1
+   DP(L+1) := DP(L)*(2.0*L+NV+1.0)*(L+NV-1.0)/((L+1.0)*(2.0*L+NV-1.0))
+ENDDO
+DO L = 2, N-1
+   C2 := (2.0*(L+LAM-1.0)*X*C1 - (L+2.0*LAM-2.0)*C0)/L
+   A2 := (2.0*(L+LAM-1.0)*A1 - (L+2.0*LAM-2.0)*A0)/L
+   RP(L+1) := C2/A2
+   C0 := C1
+   C1 := C2
+   A0 := A1
+   A1 := A2
+ENDDO
+DO L = 1, N
+   WRITE(*,"('T3 %d %.17e %.17e')") L, DP(L), RP(L)
+ENDDO

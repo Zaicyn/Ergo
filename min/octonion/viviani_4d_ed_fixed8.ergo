@@ -1,0 +1,388 @@
+! viviani_4d_ed.ergo -- Stage C: 4D-dressed XX chain, exact-diagonalization
+! control pair. Run: python -m core min/<dir>/viviani_4d_ed.ergo -o /tmp/v4 && /tmp/v4
+!
+! BACKGROUND (mirror-established, dense-ED cross-checked):
+!   Field-only geometric dressing of the XX chain -- 3D Viviani normal OR 4D
+!   Hopf map -- gives purely perturbative polarization ~O(h/J), exactly linear
+!   in h, NO exact zeros, any curve. The paper's N mod 4 machine-zero rows
+!   are a DMRG artifact (under-converged leakage into the h=0-like state).
+!   The fiber twist (the genuinely 4D content) enters as a DM-like bond
+!   holonomy and FRUSTRATES rather than protects.
+!   A true per-site exact zero exists only when the ground state has zero
+!   local magnetization by symmetry -- e.g. h=0 (U(1) spin rotation about z
+!   x translation): <S_i> = 0 for all i, so m.n = 0 at the f64 floor.
+!
+! THIS PROGRAM: Lanczos ED (on-the-fly H action, bit ops, re/im REAL pairs,
+! full reorthogonalization, deterministic starts, no RNG, no COMPLEX, no
+! subroutines -- bug A6 workaround) on the 2^12 = 4096-dim Hilbert space.
+!   CASE A (negative control): (1,3)-knot S^3 dressing, field + fiber twist,
+!     J=200, h=1.  Expect perturbative polarization.
+!   CASE B (positive control): same bonds, h=0. Expect f64-floor exact zero.
+! NIT=150 Lanczos iterations, tridiagonal solved by cyclic Jacobi (200 sweeps
+! max). Start vectors: case A s=0 (all down); case B s=2730 (Neel, in the
+! Sz=0 sector -- e_0 is an exact eigenstate at h=0, beta breakdown).
+!
+! MIRROR ORACLES (sandbox, same algorithm & loop order; dense-ED truth in
+! parentheses):
+!   EA = -7.64041145458466e+02   (dense -764.041145458420)
+!   MA = +2.57866371114000e-02   (dense +2.578664e-02)
+!   EB = -7.63885720819343e+02   (dense -763.885720819292)
+!   MB = +3.46900000000000e-18   (f64 floor; anything < 1e-12 confirms)
+! Tolerances: E to ~1e-7 abs (libm 1-ulp geometry differences amplify
+! slightly through Lanczos), MA to ~1e-6 abs, MB < 1e-12.
+! VERDICT KEY: MA ~ 2.6e-2 and MB ~ 0 -> pipeline validates the mirror
+! verdict: no protection in the 4D naive model; the only exact zero is the
+! symmetry one. Both cases match = ergo certified.
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 12, NIT = 150, DIM = 4096
+STATIC REAL :: NX(12), NY(12), NZ(12), CC(12), SS(12)
+STATIC REAL :: QR(150,4096), QI(150,4096)
+STATIC REAL :: AL(150), BE(150), A(150,150), V(150,150)
+STATIC REAL :: WR(4096), WI(4096), RR(4096), RI(4096), YV(150)
+STATIC REAL :: HV(2)
+STATIC INTEGER :: S0A(2)
+REAL :: PI, CA, SA, TH, CHI, DG, AR, AI, XR, XI
+REAL :: Q0, Q1, Q2, Q3, R0, R1, R2, R3
+REAL :: BETA, ALJ, CR, CI, NRM, JJ, HH, MVAL
+REAL :: OFF, TAU, TT, C, AKP, AKQ, APK, AQR, VKP, VKQ, EMN
+INTEGER :: I, J, K, P, Q, ICASE, S0, IT, S, T, BI, BJ, I0, NSW
+
+PI := 3.14159265358979323846
+
+! ---------------- geometry: (1,3) torus knot on S3, Hopf map + fiber twist
+CA := COS(PI/4.0)
+SA := SIN(PI/4.0)
+DO I = 1, N
+   TH := 2.0*PI*(I-1)/N
+   Q0 := CA*COS(1.0*TH)
+   Q1 := CA*SIN(1.0*TH)
+   Q2 := SA*COS(3.0*TH)
+   Q3 := SA*SIN(3.0*TH)
+   ! n = q (i) conj(q), mirror qmul4 convention, scalar part discarded
+   ! qmul(q, i): (-Q1, Q0, Q2, Q3)
+   R0 := -Q1
+   R1 := Q0
+   R2 := Q2
+   R3 := Q3
+   ! qmul(R, conj(q)) = qmul(R, (Q0,-Q1,-Q2,-Q3))
+   NX(I) := R0*(-Q1) + R1*Q0 + R2*(-Q3) - R3*(-Q2)
+   NY(I) := R0*(-Q2) - R1*(-Q3) + R2*Q0 + R3*(-Q1)
+   NZ(I) := R0*(-Q3) + R1*(-Q2) - R2*(-Q1) + R3*Q0
+   ! Normalize the vector
+   DG := SQRT(NX(I)*NX(I) + NY(I)*NY(I) + NZ(I)*NZ(I))
+   IF (DG > 0.0) THEN
+      NX(I) := NX(I)/DG
+      NY(I) := NY(I)/DG
+      NZ(I) := NZ(I)/DG
+   ENDIF
+ENDDO
+DO I = 1, N
+   ! reconstruct q at i and i+1 for the fiber twist
+   TH := 2.0*PI*(I-1)/N
+   Q0 := CA*COS(1.0*TH)
+   Q1 := CA*SIN(1.0*TH)
+   Q2 := SA*COS(3.0*TH)
+   Q3 := SA*SIN(3.0*TH)
+   TH := 2.0*PI*I/N
+   IF (I == N) THEN
+      TH := 0.0
+   ENDIF
+   R0 := CA*COS(1.0*TH)
+   R1 := CA*SIN(1.0*TH)
+   R2 := SA*COS(3.0*TH)
+   R3 := SA*SIN(3.0*TH)
+   ! dq = qmul(q2, conj(q1))
+   Q0 := R0*Q0 - R1*(-Q1) - R2*(-Q2) - R3*(-Q3)
+   IF (Q0 > 1.0) THEN
+      Q0 := 1.0
+   ENDIF
+   IF (Q0 < -1.0) THEN
+      Q0 := -1.0
+   ENDIF
+   CHI := 2.0*ACOS(Q0)
+   CC(I) := COS(CHI)
+   SS(I) := SIN(CHI)
+ENDDO
+
+HV(1) := 1.0
+HV(2) := 0.0
+S0A(1) := 0
+S0A(2) := 2730
+
+DO ICASE = 1, 2
+   HH := HV(ICASE)
+   JJ := 200.0
+   S0 := S0A(ICASE)
+
+   ! ---------------- Lanczos ----------------
+   ! DIAGNOSTIC: print geometry for first few sites
+   IF (ICASE == 1) THEN
+      WRITE(*,"('CASE A: geometry check')")
+      DO I = 1, 3
+         WRITE(*,"('I=%d NX=%.8e NY=%.8e NZ=%.8e |N|=%.8e')") I, NX(I), NY(I), NZ(I), &
+            SQRT(NX(I)*NX(I)+NY(I)*NY(I)+NZ(I)*NZ(I))
+      ENDDO
+   ENDIF
+   IF (ICASE == 2) THEN
+      WRITE(*,"('CASE B (h=0): start vector S0=%d')") S0
+      ! Check how many spins are up in S0 (Hamming weight)
+      P := 0
+      Q := S0
+      DO WHILE (Q > 0)
+         IF (IAND(Q, 1) == 1) THEN
+            P := P + 1
+         ENDIF
+         Q := ISHFT(Q, -1)
+      ENDDO
+      WRITE(*,"('S0 Hamming weight (spins up): %d out of %d')") P, N
+   ENDIF
+   
+   ! DIAGNOSTIC: for case B, check if Neel is in a high-symmetry state
+   IF (ICASE == 2) THEN
+      WRITE(*,"('Diagnostic: analyzing h=0 case structure')")
+      ! At h=0 with pure XX Hamiltonian, Neel state may be in a protected sector
+      ! Check: is there any field-diagonal contribution?
+      DG := 0.0
+      DO I = 1, N
+         IF (IAND(ISHFT(S0,I-1),1) == 1) THEN
+            DG := DG - HH*NZ(I)*0.5
+         ELSE
+            DG := DG + HH*NZ(I)*0.5
+         ENDIF
+      ENDDO
+      WRITE(*,"('Diagonal energy of S0: %.15e')") DG
+   ENDIF
+   
+   DO S = 1, DIM
+      QR(1,S) := 0.0
+      QI(1,S) := 0.0
+   ENDDO
+   QR(1,S0+1) := 1.0
+   BETA := 0.0
+   DO IT = 1, NIT
+      ! H action on (QR(IT,:), QI(IT,:)) -> (WR, WI)
+      DO S = 1, DIM
+         WR(S) := 0.0
+         WI(S) := 0.0
+      ENDDO
+      DO S = 1, DIM
+         XR := QR(IT,S)
+         XI := QI(IT,S)
+         DG := 0.0
+         DO I = 1, N
+            IF (IAND(ISHFT(S-1,I-1),1) == 1) THEN
+               DG := DG - HH*NZ(I)*0.5
+            ELSE
+               DG := DG + HH*NZ(I)*0.5
+            ENDIF
+         ENDDO
+         WR(S) := WR(S) + DG*XR
+         WI(S) := WI(S) + DG*XI
+         
+         ! Fiber-twisted bonds only (CC, SS coupling when spins differ)
+         DO I = 1, N
+            BI := IAND(ISHFT(S-1,I-1),1)
+            J := I+1
+            IF (I == N) THEN
+               J := 1
+            ENDIF
+            BJ := IAND(ISHFT(S-1,J-1),1)
+            IF (BI /= BJ) THEN
+               T := IEOR(IEOR(S-1, ISHFT(1,I-1)), ISHFT(1,J-1)) + 1
+               IF (BI == 1) THEN
+                  AR := -JJ*CC(I)/2.0
+                  AI := -JJ*SS(I)/2.0
+               ELSE
+                  AR := -JJ*CC(I)/2.0
+                  AI := JJ*SS(I)/2.0
+               ENDIF
+               WR(T) := WR(T) + AR*XR - AI*XI
+               WI(T) := WI(T) + AR*XI + AI*XR
+            ENDIF
+         ENDDO
+      ENDDO
+      ! alpha
+      ALJ := 0.0
+      DO S = 1, DIM
+         ALJ := ALJ + QR(IT,S)*WR(S) + QI(IT,S)*WI(S)
+      ENDDO
+      AL(IT) := ALJ
+      IF (IT <= 3) THEN
+         WRITE(*,"('ALJ IT=%d ALJ=%.15e CASE=%d')") IT, ALJ, ICASE
+      ENDIF
+      DO S = 1, DIM
+         WR(S) := WR(S) - ALJ*QR(IT,S)
+         WI(S) := WI(S) - ALJ*QI(IT,S)
+      ENDDO
+      IF (IT > 1) THEN
+         DO S = 1, DIM
+            WR(S) := WR(S) - BETA*QR(IT-1,S)
+            WI(S) := WI(S) - BETA*QI(IT-1,S)
+         ENDDO
+      ENDIF
+      ! full reorthogonalization
+      DO K = 1, IT
+         CR := 0.0
+         CI := 0.0
+         DO S = 1, DIM
+            CR := CR + QR(K,S)*WR(S) + QI(K,S)*WI(S)
+            CI := CI + QR(K,S)*WI(S) - QI(K,S)*WR(S)
+         ENDDO
+         DO S = 1, DIM
+            WR(S) := WR(S) - CR*QR(K,S) + CI*QI(K,S)
+            WI(S) := WI(S) - CR*QI(K,S) - CI*QR(K,S)
+         ENDDO
+      ENDDO
+      NRM := 0.0
+      DO S = 1, DIM
+         NRM := NRM + WR(S)*WR(S) + WI(S)*WI(S)
+      ENDDO
+      BETA := SQRT(NRM)
+      IF (IT < NIT) THEN
+         BE(IT) := BETA
+         IF (BETA < 1.0e-14) THEN
+            WRITE(*,"('WARNING: BETA collapsed at IT=%d BETA=%.4e CASE=%d')") IT, BETA, ICASE
+         ENDIF
+         IF (IT <= 3 .OR. BETA < 1.0e-10) THEN
+            WRITE(*,"('IT=%d BETA=%.15e CASE=%d')") IT, BETA, ICASE
+         ENDIF
+         DO S = 1, DIM
+            QR(IT+1,S) := WR(S)/BETA
+            QI(IT+1,S) := WI(S)/BETA
+         ENDDO
+      ENDIF
+   ENDDO
+
+   ! ---------------- Jacobi solve of the tridiagonal ----------------
+   DO P = 1, NIT
+      DO Q = 1, NIT
+         A(P,Q) := 0.0
+         V(P,Q) := 0.0
+      ENDDO
+      A(P,P) := AL(P)
+      V(P,P) := 1.0
+   ENDDO
+   DO P = 1, NIT-1
+      A(P,P+1) := BE(P)
+      A(P+1,P) := BE(P)
+   ENDDO
+   DO NSW = 1, 200
+      OFF := 0.0
+      DO P = 1, NIT
+         DO Q = 1, NIT
+            OFF := OFF + A(P,Q)*A(P,Q)
+         ENDDO
+         OFF := OFF - A(P,P)*A(P,P)
+      ENDDO
+      OFF := SQRT(OFF)
+      IF (OFF >= 1.0e-14) THEN
+         DO P = 1, NIT-1
+            DO Q = P+1, NIT
+               IF (ABS(A(P,Q)) > 1.0e-16) THEN
+                  TAU := (A(Q,Q)-A(P,P))/(2.0*A(P,Q))
+                  IF (TAU /= 0.0) THEN
+                     TT := SIGN(1.0,TAU)/(ABS(TAU)+SQRT(1.0+TAU*TAU))
+                  ELSE
+                     TT := 1.0
+                  ENDIF
+                  C := 1.0/SQRT(1.0+TT*TT)
+                  DO K = 1, NIT
+                     AKP := A(K,P)
+                     AKQ := A(K,Q)
+                     A(K,P) := C*AKP - TT*AKQ
+                     A(K,Q) := TT*AKP + C*AKQ
+                  ENDDO
+                  DO K = 1, NIT
+                     APK := A(P,K)
+                     AQR := A(Q,K)
+                     A(P,K) := C*APK - TT*AQR
+                     A(Q,K) := TT*APK + C*AQR
+                  ENDDO
+                  DO K = 1, NIT
+                     VKP := V(K,P)
+                     VKQ := V(K,Q)
+                     V(K,P) := C*VKP - TT*VKQ
+                     V(K,Q) := TT*VKP + C*VKQ
+                  ENDDO
+               ENDIF
+            ENDDO
+         ENDDO
+      ENDIF
+   ENDDO
+   ! ground Ritz pair
+   EMN := A(1,1)
+   I0 := 1
+   DO P = 2, NIT
+      IF (A(P,P) < EMN) THEN
+         EMN := A(P,P)
+         I0 := P
+      ENDIF
+   ENDDO
+   DO K = 1, NIT
+      YV(K) := V(K,I0)
+   ENDDO
+   DO S = 1, DIM
+      RR(S) := 0.0
+      RI(S) := 0.0
+   ENDDO
+   DO K = 1, NIT
+      DO S = 1, DIM
+         RR(S) := RR(S) + YV(K)*QR(K,S)
+         RI(S) := RI(S) + YV(K)*QI(K,S)
+      ENDDO
+   ENDDO
+
+   ! ---------------- observable <m.n> = (1/N) sum_i n_i.S_i ----------------
+   ! reuse the H-action with JJ=0, HH=1/N, then negate (action has -h)
+   JJ := 0.0
+   HH := 1.0/N
+   DO S = 1, DIM
+      WR(S) := 0.0
+      WI(S) := 0.0
+   ENDDO
+   DO S = 1, DIM
+      XR := RR(S)
+      XI := RI(S)
+      DG := 0.0
+      DO I = 1, N
+         IF (IAND(ISHFT(S-1,I-1),1) == 1) THEN
+            DG := DG - HH*NZ(I)*0.5
+         ELSE
+            DG := DG + HH*NZ(I)*0.5
+         ENDIF
+      ENDDO
+      WR(S) := WR(S) + DG*XR
+      WI(S) := WI(S) + DG*XI
+   ENDDO
+   
+   MVAL := 0.0
+   DO S = 1, DIM
+      MVAL := MVAL + RR(S)*WR(S) + RI(S)*WI(S)
+   ENDDO
+   MVAL := -MVAL
+
+   IF (ICASE == 1) THEN
+      WRITE(*,"('EA %.17e')") EMN
+      WRITE(*,"('MA %.17e')") MVAL
+   ELSE
+      WRITE(*,"('EB %.17e')") EMN
+      WRITE(*,"('MB %.17e')") MVAL
+   ENDIF
+   
+   ! Reset arrays for next case
+   DO P = 1, NIT
+      DO Q = 1, NIT
+         A(P,Q) := 0.0
+         V(P,Q) := 0.0
+      ENDDO
+      AL(P) := 0.0
+      BE(P) := 0.0
+   ENDDO
+   DO P = 1, NIT
+      DO Q = 1, DIM
+         QR(P,Q) := 0.0
+         QI(P,Q) := 0.0
+      ENDDO
+   ENDDO
+ENDDO

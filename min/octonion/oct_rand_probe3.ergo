@@ -1,0 +1,60 @@
+! oct_rand_probe3.ergo -- reproduce battery draw loop verbatim, print X,Y,Z
+! Run: python -m core min/<dir>/oct_rand_probe3.ergo -o /tmp/orp3 && /tmp/orp3
+!
+! Probes 1-2 proved RAND is healthy across statements. Battery's NONASSOC
+! landing at EXACTLY 0 with a verified-correct octonion product means X,Y,Z
+! per draw were degenerate (2-generated subalgebra). Leading suspect: the
+! three RAND(BASE+K+c) calls inside ONE loop body get mis-keyed/CSE'd and
+! return the same value -> X=Y=Z per draw.
+!
+! This prints X,Y,Z for the first battery draw (T=1) exactly as the battery
+! computes them. Read the key:
+!   - X=Y=Z componentwise      -> same-body RAND calls mis-keyed (compiler bug)
+!   - X,Y,Z distinct           -> draw loop fine; bug is in the NONASSOC block
+!                                 or OMAXD; I re-mirror with your hash values
+! Either way paste the full output -- from the printed X,Y,Z I can compute
+! the true associator in the sandbox regardless.
+
+IMPLICIT NONE
+INTEGER :: T, K, BASE
+REAL :: X(8), Y(8), Z(8)
+
+T := 1
+BASE := 1000003 + (T-1)*64
+DO K = 1, 8
+   X(K) := 2.0*RAND(BASE+K-1) - 1.0
+   Y(K) := 2.0*RAND(BASE+K+7) - 1.0
+   Z(K) := 2.0*RAND(BASE+K+15) - 1.0
+ENDDO
+
+WRITE(*,"('BASE %d')") BASE
+DO K = 1, 8
+   WRITE(*,"('X %d %.17e')") K, X(K)
+ENDDO
+DO K = 1, 8
+   WRITE(*,"('Y %d %.17e')") K, Y(K)
+ENDDO
+DO K = 1, 8
+   WRITE(*,"('Z %d %.17e')") K, Z(K)
+ENDDO
+
+! control: same draws, but each RAND call in its own loop
+DO K = 1, 8
+   X(K) := 2.0*RAND(BASE+K-1) - 1.0
+ENDDO
+DO K = 1, 8
+   Y(K) := 2.0*RAND(BASE+K+7) - 1.0
+ENDDO
+DO K = 1, 8
+   Z(K) := 2.0*RAND(BASE+K+15) - 1.0
+ENDDO
+WRITE(*,"('SPLIT LOOPS CONTROL')")
+DO K = 1, 8
+   WRITE(*,"('XS %d %.17e')") K, X(K)
+ENDDO
+DO K = 1, 8
+   WRITE(*,"('YS %d %.17e')") K, Y(K)
+ENDDO
+DO K = 1, 8
+   WRITE(*,"('ZS %d %.17e')") K, Z(K)
+ENDDO

@@ -1,0 +1,141 @@
+! oct_rand_probe4.ergo -- verbatim NONASSOC block on a known triple
+! Run: python -m core min/<dir>/oct_rand_probe4.ergo -o /tmp/orp4 && /tmp/orp4
+!
+! Probes 1-3: RAND healthy, draws generic. True assoc of this triple = 1.6698...
+! Engine battery printed NONASSOC max 4.44e-16 and ARTIN exactly 0.0 -- the
+! ONLY two tests comparing T2 vs T3 (outputs of two different OMUL calls).
+! Hypothesis: T2/T3 (or subroutine locals of same shape) share storage, so
+! the second OMUL overwrites the first and OMAXD compares a buffer to itself.
+!
+! This draws the probe-3 triple verbatim, runs the verbatim NONASSOC block,
+! and prints T1 (=XY), T2 (=(XY)Z), T3 (=X(YZ)), DA.
+!
+! ORACLES (sandbox, same CD convention, your drawn X,Y,Z):
+!   XY  =  7.41595869597273527e-01 -9.30832639298228015e-02
+!         -7.99426607000380707e-01 -2.41075374411746562e-01
+!         -6.74009409896355716e-01 -1.25922330650330788e-01
+!          2.04563802493785141e-01  7.69999598257028461e-01
+!   T2  =  4.80266749662654147e-01  7.27295070554299095e-02
+!         -3.11243604780323868e-01 -9.42346672235456428e-01
+!         -1.40637050710812517e+00  7.64195163047740822e-01
+!          1.48029283472848006e+00  2.17859434300456428e-01
+!   T3  =  4.80266749662654036e-01 -1.53071131730879251e+00
+!         -1.08103094418994516e-02 -2.55706027026744886e-01
+!         -1.47200201720071777e+00 -9.05640990113234401e-01
+!          3.53810675615403525e-01  5.19657739052151846e-01
+!   DA  =  1.6698361531609751 (max |T2-T3|)
+!
+! Read the key:
+!   - T1,T2,T3 match oracles but DA ~ 0    -> OMAXD / compare path broken
+!   - T2 == T3 == one of the oracles       -> T2/T3 storage aliased (compiler)
+!   - T2,T3 both wrong but T1 right        -> nested-call state corruption
+!   - everything matches                   -> the battery file itself has a
+!                                             transcription bug; I re-issue.
+
+IMPLICIT NONE
+INTEGER :: T, K, BASE
+REAL :: X(8), Y(8), Z(8), T1(8), T2(8), T3(8)
+REAL :: DA
+
+T := 1
+BASE := 1000003 + (T-1)*64
+DO K = 1, 8
+   X(K) := 2.0*RAND(BASE+K-1) - 1.0
+   Y(K) := 2.0*RAND(BASE+K+7) - 1.0
+   Z(K) := 2.0*RAND(BASE+K+15) - 1.0
+ENDDO
+
+CALL OMUL(X, Y, T1)
+CALL OMUL(T1, Z, T2)
+CALL OMUL(Y, Z, T1)
+CALL OMUL(X, T1, T3)
+CALL OMAXD(T2, T3, DA)
+
+! NOTE: T1 now holds YZ (matches battery order), so recompute XY for printing
+DO K = 1, 8
+   WRITE(*,"('T2 %d %.17e')") K, T2(K)
+ENDDO
+DO K = 1, 8
+   WRITE(*,"('T3 %d %.17e')") K, T3(K)
+ENDDO
+WRITE(*,"('DA %.17e')") DA
+
+CALL OMUL(X, Y, T1)
+DO K = 1, 8
+   WRITE(*,"('XY %d %.17e')") K, T1(K)
+ENDDO
+
+SUBROUTINE QMU4(A, B, C)
+   ! quaternion product on 4-blocks via complex CD pairs
+   IMPLICIT NONE
+   REAL :: A(4), B(4), C(4)
+   REAL :: ZR0, ZR1, CW0, CW1, WZ0, WZ1, WC0, WC1
+   ZR0 := A(1)*B(1) - A(2)*B(2)
+   ZR1 := A(1)*B(2) + A(2)*B(1)
+   CW0 := B(3)*A(3) + B(4)*A(4)
+   CW1 := B(3)*A(4) - B(4)*A(3)
+   WZ0 := B(3)*A(1) - B(4)*A(2)
+   WZ1 := B(3)*A(2) + B(4)*A(1)
+   WC0 := A(3)*B(1) + B(2)*A(4)
+   WC1 := -B(2)*A(3) + A(4)*B(1)
+   C(1) := ZR0 - CW0
+   C(2) := ZR1 - CW1
+   C(3) := WZ0 + WC0
+   C(4) := WZ1 + WC1
+END
+
+SUBROUTINE OMUL(A, B, C)
+   ! octonion product: A=(p,q), B=(r,s) ->
+   ! C = (p r - conj(s) q, s p + q conj(r))
+   IMPLICIT NONE
+   REAL :: A(8), B(8), C(8)
+   REAL :: P(4), R(4), S(4), CS(4), CR(4)
+   REAL :: PR(4), CSQ(4), SP(4), QCR(4)
+   INTEGER :: I
+   DO I = 1, 4
+      P(I) := A(I)
+      R(I) := B(I)
+      S(I) := B(I+4)
+   ENDDO
+   CALL QMU4(P, R, PR)
+   CS(1) := S(1)
+   CS(2) := -S(2)
+   CS(3) := -S(3)
+   CS(4) := -S(4)
+   DO I = 1, 4
+      R(I) := A(I+4)
+   ENDDO
+   CALL QMU4(CS, R, CSQ)
+   DO I = 1, 4
+      P(I) := B(I+4)
+      R(I) := A(I)
+   ENDDO
+   CALL QMU4(P, R, SP)
+   CR(1) := B(1)
+   CR(2) := -B(2)
+   CR(3) := -B(3)
+   CR(4) := -B(4)
+   DO I = 1, 4
+      P(I) := A(I+4)
+   ENDDO
+   CALL QMU4(P, CR, QCR)
+   DO I = 1, 4
+      C(I) := PR(I) - CSQ(I)
+      C(I+4) := SP(I) + QCR(I)
+   ENDDO
+END
+
+SUBROUTINE OMAXD(A, B, DEV)
+   ! max |A-B| componentwise
+   IMPLICIT NONE
+   REAL :: A(8), B(8), DEV
+   REAL :: SS
+   INTEGER :: I
+   DEV := 0.0
+   DO I = 1, 8
+      SS := ABS(A(I) - B(I))
+      IF (SS > DEV) THEN
+         DEV := SS
+      ENDIF
+   ENDDO
+END
