@@ -174,6 +174,13 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
         c_code = IRCodeGen(ir_module, render=render,
                            no_verify=no_verify).generate()
     else:
+        # Legacy AST codegen — DEPRECATED (2026-08-12): the IR path is
+        # the supported backend. Legacy remains only for the dual-path
+        # golden tests (see ERGO_FIX_FIRST_LIST.md A2); new language
+        # fixes are not guaranteed to land here.
+        print("ERGO WARNING: the legacy codegen (use_ir=False) is "
+              "deprecated; the IR path is the supported backend",
+              file=sys.stderr)
         c_code = CodeGen(tree, source_file=source_path).generate()
 
     if emit_c:
@@ -190,7 +197,7 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
         runtime_dir = os.path.join(os.path.dirname(__file__), "runtime")
         gcc_flags = (["gcc", "-o", output, c_path] + DETERMINISTIC_FLAGS +
                      ["-lm", f"-I{runtime_dir}"])
-        if _static_array_bytes(ir_module) > _LARGE_CMODEL_THRESHOLD:
+        if use_ir and _static_array_bytes(ir_module) > _LARGE_CMODEL_THRESHOLD:
             gcc_flags.append("-mcmodel=large")
         if render:
             # Link against Vulkan runtime for rendering

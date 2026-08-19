@@ -138,6 +138,29 @@ PARAMETER REAL :: LONG_NAME = &
 ✅ **Comparison chaining is real:** `1 < x ≤ 10` is sugar for `(1 < x) .AND. (x ≤ 10)`  
 ✅ **No magic shape inference:** If shapes don't match, compiler rejects  
 
+✅ **Case policy (ratified 2026-08-12):** *identifiers are
+case-sensitive; keywords are case-insensitive; intrinsic dispatch is
+case-insensitive.* `alpha` and `ALPHA` are different variables;
+`DO`/`do` and `CALL ZERO`/`call zero` are the same construct.
+
+✅ **Subroutine argument passing (A6, ratified 2026-08-12):**
+Fortran-style by-reference. A SUBROUTINE dummy that is a scalar
+lowers to a pointer — assignments to it copy out to the caller's
+variable. Consequently, at the call site a written scalar dummy
+requires a plain scalar variable: passing a literal, expression, or
+array element to a dummy the subroutine writes is a compile-time
+error (the checker names the argument). Read-only scalar dummies
+accept any expression (the compiler copies it to a temporary).
+Array dummies are by-reference as before; STATIC arrays as arguments
+remain forbidden (Part 7). FUNCTION arguments are by-value and do
+not copy out.
+
+✅ **Backends (ratified 2026-08-12):** the IR codegen
+(`core/ir_codegen.py`) is the supported backend. The legacy AST
+codegen (`core/codegen.py`, reachable only via the Python API with
+`use_ir=False`) is **deprecated**: it remains for dual-path golden
+testing and prints a deprecation warning when selected.
+
 ---
 
 ## What Is NOT in This Language

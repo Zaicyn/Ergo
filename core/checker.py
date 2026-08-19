@@ -123,6 +123,72 @@ class Diagnostic:
         return f"ERGO {self.level.upper()}{loc}: {self.msg}"
 
 
+def analyze_subroutine_scalars(tree: ast.Program):
+    """By-reference scalar dummy analysis (A6, Fortran argument semantics).
+
+    Returns (scalar_params, written):
+      scalar_params: sub name -> list of (param_name, is_scalar, c_type_kind)
+                     in parameter order (c_type_kind is the declared type
+                     name, e.g. "REAL"/"INTEGER").
+      written:       sub name -> set of scalar dummy names the subroutine
+                     writes (directly, or transitively by passing its own
+                     dummy into a written position of another subroutine).
+    """
+    subs = {u.name: u for u in tree.units
+            if isinstance(u, ast.SubroutineDef)}
+    scalar_params = {}
+    for name, fn in subs.items():
+        types = {}
+        shaped = set()
+        for decl in fn.declarations:
+            for v in decl.variables:
+                types[v.name] = decl.type_name
+                if v.shape:
+                    shaped.add(v.name)
+        scalar_params[name] = [
+            (p, p not in shaped, types.get(p, "REAL")) for p in fn.params
+        ]
+    written = {name: set() for name in subs}
+    edges = []  # (caller, callee, args)
+
+    def walk(fn_name, stmts):
+        for s in stmts:
+            if isinstance(s, ast.AssignStmt) and \
+                    isinstance(s.target, ast.Variable):
+                if s.target.name in _scalar_names(fn_name):
+                    written[fn_name].add(s.target.name)
+            if isinstance(s, ast.CallStmt) and s.name in subs:
+                edges.append((fn_name, s.name, s.args))
+            for attr in ("body", "then_body", "else_body"):
+                sub = getattr(s, attr, None)
+                if sub:
+                    walk(fn_name, sub)
+            if isinstance(s, ast.SelectCaseStmt):
+                for _, body in s.cases:
+                    walk(fn_name, body)
+
+    def _scalar_names(fn_name):
+        return {p for p, is_s, _ in scalar_params[fn_name] if is_s}
+
+    for name, fn in subs.items():
+        walk(name, fn.body)
+    # pass-through fixpoint: caller's dummy lands in a written position
+    changed = True
+    while changed:
+        changed = False
+        for caller, callee, args in edges:
+            callee_params = subs[callee].params
+            for i, arg in enumerate(args):
+                if (isinstance(arg, ast.Variable)
+                        and i < len(callee_params)
+                        and arg.name in _scalar_names(caller)
+                        and callee_params[i] in written[callee]
+                        and arg.name not in written[caller]):
+                    written[caller].add(arg.name)
+                    changed = True
+    return scalar_params, written
+
+
 class Checker:
     """Type checker and semantic validator for MCL AST."""
 
@@ -133,6 +199,8 @@ class Checker:
         self._in_loop: int = 0  # nesting depth for CYCLE validation
         self._stmt_line: int = 0  # line of enclosing statement (for expr errors)
         self._data_seen: set[str] = set()  # targets of DATA statements (per scope)
+        self._sub_writes: dict = {}  # sub name -> set of written scalar dummies
+        self._sub_scalar_params: dict = {}  # sub name -> [(name, is_scalar, type)]
 
     def check(self, tree: ast.Program) -> list[str]:
         """Check the program. Returns list of error strings (empty = success)."""
@@ -147,6 +215,10 @@ class Checker:
                 self._register_function(unit)
             elif isinstance(unit, ast.SubroutineDef):
                 self._register_subroutine(unit)
+
+        # Pass 1.5: by-reference scalar dummy write analysis (A6)
+        self._sub_scalar_params, self._sub_writes = \
+            analyze_subroutine_scalars(tree)
 
         # Pass 2: check all code
         for unit in tree.units:
@@ -609,6 +681,25 @@ class Checker:
                 )
         elif node.name.upper() not in STATEMENT_INTRINSICS:
             self._error(f"Undefined subroutine '{node.name}'", node.line)
+        # A6: a written by-reference scalar dummy needs a plain scalar
+        # variable at the call site — a literal/expression has nowhere to
+        # copy out to (and array elements lower to temporaries on the IR
+        # path, so they are rejected uniformly rather than diverging).
+        if fsym and fsym.is_subroutine:
+            wr = self._sub_writes.get(node.name, set())
+            for i, arg in enumerate(node.args):
+                if i >= len(fsym.param_names):
+                    break
+                pname = fsym.param_names[i]
+                # (a bare array name here is a type error caught by the
+                # usual arg/type checks — this check is about lvalues)
+                if pname in wr and not isinstance(arg, ast.Variable):
+                    self._error(
+                        f"CALL {node.name}: argument {i + 1} ({pname}) is "
+                        f"a scalar dummy that {node.name} writes — pass a "
+                        f"plain scalar variable (by-reference copy-out), "
+                        f"not a literal/expression/array element",
+                        node.line)
         for arg in node.args:
             self._infer_type(arg)
 

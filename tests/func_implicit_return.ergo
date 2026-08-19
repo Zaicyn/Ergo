@@ -1,0 +1,11 @@
+! func_implicit_return.ergo — F8 golden: a FUNCTION that sets its
+! name-variable and falls off the end (no RETURN) returns it.
+IMPLICIT NONE
+REAL :: Y
+Y := DOUBLEIT(2.5) + 1.0
+WRITE(*,"('Y %.1f')") Y
+REAL FUNCTION DOUBLEIT(X)
+   IMPLICIT NONE
+   REAL :: X
+   DOUBLEIT := 2.0 * X
+END

@@ -1,0 +1,77 @@
+! sub_scalar_ref.ergo — A6 golden: by-reference scalar subroutine dummies.
+! Compile BOTH paths and diff:
+!   IR:     python -m core tests/sub_scalar_ref.ergo -o /tmp/ssr_ir
+!   legacy: compile_file('tests/sub_scalar_ref.ergo', use_ir=False)
+! Expected stdout (both paths, bitwise):
+!   SET42 4.2e+01 / ADD1 2.0 / DMAX2 2.5 / PASS THROUGH 7.5 / RONLY 3.5
+
+IMPLICIT NONE
+REAL :: DA, DB
+REAL :: A(2), B(2)
+
+DA := 0.0
+CALL SET42(DA)
+WRITE(*,"('SET42 %.17e')") DA
+
+DA := 1.0
+CALL ADD1(DA)
+WRITE(*,"('ADD1 %.17e')") DA
+
+A(1) := 0.0
+A(2) := 0.0
+B(1) := 0.0
+B(2) := 2.5
+DB := 0.0
+CALL DMAX2(A, B, DB)
+WRITE(*,"('DMAX2 %.17e')") DB
+
+DA := 0.0
+CALL OUTER(DA)
+WRITE(*,"('PASS %.17e')") DA
+
+CALL RONLY(3.5)
+WRITE(*,"('RONLY done')")
+
+SUBROUTINE SET42(X)
+   IMPLICIT NONE
+   REAL :: X
+   X := 42.0
+END
+
+SUBROUTINE ADD1(X)
+   IMPLICIT NONE
+   REAL :: X
+   X := X + 1.0
+END
+
+SUBROUTINE DMAX2(A, B, DEV)
+   IMPLICIT NONE
+   REAL :: A(2), B(2), DEV
+   REAL :: SS
+   INTEGER :: I
+   DEV := 0.0
+   DO I = 1, 2
+      SS := ABS(A(I) - B(I))
+      IF (SS > DEV) THEN
+         DEV := SS
+      ENDIF
+   ENDDO
+END
+
+SUBROUTINE OUTER(X)
+   IMPLICIT NONE
+   REAL :: X
+   CALL SETVAL(X)
+END
+
+SUBROUTINE SETVAL(Y)
+   IMPLICIT NONE
+   REAL :: Y
+   Y := 7.5
+END
+
+SUBROUTINE RONLY(X)
+   IMPLICIT NONE
+   REAL :: X
+   WRITE(*,"('RONLY %.1f')") X
+END

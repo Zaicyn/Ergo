@@ -143,6 +143,13 @@ class IRCodeGen:
         self._in_frame_loop = False
         self._batched_frame = False  # True inside batched frame dispatch loop
         self._frame_gpu_dirty = set()  # GPU arrays written by a dispatch
+        # A6: by-reference scalar dummies (Fortran argument semantics).
+        # Subroutine signature table + the ref set active during the
+        # subroutine body currently being emitted.
+        self._ir_subs = {fn.name: fn for fn in module.functions
+                         if fn.is_subroutine}
+        self._ref_scalars: set[str] = set()
+        self._carg_counter = 0  # deterministic temp naming for call args
                                        # in the current frame (D19)
         self._frame_ended_early = False  # True when frame_end emitted before CPU suffix
         # Coalesced reductions: reduction kernels dispatched into the
@@ -466,6 +473,9 @@ class IRCodeGen:
         if isinstance(op, IRConst):
             return self._const_lit(op.type, op.value)
         if isinstance(op, IRRef):
+            # A6: by-reference scalar dummy read — dereference the pointer
+            if op.name in self._ref_scalars:
+                return f"(*{op.name})"
             return op.name
         return "/* ? */"
 
@@ -570,6 +580,39 @@ class IRCodeGen:
 
     # ── forward declarations ─────────────────────────────────
 
+    def _sub_call_args(self, func: str, sub_fn, args) -> str:
+        """A6: build a user-subroutine call's argument list.
+
+        Scalar dummies are by-reference: a variable argument passes its
+        address (a bare name when the argument is itself a by-reference
+        dummy of the subroutine currently being emitted — pass-through
+        of an already-pointer value); a constant argument is only
+        reachable for read-only dummies (the checker rejects non-lvalue
+        arguments to written dummies) and is copied to a temp whose
+        address is passed.
+        """
+        if sub_fn is None:
+            return ", ".join(self._operand(a) for a in args)
+        parts = []
+        for i, arg in enumerate(args):
+            p = sub_fn.params[i]
+            if p.shape:
+                parts.append(self._operand(arg))
+                continue
+            if isinstance(arg, IRRef):
+                if arg.name in self._ref_scalars:
+                    parts.append(arg.name)
+                else:
+                    parts.append(f"&{arg.name}")
+                continue
+            # constant/expression into a read-only scalar dummy: temp copy
+            self._carg_counter += 1
+            t = f"_carg_{self._carg_counter}"
+            ct = self._c_type(p.type)
+            self._put(f"{ct} {t} = {self._operand(arg)};")
+            parts.append(f"&{t}")
+        return ", ".join(parts)
+
     def _emit_forward_decl(self, fn: IRFunc):
         params = self._func_param_str(fn)
         if fn.is_subroutine:
@@ -596,6 +639,10 @@ class IRCodeGen:
                     dims = "".join(f"[{self._dim_expr(d)}]"
                                    for d in reversed(p.shape[:-1]))
                     parts.append(f"{ct} {p.name}[]{dims}")
+            elif fn.is_subroutine:
+                # A6: scalar subroutine dummies are by-reference
+                # (Fortran semantics) — writes copy out to the caller.
+                parts.append(f"{ct} *{p.name}")
             else:
                 parts.append(f"{ct} {p.name}")
         return ", ".join(parts)
@@ -632,7 +679,13 @@ class IRCodeGen:
         # and GPU buffer/pipeline variables live.
         saved_kernel_map = self._kernel_by_line
         self._kernel_by_line = {}
+        # A6: scalar dummies of a subroutine lower to C pointers —
+        # reads/writes in the body dereference them.
+        saved_ref = self._ref_scalars
+        if fn.is_subroutine:
+            self._ref_scalars = {p.name for p in fn.params if not p.shape}
         self._emit_body(fn.body)
+        self._ref_scalars = saved_ref
         self._kernel_by_line = saved_kernel_map
 
         # Fortran semantics: falling off the end of a function returns the
@@ -647,8 +700,35 @@ class IRCodeGen:
 
     # ── local declarations ───────────────────────────────────
 
+    def _warn_large_stack_array(self, v: IRVar):
+        """A1 (interim): warn when a non-STATIC local array with a
+        compile-time-known size exceeds ~1 MB of stack — the default
+        8 MB stack segfaults at the first store with no diagnostic
+        otherwise (octonion Stage 5, ab_recoil.ergo)."""
+        if v.storage != StorageClass.STATIC and v.shape:
+            total = 1
+            for d in v.shape:
+                c = d if isinstance(d, int) else self._resolve_const(d)
+                if c is None:
+                    return
+                total *= c
+            if v.type == IRType.INTEGER:
+                el = 4
+            else:
+                el = 4 if get_real_precision() == 32 else 8
+            nbytes = total * el
+            if nbytes > 1024 * 1024:
+                import sys as _sys
+                dims = ",".join(str(d if isinstance(d, int)
+                                    else self._resolve_const(d))
+                                for d in v.shape)
+                print(f"ERGO WARNING: local array {v.name}({dims}) is "
+                      f"{nbytes / 1e6:.1f} MB on the stack; declare "
+                      f"STATIC or raise ulimit", file=_sys.stderr)
+
     def _emit_local_decl(self, v: IRVar, mod: IRModule):
         self._emit_line(v.line)
+        self._warn_large_stack_array(v)
         ct = self._c_type(v.type)
         if v.storage == StorageClass.PARAMETER:
             init = self._const_lit(v.type, v.init_value)
@@ -672,6 +752,7 @@ class IRCodeGen:
             self._put(f"{ct} {v.name}{init};")
 
     def _emit_local_decl_simple(self, v: IRVar):
+        self._warn_large_stack_array(v)
         ct = self._c_type(v.type)
         if v.storage == StorageClass.PARAMETER:
             init = self._const_lit(v.type, v.init_value)
@@ -1890,6 +1971,9 @@ class IRCodeGen:
         op = inst.op
         args = inst.args
         result = inst.result
+        # A6: stores into a by-reference scalar dummy go through the pointer
+        if result and result in self._ref_scalars:
+            result = f"(*{result})"
 
         # Simple copy (assignment)
         if op == Op.COPY:
@@ -2241,7 +2325,11 @@ class IRCodeGen:
                         self._frame_ended_early = False
                         self._frame_gpu_dirty.clear()
                 return
-            a = ", ".join(self._operand(a) for a in args)
+            # A6: user subroutine with by-reference scalar dummies —
+            # build the argument list signature-aware (addresses for
+            # scalar positions; temps for read-only constant arguments).
+            sub_fn = self._ir_subs.get(func)
+            a = self._sub_call_args(func, sub_fn, args)
             # GPU sync: download arrays before CPU call, upload after.
             # Not gated on _in_frame_loop (D18): a non-inlined subroutine
             # outside the frame loop reads stale CPU copies otherwise.

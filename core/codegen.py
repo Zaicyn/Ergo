@@ -57,6 +57,22 @@ class CodeGen:
         self.data_inits: dict[str, list] = {}
         # Current function's return variable name (for Fortran-style returns)
         self._func_ret_var: str | None = None
+        # A6: by-reference scalar dummy analysis (subroutine signatures)
+        from .checker import analyze_subroutine_scalars
+        self._sub_sigs, self._sub_writes = analyze_subroutine_scalars(tree)
+        # A1: INTEGER PARAMETER values for the stack-size warning's
+        # const-eval (literals and simple literal arithmetic only)
+        self._param_int_vals: dict[str, int] = {}
+        for unit in tree.units:
+            if isinstance(unit, ast.Declaration) and unit.parameter \
+                    and unit.type_name == "INTEGER":
+                for v in unit.variables:
+                    val = self._const_int(v.init_value)
+                    if val is not None:
+                        self._param_int_vals[v.name] = val
+        # Scalar dummies of the subroutine currently being emitted
+        # (lowered as C pointers — Fortran by-reference semantics)
+        self._ref_scalars: set[str] = set()
 
     def generate(self) -> str:
         self.lines.append("#include <stdio.h>")
@@ -278,8 +294,9 @@ class CodeGen:
             if p in self.array_shapes:
                 parts.append(f"{ct} *{p}")
             else:
-                # Value parameters — MCL has no hidden pointers
-                parts.append(f"{ct} {p}")
+                # A6: scalar dummies are by-reference (Fortran semantics)
+                # — writes copy out to the caller.
+                parts.append(f"{ct} *{p}")
         if not parts:
             return "void"
         return ", ".join(parts)
@@ -303,6 +320,8 @@ class CodeGen:
                     self.var_types[v.name] = decl.type_name
                     if v.shape:
                         self.array_shapes[v.name] = v.shape
+                        self._warn_big_local(v.name, v.shape,
+                                             decl.type_name)
                         # Column-major (LOCKED): reversed C dims.
                         dims = "".join(f"[{self._expr(d)}]" for d in reversed(v.shape))
                         self._put(f"{c_type} {v.name}{dims};")
@@ -328,6 +347,11 @@ class CodeGen:
         self.indent += 1
 
         param_set = set(fn.params)
+        # A6: scalar dummies are C pointers in the body (by-reference).
+        saved_ref = self._ref_scalars
+        sig = self._sub_sigs.get(fn.name)
+        self._ref_scalars = ({p for p, is_s, _ in sig if is_s}
+                             if sig else set())
         for decl in fn.declarations:
             c_type = self._c_type(decl.type_name)
             for v in decl.variables:
@@ -335,6 +359,8 @@ class CodeGen:
                     self.var_types[v.name] = decl.type_name
                     if v.shape:
                         self.array_shapes[v.name] = v.shape
+                        self._warn_big_local(v.name, v.shape,
+                                             decl.type_name)
                         # Column-major (LOCKED): reversed C dims.
                         dims = "".join(f"[{self._expr(d)}]" for d in reversed(v.shape))
                         self._put(f"{c_type} {v.name}{dims};")
@@ -346,6 +372,7 @@ class CodeGen:
         for stmt in fn.body:
             self._emit_stmt(stmt)
 
+        self._ref_scalars = saved_ref
         self.indent -= 1
         self._put("}")
 
@@ -373,6 +400,8 @@ class CodeGen:
                 else:
                     args = ", ".join(self._call_arg(a) for a in node.args)
                     self._put(f"{node.name}({args});")
+            elif node.name in self._sub_sigs:
+                self._emit_user_call(node)
             else:
                 args = ", ".join(self._call_arg(a) for a in node.args)
                 self._put(f"{node.name}({args});")
@@ -411,6 +440,7 @@ class CodeGen:
                 self._put(f"{c_type} *{v.name} = NULL;")
             elif v.shape:
                 self.array_shapes[v.name] = v.shape
+                self._warn_big_local(v.name, v.shape, node.type_name)
                 # Column-major (LOCKED): reversed C dims (first index fastest).
                 dims = "".join(f"[{self._expr(d)}]" for d in reversed(v.shape))
                 # Check for DATA initializer
@@ -714,6 +744,77 @@ class CodeGen:
         """For subroutine CALL, pass by value (MCL: no hidden pointers)."""
         return self._expr(arg)
 
+    def _emit_user_call(self, node: ast.CallStmt):
+        """A6: call a user subroutine — scalar dummies are by-reference.
+
+        Variable arg  -> &name (or the bare name when the arg is itself
+                       a by-reference dummy of the current subroutine,
+                       i.e. pass-through of an already-pointer value).
+        Anything else -> only reachable for read-only dummies (the
+                       checker rejects non-lvalue args to written
+                       dummies); copy to a temp and pass its address.
+        """
+        sig = self._sub_sigs[node.name]
+        temps = []
+        parts = []
+        for i, arg in enumerate(node.args):
+            pname, is_scalar, ctype = sig[i]
+            if not is_scalar:
+                parts.append(self._call_arg(arg))
+                continue
+            if isinstance(arg, ast.Variable) and \
+                    arg.name not in self.array_shapes:
+                if arg.name in self._ref_scalars:
+                    parts.append(arg.name)
+                else:
+                    parts.append(f"&{arg.name}")
+                continue
+            t = f"_carg_{node.line}_{i}"
+            temps.append(f"{self._c_type(ctype)} {t} = "
+                         f"{self._expr(arg)};")
+            parts.append(f"&{t}")
+        for t in temps:
+            self._put(t)
+        self._put(f"{node.name}({', '.join(parts)});")
+
+    def _const_int(self, e) -> int | None:
+        """Minimal compile-time integer evaluation (A1 warning only)."""
+        if isinstance(e, ast.Literal) and e.type == "INTEGER":
+            return e.value
+        if isinstance(e, ast.Variable):
+            return self._param_int_vals.get(e.name)
+        if isinstance(e, ast.BinaryOp):
+            a = self._const_int(e.left)
+            b = self._const_int(e.right)
+            if a is None or b is None:
+                return None
+            if e.op == "+":
+                return a + b
+            if e.op == "-":
+                return a - b
+            if e.op == "*":
+                return a * b
+        return None
+
+    def _warn_big_local(self, name: str, shape, type_name: str):
+        """A1 (interim): warn when a local array with compile-time-known
+        size exceeds ~1 MB of stack (default 8 MB stack segfaults with no
+        diagnostic otherwise)."""
+        total = 1
+        for d in shape:
+            c = self._const_int(d)
+            if c is None:
+                return
+            total *= c
+        el = 4 if type_name.startswith("INTEGER") else 8
+        nbytes = total * el
+        if nbytes > 1024 * 1024:
+            import sys as _sys
+            dims = ",".join(str(self._const_int(d)) for d in shape)
+            print(f"ERGO WARNING: local array {name}({dims}) is "
+                  f"{nbytes / 1e6:.1f} MB on the stack; declare STATIC "
+                  f"or raise ulimit", file=_sys.stderr)
+
     # ── lvalue (assignment target) ───────────────────────────
 
     def _lvalue(self, node) -> str:
@@ -721,6 +822,9 @@ class CodeGen:
             # Function return variable: SQ2SCT := val
             if hasattr(self, '_func_ret_var') and self._func_ret_var and node.name == self._func_ret_var:
                 return f"{node.name}_"
+            # A6: by-reference scalar dummy — dereference the C pointer
+            if node.name in self._ref_scalars:
+                return f"(*{node.name})"
             return node.name
         if isinstance(node, ast.CallOrSubscript):
             # Array subscript on left side
@@ -749,6 +853,9 @@ class CodeGen:
                 return "1" if node.value else "0"
 
         if isinstance(node, ast.Variable):
+            # A6: by-reference scalar dummy read — dereference
+            if node.name in self._ref_scalars:
+                return f"(*{node.name})"
             return node.name
 
         if isinstance(node, ast.BinaryOp):

@@ -1,0 +1,11 @@
+! do_neg_step.ergo — F7 golden: negative-step DO loops.
+! COUNT must be 5 (10,8,6,4,2) and LAST must retain 2.
+IMPLICIT NONE
+INTEGER :: I, COUNT, LAST
+COUNT := 0
+LAST := -1
+DO I = 10, 1, -2
+  COUNT := COUNT + 1
+  LAST := I
+ENDDO
+WRITE(*,"('COUNT %d LAST %d')") COUNT, LAST
