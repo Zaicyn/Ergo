@@ -1,0 +1,31 @@
+! write_formats.ergo — A4 golden: the supported WRITE format set.
+! Supported (Spec/Ergo_Spec.md Part 6): %d %i %x %X (INTEGER), %lld
+! (INTEGER*8), %f %e %g (REAL, with E/G variants), %s (CHARACTER),
+! flags -+0 space #, field width, .precision, %% literal.
+! Unsupported (named compile-time errors): %n, dynamic */.* , length
+! modifiers other than ll, unknown conversions, arg-count/type
+! mismatch.
+IMPLICIT NONE
+INTEGER :: I
+INTEGER*8 :: L8
+REAL :: X
+I := -42
+L8 := INT8(3486784) * INT8(1000) + INT8(401)
+X := 2.5
+WRITE(*,"('d %d')") I
+WRITE(*,"('i %i')") I
+WRITE(*,"('x %x')") 255
+WRITE(*,"('X %X')") 255
+WRITE(*,"('lld %lld')") L8
+WRITE(*,"('f %f')") X
+WRITE(*,"('e %e')") X
+WRITE(*,"('g %g')") X
+WRITE(*,"('E %.2E')") X
+WRITE(*,"('plus %+d %+d')") I, 7
+WRITE(*,"('minus %-6d|')") I
+WRITE(*,"('zero %05d')") I
+WRITE(*,"('space % d')") 7
+WRITE(*,"('hash %#x')") 255
+WRITE(*,"('wp %10.3f|')") X
+WRITE(*,"('pct 100%%')")
+WRITE(*,"('mix %d %.4f')") I, X

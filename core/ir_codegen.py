@@ -700,31 +700,52 @@ class IRCodeGen:
 
     # ── local declarations ───────────────────────────────────
 
+    def _local_array_bytes(self, v: IRVar) -> int | None:
+        """Compile-time byte size of a local array, or None."""
+        if v.storage == StorageClass.STATIC or not v.shape:
+            return None
+        total = 1
+        for d in v.shape:
+            c = d if isinstance(d, int) else self._resolve_const(d)
+            if c is None:
+                return None
+            total *= c
+        if v.type == IRType.INTEGER:
+            el = 4
+        else:
+            el = 4 if get_real_precision() == 32 else 8
+        return total * el
+
+    def _hoist_local(self, v: IRVar) -> bool:
+        """A1: large compile-time-sized local arrays (>1 MB) lower to
+        function-local C statics — file-scope lifetime, no stack frame
+        pressure, no renaming. Reentrancy is safe because the checker
+        rejects recursion cycles involving such functions
+        (Checker._check_recursion). Persistence across calls can only
+        mask (never create) read-before-write bugs; statics are
+        zero-initialized, which is MORE deterministic than stack."""
+        nbytes = self._local_array_bytes(v)
+        return nbytes is not None and nbytes > 1024 * 1024
+
     def _warn_large_stack_array(self, v: IRVar):
-        """A1 (interim): warn when a non-STATIC local array with a
-        compile-time-known size exceeds ~1 MB of stack — the default
-        8 MB stack segfaults at the first store with no diagnostic
-        otherwise (octonion Stage 5, ab_recoil.ergo)."""
-        if v.storage != StorageClass.STATIC and v.shape:
-            total = 1
-            for d in v.shape:
-                c = d if isinstance(d, int) else self._resolve_const(d)
-                if c is None:
-                    return
-                total *= c
-            if v.type == IRType.INTEGER:
-                el = 4
-            else:
-                el = 4 if get_real_precision() == 32 else 8
-            nbytes = total * el
-            if nbytes > 1024 * 1024:
-                import sys as _sys
-                dims = ",".join(str(d if isinstance(d, int)
-                                    else self._resolve_const(d))
-                                for d in v.shape)
-                print(f"ERGO WARNING: local array {v.name}({dims}) is "
-                      f"{nbytes / 1e6:.1f} MB on the stack; declare "
-                      f"STATIC or raise ulimit", file=_sys.stderr)
+        """A1: warn when a local array is too big for the stack and is
+        NOT hoistable (size not compile-time-known). Hoisted arrays are
+        reported as hoisted, not warned."""
+        nbytes = self._local_array_bytes(v)
+        if nbytes is None or nbytes <= 1024 * 1024:
+            return
+        import sys as _sys
+        dims = ",".join(str(d if isinstance(d, int)
+                            else self._resolve_const(d))
+                        for d in v.shape)
+        if self._hoist_local(v):
+            print(f"ERGO NOTE: local array {v.name}({dims}) is "
+                  f"{nbytes / 1e6:.1f} MB — hoisted to static storage "
+                  f"(A1)", file=_sys.stderr)
+        else:
+            print(f"ERGO WARNING: local array {v.name}({dims}) is "
+                  f"{nbytes / 1e6:.1f} MB on the stack; declare "
+                  f"STATIC or raise ulimit", file=_sys.stderr)
 
     def _emit_local_decl(self, v: IRVar, mod: IRModule):
         self._emit_line(v.line)
@@ -742,7 +763,9 @@ class IRCodeGen:
             # Column-major (LOCKED): reversed C dims (see _emit_static_var).
             dims = "".join(f"[{self._dim_expr(d)}]" for d in reversed(v.shape))
             init = self._data_array_init(v, mod)
-            self._put(f"{ct} {v.name}{dims}{init};")
+            # A1: >1MB locals become function-local statics (no stack)
+            kw = "static " if self._hoist_local(v) else ""
+            self._put(f"{kw}{ct} {v.name}{dims}{init};")
         else:
             init = ""
             if v.init_value is not None:
@@ -766,7 +789,9 @@ class IRCodeGen:
             # Column-major (LOCKED): reversed C dims (see _emit_static_var).
             dims = "".join(f"[{self._dim_expr(d)}]" for d in reversed(v.shape))
             init = self._data_array_init(v, self.module)
-            self._put(f"{ct} {v.name}{dims}{init};")
+            # A1: >1MB locals become function-local statics (no stack)
+            kw = "static " if self._hoist_local(v) else ""
+            self._put(f"{kw}{ct} {v.name}{dims}{init};")
         else:
             init = ""
             if v.init_value is not None:

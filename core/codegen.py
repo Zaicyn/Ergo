@@ -12,9 +12,20 @@ from . import ast_nodes as ast
 from .errors import MCLError
 
 
+def _c_str_escape(s: str) -> str:
+    """Escape a string's contents for a C string literal (kept in
+    lockstep with ir_codegen._c_str_escape — A2 golden parity)."""
+    return (s.replace("\\", "\\\\")
+             .replace('"', '\\"')
+             .replace("\n", "\\n")
+             .replace("\t", "\\t")
+             .replace("\r", "\\r"))
+
+
 C_TYPE = {
     "REAL": "double",
     "INTEGER": "int",
+    "INTEGER*8": "long long",
     "LOGICAL": "int",
     "COMPLEX": "double _Complex",
 }
@@ -417,6 +428,8 @@ class CodeGen:
             self._emit_write(node)
         elif isinstance(node, ast.CycleStmt):
             self._put("continue;")
+        elif isinstance(node, ast.ExitStmt):
+            self._put("break;")
         elif isinstance(node, ast.StopStmt):
             self._put("return 0;")
         elif isinstance(node, ast.FlushStmt):
@@ -542,8 +555,12 @@ class CodeGen:
         self._put(f"{{ int _ergo_end{n} = ({end}); "
                   f"int _ergo_step{n} = ({step});")
         self.indent += 1
+        # R5: iterate the USER's variable (no shadowing declaration) —
+        # after the loop it retains its final value (Fortran semantics:
+        # end+step on normal completion, the current value on EXIT),
+        # matching the IR path.
         self._put(
-            f"for (int {var} = ({start}); "
+            f"for ({var} = ({start}); "
             f"_ergo_step{n} > 0 ? {var} <= _ergo_end{n} "
             f": {var} >= _ergo_end{n}; "
             f"{var} += _ergo_step{n}) {{")
@@ -563,7 +580,10 @@ class CodeGen:
     def _emit_write(self, node: ast.WriteStmt):
         """Emit WRITE as fprintf/printf with format string."""
         stream = "stderr" if node.unit == "0" else "stdout"
-        fmt = node.fmt
+        # Escape for C (the lexer now processes \\ escapes in string
+        # literals, so the fmt may hold raw control bytes) — matches the
+        # IR path's _c_str_escape.
+        fmt = _c_str_escape(node.fmt)
         # Add newline unless ADVANCE=NO
         if node.advance:
             fmt = fmt + "\\n"
@@ -848,7 +868,7 @@ class CodeGen:
             if node.type == "INTEGER":
                 return str(node.value)
             if node.type == "STRING":
-                return f'"{node.value}"'
+                return f'"{_c_str_escape(node.value)}"'
             if node.type == "LOGICAL":
                 return "1" if node.value else "0"
 
@@ -922,6 +942,8 @@ class CodeGen:
                 return f"(double)({self._expr(node.args[0])})"
             if upper == "INT":
                 return f"(int)({self._expr(node.args[0])})"
+            if upper == "INT8":
+                return f"(long long)({self._expr(node.args[0])})"
             if upper == "CHAR":
                 return f"(char)({self._expr(node.args[0])})"
 

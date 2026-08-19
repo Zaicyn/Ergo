@@ -292,7 +292,7 @@ DO FRAME = 1, MAXFRAME
       ENDIF
     ENDDO
 
-    WRITE(*, "%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%d,%d,%d,%.6f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d") &
+    WRITE(*, "%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%d,%d,%d,%.6f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d") &
       FRAME, N, NATOM, NKNOT, MEAN_STRESS, MAX_STRESS, SUM_AMP, MAX_AMP, COHERENCE, &
       MEAN_ARCTAN_STRESS, MAX_ARCTAN_STRESS, MAX_LYAPUNOV, MEAN_SURFACE, MEAN_W_ATOM, FLOW_FRACTION, &
       NBOND, MAX_COMPONENT, DEGREE_0, DEGREE_1, DEGREE_2, N_COAST, N_ACTIVE, N_FLOW, N_REFINE, N_ACTIVE_ATOM, &

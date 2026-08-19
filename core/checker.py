@@ -220,6 +220,12 @@ class Checker:
         self._sub_scalar_params, self._sub_writes = \
             analyze_subroutine_scalars(tree)
 
+        # Pass 1.6: recursion guard (A1 hoisting relies on it — large
+        # local arrays lower to function-local C statics, which are
+        # shared across activations, so recursion into a function with
+        # a hoisted local would corrupt it silently).
+        self._check_recursion(tree)
+
         # Pass 2: check all code
         for unit in tree.units:
             self._check_unit(unit)
@@ -523,8 +529,7 @@ class Checker:
         elif isinstance(node, ast.PrintStmt):
             self._infer_type(node.value)
         elif isinstance(node, ast.WriteStmt):
-            for arg in node.args:
-                self._infer_type(arg)
+            self._check_write(node)
         elif isinstance(node, ast.ReturnStmt):
             if node.value is not None:
                 self._infer_type(node.value)
@@ -702,6 +707,251 @@ class Checker:
                         node.line)
         for arg in node.args:
             self._infer_type(arg)
+
+    # ── A1: recursion guard for hoisted locals ───────────────
+
+    def _check_recursion(self, tree: ast.Program):
+        """Named error when a call cycle involves a function/subroutine
+        that owns a large (hoistable, >1 MB compile-time-sized) local
+        array — such locals lower to function-local C statics, which
+        recursion would share silently."""
+        funcs = {u.name: u for u in tree.units
+                 if isinstance(u, (ast.FunctionDef, ast.SubroutineDef))}
+        fname_set = set(funcs)
+
+        def expr_calls(e, acc):
+            # function calls inside expressions look like CallOrSubscript
+            if isinstance(e, ast.CallOrSubscript) and e.name in fname_set:
+                acc.add(e.name)
+            for v in getattr(e, "__dict__", {}).values():
+                if isinstance(v, list):
+                    for it in v:
+                        if hasattr(it, "__dict__"):
+                            expr_calls(it, acc)
+                elif hasattr(v, "__dict__") and not isinstance(v, str):
+                    expr_calls(v, acc)
+
+        def stmt_calls(stmts, acc):
+            for s in stmts:
+                if isinstance(s, ast.CallStmt) and s.name in fname_set:
+                    acc.add(s.name)
+                for attr in ("body", "then_body", "else_body"):
+                    sub = getattr(s, attr, None)
+                    if sub:
+                        stmt_calls(sub, acc)
+                if isinstance(s, ast.SelectCaseStmt):
+                    for _, body in s.cases:
+                        stmt_calls(body, acc)
+                for attr in ("condition", "value", "target", "start",
+                             "end", "step", "expr"):
+                    ex = getattr(s, attr, None)
+                    if ex is not None and hasattr(ex, "__dict__"):
+                        expr_calls(ex, acc)
+                for a in getattr(s, "args", []) or []:
+                    expr_calls(a, acc)
+
+        graph = {}
+        for name, fn in funcs.items():
+            acc = set()
+            stmt_calls(fn.body, acc)
+            graph[name] = acc
+
+        # integer PARAMETER values (file scope + per-function) for
+        # resolving local array dims
+        param_vals = {}
+        for unit in tree.units:
+            if isinstance(unit, ast.Declaration) and unit.parameter \
+                    and unit.type_name == "INTEGER":
+                for v in unit.variables:
+                    if isinstance(v.init_value, ast.Literal) and \
+                            v.init_value.type == "INTEGER":
+                        param_vals[v.name] = v.init_value.value
+
+        def has_big_local(fn):
+            local_params = dict(param_vals)
+            for decl in fn.declarations:
+                if decl.parameter and decl.type_name == "INTEGER":
+                    for v in decl.variables:
+                        if isinstance(v.init_value, ast.Literal) and \
+                                v.init_value.type == "INTEGER":
+                            local_params[v.name] = v.init_value.value
+            for decl in fn.declarations:
+                for v in decl.variables:
+                    if v.shape:
+                        total = 1
+                        ok = True
+                        for d in v.shape:
+                            if isinstance(d, ast.Literal) and \
+                                    d.type == "INTEGER":
+                                total *= d.value
+                            elif isinstance(d, ast.Variable) and \
+                                    d.name in local_params:
+                                total *= local_params[d.name]
+                            else:
+                                ok = False
+                                break
+                        el = 4 if decl.type_name.startswith(
+                            "INTEGER") else 8
+                        if ok and total * el > 1024 * 1024:
+                            return True
+            return False
+
+        # DFS cycle detection; report cycles that include a big-local fn
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {n: WHITE for n in funcs}
+        reported = set()
+
+        def dfs(n, stack):
+            color[n] = GRAY
+            for m in graph.get(n, ()):
+                if m not in color:
+                    continue
+                if color[m] == GRAY:
+                    cyc = stack[stack.index(m):] + [m] if m in stack \
+                        else [n, m]
+                    key = frozenset(cyc)
+                    if key not in reported and any(
+                            has_big_local(funcs[c]) for c in cyc
+                            if c in funcs):
+                        reported.add(key)
+                        self._error(
+                            f"recursive call cycle "
+                            f"{' -> '.join(cyc)} involves a function "
+                            f"with a large local array: such locals are "
+                            f"hoisted to C static storage (A1) and "
+                            f"recursion would share them — restructure "
+                            f"or keep the array small/ALLOCATABLE")
+                elif color[m] == WHITE:
+                    dfs(m, stack + [m])
+            color[n] = BLACK
+
+        for n in funcs:
+            if color[n] == WHITE:
+                dfs(n, [n])
+
+    # ── A4: WRITE format-string audit ────────────────────────
+    # The format text is lowered verbatim into C fprintf on both codegen
+    # paths, so an invalid spec is a runtime dice-roll (garbage reads,
+    # or worse with %n). Validate at compile time instead. Supported
+    # set (documented in Spec/Ergo_Spec.md Part 6):
+    #   conversions: %d %i %x %X (INTEGER/LOGICAL), %f %F %e %E %g %G
+    #   (REAL), %s (CHARACTER), %% literal
+    #   flags: - + 0 space #  ;  width: digits  ;  precision: .digits
+    # Not supported (named compile-time errors): %n (never), dynamic
+    # width/precision '*', length modifiers (h, l, ll, z...), any other
+    # conversion letter.
+
+    _WRITE_CONV_INT = set("di xX".replace(" ", ""))
+    _WRITE_CONV_REAL = set("fFeEgG")
+    _WRITE_CONV_STR = set("s")
+    _WRITE_FLAGS = set("-+0 #")
+
+    def _check_write(self, node: ast.WriteStmt):
+        arg_types = [self._infer_type(a) for a in node.args]
+        fmt = node.fmt or ""
+        convs = []  # (conversion letter, position in fmt)
+        i = 0
+        while i < len(fmt):
+            if fmt[i] != "%":
+                i += 1
+                continue
+            i += 1
+            if i < len(fmt) and fmt[i] == "%":
+                i += 1
+                continue  # %% literal
+            start = i
+            while i < len(fmt) and fmt[i] in self._WRITE_FLAGS:
+                i += 1
+            if i < len(fmt) and fmt[i] == "*":
+                self._error(
+                    "WRITE: dynamic width '*' is not supported "
+                    "(use a fixed width)", node.line)
+                return
+            while i < len(fmt) and fmt[i].isdigit():
+                i += 1
+            if i < len(fmt) and fmt[i] == ".":
+                i += 1
+                if i < len(fmt) and fmt[i] == "*":
+                    self._error(
+                        "WRITE: dynamic precision '.*' is not supported",
+                        node.line)
+                    return
+                while i < len(fmt) and fmt[i].isdigit():
+                    i += 1
+            if i >= len(fmt):
+                self._error("WRITE: format string ends mid-conversion "
+                            "'%…'", node.line)
+                return
+            lmod = ""
+            if fmt.startswith("ll", i):
+                lmod = "ll"
+                i += 2
+            elif fmt[i] in "hljztLq":
+                self._error(
+                    f"WRITE: length modifier '%{fmt[i]}...' is not "
+                    f"supported (only %lld/%lli for INTEGER*8)",
+                    node.line)
+                return
+            if i >= len(fmt):
+                self._error("WRITE: format string ends mid-conversion "
+                            "'%…'", node.line)
+                return
+            c = fmt[i]
+            i += 1
+            if c == "n":
+                self._error("WRITE: %n is not supported (writes through "
+                            "a pointer; never allowed)", node.line)
+                return
+            if c not in self._WRITE_CONV_INT | self._WRITE_CONV_REAL \
+                    | self._WRITE_CONV_STR:
+                self._error(
+                    f"WRITE: unsupported conversion '%{c}' "
+                    f"(supported: %d %i %x %X %lld %f %e %g %s, "
+                    f"flags -+0 space #, width, .precision)", node.line)
+                return
+            if lmod and c not in self._WRITE_CONV_INT:
+                self._error(
+                    f"WRITE: '%ll{c}' is not supported (ll only with "
+                    f"d/i/x/X for INTEGER*8)", node.line)
+                return
+            convs.append(lmod + c)
+        if len(convs) != len(arg_types):
+            self._error(
+                f"WRITE: format has {len(convs)} conversion(s) but "
+                f"{len(arg_types)} argument(s) — they must match "
+                f"exactly (fprintf reads garbage otherwise)", node.line)
+            return
+        for c, t in zip(convs, arg_types):
+            if t is None:
+                continue
+            if c.startswith("ll"):
+                if t != "INTEGER*8":
+                    self._error(
+                        f"WRITE: %{c} needs an INTEGER*8 argument, "
+                        f"got {t}", node.line)
+                    return
+                continue
+            if c in self._WRITE_CONV_INT and \
+                    t not in ("INTEGER", "LOGICAL"):
+                if t == "INTEGER*8":
+                    self._error(
+                        f"WRITE: %{c} truncates an INTEGER*8 argument — "
+                        f"use %ll{c}", node.line)
+                else:
+                    self._error(
+                        f"WRITE: %{c} needs an INTEGER argument, got {t}",
+                        node.line)
+                return
+            if c in self._WRITE_CONV_REAL and t != "REAL":
+                self._error(
+                    f"WRITE: %{c} needs a REAL argument, got {t}",
+                    node.line)
+                return
+            if c in self._WRITE_CONV_STR and t != "CHARACTER":
+                self._error(
+                    f"WRITE: %s needs a CHARACTER argument, got {t}",
+                    node.line)
+                return
 
     def _check_select(self, node: ast.SelectCaseStmt):
         expr_type = self._infer_type(node.expr)

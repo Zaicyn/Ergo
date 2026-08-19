@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""run_golden.py — A2 golden-output harness: both codegen paths, one verdict.
+
+Compiles each corpus program through the IR path (default, supported)
+and the legacy AST path (deprecated; driver use_ir=False), runs both,
+and compares stdout byte-exact. The paths have known drift — expected
+divergences are listed in KNOWN (with notes in KNOWN_DIVERGENCES.md);
+a divergence NOT in KNOWN is reported as NEW (the burn-down alarm).
+
+Deterministic: fixed corpus order, no timestamps, no absolute paths in
+the report. Exit 0 when the harness itself ran to completion; read the
+table for the verdicts.
+
+Run from repo root:  python3 tests/golden/run_golden.py
+"""
+
+import os
+import subprocess
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+sys.path.insert(0, REPO)
+
+CORPUS = [
+    "tests/alloc_smoke.ergo",
+    "tests/allocate_bench.ergo",
+    "tests/buc_colony.ergo",
+    "tests/do_neg_step.ergo",
+    "tests/dot_product.ergo",
+    "tests/func_implicit_return.ergo",
+    "tests/int64.ergo",
+    "tests/loopvar_after.ergo",
+    "tests/prng.ergo",
+    "tests/sq2core.ergo",
+    "tests/sq3core.ergo",
+    "tests/sub_scalar_ref.ergo",
+    "tests/test_first.ergo",
+    "tests/write_formats.ergo",
+    "min/fdtd/stencil_test.ergo",
+    "min/dendrite/laplace_annulus.ergo",
+]
+
+# Expected divergences (details: KNOWN_DIVERGENCES.md). Anything else
+# that differs is reported as NEW.
+KNOWN = {
+    # "tests/example.ergo": "reason",
+}
+
+RUN_TIMEOUT = 60  # seconds per binary
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=False,
+                          timeout=kw.pop("timeout", 120), **kw)
+
+
+def build_ir(path, out):
+    r = sh(["python", "-m", "core", path, "-o", out], cwd=REPO)
+    return r.returncode == 0, r
+
+
+def build_legacy(path, out):
+    # In-process (no CLI route by design); deprecation warning expected.
+    code = (
+        "from core.driver import compile_file; "
+        f"compile_file({path!r}, output={out!r}, use_ir=False)"
+    )
+    r = sh([sys.executable, "-c", code], cwd=REPO)
+    return r.returncode == 0, r
+
+
+def main():
+    rows = []
+    for rel in CORPUS:
+        ir_bin = "/tmp/golden_ir.bin"
+        leg_bin = "/tmp/golden_leg.bin"
+        ok_ir, r_ir = build_ir(rel, ir_bin)
+        ok_leg, r_leg = build_legacy(rel, leg_bin)
+        if not ok_ir or not ok_leg:
+            note = ""
+            if not ok_ir and ok_leg:
+                # e.g. COMPLEX: IR raises cleanly, legacy lowers — a
+                # documented known divergence class
+                msg = (r_ir.stderr or b"").decode(errors="replace")
+                note = "IR raises: " + msg.strip().splitlines()[-1][:60] \
+                    if msg.strip() else "IR build failed"
+                status = "KNOWN" if rel in KNOWN else "BUILD-DIVERGE"
+            elif not ok_leg and ok_ir:
+                msg = (r_leg.stderr or b"").decode(errors="replace")
+                note = "legacy build fails: " + \
+                    (msg.strip().splitlines()[-1][:60]
+                     if msg.strip() else "?")
+                status = "KNOWN" if rel in KNOWN else "BUILD-DIVERGE"
+            else:
+                note = "both builds fail"
+                status = "KNOWN" if rel in KNOWN else "BUILD-DIVERGE"
+            rows.append((rel, status, note))
+            continue
+        out_ir = sh([ir_bin], timeout=RUN_TIMEOUT).stdout
+        out_leg = sh([leg_bin], timeout=RUN_TIMEOUT).stdout
+        if out_ir == out_leg:
+            rows.append((rel, "MATCH", ""))
+        else:
+            first = next(i for i, (a, b) in
+                         enumerate(zip(out_ir, out_leg)) if a != b)
+            note = f"outputs differ at byte {first}"
+            status = "KNOWN" if rel in KNOWN else "NEW-DIVERGENCE"
+            rows.append((rel, status, note))
+
+    print("=" * 68)
+    print("A2 GOLDEN HARNESS — IR vs legacy, byte-exact stdout")
+    print("=" * 68)
+    for rel, status, note in rows:
+        print(f"  {status:14s} {rel}" + (f"  ({note})" if note else ""))
+    n_match = sum(1 for r in rows if r[1] == "MATCH")
+    n_known = sum(1 for r in rows if r[1] == "KNOWN")
+    n_new = sum(1 for r in rows if r[1] not in ("MATCH", "KNOWN"))
+    print("-" * 68)
+    print(f"  {n_match} match, {n_known} known divergences, "
+          f"{n_new} NEW divergences (of {len(rows)})")
+    if n_new:
+        print("  NEW divergences are the burn-down alarm — investigate "
+              "before release.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

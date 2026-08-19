@@ -161,6 +161,29 @@ codegen (`core/codegen.py`, reachable only via the Python API with
 `use_ir=False`) is **deprecated**: it remains for dual-path golden
 testing and prints a deprecation warning when selected.
 
+✅ **Large local arrays (A1, 2026-08-13):** a local (non-STATIC) array
+whose compile-time-known size exceeds 1 MB is **hoisted to
+function-local C static storage** by the IR backend (an ERGO NOTE is
+printed). Statics are zero-initialized and persist across calls —
+this can only mask, never create, read-before-write bugs.
+**Reentrancy constraint:** recursion into a function owning such an
+array would share it, so the checker rejects recursion cycles
+involving functions with hoisted locals (named error; recursion with
+only small/ALLOCATABLE locals is unaffected). Unresolvable sizes keep
+the batch-1 stack warning. The legacy backend keeps the warning only.
+
+✅ **WRITE format audit (A4, ratified 2026-08-13):** the WRITE format
+string lowers verbatim to C `fprintf`, so the supported set is
+validated at compile time (checker; both backends share it) and
+anything else is a **named compile-time error**, never a runtime
+dice-roll. Supported: conversions `%d %i %x %X` (INTEGER/LOGICAL),
+`%lld %lli` (INTEGER*8), `%f %F %e %E %g %G` (REAL), `%s`
+(CHARACTER), `%%` literal; flags `- + 0 space #`; field width digits;
+`.precision` digits. Rejected with named errors: `%n` (always),
+dynamic `*`/`.*` width-precision, other length modifiers, unknown
+conversions, conversion/argument count mismatch, and type mismatch
+(`%d` vs REAL, `%f` vs INTEGER, `%d` vs INTEGER*8 — use `%lld`).
+
 ---
 
 ## What Is NOT in This Language

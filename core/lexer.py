@@ -267,7 +267,35 @@ class Lexer:
         while self.pos < len(self.source) and self.source[self.pos] != quote:
             if self.source[self.pos] == "\n":
                 self._error("Unterminated string literal")
-            chars.append(self._advance())
+            c = self._advance()
+            if c == "\\":
+                # Escape sequences (2026-08-13, A2 golden divergence fix):
+                # \n \t \r \\ \' \" and octal \NNN (1-3 digits, e.g.
+                # \033 = ESC for ANSI codes). Previously the backslash
+                # passed through raw and the two codegen paths disagreed
+                # (legacy let C's octal interpretation fire, IR escaped
+                # the backslash into literal text). Unknown escapes are
+                # a named error, never a silent drop.
+                if self.pos >= len(self.source):
+                    self._error("Unterminated string literal")
+                e = self._advance()
+                simple = {"n": "\n", "t": "\t", "r": "\r",
+                          "\\": "\\", "'": "'", '"': '"', "0": None}
+                if e in "01234567":
+                    digits = e
+                    while (len(digits) < 3 and
+                           self.pos < len(self.source) and
+                           self.source[self.pos] in "01234567"):
+                        digits += self._advance()
+                    chars.append(chr(int(digits, 8)))
+                elif e in simple and simple[e] is not None:
+                    chars.append(simple[e])
+                else:
+                    self._error(f"Unknown escape sequence '\\{e}' in "
+                                f"string literal (supported: \\n \\t \\r "
+                                f"\\\\ \\' \\\" \\NNN octal)")
+            else:
+                chars.append(c)
         if self.pos >= len(self.source):
             self._error("Unterminated string literal")
         self._advance()  # closing quote

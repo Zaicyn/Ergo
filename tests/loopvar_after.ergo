@@ -1,0 +1,22 @@
+! loopvar_after.ergo — R5 golden: the DO loop variable retains its final
+! value after the loop (Fortran semantics, both codegen paths).
+!   positive step: DO I = 1, 5      -> I = 6 after (first failing value)
+!   negative step: DO J = 10, 1, -2 -> J = 0 after
+!   EXIT: leaves the loop var at its current value
+IMPLICIT NONE
+INTEGER :: I, J, K
+
+DO I = 1, 5
+ENDDO
+WRITE(*,"('POS %d')") I
+
+DO J = 10, 1, -2
+ENDDO
+WRITE(*,"('NEG %d')") J
+
+DO K = 1, 100
+  IF (K == 4) THEN
+    EXIT
+  ENDIF
+ENDDO
+WRITE(*,"('EXIT %d')") K

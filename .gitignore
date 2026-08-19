@@ -63,6 +63,10 @@
 !tests/*.ergo
 !tests/*.c
 !tests/*.h
+# A2 golden harness (runner + burn-down doc)
+!tests/golden/
+!tests/golden/*.py
+!tests/golden/*.md
 
 # Always ignore build artifacts
 __pycache__/

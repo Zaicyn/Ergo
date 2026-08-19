@@ -1,0 +1,334 @@
+! ════════════════════════════════════════════════════════════════════
+! AB_PI_LEDGER_FLIP — Stage 4b: flux polarity flip (handedness test)
+! ════════════════════════════════════════════════════════════════════
+! Same engine + ledger as ab_pi_ledger v2 (validated 2026-08-11:
+! led/FL = 0.6442/0.6455/0.6500, phasors byte-exact vs stage-2).
+!
+! Purpose: reverse the flux, reverse the SENSE of the phase accrual.
+! If the AB phase is a continuous rotation (anti-phase = mirrored
+! accrual), the ledger curve for -FL must be the +FL curve reflected
+! through zero at every timestep - not just a flipped endpoint.
+!
+! CAVEAT BUILT INTO THE ORACLE: conjugating the links (SIN odd, COS
+! even) is time-reversal, but the packet still flies +x, so the -FL
+! run is NOT the exact mirror of +FL. This test therefore measures
+! two things at once:
+!   1. HANDEDNESS: sign(ledger) follows sign(FL) everywhere in time.
+!   2. POLARITY ASYMMETRY BUDGET: |ledger(-FL)| / |ledger(+FL)|.
+!      Exact mirror = 1.000. Stage-3 lens showed the engine can carry
+!      real polarity asymmetry (+5.80 vs -8.56 there); here the
+!      geometry is symmetric, so a deviation > ~5% is engine, not
+!      physics, and worth knowing the size of.
+!
+! FIX vs v2: link setup was guarded by IF (FLV > 0.0) - negative
+! fluxes would have run as FREE PROPAGATION (false-perfect null).
+! Guard is now FLV /= 0.0.
+!
+! Cases: 1: 0   2: +pi/2   3: -pi/2   4: +pi   5: -pi
+!        6: +2pi   7: -2pi
+! Fine time series printed for CS 4 and 5 (+-pi) so the accrual
+! curves can be compared reflected.
+!
+! Expected:
+!   null: everything ~0
+!   +-pi/2: ledger +-1.01, phasor +-1.14 (stage-2 response)
+!   +-pi:   ledger +-2.03, phasor +-2.636
+!   +-2pi:  ledger +-4.08, phasor -+0.33 (screen blind both ways)
+!   led/FL ~ +0.645 for ALL cases (ratio preserves sign)
+!   |led(-FL)|/|led(+FL)| within ~5% of 1.000
+!
+!   python -m core min/ab/ab_pi_ledger_flip.ergo -o /tmp/piflip && /tmp/piflip
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 512, NY = 512
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 2200
+INTEGER, PARAMETER :: NSP = 48
+REAL, PARAMETER :: AA = 0.20
+REAL, PARAMETER :: SIG = 14.0
+REAL, PARAMETER :: K0 = 0.3
+INTEGER, PARAMETER :: X0 = 100
+INTEGER, PARAMETER :: Y1 = 204, Y2 = 308
+INTEGER, PARAMETER :: XSCR = 350
+INTEGER, PARAMETER :: XC = 256, YC = 256
+REAL, PARAMETER :: PI2 = 6.283185307179586
+REAL, PARAMETER :: PIH = 3.14159265358979
+
+STATIC REAL :: R(NPTS), I(NPTS)
+STATIC REAL :: ABSORB(NPTS), WALL(NPTS)
+STATIC REAL :: CXL(NPTS), SXL(NPTS), CYL(NPTS), SYL(NPTS)
+STATIC REAL :: SCR(NY)
+REAL :: PTAB(7), LTAB(7)
+REAL :: SV, FR, FI, TH, DX, DY, R2, RH
+REAL :: EX1, EY1, EX2, EY2, EMAG
+REAL :: W1, WX1, WY1, W2, WX2, WY2
+REAL :: CX1, CY1M, CX2, CY2M
+REAL :: PCX1, PCY1, PCX2, PCY2
+REAL :: VX1, VY1M, VX2, VY2M
+REAL :: PH1, PH2, PHL, DLED
+REAL :: FLV, PHS
+INTEGER :: K, J, T, CS
+
+DO CS = 1, 7
+  FLV := 0.0
+  IF (CS == 2) THEN
+    FLV := PIH / 2.0
+  ENDIF
+  IF (CS == 3) THEN
+    FLV := 0.0 - PIH / 2.0
+  ENDIF
+  IF (CS == 4) THEN
+    FLV := PIH
+  ENDIF
+  IF (CS == 5) THEN
+    FLV := 0.0 - PIH
+  ENDIF
+  IF (CS == 6) THEN
+    FLV := PI2
+  ENDIF
+  IF (CS == 7) THEN
+    FLV := 0.0 - PI2
+  ENDIF
+
+  DO K = 1, NPTS
+    R(K) := 0.0
+    I(K) := 0.0
+    ABSORB(K) := 1.0
+    WALL(K) := 1.0
+  ENDDO
+  DO J = 1, NY
+    SCR(J) := 0.0
+  ENDDO
+  DO J = 1, NSP
+    SV := 1.0 - 0.35 * (1.0 - REAL(J) / REAL(NSP + 1)) * &
+      (1.0 - REAL(J) / REAL(NSP + 1))
+    DO K = 1, NX
+      ABSORB(K + (J - 1) * NX) := ABSORB(K + (J - 1) * NX) * SV
+      ABSORB(K + (NY - J) * NX) := ABSORB(K + (NY - J) * NX) * SV
+    ENDDO
+    DO K = 1, NY
+      ABSORB(J + (K - 1) * NX) := ABSORB(J + (K - 1) * NX) * SV
+      ABSORB(NX - J + 1 + (K - 1) * NX) := &
+        ABSORB(NX - J + 1 + (K - 1) * NX) * SV
+    ENDDO
+  ENDDO
+  ! absorbing disk at the flux line (Tonomura shield)
+  DO J = YC - 8, YC + 8
+    DO K = XC - 8, XC + 8
+      DX := REAL(K - XC)
+      DY := REAL(J - YC)
+      IF (DX * DX + DY * DY < 64.0) THEN
+        WALL(K + (J - 1) * NX) := 0.0
+      ENDIF
+    ENDDO
+  ENDDO
+  ! link phases (identity default; flux line A_phi = FLV/(2 pi r))
+  DO J = 1, NY
+    DO K = 1, NX
+      CXL(K + (J - 1) * NX) := 1.0
+      SXL(K + (J - 1) * NX) := 0.0
+      CYL(K + (J - 1) * NX) := 1.0
+      SYL(K + (J - 1) * NX) := 0.0
+    ENDDO
+  ENDDO
+  IF (FLV /= 0.0) THEN
+    TH := FLV / PI2
+    DO J = 2, NY - 1
+      DO K = 2, NX - 1
+        DX := REAL(K - XC) + 0.5
+        DY := REAL(J - YC)
+        R2 := DX * DX + DY * DY
+        IF (R2 > 36.0) THEN
+          SV := (0.0 - TH) * DY / R2
+          CXL(K + (J - 1) * NX) := COS(SV)
+          SXL(K + (J - 1) * NX) := SIN(SV)
+        ENDIF
+        DX := REAL(K - XC)
+        DY := REAL(J - YC) + 0.5
+        R2 := DX * DX + DY * DY
+        IF (R2 > 36.0) THEN
+          SV := TH * DX / R2
+          CYL(K + (J - 1) * NX) := COS(SV)
+          SYL(K + (J - 1) * NX) := SIN(SV)
+        ENDIF
+      ENDDO
+    ENDDO
+  ENDIF
+  ! packets
+  DO J = 1, NY
+    DO K = 1, NX
+      SV := EXP(0.0 - ((REAL(K - X0) / 30.0) * (REAL(K - X0) / 30.0) &
+        + (REAL(J - Y1) / SIG) * (REAL(J - Y1) / SIG)))
+      R(K + (J - 1) * NX) := SV * COS(K0 * REAL(K - X0))
+      I(K + (J - 1) * NX) := SV * SIN(K0 * REAL(K - X0))
+      SV := EXP(0.0 - ((REAL(K - X0) / 30.0) * (REAL(K - X0) / 30.0) &
+        + (REAL(J - Y2) / SIG) * (REAL(J - Y2) / SIG)))
+      R(K + (J - 1) * NX) := R(K + (J - 1) * NX) &
+        + SV * COS(K0 * REAL(K - X0))
+      I(K + (J - 1) * NX) := I(K + (J - 1) * NX) &
+        + SV * SIN(K0 * REAL(K - X0))
+    ENDDO
+  ENDDO
+
+  PH1 := 0.0
+  PH2 := 0.0
+  PCX1 := REAL(X0)
+  PCY1 := REAL(Y1)
+  PCX2 := REAL(X0)
+  PCY2 := REAL(Y2)
+
+  DO T = 1, NSTEPS
+    DO K = NX + 2, NEND
+      I(K) := (I(K) + AA * ( &
+        CXL(K) * R(K + 1) + CXL(K - 1) * R(K - 1) &
+        + CYL(K) * R(K + NX) + CYL(K - NX) * R(K - NX) - 4.0 * R(K) &
+        - SXL(K) * I(K + 1) + SXL(K - 1) * I(K - 1) &
+        - SYL(K) * I(K + NX) + SYL(K - NX) * I(K - NX))) &
+        * ABSORB(K) * WALL(K)
+    ENDDO
+    DO K = NX + 2, NEND
+      R(K) := (R(K) - AA * ( &
+        SXL(K) * R(K + 1) - SXL(K - 1) * R(K - 1) &
+        + SYL(K) * R(K + NX) - SYL(K - NX) * R(K - NX) &
+        + CXL(K) * I(K + 1) + CXL(K - 1) * I(K - 1) &
+        + CYL(K) * I(K + NX) + CYL(K - NX) * I(K - NX) - 4.0 * I(K))) &
+        * ABSORB(K) * WALL(K)
+    ENDDO
+
+    ! -- ledger pass: per-channel mass, centroid, E-field at core --
+    W1 := 0.0
+    WX1 := 0.0
+    WY1 := 0.0
+    EX1 := 0.0
+    EY1 := 0.0
+    W2 := 0.0
+    WX2 := 0.0
+    WY2 := 0.0
+    EX2 := 0.0
+    EY2 := 0.0
+    DO J = 2, NY - 1
+      DO K = 2, NX - 1
+        RH := R(K + (J - 1) * NX) * R(K + (J - 1) * NX) &
+          + I(K + (J - 1) * NX) * I(K + (J - 1) * NX)
+        IF (RH > 0.0) THEN
+          DX := REAL(XC - K)
+          DY := REAL(YC - J)
+          R2 := DX * DX + DY * DY
+          IF (R2 > 64.0) THEN
+            IF (J <= YC) THEN
+              W1 := W1 + RH
+              WX1 := WX1 + RH * REAL(K)
+              WY1 := WY1 + RH * REAL(J)
+              EX1 := EX1 + RH * DX / R2
+              EY1 := EY1 + RH * DY / R2
+            ELSE
+              W2 := W2 + RH
+              WX2 := WX2 + RH * REAL(K)
+              WY2 := WY2 + RH * REAL(J)
+              EX2 := EX2 + RH * DX / R2
+              EY2 := EY2 + RH * DY / R2
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDDO
+    IF (W1 > 1.0E-20) THEN
+      CX1 := WX1 / W1
+      CY1M := WY1 / W1
+      VX1 := CX1 - PCX1
+      VY1M := CY1M - PCY1
+      PCX1 := CX1
+      PCY1 := CY1M
+      PH1 := PH1 + FLV * (VX1 * EY1 - VY1M * EX1) / (PI2 * W1)
+    ENDIF
+    IF (W2 > 1.0E-20) THEN
+      CX2 := WX2 / W2
+      CY2M := WY2 / W2
+      VX2 := CX2 - PCX2
+      VY2M := CY2M - PCY2
+      PCX2 := CX2
+      PCY2 := CY2M
+      PH2 := PH2 + FLV * (VX2 * EY2 - VY2M * EX2) / (PI2 * W2)
+    ENDIF
+    PHL := PH1 - PH2
+
+    IF (T > 1500) THEN
+      DO J = 120, 392
+        K := XSCR + (J - 1) * NX
+        SCR(J) := SCR(J) + R(K) * R(K) + I(K) * I(K)
+      ENDDO
+    ENDIF
+
+    ! coarse time series every 100 steps
+    SV := REAL(T - 100 * (T / 100))
+    IF (SV < 0.5) THEN
+      WRITE(*, "cs %d t %d cx1 %.1f ledger %.5f") CS, T, CX1, PHL
+    ENDIF
+    ! fine window around closest approach for +-pi
+    IF (CS >= 4) THEN
+      IF (CS <= 5) THEN
+        IF (T >= 1000) THEN
+          IF (T <= 1600) THEN
+            SV := REAL(T - 25 * (T / 25))
+            IF (SV < 0.5) THEN
+              DLED := FLV * (VX1 * EY1 - VY1M * EX1) / (PI2 * W1)
+              WRITE(*, "  fine cs %d t %d cx1 %.2f dled %.6f led %.5f") &
+                CS, T, CX1, DLED, PHL
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDIF
+    ENDIF
+  ENDDO
+
+  ! screen phasor (period-40 reference)
+  FR := 0.0
+  FI := 0.0
+  DO J = 170, 342
+    TH := 6.283185307179586 * REAL(J - 256) / 40.0
+    FR := FR + SCR(J) * COS(TH)
+    FI := FI + SCR(J) * SIN(TH)
+  ENDDO
+  PHS := ATAN2(FI, FR)
+  PTAB(CS) := PHS
+  LTAB(CS) := PHL
+  WRITE(*, "case %d  FL %.4f  phasor %.5f  ledger %.5f") &
+    CS, FLV, PHS, PHL
+ENDDO
+
+WRITE(*, "-- flip summary ------------------------------------")
+DO CS = 1, 7
+  FLV := 0.0
+  IF (CS == 2) THEN
+    FLV := PIH / 2.0
+  ENDIF
+  IF (CS == 3) THEN
+    FLV := 0.0 - PIH / 2.0
+  ENDIF
+  IF (CS == 4) THEN
+    FLV := PIH
+  ENDIF
+  IF (CS == 5) THEN
+    FLV := 0.0 - PIH
+  ENDIF
+  IF (CS == 6) THEN
+    FLV := PI2
+  ENDIF
+  IF (CS == 7) THEN
+    FLV := 0.0 - PI2
+  ENDIF
+  IF (ABS(FLV) > 0.01) THEN
+    WRITE(*, "FL %+.4f  phasor %+.5f  ledger %+.5f  led/FL %.4f") &
+      FLV, PTAB(CS), LTAB(CS), LTAB(CS) / FLV
+  ELSE
+    WRITE(*, "FL 0.0000  phasor %.5f  ledger %.5f  (null)") &
+      PTAB(CS), LTAB(CS)
+  ENDIF
+ENDDO
+WRITE(*, "polarity budget |led(-FL)|/|led(+FL)|:")
+WRITE(*, "  pi/2: %.4f   pi: %.4f   2pi: %.4f") &
+  ABS(LTAB(3) / LTAB(2)), ABS(LTAB(5) / LTAB(4)), &
+  ABS(LTAB(7) / LTAB(6))
+WRITE(*, "expect: led/FL ~ +0.645 all cases; budget within ~5%%")
+WRITE(*, "of 1.000; phasors sign-flipped; +-2pi phasor -+0.33")
