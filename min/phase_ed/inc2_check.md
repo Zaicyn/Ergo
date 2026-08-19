@@ -209,3 +209,67 @@ explicit small `ncv`. One heavyweight job at a time.
   `core/ir_codegen.py`, `core/ir_gpu.py` (int64 GPU rejection),
   `core/driver.py` (scoped -mcmodel=large), `core/runtime/vk_host.c`
   (maxStorageBufferRange query + assert)
+
+## Inc-2 follow-up (2026-08-10): frame-batch stale-scalar bugs, found by the tower variant
+
+The `tower` generator variant (deflated power iteration, N=16 GPU ED
+for the LL↔string campaign) exposed two GPU-path correctness bugs.
+Both were 100% reproducible: deflated states collapsed to the ground
+energy; the last state's SECT overlaps read as exact zeros. CPU builds
+were correct throughout, which is what fingered the GPU codegen path.
+
+### Bug 1 (the campaign blocker): pending reduction scalar consumed by a GPU kernel's push constants
+
+`core/ir_codegen.py::_emit_body` deferred coalesced reduction
+readbacks (`_pending_reductions`, Inc-5) until "the next item is NOT a
+GPU kernel". A GPU kernel whose push constants pack a pending
+accumulator is also a consumer — the PC block is memcpy'd at record
+time — but the flush test never fired for it, so the consumer recorded
+a one-iteration-stale (or zero) value. In the tower: the Gram–Schmidt
+overlap reduction OV was immediately followed by the W-update kernel
+whose PC packs OV; the update ran with stale OV every iteration, the
+deflation never bit, and every later state converged to the ground
+state (E1 = E0 = −5.0250389412 instead of −4.8774898361 at N=8).
+
+The earlier "workaround print" (an in-loop WRITE of OV) only worked
+because a host read of OV made the next item non-GPU, forcing the
+flush — position mattered, not the print. Fix: the flush condition now
+also fires when the next GPU kernel's PC scalar set
+(`scalars_read` + loop-bound ref) intersects the pending accumulators
+(`reduction_var`/`reduction_vars`). Emitted C now orders: OV reduction
+→ drain → readback → W-update dispatch with the fresh OV.
+
+### Bug 2 (diagnostics): host-fallback kernel loops read stale host arrays
+
+`_gpu_arrays()` gives device buffers only to arrays used by frame-loop
+kernels, so the tower's last-state array (ST3: written after the final
+frame loop, read only by the post-loop SECT kernels) stays host-only.
+Its store loop then host-falls-back — `_emit_loop` set `kernel = None`
+and emitted the CPU loop with NO download of its GPU-resident reads,
+so `ST3 := V` copied a stale host V (mid-body download logic skips
+kernel-planned loops, assuming they run on device), and the SECT
+overlaps involving ST3 printed exact zeros on GPU. Fix: on host
+fallback of a kernel-planned loop, drain the frame and download the
+intersection `kernel.arrays_read ∩ _gpu_arrays()` before the CPU loop
+(body-download bookkeeping + ping-pong offset handling included).
+SECT now resolves the winding pair to M = ±1 exactly (2×2 block
+eigenvalues ±1.0000) on GPU.
+
+### Proof
+
+- Workaround removed from `gen_ed_matvec.py` (tower variant emits no
+  sync print). N=8 GPU tower NSTATE=3: −5.0250389412, −4.8774898361,
+  −4.8774898361 — scipy to print precision; two runs byte-identical.
+- N=16 tower regression: two runs byte-identical (T16_FIX_DET_OK),
+  E0 = −9.9142125030, winding gap 0.07426 (campaign values unchanged).
+- CPU `--emit-c` byte-identical to pre-fix HEAD for programs not using
+  either changed path (gpu_stencil2d, gpu_dot_product, prng,
+  xfer_range sampled).
+- Oracle suite: see below / campaign report.
+
+### Pre-existing limitation (deferral, unrelated)
+
+`ERGO_VK_MAX_BUFFERS` = 64 counts every per-kernel reduction partials
+buffer; the 7-state tower exceeds it (9 arrays + ~70 `d__reduce_*`
+slots). NSTATE ≤ 3 fits. A shared partials pool needs liveness
+analysis across deferred readbacks — not attempted here.

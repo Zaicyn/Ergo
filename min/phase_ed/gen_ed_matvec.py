@@ -386,24 +386,6 @@ def tower(N, nstate=7, J=1.5):
                 "    DO K = 1, DIM",
                 f"      OV := OV + ST{j}(K) * W(K)",
                 "    ENDDO",
-            ]
-            # vk_host frame-batch workaround (measured 2026-08-10): the
-            # per-state ITER loop's kernels replay with ST bindings
-            # recorded before the previous state's store landed; an
-            # in-loop readback print right after the first GS reduction
-            # at ITER == 2 forces a drain + re-record, after which every
-            # replay sees the stored states. Without it the deflation
-            # silently reads stale ST content and later states collapse
-            # to the ground state (GPU only; CPU builds are correct
-            # without the sync). Position AND iteration both matter
-            # (iter==1 or post-update placement failed — measured).
-            if j == 1:
-                L += [
-                    "    IF (ITER == 2) THEN",
-                    f"      WRITE(*, \"sync state {s} ov %.6e\") OV",
-                    "    ENDIF",
-                ]
-            L += [
                 "    DO K = 1, DIM",
                 f"      W(K) := W(K) - OV * ST{j}(K)",
                 "    ENDDO",

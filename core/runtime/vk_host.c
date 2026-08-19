@@ -1470,7 +1470,18 @@ void ergo_vk_dispatch(ErgoVkPipe pipe, int n_groups) {
     submit_and_wait();
 }
 
-/* ── Batched frame dispatch (no per-dispatch submit) ────── */
+/* ── Batched frame dispatch (no per-dispatch submit) ──────
+ *
+ * INVARIANT (2026-08-10, tower-variant bug): push constants are packed
+ * host-side at RECORD time (see ergo_vk_push_constants /
+ * ergo_vk_frame_dispatch below). A kernel whose PCs pack the result of
+ * a not-yet-read-back reduction therefore records a STALE scalar — the
+ * frame machinery cannot see this; the codegen must drain + read back
+ * the reduction BEFORE emitting such a dispatch (ir_codegen.py
+ * _emit_body pending-reduction flush, incl. GPU PC consumers), and must
+ * download GPU-resident arrays before any host-fallback kernel loop
+ * that reads them (_emit_loop). Root cause + fixes documented in
+ * min/phase_ed/inc2_check.md ("Inc-2 follow-up"). */
 
 void ergo_vk_frame_begin(void) {
     if (!g.device) return;

@@ -782,8 +782,30 @@ class IRCodeGen:
                             and item.line in self._kernel_by_line
                             and self._is_gpu_kernel(
                                 self._kernel_by_line[item.line]))
-            if not _next_is_gpu and self._pending_reductions:
-                self._flush_pending_reductions()
+            if self._pending_reductions:
+                if not _next_is_gpu:
+                    self._flush_pending_reductions()
+                else:
+                    # A GPU kernel can ALSO consume a pending reduction
+                    # accumulator — through its push constants, packed
+                    # at record time (tower deflation: the GS overlap OV
+                    # feeds the W-update kernel's PC). The "non-dispatch"
+                    # test above misses that consumer: the dispatch then
+                    # records a one-iteration-stale (or zero) value and
+                    # the readback lands too late. Flush first when the
+                    # next kernel's PC scalars name a pending accumulator.
+                    _kn = self._kernel_by_line[item.line]
+                    _acc = set()
+                    for _pk in self._pending_reductions:
+                        if _pk.reduction_var:
+                            _acc.add(_pk.reduction_var)
+                        _acc.update(_pk.reduction_vars)
+                    _uses = set(_kn.scalars_read)
+                    _bnd = getattr(_kn, "loop_bound", None)
+                    if isinstance(_bnd, IRRef):
+                        _uses.add(_bnd.name)
+                    if _acc & _uses:
+                        self._flush_pending_reductions()
 
             # If we just dispatched and this item is NOT another extracted
             # loop, the CPU is about to read — download GPU arrays first.
@@ -1232,7 +1254,48 @@ class IRCodeGen:
                 self._emit_gpu_dispatch(kernel)
                 return
             else:
-                # Kernel references arrays without GPU buffers — run on CPU
+                # Kernel references arrays without GPU buffers — run on
+                # CPU. Its GPU-RESIDENT reads must be downloaded first:
+                # the host copies are stale after GPU dispatches, and the
+                # generic download paths skip kernel-planned loops (they
+                # assume the loop runs on device). Without this the
+                # fallback silently reads stale host memory (tower
+                # variant: last state's store ST3:=V and its SECT
+                # overlaps read zeros). Only reads need downloads —
+                # arrays it writes are covered by the dirty-interval
+                # upload machinery; mixed host/device kernels still
+                # keep every access coherent.
+                fb_dl = sorted(kernel.arrays_read
+                               & set(self._gpu_arrays()))
+                if fb_dl:
+                    if self._batched_frame and not self._frame_ended_early:
+                        self._put("ergo_vk_frame_end();")
+                        self._put("ergo_vk_frame_wait();")
+                        self._frame_ended_early = True
+                    self._put("/* Download GPU arrays for host-fallback "
+                              "kernel (host copies stale) */")
+                    pp = getattr(self, '_pp_arrays', set())
+                    for arr in fb_dl:
+                        shape = self._array_shapes.get(arr)
+                        if not shape:
+                            continue
+                        self._body_downloaded.add(arr)
+                        size_expr = " * ".join(
+                            self._dim_expr(d) for d in shape)
+                        sz = self._gpu_sizeof(arr)
+                        if arr in pp:
+                            self._put(
+                                f"ergo_vk_download_at(d_{arr}, {arr}, "
+                                f"(size_t)_pp_wr_offset * {sz}, "
+                                f"{size_expr} * {sz});")
+                        else:
+                            self._put(
+                                f"ergo_vk_download(d_{arr}, {arr}, "
+                                f"{size_expr} * {sz});")
+                    if self._batched_frame and self._frame_ended_early:
+                        self._put("ergo_vk_frame_begin();")
+                        self._frame_ended_early = False
+                        self._frame_gpu_dirty.clear()
                 kernel = None
 
         if kernel and kernel.is_partial:
