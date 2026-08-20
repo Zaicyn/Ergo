@@ -1,0 +1,232 @@
+! ════════════════════════════════════════════════════════════════════
+! HE_ORB — helium radial orbital engine (Stage 1 of the He campaign).
+! Hydrogenic ladder for charge Z (1s,2s,2p,3s,3p,3d) on a uniform
+! radial grid in u(r) = r*R(r), by imaginary-time propagation with
+! Gram-Schmidt deflation within each l-block; then all radial Slater
+! integrals
+!   R^k[ab,cd] = int int u_a u_b(r1) u_c u_d(r2) r<^k/r>^(k+1) dr1 dr2
+! via the cumulative Y^k Poisson form:
+!   Y^k_ab(r) = r^(-k-1) int_0^r u_a u_b r'^k dr'
+!             + r^k      int_r^R u_a u_b r'^(-k-1) dr'
+! printed for every pair-pair (a<=b, c<=d), k = 0..4.
+!
+! Z is a build-time PARAMETER (sed to 3 for the Li+ isoelectronic
+! check — SAME code, no refitting).
+!
+! Oracles (printed): E_nl vs -Z^2/2n^2 (hydrogenic ladder),
+! F0(1s,1s) = 5Z/8 = 1.25 (Z=2). Determinism: fixed step counts, no
+! RNG — run twice, byte-identical.
+! Compile from repo root: python -m core min/helium/he_orb.ergo -o <bin>
+! ════════════════════════════════════════════════════════════════════
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: Z = 2
+INTEGER, PARAMETER :: NR = 6000
+REAL, PARAMETER :: RMAX = 40.0
+INTEGER, PARAMETER :: NORB = 6
+INTEGER, PARAMETER :: NSTEP0 = 260000
+REAL, PARAMETER :: DT = 1.2e-5
+
+! orbital table: index -> (n, l): 1s 2s 2p 3s 3p 3d
+STATIC INTEGER :: NTAB(6), LTAB(6)
+DATA NTAB / 1, 2, 2, 3, 3, 3 /
+DATA LTAB / 0, 0, 1, 0, 1, 2 /
+
+STATIC REAL :: U(NR, 6), UN(NR), YK(NR), FK(NR)
+STATIC REAL :: PAIRY(NR)
+
+REAL :: DR, DR2, X, R, NRM, LAP, VV, EKIN, EPOT, ETOT, OV
+REAL :: ZZ, DTLOC, AC, BC, F0, R0, R1, FA, FB, SUM
+INTEGER :: I, J, K, IO, JO, KO, LO, T, LA, LB, LC, LD, NST
+INTEGER :: NA, NB, NC, ND
+
+DR := RMAX / REAL(NR - 1)
+DR2 := DR * DR
+ZZ := REAL(Z)
+
+! ── orbital production ─────────────────────────────────────────────
+DO IO = 1, NORB
+  LA := LTAB(IO)
+  NA := NTAB(IO)
+  ! initial packet: r^(l+1+j) exp(-Z r / n), j = radial excitation index
+  J := 0
+  DO KO = 1, IO - 1
+    IF (LTAB(KO) == LA) THEN
+      J := J + 1
+    ENDIF
+  ENDDO
+  DO I = 1, NR
+    R := REAL(I - 1) * DR
+    UN(I) := (R ** (LA + 1 + J)) * EXP(-ZZ * R / REAL(NA))
+  ENDDO
+  ! steps: scale with n (higher shells converge slowly — small gaps
+  ! to the next same-l state); l=2 needs smaller dt (centrifugal wall)
+  NST := NSTEP0 * NA
+  IF (LA == 2) THEN
+    NST := 3 * NSTEP0 * NA
+  ENDIF
+  DTLOC := DT
+  IF (LA == 2) THEN
+    DTLOC := DT / 3.0
+  ENDIF
+  DO T = 1, NST
+    ! deflate against converged same-l orbitals
+    DO JO = 1, IO - 1
+      IF (LTAB(JO) == LA) THEN
+        OV := 0.0
+        DO I = 1, NR
+          OV := OV + UN(I) * U(I, JO) * DR
+        ENDDO
+        DO I = 1, NR
+          UN(I) := UN(I) - OV * U(I, JO)
+        ENDDO
+      ENDIF
+    ENDDO
+    ! normalize
+    NRM := 0.0
+    DO I = 1, NR
+      NRM := NRM + UN(I) * UN(I) * DR
+    ENDDO
+    NRM := SQRT(NRM)
+    DO I = 1, NR
+      UN(I) := UN(I) / NRM
+    ENDDO
+    ! imaginary-time Euler step on u: u_tau = 0.5 u'' - V_eff u
+    ! 5-point Laplacian (dr^4 error) — the s-orbital cusp needs it
+    U(1, IO) := 0.0
+    U(NR, IO) := 0.0
+    DO I = 3, NR - 2
+      R := REAL(I - 1) * DR
+      LAP := (-UN(I-2) + 16.0*UN(I-1) - 30.0*UN(I) + 16.0*UN(I+1) &
+        - UN(I+2)) / (12.0 * DR2)
+      VV := -ZZ / R + REAL(LA*(LA+1)) / (2.0 * R * R)
+      U(I, IO) := UN(I) + DTLOC * (0.5 * LAP - VV * UN(I))
+    ENDDO
+    I := 2
+    R := REAL(I - 1) * DR
+    LAP := (UN(I-1) + UN(I+1) - 2.0*UN(I)) / DR2
+    VV := -ZZ / R + REAL(LA*(LA+1)) / (2.0 * R * R)
+    U(I, IO) := UN(I) + DTLOC * (0.5 * LAP - VV * UN(I))
+    I := NR - 1
+    R := REAL(I - 1) * DR
+    LAP := (UN(I-1) + UN(I+1) - 2.0*UN(I)) / DR2
+    VV := -ZZ / R + REAL(LA*(LA+1)) / (2.0 * R * R)
+    U(I, IO) := UN(I) + DTLOC * (0.5 * LAP - VV * UN(I))
+    DO I = 1, NR
+      UN(I) := U(I, IO)
+    ENDDO
+  ENDDO
+  ! energy via <u|h|u>
+  NRM := 0.0
+  DO I = 1, NR
+    NRM := NRM + UN(I) * UN(I) * DR
+  ENDDO
+  NRM := SQRT(NRM)
+  EKIN := 0.0
+  EPOT := 0.0
+  DO I = 3, NR - 2
+    R := REAL(I - 1) * DR
+    LAP := (-UN(I-2) + 16.0*UN(I-1) - 30.0*UN(I) + 16.0*UN(I+1) &
+      - UN(I+2)) / (12.0 * DR2)
+    VV := -ZZ / R + REAL(LA*(LA+1)) / (2.0 * R * R)
+    EKIN := EKIN - 0.5 * UN(I) * LAP * DR
+    EPOT := EPOT + VV * UN(I) * UN(I) * DR
+  ENDDO
+  EKIN := EKIN / (NRM * NRM)
+  EPOT := EPOT / (NRM * NRM)
+  ETOT := EKIN + EPOT
+  WRITE(*, "('ORB %d %d %d %.10e %.10e %.10e')") IO, NA, LA, ETOT, &
+    -ZZ*ZZ / (2.0 * REAL(NA*NA)), ETOT + ZZ*ZZ / (2.0 * REAL(NA*NA))
+ENDDO
+
+! ── Slater integrals R^k[ab,cd] for all pairs, k = 0..4 ────────────
+DO IO = 1, NORB
+  DO JO = IO, NORB
+    ! pair density fk = u_a u_b
+    DO I = 1, NR
+      FK(I) := U(I, IO) * U(I, JO)
+    ENDDO
+    DO K = 0, 4
+      ! Y^k(r) = r^(-k-1) A(r) + r^k B(r); A forward, B backward
+      ! trapezoid cumulative sums
+      YK(1) := 0.0
+      AC := 0.0
+      DO I = 2, NR
+        R0 := REAL(I - 2) * DR
+        R1 := REAL(I - 1) * DR
+        FA := FK(I-1) * (R0 ** K)
+        FB := FK(I) * (R1 ** K)
+        AC := AC + 0.5 * (FA + FB) * DR
+        YK(I) := AC
+      ENDDO
+      DO I = 1, NR
+        R := REAL(I - 1) * DR
+        YK(I) := YK(I) / (R ** (K + 1))
+      ENDDO
+      BC := 0.0
+      PAIRY(NR) := 0.0
+      DO J = 1, NR - 1
+        I := NR - J
+        R0 := REAL(I - 1) * DR
+        R1 := REAL(I) * DR
+        FA := FK(I) / (R0 ** (K + 1))
+        FB := FK(I+1) / (R1 ** (K + 1))
+        BC := BC + 0.5 * (FA + FB) * DR
+        PAIRY(I) := BC
+      ENDDO
+      DO I = 1, NR
+        R := REAL(I - 1) * DR
+        YK(I) := YK(I) + (R ** K) * PAIRY(I)
+      ENDDO
+      DO KO = 1, NORB
+        DO LO = KO, NORB
+          SUM := 0.0
+          DO I = 2, NR - 1
+            SUM := SUM + U(I, KO) * U(I, LO) * YK(I) * DR
+          ENDDO
+          WRITE(*, "('INT %d %d %d %d %d %.12e')") IO, JO, KO, LO, K, SUM
+        ENDDO
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+
+! ── headline oracles ───────────────────────────────────────────────
+! F0(1s,1s) is recomputed directly here for a clean print
+DO I = 1, NR
+  FK(I) := U(I, 1) * U(I, 1)
+ENDDO
+YK(1) := 0.0
+AC := 0.0
+DO I = 2, NR
+  AC := AC + 0.5 * (FK(I-1) + FK(I)) * DR
+  YK(I) := AC
+ENDDO
+DO I = 1, NR
+  R := REAL(I - 1) * DR
+  YK(I) := YK(I) / R
+ENDDO
+BC := 0.0
+PAIRY(NR) := 0.0
+DO J = 1, NR - 1
+  I := NR - J
+  R0 := REAL(I - 1) * DR
+  R1 := REAL(I) * DR
+  FA := FK(I) / R0
+  FB := FK(I+1) / R1
+  BC := BC + 0.5 * (FA + FB) * DR
+  PAIRY(I) := BC
+ENDDO
+DO I = 1, NR
+  R := REAL(I - 1) * DR
+  YK(I) := YK(I) + PAIRY(I)
+ENDDO
+F0 := 0.0
+DO I = 2, NR - 1
+  F0 := F0 + FK(I) * YK(I) * DR
+ENDDO
+WRITE(*, "('F0(1s,1s) = %.10e  vs 5Z/8 = %.10e  dev %.3e')") F0, &
+  5.0 * ZZ / 8.0, F0 - 5.0 * ZZ / 8.0
+WRITE(*, "('DONE')")
+STOP
