@@ -151,10 +151,17 @@ measurements; labeled as such).
 ## Layered verdict
 
 - **Exact spectra:** 1 atom (hydrogen, 5-digit Balmer/Lyman ratios) plus
-  all one-electron ions up to the relativistic ceiling — computed at
-  **Z ≈ 13.7** ((Zα)² correction to Lyα passes 1% at Z=14, Si XIV;
-  through Al XIII the map is exact to better than 1% with reduced mass
-  alone).
+  all one-electron ions up to the relativistic ceiling. The original
+  estimate used the crude rule (Zα)² = 1% (Z ≈ 13.7). The Dirac
+  campaign (`min/dirac/`, DIRAC_FINDINGS.md) re-measured it with the
+  exact all-orders Dirac–Coulomb corrections (Ergo shooting solver,
+  validated against the Sommerfeld closed form to ~1e-11 Ha): the
+  transition-level correction has a ~1/4 prefactor vs (Zα)², so the
+  **1% Lyα error crossing sits at Z = 29 (Cu XXIX), the 1% K-shell
+  (1s) crossing at Z = 28 (Ni XXVIII)** — the Schrödinger map is exact
+  to better than 1% through Fe XXVI. (The old line stays as the
+  Schrödinger-limit estimate: it was the (Zα)² = 1% rule, not a
+  transition-level computation.)
 - **Configurations:** 27/118 pure geometry; 98/118 with the Madelung
   interaction patch; 20 resisters by name (above) — all d/f-block
   near-degeneracy effects (half/full-shell stabilization and f/d
