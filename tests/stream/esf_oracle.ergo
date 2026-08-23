@@ -1,0 +1,43 @@
+! esf_oracle.ergo — language oracle for the stream suite: one program
+! writes a formatted text file (Part 10 OPEN/WRITE/CLOSE) and a
+! 4-channel .esf stream (ESF_OPEN/ESF_NEXT/ESF_WRITE/ESF_CLOSE), both
+! with content the Python side regenerates independently.
+!
+! Payload rule (must match tests/stream/run_stream.py):
+!   channel ch, per-channel sequence s, length n = 4*(1 + MOD(s, 3))
+!   integers; BUF(j) = ch*100000 + s*10 + j   (j = 1..n)
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NFR = 96
+INTEGER :: I, CH, S, N, J
+STATIC INTEGER :: BUF(12)
+STATIC INTEGER :: CNT(4)
+
+DO I = 1, 4
+  CNT(I) := 0
+ENDDO
+
+! ── formatted file (Part 10.3) ──
+OPEN(7, "tests/stream/out/oracle.txt", "WRITE")
+WRITE(7, "('HEADER %d %.3f')") 7, 0.125
+WRITE(7, "('LINE %d')") 1
+WRITE(7, "('LINE %d')") 2
+CLOSE(7)
+
+! ── .esf stream, 4 channels, 96 frames ──
+CALL ESF_OPEN(8, "tests/stream/out/oracle.esf", 4)
+DO I = 1, NFR
+  CH := ESF_NEXT(8)
+  S := CNT(CH + 1)
+  N := 4 * (1 + MOD(S, 3))
+  DO J = 1, N
+    BUF(J) := CH * 100000 + S * 10 + J
+  ENDDO
+  CALL ESF_WRITE(8, CH, BUF, N)
+  CNT(CH + 1) := S + 1
+ENDDO
+CALL ESF_CLOSE(8)
+
+WRITE(*, "('ORACLE DONE %d')") NFR
+STOP

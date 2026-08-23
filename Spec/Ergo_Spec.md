@@ -889,6 +889,80 @@ CPU backend always computes in the declared precision.
 
 ---
 
+## Part 10: File I/O Model
+
+Ergo programs produce ordered, deterministic output. Part 10 extends
+that contract from stdout/stderr to named files. READ is deferred —
+this part covers the write path only. File I/O is **IR-path only**;
+the legacy AST backend raises a named compile-time error on `OPEN`,
+`CLOSE`, raw-record `WRITE`, and the `ESF_*` stream intrinsics.
+
+### 10.1 Units
+
+A **unit** is an integer handle identifying an output sink.
+
+- `*` — preconnected to stdout (unchanged).
+- `0` — preconnected to stderr (unchanged).
+- `1..63` — available for `OPEN` / `ESF_OPEN`. One namespace: a unit
+  is either closed, open for formatted/raw write (`OPEN`), or open as
+  an .esf stream (`ESF_OPEN`).
+
+### 10.2 OPEN / CLOSE
+
+```
+OPEN(unit, "path", MODE)     ! MODE: "WRITE" (truncate) | "APPEND"
+CLOSE(unit)
+```
+
+- `unit` is an INTEGER expression in `1..63`; `path` is a string
+  literal; `MODE` is a string literal, case-insensitive.
+- Open failure (bad path, permissions, full table) is a **named
+  runtime error** naming the path: `ERGO-IO: OPEN failed ...`,
+  exit status 1. `OPEN` on an already-open unit is a named error.
+- `CLOSE` flushes and closes the unit. `CLOSE` on a unit that is not
+  open is a named error.
+- At normal program end (`STOP` or falling off the main body) every
+  still-open unit is flushed and closed in increasing unit order.
+
+### 10.3 Formatted WRITE to a unit
+
+`WRITE(unit, "fmt") args` accepts any open unit in place of `*`/`0`.
+The format string and argument rules are exactly the A4 audit
+(Part 6 / checker `_check_write`): same conversions, same flags,
+same compile-time validation. Each `WRITE` is one `fprintf` to the
+unit's stream; `WRITE(unit, "fmt", "NO")` suppresses the trailing
+newline as before.
+
+### 10.4 Unformatted (raw-record) WRITE
+
+```
+WRITE(unit) A(lo:hi)            ! one or more sections, comma-separated
+```
+
+- Writes the raw bytes of the array element storage for `A(lo:hi)`,
+  in column-major linear order, with **no record markers, no length
+  prefix, no padding**. The byte count is `(hi - lo + 1) *
+  element_size`, explicit in the program via the section bounds.
+- Sections are 1-D (`A(lo:hi)` with `A` a 1-D array); `lo`, `hi` are
+  INTEGER expressions, checked `1 <= lo <= hi <= SIZE(A)` at runtime
+  (named error `ERGO-IO: raw WRITE section out of bounds`).
+- Element types: INTEGER (4 bytes) or REAL (8 bytes, or 4 under
+  `--precision f32`). **Endianness is native** (little-endian on all
+  supported targets); portable interchange goes through `.esf`
+  (Spec/Ergo_Stream_Format.md), not raw records.
+
+### 10.5 Determinism contract
+
+- Writes to a unit are totally ordered by program order; there is no
+  hidden re-ordering and no hidden flush. Flush points are exactly:
+  `CLOSE`, `ESF_CLOSE`, and program end.
+- Same program, same inputs → byte-identical file contents.
+- I/O statements never extract to GPU kernels; a `WRITE`/`OPEN`/
+  `CLOSE` inside a loop forces that loop onto the CPU path (named
+  reason in `--kernel-report`, like any host call).
+
+---
+
 ## APPENDIX: Design Rationale (TL;DR)
 
 Ergo is a **mathematical compute language** designed for physics simulation, GPU kernels, and HPC. It is not:

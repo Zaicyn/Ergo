@@ -328,6 +328,10 @@ class Parser:
             return self._parse_print()
         if self._at(TT.KW_WRITE):
             return self._parse_write()
+        if self._at(TT.KW_OPEN):
+            return self._parse_open()
+        if self._at(TT.KW_CLOSE):
+            return self._parse_close()
         if self._at(TT.KW_RETURN):
             return self._parse_return()
         if self._at(TT.KW_CALL):
@@ -605,17 +609,37 @@ class Parser:
     def _parse_write(self) -> ast.WriteStmt:
         """Parse: WRITE(unit, "fmt") arg1, arg2, ...
         Or:    WRITE(unit, "fmt", "NO") arg1, arg2, ...  (no-advance)
-        unit: * for stdout, 0 for stderr
+        Or:    WRITE(unit) A(lo:hi), B(lo:hi), ...       (raw record)
+        unit: * for stdout, 0 for stderr, or an INTEGER expression
+        naming an OPEN'd file unit (Spec Part 10).
         """
         line = self._cur().line
         self._eat(TT.KW_WRITE)
         self._eat(TT.LPAREN)
-        # Unit: * or 0 or integer
+        # Unit: * or integer literal or integer expression
         if self._match(TT.STAR):
             unit = "*"
-        else:
+        elif self._at(TT.INTEGER_LIT) and \
+                self._peek().type in (TT.COMMA, TT.RPAREN):
             tok = self._eat(TT.INTEGER_LIT)
             unit = str(tok.value)
+        else:
+            unit = self._parse_expression()
+        if self._match(TT.RPAREN):
+            # Raw-record form: WRITE(unit) A(lo:hi), ...
+            sections = []
+            if not self._at(TT.NEWLINE, TT.EOF):
+                sections.append(self._parse_section())
+                while self._match(TT.COMMA):
+                    sections.append(self._parse_section())
+            if not sections:
+                raise ParseError(
+                    "WRITE(unit) with no format needs at least one "
+                    "array section: WRITE(unit) A(lo:hi)",
+                    self._cur().line, self._cur().col,
+                )
+            self._eat_newline()
+            return ast.WriteStmt(unit, None, sections, True, line=line)
         self._eat(TT.COMMA)
         # Format string
         fmt_tok = self._eat(TT.STRING_LIT)
@@ -635,6 +659,47 @@ class Parser:
                 args.append(self._parse_expression())
         self._eat_newline()
         return ast.WriteStmt(unit, fmt, args, advance, line=line)
+
+    def _parse_section(self) -> ast.ArraySection:
+        """Parse A(lo:hi) — a 1-D array section (raw-record WRITE)."""
+        line = self._cur().line
+        name_tok = self._eat(TT.IDENT)
+        self._eat(TT.LPAREN)
+        lo = self._parse_expression()
+        self._eat(TT.COLON)
+        hi = self._parse_expression()
+        self._eat(TT.RPAREN)
+        return ast.ArraySection(name_tok.value, lo, hi, line=line)
+
+    def _parse_open(self) -> ast.OpenStmt:
+        """Parse: OPEN(unit, "path", MODE) — MODE "WRITE" | "APPEND"."""
+        line = self._cur().line
+        self._eat(TT.KW_OPEN)
+        self._eat(TT.LPAREN)
+        unit = self._parse_expression()
+        self._eat(TT.COMMA)
+        path_tok = self._eat(TT.STRING_LIT)
+        self._eat(TT.COMMA)
+        mode_tok = self._eat(TT.STRING_LIT)
+        mode = mode_tok.value.upper()
+        if mode not in ("WRITE", "APPEND"):
+            raise ParseError(
+                f"OPEN: MODE must be \"WRITE\" or \"APPEND\", got "
+                f"\"{mode_tok.value}\"", mode_tok.line, mode_tok.col,
+            )
+        self._eat(TT.RPAREN)
+        self._eat_newline()
+        return ast.OpenStmt(unit, path_tok.value, mode, line=line)
+
+    def _parse_close(self) -> ast.CloseStmt:
+        """Parse: CLOSE(unit)."""
+        line = self._cur().line
+        self._eat(TT.KW_CLOSE)
+        self._eat(TT.LPAREN)
+        unit = self._parse_expression()
+        self._eat(TT.RPAREN)
+        self._eat_newline()
+        return ast.CloseStmt(unit, line=line)
 
     def _parse_return(self) -> ast.ReturnStmt:
         line = self._cur().line

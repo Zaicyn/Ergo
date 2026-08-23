@@ -122,6 +122,20 @@ def main():
     if n_new:
         print("  NEW divergences are the burn-down alarm — investigate "
               "before release.")
+
+    # Stream suite (tests/stream/: file I/O Part 10 + .esf format) —
+    # IR-only features, so they live outside the IR-vs-legacy corpus
+    # but run as part of the golden gate.
+    stream = os.path.join(REPO, "tests", "stream", "run_stream.py")
+    if os.path.exists(stream):
+        r = sh([sys.executable, stream], timeout=600)
+        tail = r.stdout.decode(errors="replace").strip().splitlines()
+        print("-" * 68)
+        print("  STREAM SUITE (tests/stream/):")
+        for ln in tail:
+            print("  " + ln)
+        if any(ln.lstrip().startswith("FAIL ") for ln in tail):
+            print("  stream suite FAIL — investigate before release.")
     return 0
 
 

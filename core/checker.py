@@ -35,6 +35,7 @@ INTRINSIC_RETURNS = {
     "ISHFT": "INTEGER", "IEOR": "INTEGER", "IAND": "INTEGER",
     "IOR": "INTEGER", "NOT": "INTEGER",
     "HASH": "INTEGER", "RAND": "REAL",
+    "ESF_NEXT": "INTEGER",
     "ABS": None, "MOD": None, "MAX": None, "MIN": None, "CLAMP": None,
     "SIGN": None,
     "SUM": None, "PRODUCT": None, "DOT_PRODUCT": "REAL",
@@ -69,6 +70,7 @@ INTRINSIC_ARG_RULES = {
     "IAND": (2, 2, "int"), "IOR": (2, 2, "int"),
     "NOT": (1, 1, "int"),
     "HASH": (1, 1, "int"), "RAND": (1, 1, "int"),
+    "ESF_NEXT": (1, 1, "int"),
     "REAL": (1, 1, "numeric"), "INT": (1, 1, "numeric"),
     "INT8": (1, 1, "numeric"),
     "CHAR": (1, 1, "int"),
@@ -78,7 +80,8 @@ INTRINSIC_ARG_RULES = {
 }
 
 # Intrinsics that are legal as CALL statements
-STATEMENT_INTRINSICS = {"ZERO", "VK_STAGE", "VK_FETCH"}
+STATEMENT_INTRINSICS = {"ZERO", "VK_STAGE", "VK_FETCH",
+                        "ESF_OPEN", "ESF_WRITE", "ESF_CLOSE"}
 
 
 def promote(t1: str, t2: str) -> str:
@@ -530,6 +533,10 @@ class Checker:
             self._infer_type(node.value)
         elif isinstance(node, ast.WriteStmt):
             self._check_write(node)
+        elif isinstance(node, ast.OpenStmt):
+            self._check_open(node)
+        elif isinstance(node, ast.CloseStmt):
+            self._check_close(node)
         elif isinstance(node, ast.ReturnStmt):
             if node.value is not None:
                 self._infer_type(node.value)
@@ -753,6 +760,10 @@ class Checker:
         # R1/spec Part 7: STATIC arrays as arguments are against the
         # aliasing rule — extremely common in the existing corpus, so
         # this TEACHES (warning) rather than breaks the build.
+        # Statement intrinsics (ZERO, VK_*, ESF_*) take arrays by
+        # design — exempt.
+        if node.name.upper() in STATEMENT_INTRINSICS:
+            return
         for arg in node.args:
             if isinstance(arg, ast.Variable):
                 sym = self.symtab.lookup(arg.name)
@@ -903,6 +914,44 @@ class Checker:
     _WRITE_FLAGS = set("-+0 #")
 
     def _check_write(self, node: ast.WriteStmt):
+        # Unit: preconnected ("*", "0") or an INTEGER expression naming
+        # an OPEN'd file unit (Spec Part 10).
+        if not isinstance(node.unit, str):
+            ut = self._infer_type(node.unit)
+            if ut is not None and ut != "INTEGER":
+                self._error(
+                    f"WRITE: unit must be an INTEGER expression, "
+                    f"got {ut}", node.line)
+                return
+        # Raw-record form: WRITE(unit) A(lo:hi), ... (Spec Part 10.4)
+        if node.fmt is None:
+            for sec in node.args:
+                sym = self.symtab.lookup(sec.name)
+                if not sym or sym.shape is None:
+                    self._error(
+                        f"WRITE raw record: '{sec.name}' is not a "
+                        f"declared array", sec.line or node.line)
+                    return
+                if len(sym.shape) != 1:
+                    self._error(
+                        f"WRITE raw record: '{sec.name}' must be a 1-D "
+                        f"array (sections are 1-D only)", sec.line
+                        or node.line)
+                    return
+                if sym.type_name not in ("INTEGER", "REAL", "INTEGER*8"):
+                    self._error(
+                        f"WRITE raw record: '{sec.name}' must be INTEGER "
+                        f"or REAL, got {sym.type_name}", sec.line or node.line)
+                    return
+                for bd in (sec.lo, sec.hi):
+                    bt = self._infer_type(bd)
+                    if bt is not None and bt != "INTEGER":
+                        self._error(
+                            f"WRITE raw record: section bounds of "
+                            f"'{sec.name}' must be INTEGER, got {bt}",
+                            sec.line or node.line)
+                        return
+            return
         arg_types = [self._infer_type(a) for a in node.args]
         fmt = node.fmt or ""
         convs = []  # (conversion letter, position in fmt)
@@ -1008,6 +1057,20 @@ class Checker:
                     f"WRITE: %s needs a CHARACTER argument, got {t}",
                     node.line)
                 return
+
+    def _check_open(self, node: ast.OpenStmt):
+        ut = self._infer_type(node.unit)
+        if ut is not None and ut != "INTEGER":
+            self._error(
+                f"OPEN: unit must be an INTEGER expression, got {ut}",
+                node.line)
+
+    def _check_close(self, node: ast.CloseStmt):
+        ut = self._infer_type(node.unit)
+        if ut is not None and ut != "INTEGER":
+            self._error(
+                f"CLOSE: unit must be an INTEGER expression, got {ut}",
+                node.line)
 
     def _check_select(self, node: ast.SelectCaseStmt):
         expr_type = self._infer_type(node.expr)

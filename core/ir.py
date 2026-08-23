@@ -220,8 +220,11 @@ class Op(Enum):
 
     # I/O
     PRINT = "print"         # print single value
-    WRITE = "write"         # formatted write
+    WRITE = "write"         # formatted write (or raw record: meta fmt=None)
     FLUSH = "flush"
+    OPEN = "open"           # OPEN(unit, path, mode) — file unit (Part 10)
+    CLOSE = "close"         # CLOSE(unit)
+    ESF_NEXT = "esf_next"   # .esf stream: scheduled channel of next frame
 
     # Control flow (these are pseudo-ops — actual control flow is structural)
     RETURN = "return"

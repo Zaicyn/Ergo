@@ -1,0 +1,22 @@
+! esf_bench_raw.ergo — raw-record write throughput baseline for the
+! overhead test: the same payload bytes as esf_bench_esf.ergo via
+! plain unformatted WRITE (Part 10.4), no framing/integrity.
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NFR = 20000
+INTEGER :: I, J
+STATIC INTEGER :: BUF(1017)
+
+DO J = 1, 1017
+  BUF(J) := J
+ENDDO
+
+OPEN(9, "tests/stream/out/bench.raw", "WRITE")
+DO I = 1, NFR
+  WRITE(9) BUF(1:1017)
+ENDDO
+CLOSE(9)
+
+WRITE(*, "('BENCH RAW DONE %d')") NFR
+STOP

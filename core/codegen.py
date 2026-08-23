@@ -416,6 +416,12 @@ class CodeGen:
         elif isinstance(node, ast.ReturnStmt):
             self._emit_return(node)
         elif isinstance(node, ast.CallStmt):
+            if node.name.upper() in ("ESF_OPEN", "ESF_WRITE",
+                                     "ESF_CLOSE"):
+                raise MCLError(
+                    f"CALL {node.name.upper()}: .esf stream I/O is "
+                    f"IR-path only (the legacy AST backend is "
+                    f"deprecated) — compile without use_ir=False")
             if node.name.upper() == "ZERO" and len(node.args) == 1:
                 arg = node.args[0]
                 if isinstance(arg, ast.Variable) and arg.name in self.array_shapes:
@@ -438,6 +444,11 @@ class CodeGen:
             self._emit_select_case(node)
         elif isinstance(node, ast.WriteStmt):
             self._emit_write(node)
+        elif isinstance(node, (ast.OpenStmt, ast.CloseStmt)):
+            raise MCLError(
+                "OPEN/CLOSE file units are IR-path only (the legacy "
+                "AST backend is deprecated) — compile without "
+                "use_ir=False")
         elif isinstance(node, ast.CycleStmt):
             self._put("continue;")
         elif isinstance(node, ast.ExitStmt):
@@ -591,6 +602,11 @@ class CodeGen:
 
     def _emit_write(self, node: ast.WriteStmt):
         """Emit WRITE as fprintf/printf with format string."""
+        if node.fmt is None or not isinstance(node.unit, str):
+            raise MCLError(
+                "WRITE to file units and raw-record WRITE are IR-path "
+                "only (the legacy AST backend is deprecated) — "
+                "compile without use_ir=False")
         stream = "stderr" if node.unit == "0" else "stdout"
         # Escape for C (the lexer now processes \\ escapes in string
         # literals, so the fmt may hold raw control bytes) — matches the

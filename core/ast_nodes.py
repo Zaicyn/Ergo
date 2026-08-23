@@ -163,17 +163,45 @@ class SortByGenStmt:
 
 
 @dataclass
+class ArraySection:
+    """A(lo:hi) — 1-D array section (raw-record WRITE payload)."""
+    name: str
+    lo: Any
+    hi: Any
+    line: int = 0
+
+
+@dataclass
 class WriteStmt:
-    """WRITE(unit, fmt) args — formatted output.
-    unit: 0=stderr, *=stdout
-    fmt: format string
-    args: list of expressions
+    """WRITE(unit, fmt) args — formatted output; WRITE(unit) A(lo:hi)
+    sections — unformatted raw-record output (fmt is None then).
+    unit: "*"/"0" for the preconnected streams, or an INTEGER
+    expression for an OPEN'd file unit.
+    fmt: format string (C printf-style after translation), or None
+    for the raw-record form (args are ArraySection nodes).
+    args: list of expressions (formatted) or ArraySection (raw)
     advance: True=with newline, False=no newline
     """
-    unit: str    # "*" or "0" or "6"
-    fmt: str     # format string (C printf-style after translation)
+    unit: Any   # "*" or "0" or an INTEGER expression
+    fmt: str    # format string; None for the raw-record form
     args: list
     advance: bool = True
+    line: int = 0
+
+
+@dataclass
+class OpenStmt:
+    """OPEN(unit, "path", MODE) — MODE "WRITE" (truncate) | "APPEND"."""
+    unit: Any    # INTEGER expression
+    path: str    # string literal
+    mode: str    # "WRITE" or "APPEND" (normalized uppercase)
+    line: int = 0
+
+
+@dataclass
+class CloseStmt:
+    """CLOSE(unit) — flush and close an open unit."""
+    unit: Any    # INTEGER expression
     line: int = 0
 
 

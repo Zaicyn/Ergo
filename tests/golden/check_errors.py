@@ -62,6 +62,16 @@ CASES = [
     ("WRITE arg-count mismatch (A4)",
      "IMPLICIT NONE\nREAL :: X\nX := 1.0\nWRITE(*,\"('%d %d')\") X\n",
      "must match exactly"),
+    ("OPEN bad mode (Part 10)",
+     "IMPLICIT NONE\nOPEN(5,\"/tmp/x.txt\",\"READ\")\n",
+     "MODE must be"),
+    ("WRITE raw record non-array (Part 10)",
+     "IMPLICIT NONE\nINTEGER :: X\nX := 1\nOPEN(5,\"/tmp/x.txt\",\"WRITE\")\n"
+     "WRITE(5) X(1:2)\n",
+     "is not a declared array"),
+    ("ESF_WRITE bad args (Part 10)",
+     "IMPLICIT NONE\nCALL ESF_WRITE(9, 0, 1, 4)\n",
+     "ESF_WRITE: bad arguments"),
 ]
 
 

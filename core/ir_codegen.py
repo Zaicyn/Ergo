@@ -268,6 +268,12 @@ class IRCodeGen:
         self._has_net = has_net
         if has_net:
             self._put_raw("#include \"ergo_net.h\"")
+        # File I/O runtime (Spec Part 10): unit table + OPEN/CLOSE/raw
+        # helpers — header-only, always included (static inline, no
+        # cost when unused).
+        self._put_raw("#include \"ergo_io.h\"")
+        if self._uses_esf(mod):
+            self._put_raw("#include \"ergo_stream.h\"")
         self._put_raw("")
 
         # FNV-1a hash helper for ERGO_HASH_FINAL=1 state-hash diagnostic.
@@ -405,6 +411,9 @@ class IRCodeGen:
         # NET shutdown
         if has_net:
             self._put("if (_consensus_enabled) ergo_net_close(&_ergo_net);")
+
+        # File I/O shutdown: flush+close open units in unit order
+        self._put("_ergo_io_shutdown();")
 
         self._put("return 0;")
         self.indent -= 1
@@ -2350,6 +2359,25 @@ class IRCodeGen:
                         self._frame_ended_early = False
                         self._frame_gpu_dirty.clear()
                 return
+            # .esf stream intrinsics (Spec/Ergo_Stream_Format.md)
+            if func == "ESF_OPEN":
+                u = self._operand(args[0])
+                nch = self._operand(args[1])
+                path = _c_str_escape(inst.meta["path"])
+                self._put(f'esf_open({u}, "{path}", {nch});')
+                return
+            if func == "ESF_WRITE":
+                u = self._operand(args[0])
+                ch = self._operand(args[1])
+                n = self._operand(args[2])
+                arr = inst.meta["array"]
+                self._put(f"esf_write({u}, {ch}, {arr}, "
+                          f"({n}) * (int)sizeof({arr}[0]));")
+                return
+            if func == "ESF_CLOSE":
+                u = self._operand(args[0])
+                self._put(f"esf_close({u});")
+                return
             # A6: user subroutine with by-reference scalar dummies —
             # build the argument list signature-aware (addresses for
             # scalar positions; temps for read-only constant arguments).
@@ -2434,7 +2462,38 @@ class IRCodeGen:
             unit = inst.meta.get("unit", "*")
             fmt = inst.meta.get("fmt", "")
             advance = inst.meta.get("advance", True)
-            stream = "stderr" if unit == "0" else "stdout"
+            if isinstance(unit, str):
+                if unit == "*":
+                    stream = "stdout"
+                elif unit == "0":
+                    stream = "stderr"
+                else:
+                    # Numeric file unit (Spec Part 10): runtime FILE*
+                    # lookup — named error if the unit is not open.
+                    stream = f"_ergo_unit({unit})"
+            else:
+                # File unit expression (Spec Part 10): runtime FILE*
+                # lookup — named error if the unit is not open for
+                # formatted output.
+                stream = f"_ergo_unit({self._operand(unit)})"
+            # Raw-record form: WRITE(unit) A(lo:hi), ... — binary
+            # block, explicit length, native endianness (Part 10.4).
+            if fmt is None:
+                for name, lo, hi in inst.meta["sections"]:
+                    shape = self._array_shapes.get(name)
+                    if not shape or len(shape) != 1:
+                        from .errors import MCLError as _MCLErr
+                        raise _MCLErr(
+                            f"WRITE raw record: '{name}' needs a "
+                            f"compile-time-sized 1-D array")
+                    slo = self._operand(lo)
+                    shi = self._operand(hi)
+                    self._put(
+                        f"_ergo_raw_write({stream}, {name}, "
+                        f"(long)({slo}), (long)({shi}), "
+                        f"(long)(sizeof({name}) / sizeof({name}[0])), "
+                        f"sizeof({name}[0]), \"{name}\");")
+                return
             # The format text is embedded in a C string literal — escape
             # it the same way as string constants.
             fmt = _c_str_escape(fmt)
@@ -2445,6 +2504,24 @@ class IRCodeGen:
                 self._put(f'fprintf({stream}, "{fmt}", {a});')
             else:
                 self._put(f'fprintf({stream}, "{fmt}");')
+            return
+
+        # OPEN / CLOSE — file units (Spec Part 10)
+        if op == Op.OPEN:
+            u = self._operand(args[0])
+            path = _c_str_escape(inst.meta["path"])
+            mode = "w" if inst.meta["mode"] == "WRITE" else "a"
+            self._put(f'_ergo_open({u}, "{path}", "{mode}");')
+            return
+        if op == Op.CLOSE:
+            u = self._operand(args[0])
+            self._put(f"_ergo_close({u});")
+            return
+
+        # ESF_NEXT — scheduled channel of the stream's next frame
+        if op == Op.ESF_NEXT:
+            a = self._operand(args[0])
+            self._put(f"{result} = esf_next({a});")
             return
 
         # FLUSH
@@ -2468,6 +2545,7 @@ class IRCodeGen:
             if self.gpu_plan and self.gpu_plan.kernels:
                 self._emit_final_hash_hook()
                 self._put("ergo_vk_shutdown();")
+            self._put("_ergo_io_shutdown();")
             self._put("exit(0);")
             return
 
@@ -3267,7 +3345,37 @@ class IRCodeGen:
                 return True
         return False
 
-    # ── HASH / RAND lowering ───────────────────────────────────
+    def _uses_esf(self, mod: IRModule) -> bool:
+        """Return True if any .esf stream op (ESF_* / ESF_NEXT) is
+        reachable — gates the ergo_stream.h include."""
+        def walk_items(items) -> bool:
+            for item in items:
+                if isinstance(item, IRBlock):
+                    for inst in item.insts:
+                        if inst.op == Op.ESF_NEXT:
+                            return True
+                        if inst.op == Op.CALL_VOID and \
+                                str(inst.meta.get("func", "")) \
+                                .startswith("ESF_"):
+                            return True
+                elif isinstance(item, IRLoop):
+                    if walk_items(item.body):
+                        return True
+                elif isinstance(item, IRWhileLoop):
+                    if walk_items(item.body):
+                        return True
+                elif isinstance(item, IRIf):
+                    if walk_items(item.then_body):
+                        return True
+                    if item.else_body and walk_items(item.else_body):
+                        return True
+            return False
+        if walk_items(mod.main_body):
+            return True
+        for fn in mod.functions:
+            if walk_items(fn.body):
+                return True
+        return False
     # splitmix64 finalizer (Stafford 2013). Constants: the Weyl increment
     # is the golden-ratio 2^64/phi; both multipliers are Stafford's
     # odd 64-bit constants chosen for maximal avalanche. The full 64-bit

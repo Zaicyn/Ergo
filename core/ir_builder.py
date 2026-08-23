@@ -53,6 +53,7 @@ INTRINSIC_MAP = {
     "MOD": (Op.MOD, None),
     "SIGN": (Op.SIGN, None),
     "HASH": (Op.HASH, IRType.INTEGER), "RAND": (Op.RAND, IRType.REAL),
+    "ESF_NEXT": (Op.ESF_NEXT, IRType.INTEGER),
 }
 
 
@@ -758,12 +759,31 @@ class IRBuilder:
 
     def _lower_write(self, node: ast.WriteStmt) -> list:
         block = IRBlock(self._fresh_block("write"), line=node.line)
+        # Unit: preconnected string ("*", "0") or a lowered INTEGER expr
+        if isinstance(node.unit, str):
+            unit = node.unit
+        else:
+            unit = self._lower_expr(node.unit, block)
+        # Raw-record form: WRITE(unit) A(lo:hi), ... — sections carry
+        # the array name plus lowered bounds (Spec Part 10.4).
+        if node.fmt is None:
+            sections = []
+            for sec in node.args:
+                lo = self._lower_expr(sec.lo, block)
+                hi = self._lower_expr(sec.hi, block)
+                sections.append((sec.name, lo, hi))
+            block.insts.append(IRInst(
+                op=Op.WRITE, args=[], type=IRType.VOID,
+                line=node.line,
+                meta={"unit": unit, "fmt": None, "sections": sections},
+            ))
+            return [block]
         lowered_args = [self._lower_expr(a, block) for a in node.args]
         block.insts.append(IRInst(
             op=Op.WRITE, args=lowered_args, type=IRType.VOID,
             line=node.line,
             meta={
-                "unit": node.unit,
+                "unit": unit,
                 "fmt": node.fmt,
                 "advance": node.advance,
             },
@@ -823,6 +843,50 @@ class IRBuilder:
             from .errors import MCLError
             raise MCLError(
                 f"{uname}: first two arguments must be declared arrays")
+
+        # .esf stream intrinsics (Spec/Ergo_Stream_Format.md):
+        #   CALL ESF_OPEN(unit, "path", nch)
+        #   CALL ESF_WRITE(unit, ch, array, n)   ! n = element count
+        #   CALL ESF_CLOSE(unit)
+        if uname == "ESF_OPEN" and len(node.args) == 3 and \
+                isinstance(node.args[1], ast.Literal) and \
+                node.args[1].type == "STRING":
+            ops = [self._lower_expr(node.args[0], block),
+                   self._lower_expr(node.args[2], block)]
+            block.insts.append(IRInst(
+                op=Op.CALL_VOID, args=ops, type=IRType.VOID,
+                line=node.line,
+                meta={"func": "ESF_OPEN", "path": node.args[1].value},
+            ))
+            return [block]
+        if uname == "ESF_WRITE" and len(node.args) == 4 and \
+                isinstance(node.args[2], ast.Variable) and \
+                node.args[2].name in self._array_shapes:
+            ops = [self._lower_expr(node.args[0], block),
+                   self._lower_expr(node.args[1], block),
+                   self._lower_expr(node.args[3], block)]
+            block.insts.append(IRInst(
+                op=Op.CALL_VOID, args=ops, type=IRType.VOID,
+                line=node.line,
+                meta={"func": "ESF_WRITE",
+                      "array": node.args[2].name},
+            ))
+            return [block]
+        if uname == "ESF_CLOSE" and len(node.args) == 1:
+            ops = [self._lower_expr(node.args[0], block)]
+            block.insts.append(IRInst(
+                op=Op.CALL_VOID, args=ops, type=IRType.VOID,
+                line=node.line, meta={"func": "ESF_CLOSE"},
+            ))
+            return [block]
+        if uname in ("ESF_OPEN", "ESF_WRITE", "ESF_CLOSE"):
+            from .errors import MCLError
+            raise MCLError(
+                f"{uname}: bad arguments — expected "
+                + {"ESF_OPEN": 'ESF_OPEN(unit, "path", nch)',
+                   "ESF_WRITE": "ESF_WRITE(unit, ch, array, n) "
+                                "(array a declared 1-D array)",
+                   "ESF_CLOSE": "ESF_CLOSE(unit)"}[uname])
 
         lowered_args = [self._lower_expr(a, block) for a in node.args]
         block.insts.append(IRInst(
@@ -968,6 +1032,23 @@ class IRBuilder:
 
         if isinstance(node, ast.WriteStmt):
             return self._lower_write(node)
+
+        if isinstance(node, ast.OpenStmt):
+            block = IRBlock(self._fresh_block("open"), line=node.line)
+            u = self._lower_expr(node.unit, block)
+            block.insts.append(IRInst(
+                op=Op.OPEN, args=[u], type=IRType.VOID, line=node.line,
+                meta={"path": node.path, "mode": node.mode},
+            ))
+            return [block]
+
+        if isinstance(node, ast.CloseStmt):
+            block = IRBlock(self._fresh_block("close"), line=node.line)
+            u = self._lower_expr(node.unit, block)
+            block.insts.append(IRInst(
+                op=Op.CLOSE, args=[u], type=IRType.VOID, line=node.line,
+            ))
+            return [block]
 
         if isinstance(node, ast.ReturnStmt):
             return self._lower_return(node)

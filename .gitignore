@@ -67,6 +67,12 @@
 !tests/golden/
 !tests/golden/*.py
 !tests/golden/*.md
+# D3 stream suite (file I/O + .esf) — sources tracked, out/ artifacts
+# stay ignored (regenerable: run_stream.py rebuilds them)
+!tests/stream/
+!tests/stream/*.py
+!tests/stream/*.ergo
+!tests/stream/*.md
 
 # Always ignore build artifacts
 __pycache__/

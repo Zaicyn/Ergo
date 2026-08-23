@@ -77,6 +77,8 @@ class TT(Enum):
     KW_STOP = auto()
     KW_WRITE = auto()
     KW_FLUSH = auto()
+    KW_OPEN = auto()
+    KW_CLOSE = auto()
     KW_PARAMETER = auto()
     KW_SELECT = auto()
     KW_CASE = auto()
@@ -122,6 +124,8 @@ KEYWORDS = {
     "STOP": TT.KW_STOP,
     "WRITE": TT.KW_WRITE,
     "FLUSH": TT.KW_FLUSH,
+    "OPEN": TT.KW_OPEN,
+    "CLOSE": TT.KW_CLOSE,
     "PARAMETER": TT.KW_PARAMETER,
     "SELECT": TT.KW_SELECT,
     "CASE": TT.KW_CASE,

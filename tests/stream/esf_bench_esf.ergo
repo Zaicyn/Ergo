@@ -1,0 +1,22 @@
+! esf_bench_esf.ergo — .esf write throughput (test 5, measured not
+! promised): NFR full-payload frames on 8 channels.
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NFR = 20000
+INTEGER :: I, J, CH
+STATIC INTEGER :: BUF(1017)
+
+DO J = 1, 1017
+  BUF(J) := J
+ENDDO
+
+CALL ESF_OPEN(8, "tests/stream/out/bench.esf", 8)
+DO I = 1, NFR
+  CH := ESF_NEXT(8)
+  CALL ESF_WRITE(8, CH, BUF, 1017)
+ENDDO
+CALL ESF_CLOSE(8)
+
+WRITE(*, "('BENCH ESF DONE %d')") NFR
+STOP
