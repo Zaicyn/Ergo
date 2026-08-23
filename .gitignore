@@ -67,12 +67,21 @@
 !tests/golden/
 !tests/golden/*.py
 !tests/golden/*.md
+# corpus audit + regression manifest (sha256 oracle, tracked); the
+# full .out baselines stay local-only (regenerable: run_corpus.py
+# --record) — 50 MB of dumps don't belong in the repo
+!tests/golden/*.json
 # D3 stream suite (file I/O + .esf) — sources tracked, out/ artifacts
 # stay ignored (regenerable: run_stream.py rebuilds them)
 !tests/stream/
 !tests/stream/*.py
 !tests/stream/*.ergo
 !tests/stream/*.md
+# nodegraph golden tests (graph JSON + runner)
+!tests/nodegraph/
+!tests/nodegraph/*.py
+!tests/nodegraph/*.json
+!tests/nodegraph/*.md
 
 # Always ignore build artifacts
 __pycache__/

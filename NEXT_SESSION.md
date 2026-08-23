@@ -26,6 +26,8 @@ quantum battery), and LLPS/condensate simulation.
 ```bash
 python -m core <source>.ergo -o <binary>     # compile
 ./<binary>                                    # run
+python -m core <graph>.json -o <binary>      # node graph → binary (Phase A)
+python -m core <graph>.json --emit-ergo      # graph → readable Ergo source
 ```
 
 **Key flags:**

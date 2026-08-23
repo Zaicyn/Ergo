@@ -1,0 +1,27 @@
+{
+  "name": "nernst_potential",
+  "version": "0.1",
+  "parameters": [
+    {"name": "RT_F", "type": "REAL", "value": 61.5}
+  ],
+  "inputs": [
+    {"name": "ion_out", "type": "REAL", "value": 100.0},
+    {"name": "ion_in", "type": "REAL", "value": 5.0}
+  ],
+  "outputs": [
+    {"name": "E", "type": "REAL"}
+  ],
+  "nodes": [
+    {"id": "div_0", "type": "intrinsic", "op": "Div", "position": [100, 150]},
+    {"id": "log10_0", "type": "intrinsic", "op": "Log10", "position": [200, 150]},
+    {"id": "mul_0", "type": "intrinsic", "op": "Mul", "position": [300, 150]}
+  ],
+  "edges": [
+    {"src": "input:ion_out", "dst": "div_0:a"},
+    {"src": "input:ion_in", "dst": "div_0:b"},
+    {"src": "div_0:out", "dst": "log10_0:x"},
+    {"src": "log10_0:out", "dst": "mul_0:a"},
+    {"src": "param:RT_F", "dst": "mul_0:b"},
+    {"src": "mul_0:out", "dst": "output:E"}
+  ]
+}

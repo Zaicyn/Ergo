@@ -452,3 +452,42 @@ and the source contain exactly the same information.
 3. **Types are visual.** Pin colors encode types. Shape mismatches are impossible to connect.
 4. **Deterministic layout.** Same graph → same source → same binary → same output. Always.
 5. **Bidirectional.** Graph ↔ Source. Neither is "primary". Both are views of the same program.
+
+---
+
+## Implementation Status (2026-08, Phase A complete)
+
+**Working and gated** (`tests/nodegraph/run_nodegraph.py`, 11/11,
+wired into the golden gate):
+
+- Data model, validation (cycles, types, fan-in, unconnected pins,
+  unknown ops, undeclared parameters), deterministic topological
+  compile to Ergo source — `core/nodegraph.py`.
+- JSON serialization **in the schema of this document** (top-level
+  `inputs`/`outputs`, `input:`/`output:`/`param:` edge refs);
+  round-trip is text-stable. `input` pins accept a `"value"` default
+  (standalone-target initializer; absent = 0/false).
+- CLI route: `python -m core <graph>.json [-o bin]` compiles a graph
+  straight to a binary; `--emit-ergo` prints the generated Ergo
+  source (the readable/editable target from the Compilation Targets
+  table), `--emit-c` the C.
+- Examples: `tests/nodegraph/nernst.json` (the §Serialization graph,
+  verified against the analytic Nernst potential),
+  `tests/nodegraph/signal_condition.json` (constants, comparison,
+  fan-out, Switch → IF/ELSE).
+
+**Deferred (roadmap, honest gaps):**
+
+- **Subgraph nodes** (collapse → Ergo FUNCTION): catalog/validation
+  have no subgraph support yet. This is the next implementation
+  tranche; the boundary machinery (input/output pins + defaults)
+  already matches what a FUNCTION lowering needs.
+- **Array/shape pins**: `Pin.shape` exists in the model but no
+  catalog node consumes arrays and compile() emits scalars only.
+- **Select node** (SELECT CASE): not implemented; Switch (IF/ELSE)
+  is.
+- **Tick-based execution** (Phase D): design-only. The graph boundary
+  maps to loop state as specified here; no lowering exists.
+- **Nuklear renderer / interactive editing** (Phases B–C): not
+  started; `position` fields round-trip through JSON for it.
+- **Source → graph** direction of bidirectional editing: not started.

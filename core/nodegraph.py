@@ -185,6 +185,7 @@ class Node:
     # For input/output boundary nodes
     pin_name: str | None = None
     pin_type: PinType | None = None
+    pin_default: Any = None     # input nodes: initial value (standalone target)
 
     @property
     def definition(self) -> NodeDef | None:
@@ -299,7 +300,33 @@ class Graph:
                     errors.append(f"Node '{nid}': unknown operation '{node.op}'")
 
         # Check all edges reference valid nodes and pins
+        param_names = {p.name: p for p in self.parameters}
         for edge in self.edges:
+            # "param:<name>" is a pseudo-node: always available, typed
+            # by the parameter declaration.
+            if edge.src_node == "param":
+                prm = param_names.get(edge.src_pin)
+                if prm is None:
+                    errors.append(
+                        f"Edge: parameter '{edge.src_pin}' not declared")
+                    continue
+                if edge.dst_node not in self.nodes:
+                    errors.append(
+                        f"Edge: destination node '{edge.dst_node}' not found")
+                    continue
+                dst = self.nodes[edge.dst_node]
+                dst_pin = dst.get_input_pin(edge.dst_pin)
+                if dst_pin is None:
+                    errors.append(
+                        f"Edge: node '{edge.dst_node}' has no input pin "
+                        f"'{edge.dst_pin}'")
+                    continue
+                if not prm.type.promotes_to(dst_pin.type):
+                    errors.append(
+                        f"Edge param:{edge.src_pin} -> "
+                        f"{edge.dst_node}.{edge.dst_pin}: type mismatch "
+                        f"{prm.type.value} -> {dst_pin.type.value}")
+                continue
             if edge.src_node not in self.nodes:
                 errors.append(f"Edge: source node '{edge.src_node}' not found")
                 continue
@@ -366,6 +393,11 @@ class Graph:
         successors: dict[str, list[str]] = {nid: [] for nid in self.nodes}
 
         for edge in self.edges:
+            if edge.src_node == "param":
+                continue  # parameters are always available (no ordering)
+            if edge.dst_node not in in_degree or \
+                    edge.src_node not in successors:
+                continue  # dangling edge — already reported by validate()
             in_degree[edge.dst_node] += 1
             successors[edge.src_node].append(edge.dst_node)
 
@@ -421,6 +453,10 @@ class Graph:
 
         # Map node outputs to variable names
         var_names: dict[tuple[str, str], str] = {}  # (node_id, pin_name) -> var_name
+
+        # Parameters are addressable by name via the "param" pseudo-node
+        for param in self.parameters:
+            var_names[("param", param.name)] = param.name
 
         # Assign names to graph inputs
         for nid in order:
@@ -503,6 +539,29 @@ class Graph:
                     val_str = str(val)
                 lines.append(f"{vname} := {val_str}")
 
+        # Emit graph inputs (standalone target: each input is
+        # initialized to its declared "value" default, else 0)
+        for nid in order:
+            node = self.nodes[nid]
+            if node.op == "input":
+                vname = var_names[(nid, node.pin_name or "value")]
+                dv = node.pin_default
+                if dv is None:
+                    ptype = node.pin_type or PinType.REAL
+                    if ptype == PinType.REAL:
+                        dv = "0.0"
+                    elif ptype == PinType.LOGICAL:
+                        dv = ".FALSE."
+                    else:
+                        dv = "0"
+                if isinstance(dv, float):
+                    dv = repr(dv)
+                elif isinstance(dv, bool):
+                    dv = ".TRUE." if dv else ".FALSE."
+                else:
+                    dv = str(dv)
+                lines.append(f"{vname} := {dv}")
+
         # Emit operations in topological order
         for nid in order:
             node = self.nodes[nid]
@@ -558,7 +617,39 @@ class Graph:
     # ── serialization ────────────────────────────────────
 
     def to_json(self) -> str:
-        """Serialize to JSON."""
+        """Serialize to the design-doc JSON schema: boundary pins at
+        top level ("inputs"/"outputs"), edges referencing
+        input:<name> / output:<name> / param:<name> pseudo-nodes."""
+        inputs = []
+        outputs = []
+        nodes = []
+        for n in self.nodes.values():
+            if n.op == "input":
+                d: dict[str, Any] = {
+                    "name": n.pin_name,
+                    "type": (n.pin_type or PinType.REAL).value,
+                }
+                if n.pin_default is not None:
+                    d["value"] = n.pin_default
+                inputs.append(d)
+            elif n.op == "output":
+                outputs.append({
+                    "name": n.pin_name,
+                    "type": (n.pin_type or PinType.REAL).value,
+                })
+            else:
+                nodes.append(self._node_to_dict(n))
+
+        def _ref(node_id: str, pin: str) -> str:
+            if node_id == "param":
+                return f"param:{pin}"
+            n = self.nodes.get(node_id)
+            if n is not None and n.op == "input":
+                return f"input:{n.pin_name}"
+            if n is not None and n.op == "output":
+                return f"output:{n.pin_name}"
+            return f"{node_id}:{pin}"
+
         data = {
             "name": self.name,
             "version": "0.1",
@@ -566,13 +657,13 @@ class Graph:
                 {"name": p.name, "type": p.type.value, "value": p.value}
                 for p in self.parameters
             ],
-            "nodes": [
-                self._node_to_dict(n) for n in self.nodes.values()
-            ],
+            "inputs": inputs,
+            "outputs": outputs,
+            "nodes": nodes,
             "edges": [
                 {
-                    "src": f"{e.src_node}:{e.src_pin}",
-                    "dst": f"{e.dst_node}:{e.dst_pin}",
+                    "src": _ref(e.src_node, e.src_pin),
+                    "dst": _ref(e.dst_node, e.dst_pin),
                 }
                 for e in self.edges
             ],
@@ -581,7 +672,10 @@ class Graph:
 
     @staticmethod
     def from_json(text: str) -> Graph:
-        """Deserialize from JSON."""
+        """Deserialize. Accepts the design-doc schema (top-level
+        "inputs"/"outputs", input:/output:/param: edge refs, nodes
+        with a "type" field) and the internal schema (explicit
+        boundary nodes with op input/output/constant)."""
         data = json.loads(text)
         g = Graph(name=data["name"])
 
@@ -592,10 +686,34 @@ class Graph:
                 value=p["value"],
             ))
 
+        # Top-level boundary declarations (design-doc schema)
+        for inp in data.get("inputs", []):
+            node = Node(id=f"in_{inp['name']}", op="input",
+                        pin_name=inp["name"],
+                        pin_type=PinType(inp["type"]))
+            if "value" in inp:
+                node.pin_default = inp["value"]
+            g.nodes[node.id] = node
+        for outp in data.get("outputs", []):
+            node = Node(id=f"out_{outp['name']}", op="output",
+                        pin_name=outp["name"],
+                        pin_type=PinType(outp["type"]))
+            g.nodes[node.id] = node
+
         for nd in data["nodes"]:
+            # design-doc nodes carry "type": intrinsic/constant/...;
+            # internal-format nodes carry the op directly
+            ntype = nd.get("type")
+            if ntype in ("input", "output", "constant"):
+                op = ntype
+            elif ntype in (None, "intrinsic", "expression"):
+                op = nd["op"]
+            else:
+                raise ValueError(
+                    f"node '{nd.get('id')}': unsupported type '{ntype}'")
             node = Node(
                 id=nd["id"],
-                op=nd["op"],
+                op=op,
                 position=tuple(nd.get("position", [0, 0])),
             )
             if "const_type" in nd:
@@ -606,14 +724,26 @@ class Graph:
                 node.pin_name = nd["pin_name"]
             if "pin_type" in nd:
                 node.pin_type = PinType(nd["pin_type"])
+            if "value" in nd and op == "input":
+                node.pin_default = nd["value"]
             g.nodes[node.id] = node
 
         for ed in data["edges"]:
-            src_parts = ed["src"].split(":")
-            dst_parts = ed["dst"].split(":")
+            src_node, src_pin = ed["src"].split(":")
+            dst_node, dst_pin = ed["dst"].split(":")
+            # Normalize design-doc pseudo-refs to internal node ids
+            if src_node == "input":
+                src_node = f"in_{src_pin}"
+            if dst_node == "input":
+                dst_node = f"in_{dst_pin}"
+            if src_node == "output":
+                src_node = f"out_{src_pin}"
+            if dst_node == "output":
+                dst_node = f"out_{dst_pin}"
+            # "param:<name>" stays a pseudo-node ref
             g.edges.append(Edge(
-                src_node=src_parts[0], src_pin=src_parts[1],
-                dst_node=dst_parts[0], dst_pin=dst_parts[1],
+                src_node=src_node, src_pin=src_pin,
+                dst_node=dst_node, dst_pin=dst_pin,
             ))
 
         return g
@@ -621,6 +751,7 @@ class Graph:
     def _node_to_dict(self, n: Node) -> dict:
         d: dict[str, Any] = {
             "id": n.id,
+            "type": "constant" if n.op == "constant" else "intrinsic",
             "op": n.op,
             "position": list(n.position),
         }

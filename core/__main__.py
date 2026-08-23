@@ -21,6 +21,11 @@ def main():
         help="Emit generated C code to stdout instead of compiling",
     )
     parser.add_argument(
+        "--emit-ergo", action="store_true",
+        help="With a .json node-graph source: emit the generated Ergo "
+             "source to stdout instead of compiling",
+    )
+    parser.add_argument(
         "--emit-ir", action="store_true",
         help="Dump Ergo IR to stdout (for debugging)",
     )
@@ -112,6 +117,41 @@ def main():
     set_real_precision(32 if args.precision == "f32" else 64)
 
     try:
+        # Node graph route: a .json source is a node graph
+        # (Spec/Ergo_NodeGraph_Design.md) — validate, lower to Ergo
+        # source, then feed the normal pipeline.
+        if args.source.endswith(".json"):
+            from .nodegraph import Graph
+            from .driver import compile_source
+
+            with open(args.source) as f:
+                graph = Graph.from_json(f.read())
+            errs = graph.validate()
+            if errs:
+                raise MCLError(
+                    f"node graph '{args.source}' failed validation:\n  "
+                    + "\n  ".join(errs))
+            ergo_src = graph.compile()
+            if args.emit_ergo:
+                print(ergo_src, end="")
+                return
+            out = args.output or args.source.rsplit(".", 1)[0]
+            c_code = compile_source(
+                ergo_src, output=out, emit_c=args.emit_c,
+                cpu_fast_math=args.cpu_fast_math,
+                gpu_fast_math=args.gpu_fast_math,
+                source_path=args.source,
+                target=args.target, no_split=args.no_split,
+                render=args.render,
+                promote_locals_flag=args.promote_locals,
+                no_verify=args.no_verify,
+                gpu_tile_size=args.gpu_tile_size)
+            if args.emit_c:
+                print(c_code)
+            else:
+                print(f"Compiled successfully: ./{out}")
+            return
+
         # --emit-ir: dump IR and exit
         if args.emit_ir:
             from .lexer import Lexer

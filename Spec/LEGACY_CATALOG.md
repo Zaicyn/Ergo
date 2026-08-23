@@ -95,6 +95,9 @@ unstable ("for a working JIT today use core.jit"), flagged experimental in
   node-graph tooling in scope for 1.0? If yes, both need a fix-and-verify pass
   (extension.js module path at minimum). If no: DELETE `nodegraph.py`,
   DEPRECATE-then-delete the LSP + `ergo-extension/`.
+- **RESOLVED 2026-08 (nodegraph only):** user ruled it an essential
+  production feature — completed and gated; see "Decisions recorded"
+  below. The LSP half of the question stays open.
 
 ## 5. NVVM backend — `core/backends/nvvm.py`
 
@@ -112,6 +115,9 @@ GPU work since is SPIRV. No script or test uses `--target nvvm` (grep clean).
 - **Disposition: DECIDE.** It is already a loud-stub; options: keep the stub
   (costs nothing, documents the dead end), or DELETE the file and drop "nvvm"
   from the driver target list. Either way fix the `__main__.py` help text.
+- **RESOLVED 2026-08:** keep-stub now, delete at 1.0 unless a CUDA-only
+  deployment requirement appears — full reasoning + the musl analysis in
+  "Decisions recorded" below.
 
 ## 6. Render runtime — `core/runtime/vk_render.c` orphan; `--render` path
 
@@ -288,3 +294,76 @@ file the `--render` build depends on).
 **Undecidable from the repo (user input needed):** whether dual-path golden
 testing survives to 1.0 (#17); whether LSP/node-graph/android/JIT-native are
 1.0 scope (#9/#11/#12/#13); whether `structured/` is alive (#14).
+
+---
+
+## Decisions recorded (2026-08)
+
+### Nodegraph (catalog #11 / §4) — KEPT, completed to Phase A
+
+User ruling: the node graph is an essential production feature, not a
+deletion candidate. Completed to a working, gated state:
+
+- `core/nodegraph.py` now round-trips the design-doc JSON schema
+  (top-level `inputs`/`outputs`, `input:`/`output:`/`param:` edge refs,
+  input `"value"` defaults), handles `param:` pseudo-node refs in
+  validation/topo/codegen, and initializes standalone-target inputs.
+- CLI route: `python -m core <graph>.json [-o bin]` (plus `--emit-ergo`
+  for the readable-source target) — the zero-importer orphan now has a
+  production entry point.
+- Golden suite: `tests/nodegraph/run_nodegraph.py` (11/11) — two
+  end-to-end graphs verified against analytic values (Nernst potential,
+  switch pipeline), six validation negatives, determinism +
+  round-trip checks; wired into `run_golden.py`.
+- Remaining roadmap (subgraph nodes, array pins, Select, tick mode,
+  Nuklear phases B–D, source→graph) is documented in
+  `Spec/Ergo_NodeGraph_Design.md` "Implementation Status".
+
+### NVVM (catalog #15 / §5) — keep-stub now, delete at 1.0
+
+**Is it needed for anything? No.** Every GPU feature since 2026-05 is
+SPIRV-only: staged/segmented reductions, ATAN2, HASH/RAND (int64 ALU),
+tiled dispatch, ping-pong buffers, clipmaps, the F104 2D stencils. The
+SPIRV path runs on NVIDIA hardware via Vulkan (verified on the RTX 2060
+here), so NVVM's only distinct value would be a CUDA-only deployment
+(no Vulkan loader) — no such requirement exists. Making NVVM viable
+means re-doing the SPIRV backend's correctness work against its
+docstring's own broken catalog (.approx intrinsics without correction,
+SCATTER without atomics, invalid IR for integer arrays/mixed
+arithmetic, missing phi nodes) — a 634-line stub vs spirv.py's 3,547
+audited lines. Not worth it.
+
+**Does musl change the calculus? No — it reinforces the verdict.** musl
+builds concern the host side (static/small libc for the generated C +
+gcc link; the Ergo C runtime is already near-libc-free — stdio/math/
+stdlib only, so a musl static build of CPU-only programs is close to
+trivial). The GPU constraint under musl is the *Vulkan loader and
+proprietary driver stack*, which is libc-sensitive — not the choice of
+kernel IR. NVVM would make musl strictly worse: libNVVM and the CUDA
+driver are glibc-centric binary dependencies. If small static builds
+become a goal, the path is CPU-only-musl today and possibly
+SPIRV-via-fossilize/lavapipe later — never NVVM.
+
+**Verdict:** keep the loud stub through 1.0 (zero cost, documents the
+dead end); DELETE at 1.0 unless a CUDA-only deployment requirement
+materializes, and then drop "nvvm" from `driver.py`'s target list and
+the `__main__.py` help texts in the same commit.
+
+### Android (catalog #13) — revival sketch (glance only)
+
+Current state: `android/build_android.sh` was un-broken in the cleanup
+batch (now invokes `python -m core --target spirv --precision f32`);
+`vk_host.c` still carries its `ERGO_VK_ANDROID` guards (26 sites:
+includes, `ANativeWindow`, log redirection, render deferred). Neither
+is verified — that needs the NDK, which this box may not even have
+installed. Revival cost estimate: (1) confirm the NDK and run
+`build_android.sh` once — the likely rot points are the vk_host.c
+ifdef sites (they've been carried through months of vk_host.c edits
+without a compile check) and the Gradle config in `android-app/`;
+(2) runtime verification needs an emulator image with Vulkan
+(SwiftShader) or a physical device — the sim is headless-capable, so a
+plain instrumentation run (`SimActivity` → logcat) suffices for a
+smoke test; (3) expect half a day of guard fixes, not a redesign.
+Recommendation: leave parked until an actual Android deployment need
+exists; the pieces are coherent enough that revival is a verification
+job, not archaeology.

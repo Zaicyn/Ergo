@@ -1,0 +1,29 @@
+{
+  "name": "signal_condition",
+  "version": "0.1",
+  "parameters": [],
+  "inputs": [
+    {"name": "signal", "type": "REAL", "value": 7.5}
+  ],
+  "outputs": [
+    {"name": "result", "type": "REAL"}
+  ],
+  "nodes": [
+    {"id": "thresh", "type": "constant", "const_type": "REAL", "const_value": 5.0, "position": [60, 220]},
+    {"id": "two", "type": "constant", "const_type": "REAL", "const_value": 2.0, "position": [60, 300]},
+    {"id": "zero", "type": "constant", "const_type": "REAL", "const_value": 0.0, "position": [60, 380]},
+    {"id": "cmp_0", "type": "intrinsic", "op": "Greater", "position": [180, 220]},
+    {"id": "mul_0", "type": "intrinsic", "op": "Mul", "position": [180, 300]},
+    {"id": "sw_0", "type": "intrinsic", "op": "Switch", "position": [320, 260]}
+  ],
+  "edges": [
+    {"src": "input:signal", "dst": "cmp_0:a"},
+    {"src": "thresh:out", "dst": "cmp_0:b"},
+    {"src": "input:signal", "dst": "mul_0:a"},
+    {"src": "two:out", "dst": "mul_0:b"},
+    {"src": "cmp_0:out", "dst": "sw_0:cond"},
+    {"src": "mul_0:out", "dst": "sw_0:t"},
+    {"src": "zero:out", "dst": "sw_0:f"},
+    {"src": "sw_0:out", "dst": "output:result"}
+  ]
+}

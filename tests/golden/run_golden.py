@@ -151,6 +151,19 @@ def main():
         if r.returncode != 0:
             print("  corpus regression FAILED — investigate before "
                   "release; re-record baselines only after review.")
+
+    # Nodegraph suite (tests/nodegraph/: graph JSON → Ergo → binary
+    # → oracle; Phase A of the node-graph design)
+    ng = os.path.join(REPO, "tests", "nodegraph", "run_nodegraph.py")
+    if os.path.exists(ng):
+        r = sh([sys.executable, ng], timeout=600)
+        tail = r.stdout.decode(errors="replace").strip().splitlines()
+        print("-" * 68)
+        print("  NODEGRAPH SUITE (tests/nodegraph/):")
+        for ln in tail:
+            print("  " + ln)
+        if any(ln.lstrip().startswith("FAIL ") for ln in tail):
+            print("  nodegraph suite FAIL — investigate before release.")
     return 0
 
 
