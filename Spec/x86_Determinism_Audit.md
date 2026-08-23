@@ -136,7 +136,7 @@ performance and the "constitution" promises rely on optimization.
 
 ### Finding B: `-ffast-math` is exposed and unsplit (HAZARD)
 
-The Ergo `--fast-math` CLI flag ([mcl/__main__.py](../mcl/__main__.py))
+The Ergo `--fast-math` CLI flag ([core/__main__.py](../core/__main__.py))
 maps directly to GCC `-ffast-math` *and* to the SPIRV atomic emission
 rule in Part 8.2 of the spec. These are two separate decisions:
 

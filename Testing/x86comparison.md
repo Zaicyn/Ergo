@@ -25,7 +25,7 @@ The arena offset is promoted to a register (`rdx`) across the entire
 loop body; loaded once on entry, stored once on exit. Per-iteration
 cost is six ops, three of which are the arena emit itself.
 
-### Source (the Ergo emit, from `mcl/codegen.py`)
+### Source (the Ergo emit, from `core/codegen.py`)
 
 ```c
 {
@@ -102,7 +102,7 @@ floor of 0.51 ns/iter — 0.25 ns delta is the bounds check.
 
 ```bash
 # From the repo root, on master with arena lowering merged:
-python -m mcl --emit-c tests/allocate_bench.ergo > /tmp/allocate_bench.c
+python -m core --emit-c tests/allocate_bench.ergo > /tmp/allocate_bench.c
 gcc -O3 -march=x86-64-v3 -ffp-contract=fast -fno-math-errno -std=c11 \
     -S -masm=intel -fno-asynchronous-unwind-tables \
     /tmp/allocate_bench.c -o /tmp/allocate_bench.s

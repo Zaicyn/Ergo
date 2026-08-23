@@ -152,7 +152,9 @@ array element to a dummy the subroutine writes is a compile-time
 error (the checker names the argument). Read-only scalar dummies
 accept any expression (the compiler copies it to a temporary).
 Array dummies are by-reference as before; STATIC arrays as arguments
-remain forbidden (Part 7). FUNCTION arguments are by-value and do
+compile but emit a teaching warning (Part 7's aliasing rule is
+advisory — the generated code is correct, and existing corpus
+programs rely on it). FUNCTION arguments are by-value and do
 not copy out.
 
 ✅ **Backends (ratified 2026-08-12):** the IR codegen
@@ -305,11 +307,13 @@ DATA SCATLT / 6, 4, 6, 2, ... /
 ### STATIC Aliasing Rule
 
 STATIC arrays are **non-aliasing**. Specifically:
-- STATIC storage must never be passed as a function/subroutine parameter
+- STATIC storage should not be passed as a function/subroutine parameter
 - Subroutines access STATIC state directly by name, not through arguments
 - This eliminates the aliasing escape that would force conservative optimization
 
 If a subroutine needs to operate on STATIC data, it references it directly. The data's address is known; passing it through a pointer adds nothing but aliasing risk.
+
+**Implementation note (ratified 2026-08-23):** passing a STATIC array as an argument *compiles* — the checker emits a teaching warning (the alias rule is advisory; the generated code is correct because the callee sees the same canonical instance). Older docs said "forbidden"; that was wrong, and ~200 corpus programs rely on the warned-but-works behavior.
 
 ### No Implicit Temporaries
 

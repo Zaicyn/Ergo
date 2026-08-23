@@ -381,7 +381,7 @@ flag pinning and was tested across rebuilds.
 
 ¹⁰ᵃ Ergo GPU bit-identical-across-rebuilds: design contract, **not
 empirically validated in this work**. The SPIRV emission contract
-in `mcl/backends/spirv.py` is deterministic by construction (no
+in `core/backends/spirv.py` is deterministic by construction (no
 hash-set iteration, no random ordering); but a back-to-back rebuild
 of the same Ergo program has not been diffed at the SPIRV level
 within this audit. Flagged for follow-up.
@@ -407,7 +407,7 @@ Design contract, **validated** by codegen inspection (no `free(` or
 
 ¹⁴ Ergo GPU bounds-check-at-allocate: design contract, **not
 empirically validated**. The Vulkan host code in
-`mcl/runtime/vk_host.c` checks `vkAllocateMemory` return codes and
+`core/runtime/vk_host.c` checks `vkAllocateMemory` return codes and
 exits on failure, but Ergo's error-handling path has not been
 exercised in an out-of-VRAM test within this audit. The CPU
 bounds-check (footnote 5) is empirically validated; the GPU path

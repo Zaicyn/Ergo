@@ -7,7 +7,7 @@
 !   REDUCTION — scalar accumulator
 !   SCATTER   — known or possible write collisions
 !
-! Run: python -m mcl tests/gpu_index_patterns.mcl --target spirv --emit-c
+! Run: python -m core tests/gpu_index_patterns.mcl --target spirv --emit-c
 ! (Will report which loops extracted and which rejected)
 
 PARAMETER INTEGER :: N = 1024

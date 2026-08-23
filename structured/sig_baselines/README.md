@@ -19,7 +19,7 @@ Restore to 0.008 in `constants.ergo` after these baselines are captured.
 ```
 # Set OMEGA_CRYSTAL_THRESH = 0.048 in structured/constants.ergo
 ./structured/build_sig.sh
-python -m mcl --target spirv --precision f32 --no-split -M 1000000 -N 500000 \
+python -m core --target spirv --precision f32 --no-split -M 1000000 -N 500000 \
     -o galaxy_sig_500k galaxy_sig.ergo
 ./galaxy_sig_500k > N500K_F200K_thresh048.log
 

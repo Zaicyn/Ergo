@@ -1,6 +1,6 @@
 """Ergo LSP server — parse, check, hover, GPU analysis.
 
-Launch:  python -m mcl.lsp_server
+Launch:  python -m core.lsp_server
 Transport: stdio (extension.js spawns this as a child process)
 
 Session 3: hover provider + PERF hints (FLOW classification, extraction failures).

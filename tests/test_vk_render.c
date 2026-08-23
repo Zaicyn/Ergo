@@ -6,7 +6,7 @@
  *
  * Build:
  *   gcc -std=c99 -o test_vk_render tests/test_vk_render.c \
- *       mcl/runtime/vk_host.c -lvulkan -lglfw -lm -Imcl/runtime
+ *       core/runtime/vk_host.c -lvulkan -lglfw -lm -Icore/runtime
  */
 
 #include "ergo_vk.h"

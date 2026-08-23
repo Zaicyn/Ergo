@@ -13,12 +13,12 @@
  *
  * Build:
  *   # First, generate and assemble the SPIR-V:
- *   python -m mcl tests/gpu_particle.mcl --target spirv
+ *   python -m core tests/gpu_particle.mcl --target spirv
  *   spirv-as --target-env spv1.3 a.out_kernel_1.spvasm -o kernel_1.spv
  *
  *   # Then compile and link:
  *   gcc -std=c99 -o test_vk_particle tests/test_vk_particle.c \
- *       mcl/runtime/vk_host.c -lvulkan -Imcl/runtime
+ *       core/runtime/vk_host.c -lvulkan -Icore/runtime
  *
  *   # Run:
  *   ./test_vk_particle kernel_1.spv

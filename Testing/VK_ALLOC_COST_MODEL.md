@@ -6,7 +6,7 @@ Pass 3 test hardware (NVIDIA RTX 2060, Linux, NVIDIA driver via Vulkan
 single-number "vkAllocateMemory cost" framing turned out to hide two
 distinct phenomena that scale differently.
 
-The instrumentation lives in `mcl/runtime/vk_host.c` under
+The instrumentation lives in `core/runtime/vk_host.c` under
 `#ifdef ERGO_BENCH_VK_ALLOC`; the microbench driver is
 `/tmp/vk_alloc_microbench.c` (not tracked — methodology lives here
 and in the Pass 3 commit message).

@@ -1,3 +1,5 @@
+> **SUPERSEDED (2026-08-23):** kept for history. Current reference: Spec/Ergo_Intrinsic_Signatures_Complete.md.
+
 # MCL Intrinsic Function Signatures (Complete Reference)
 
 ## Overview

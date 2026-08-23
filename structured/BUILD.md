@@ -23,13 +23,13 @@ cat constants.ergo    \  # Layer 1: parameters, LUTs (no state, no subs)
 ./structured/build.sh
 
 # CPU
-python -m mcl -o galaxy_cpu galaxy_structured.ergo
+python -m core -o galaxy_cpu galaxy_structured.ergo
 
 # GPU headless
-python -m mcl --target spirv --precision f32 --no-split -o galaxy_gpu galaxy_structured.ergo
+python -m core --target spirv --precision f32 --no-split -o galaxy_gpu galaxy_structured.ergo
 
 # GPU with render
-python -m mcl --target spirv --precision f32 --no-split --render -o galaxy_gpu galaxy_structured.ergo
+python -m core --target spirv --precision f32 --no-split --render -o galaxy_gpu galaxy_structured.ergo
 ```
 
 ## Why this order:

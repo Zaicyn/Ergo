@@ -71,7 +71,8 @@ assume Fortran semantics:
   `Spec/Ergo_Stream_Format.md`). READ is deferred.
   `PRINT x` takes ONE expression only.
 - **STATIC for shared state** — file-scope arrays; subroutines access
-  STATIC directly by name (passing STATIC as an argument is forbidden).
+  STATIC directly by name (passing STATIC as an argument compiles with
+  a teaching warning — see Spec Part 7).
 - **DATA statements** fill column-major (first subscript fastest).
 - **Column-major arrays** — `A(i,j)` → `A[j-1][i-1]` in C. First index
   varies fastest in memory.

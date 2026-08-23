@@ -1,4 +1,4 @@
-"""CLI entry point: python -m mcl <source.mcl> [options]"""
+"""CLI entry point: python -m core <source.ergo> [options]"""
 
 import argparse
 import sys
@@ -9,7 +9,7 @@ from .errors import MCLError
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="mcl",
+        prog="ergo",
         description="Ergo compiler — deterministic simulation language",
     )
     parser.add_argument("source", help="Source file to compile")
@@ -81,12 +81,6 @@ def main():
         help="Allow GPU fast-math intrinsics on supported backends (NVVM "
              "math intrinsic swap). SPIRV currently does not consume this "
              "flag; CPU codegen is unaffected",
-    )
-    parser.add_argument(
-        "--fast-math", action="store_true",
-        help="DEPRECATED: sets both --cpu-fast-math and --gpu-fast-math. "
-             "Use the specific flags instead. Will be removed in a "
-             "future release.",
     )
     parser.add_argument(
         "--precision", choices=["f32", "f64"], default="f64",
@@ -224,16 +218,10 @@ def main():
                       file=sys.stderr)
                 sys.exit(1)
 
-        # Resolve fast-math: deprecated --fast-math implies both new flags.
+        # Fast-math: explicit CPU/GPU split only (the combined --fast-math
+        # alias was removed 2026-08; see Spec/x86_Determinism_Audit.md).
         cpu_fast_math = args.cpu_fast_math
         gpu_fast_math = args.gpu_fast_math
-        if args.fast_math:
-            print("WARNING: --fast-math is deprecated and applies BOTH "
-                  "--cpu-fast-math and --gpu-fast-math. Use the specific "
-                  "flags instead. See Spec/x86_Determinism_Audit.md for "
-                  "the rationale.", file=sys.stderr)
-            cpu_fast_math = True
-            gpu_fast_math = True
 
         c_code = compile_file(args.source, output=args.output, emit_c=args.emit_c,
                               cpu_fast_math=cpu_fast_math,

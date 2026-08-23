@@ -1,7 +1,7 @@
 #!/bin/bash
 # build_shaders.sh — Compile GLSL shaders to SPIR-V and embed in render_shaders.h
 #
-# Run from mcl/runtime/ after editing any .vert or .frag file.
+# Run from core/runtime/ after editing any .vert or .frag file.
 # Requires: glslc (from the Vulkan SDK or shaderc package)
 #
 # Usage: ./build_shaders.sh

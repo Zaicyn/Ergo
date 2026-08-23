@@ -1,3 +1,5 @@
+> **SUPERSEDED (2026-08-23):** kept for history. Current reference: vk_host.c (the vk_render.c integration never happened; vk_render.c removed).
+
 # Render Pipeline Overhaul — Handoff Document
 
 ## What We're Doing

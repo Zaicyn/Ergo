@@ -1,4 +1,4 @@
-# Ergo (MCL)
+# Ergo
 
 A mathematical compute language for physics simulation, GPU kernels, and HPC.
 
@@ -10,18 +10,19 @@ Performance is predictable because the language forbids the patterns that make i
 
 ```bash
 # Compile and run
-python3 -m mcl tests/test_first.ergo -o test_first
+python3 -m core tests/test_first.ergo -o test_first
 ./test_first
 
 # Emit generated C (inspect what the compiler produces)
-python3 -m mcl tests/test_first.ergo --emit-c
+python3 -m core tests/test_first.ergo --emit-c
 
-# Compile with fast-math (FP reassociation, aggressive vectorization)
-python3 -m mcl tests/buc_colony.ergo -o buc_colony --fast-math
+# Compile with GPU fast-math intrinsics (opt-in, precision-relaxing)
+python3 -m core tests/buc_colony.ergo -o buc_colony --gpu-fast-math
 ./buc_colony
 ```
 
-Requirements: Python 3.10+, gcc, libm.
+Requirements: Python 3.10+, gcc, libm. New here? Start with
+`Spec/Ergo_First_Program.md` (a runnable ten-minute walkthrough).
 
 ## What It Looks Like
 
@@ -163,8 +164,8 @@ FLUSH                                               ! fflush(stdout)
 3. **No hidden indirection.** STATIC storage compiles to direct address computation.
 4. **No evaluation reordering.** Strict left-to-right, no FP reassociation (bitwise reproducible).
 5. **Numeric casts are hardware instructions.** `REAL()` → `cvtsi2sd`, `INT()` → `cvttsd2si`.
-6. **CLAMP is branchless.** `fmin(fmax(x, lo), hi)` — 2 instructions under fast-math.
-7. **IEEE semantics by default.** NaN-safe math. `--fast-math` is opt-in, never default.
+6. **CLAMP is branchless.** `fmin(fmax(x, lo), hi)` — 2 instructions.
+7. **IEEE semantics by default.** NaN-safe math. Fast-math is opt-in, never default (`--cpu-fast-math` / `--gpu-fast-math`).
 
 ### Static Analysis (Compile-Time Rejection)
 
@@ -247,26 +248,28 @@ See `Spec/Ergo_NodeGraph_Design.md` for the full specification including Nuklear
 
 ```
 Ergo/
-  mcl/                    Python compiler package
+  core/                   Python compiler package
     tokens.py               Token types and keywords
     lexer.py                Tokenizer
     parser.py               Recursive descent parser
     ast_nodes.py            AST node definitions (with source line tracking)
     symbols.py              Symbol table + allocation state + PARAMETER tracking
     checker.py              Type checker + shape propagation + constant propagation
-    codegen.py              C99 code emitter (with #line directives)
-    driver.py               Pipeline orchestration (--fast-math support)
-    nodegraph.py            Node graph data model, validation, and compilation
+    ir_codegen.py           C99 code emitter (supported backend)
+    codegen.py              Legacy AST emitter (deprecated — dual-path goldens only)
+    driver.py               Pipeline orchestration (targets, fast-math split flags)
     errors.py               Error/diagnostic classes
     __main__.py             CLI entry point
   tests/                  Ergo test programs
+    golden/                  Dual-path golden harness + error-message checks
+    stream/                  .esf framed-stream suite
     test_first.ergo          Basic arithmetic and control flow
-    sq2core.ergo             Squaragon V2 torus allocator
-    sq3core.ergo             Squaragon V3 — integer-only fast path + SQ3VAL verifier
-    buc_membrane_unit.ergo   Single-cell membrane physics
+    sq4core.ergo             Squaragon V4 torus allocator (audit-fixed)
     buc_colony.ergo          Colony simulator with ANSI display
   Spec/                   Language specification (locked)
-    MCL_Design_COMPLETE.md                Full language design + performance constitution
+    Ergo_Spec.md                        Full language reference (Parts 1–10)
+    Ergo_First_Program.md               Runnable quick-start walkthrough
+    Ergo_Stream_Format.md               .esf framed stream format
     MCL_Intrinsic_Signatures_Complete.md  Intrinsic function reference
     MCL_Bootstrap_Strategy.md             Implementation roadmap
     MCL_Quick_Reference.txt               One-page cheat sheet

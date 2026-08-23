@@ -1,5 +1,10 @@
 # MCL Language Design — COMPLETE & LOCKED
 
+> **SUPERSEDED (2026-08-23):** this is the pre-implementation lock doc.
+> The current language reference is `Spec/Ergo_Spec.md` (Parts 1–10).
+> Where they disagree (e.g. STATIC-as-argument is warned-not-forbidden,
+> and the package is `core` not `mcl`), the current spec wins.
+
 ## Status: Ready for Implementation ✅
 
 This document confirms that **all language design decisions are locked**. The compiler can now be built.

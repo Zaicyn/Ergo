@@ -7,14 +7,14 @@
  *
  * Build:
  *   # First generate the galaxy C code:
- *   python -m mcl --emit-c galaxy/galaxy_full.mcl > galaxy/galaxy_full_gen.c
+ *   python -m core --emit-c galaxy/galaxy_full.mcl > galaxy/galaxy_full_gen.c
  *
  *   # Then rename main so we can provide our own:
  *   sed -i 's/^int main(void)/int galaxy_main(void)/' galaxy/galaxy_full_gen.c
  *
  *   # Build:
  *   gcc -std=c99 -O2 -o test_galaxy_render tests/test_galaxy_render.c \
- *       mcl/runtime/vk_host.c -lvulkan -lglfw -lm -Imcl/runtime
+ *       core/runtime/vk_host.c -lvulkan -lglfw -lm -Icore/runtime
  */
 
 /* Include the generated galaxy simulation (with main renamed) */

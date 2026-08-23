@@ -1,3 +1,5 @@
+> **SUPERSEDED (2026-08-23):** kept for history. Current reference: the SPIRV backend as built (the NVVM plan was a dead end).
+
 # Ergo GPU Roadmap — Design Specification
 
 *Draft v0.1 — 2026-04-23*
