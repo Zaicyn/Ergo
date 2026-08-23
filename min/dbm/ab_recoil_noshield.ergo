@@ -1,0 +1,224 @@
+! ============================================================
+! ab_recoil_noshield.ergo  --  Stage 5c: the missing cell
+!
+! The 2x2 table:
+!                flux            no flux
+!   disk         recoil (5b)     nothing (FL=0 null)
+!   no disk      THIS FILE       trivial
+!
+! Question: does the recoil survive WITHOUT the shield disk?
+! Same links (r>6 cutoff), same r=52 geometry (rows 204/308),
+! same 7-case FL sweep (0, +-pi/4, +-pi/2, +-pi), but WALL=1
+! everywhere -- the wave passes right through the flux core.
+!
+! MIRROR VERDICT (C mirror, same engine): THE RECOIL DIES.
+!   slope dkx1/FL at pi/4:  +0.00066 (disk: -0.00302)
+!     -- magnitude at noise level, sign FLIPPED
+!   odd symmetry destroyed: +pi/4 dcx1 +0.346 vs -pi/4 -0.550
+!     (no longer mirror pairs; channel-2 takes the messy
+!      core-crossing momentum instead)
+!   null case: kx1 = 0.29533 (~K0 -- packet unperturbed),
+!              cx1 = 358.91 (no disk drag; matches the r=100
+!              no-grazing null 357.8 from the standoff sweep)
+! Conclusion if ergo matches: the recoil requires the
+! flux-threaded hole. Shield-edge circulation (paths winding
+! the disk on both sides, recombining with FL-dependent phase)
+! IS the mechanism. No hole, no loop, no recoil.
+!
+! NOTE: arrays are stack-allocated; run with:
+!   ulimit -s unlimited
+!
+! Rename: ab_recoil_noshield.ergo.txt -> ab_recoil_noshield.ergo
+! Run: python -m core min/ab/ab_recoil_noshield.ergo -o /tmp/nosh
+!      ulimit -s unlimited && /tmp/nosh
+! ============================================================
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 512, NY = 512
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 2200
+INTEGER, PARAMETER :: NSP = 48
+REAL, PARAMETER :: AA = 0.20
+REAL, PARAMETER :: SIG = 14.0
+REAL, PARAMETER :: K0 = 0.3
+INTEGER, PARAMETER :: X0 = 100
+INTEGER, PARAMETER :: XC = 256, YC = 256
+INTEGER, PARAMETER :: Y1 = 204, Y2 = 308
+REAL, PARAMETER :: PI2 = 6.283185307179586
+REAL, PARAMETER :: PIH = 3.14159265358979
+
+REAL :: R(NPTS), I(NPTS), ABSORB(NPTS), WALL(NPTS)
+REAL :: CXL(NPTS), SXL(NPTS), CYL(NPTS), SYL(NPTS)
+REAL :: FT(7), X1T(7), X2T(7), K1T(7), K2T(7)
+
+INTEGER :: J, K, KK, T, CS, IDX, C
+REAL :: FLV, SV, DX, DY, R2C, TH
+REAL :: W1, WX1, WK1, W2, WX2, WK2
+REAL :: RH, DRX, DIX, KM
+REAL :: CX1, CX2, KX1, KX2
+
+DO CS = 1, 7
+
+   FLV := 0.0
+   IF (CS = 2) THEN
+      FLV := PIH/4.0
+   ENDIF
+   IF (CS = 3) THEN
+      FLV := -PIH/4.0
+   ENDIF
+   IF (CS = 4) THEN
+      FLV := PIH/2.0
+   ENDIF
+   IF (CS = 5) THEN
+      FLV := -PIH/2.0
+   ENDIF
+   IF (CS = 6) THEN
+      FLV := PIH
+   ENDIF
+   IF (CS = 7) THEN
+      FLV := -PIH
+   ENDIF
+
+   ! --- clear grid, absorber, wall ---
+   DO KK = 1, NX*NY
+      R(KK) := 0.0
+      I(KK) := 0.0
+      ABSORB(KK) := 1.0
+      WALL(KK) := 1.0
+   ENDDO
+
+   ! --- sponge: symmetric on all four edges ---
+   DO J = 1, NSP
+      SV := 1.0 - 0.35*(1.0 - J/49.0)*(1.0 - J/49.0)
+      DO K = 1, NX
+         ABSORB(K + (J-1)*NX) := ABSORB(K + (J-1)*NX) * SV
+         ABSORB(K + (NY-J)*NX) := ABSORB(K + (NY-J)*NX) * SV
+      ENDDO
+      DO K = 1, NY
+         ABSORB(J + (K-1)*NX) := ABSORB(J + (K-1)*NX) * SV
+         ABSORB(NX+1-J + (K-1)*NX) := ABSORB(NX+1-J + (K-1)*NX) * SV
+      ENDDO
+   ENDDO
+
+   ! --- NO DISK: WALL=1 everywhere (flux unshielded) ---
+
+   ! --- Peierls links (r>6 cutoff) ---
+   DO KK = 1, NX*NY
+      CXL(KK) := 1.0
+      SXL(KK) := 0.0
+      CYL(KK) := 1.0
+      SYL(KK) := 0.0
+   ENDDO
+   IF (FLV /= 0.0) THEN
+      TH := FLV / PI2
+      DO J = 2, NY-1
+         DO K = 2, NX-1
+            DX := K - XC + 0.5
+            DY := J - YC
+            R2C := DX*DX + DY*DY
+            IF (R2C > 36.0) THEN
+               SV := -TH*DY/R2C
+               IDX := K + (J-1)*NX
+               CXL(IDX) := COS(SV)
+               SXL(IDX) := SIN(SV)
+            ENDIF
+            DX := K - XC
+            DY := J - YC + 0.5
+            R2C := DX*DX + DY*DY
+            IF (R2C > 36.0) THEN
+               SV := TH*DX/R2C
+               IDX := K + (J-1)*NX
+               CYL(IDX) := COS(SV)
+               SYL(IDX) := SIN(SV)
+            ENDIF
+         ENDDO
+      ENDDO
+   ENDIF
+
+   ! --- two Gaussian packets, rows 204 / 308 ---
+   DO J = 1, NY
+      DO K = 1, NX
+         IDX := K + (J-1)*NX
+         SV := EXP(-(((K-X0)/30.0)*((K-X0)/30.0) + ((J-Y1)/SIG)*((J-Y1)/SIG)))
+         R(IDX) := SV*COS(K0*(K-X0))
+         I(IDX) := SV*SIN(K0*(K-X0))
+         SV := EXP(-(((K-X0)/30.0)*((K-X0)/30.0) + ((J-Y2)/SIG)*((J-Y2)/SIG)))
+         R(IDX) := R(IDX) + SV*COS(K0*(K-X0))
+         I(IDX) := I(IDX) + SV*SIN(K0*(K-X0))
+      ENDDO
+   ENDDO
+
+   ! --- integration; instrument pass at final step only ---
+   DO T = 1, NSTEPS
+
+      DO K = NX+2, NEND
+         I(K) := (I(K) + AA*(CXL(K)*R(K+1) + CXL(K-1)*R(K-1) &
+            + CYL(K)*R(K+NX) + CYL(K-NX)*R(K-NX) - 4.0*R(K) &
+            - SXL(K)*I(K+1) + SXL(K-1)*I(K-1) &
+            - SYL(K)*I(K+NX) + SYL(K-NX)*I(K-NX))) &
+            * ABSORB(K) * WALL(K)
+      ENDDO
+      DO K = NX+2, NEND
+         R(K) := (R(K) - AA*(SXL(K)*R(K+1) - SXL(K-1)*R(K-1) &
+            + SYL(K)*R(K+NX) - SYL(K-NX)*R(K-NX) &
+            + CXL(K)*I(K+1) + CXL(K-1)*I(K-1) &
+            + CYL(K)*I(K+NX) + CYL(K-NX)*I(K-NX) - 4.0*I(K))) &
+            * ABSORB(K) * WALL(K)
+      ENDDO
+
+      IF (T = NSTEPS) THEN
+         W1 := 0.0
+         WX1 := 0.0
+         WK1 := 0.0
+         W2 := 0.0
+         WX2 := 0.0
+         WK2 := 0.0
+         DO J = 2, NY-1
+            DO K = 2, NX-1
+               IDX := K + (J-1)*NX
+               RH := R(IDX)*R(IDX) + I(IDX)*I(IDX)
+               DRX := 0.5*((CXL(IDX)*R(IDX+1) - SXL(IDX)*I(IDX+1)) &
+                  - (CXL(IDX-1)*R(IDX-1) + SXL(IDX-1)*I(IDX-1)))
+               DIX := 0.5*((CXL(IDX)*I(IDX+1) + SXL(IDX)*R(IDX+1)) &
+                  - (CXL(IDX-1)*I(IDX-1) - SXL(IDX-1)*R(IDX-1)))
+               KM := R(IDX)*DIX - I(IDX)*DRX
+               IF (J <= 256) THEN
+                  W1 := W1 + RH
+                  WX1 := WX1 + RH*K
+                  WK1 := WK1 + KM
+               ELSE
+                  W2 := W2 + RH
+                  WX2 := WX2 + RH*K
+                  WK2 := WK2 + KM
+               ENDIF
+            ENDDO
+         ENDDO
+         CX1 := WX1/W1
+         KX1 := WK1/W1
+         CX2 := WX2/W2
+         KX2 := WK2/W2
+      ENDIF
+
+   ENDDO
+
+   FT(CS) := FLV
+   X1T(CS) := CX1
+   X2T(CS) := CX2
+   K1T(CS) := KX1
+   K2T(CS) := KX2
+
+   WRITE(*,"('case %d FL %.4f cx1 %.2f cx2 %.2f kx1 %.5f kx2 %.5f')") CS, FLV, CX1, CX2, KX1, KX2
+
+ENDDO
+
+! ---------------- summary ----------------
+
+WRITE(*,"('-- no-shield displacement table (vs null) --')")
+DO C = 2, 7
+   WRITE(*,"('FL %.4f dcx1 %.3f dcx2 %.3f dkx1 %.5f dkx2 %.5f')") FT(C), X1T(C)-X1T(1), X2T(C)-X2T(1), K1T(C)-K1T(1), K2T(C)-K2T(1)
+ENDDO
+WRITE(*,"('slope dkx1/FL pi/4 %.5f pi/2 %.5f pi %.5f')") (K1T(2)-K1T(1))/(PIH/4.0), (K1T(4)-K1T(1))/(PIH/2.0), (K1T(6)-K1T(1))/PIH
+WRITE(*,"('-- mirror: slope(pi/4) noshield +0.00066 vs disk -0.00302 --')")
+WRITE(*,"('-- mirror: null kx1 0.29533 cx1 358.91 --')")
+WRITE(*,"('-- verdict if matched: recoil needs the flux-threaded hole --')")

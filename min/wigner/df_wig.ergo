@@ -1,0 +1,770 @@
+! ════════════════════════════════════════════════════════════════════
+! DF_RADIAL — closed-shell Dirac-Fock SCF (Stage 2 of the Dirac-Fock
+! campaign), for He (1s2) and Ne (1s2 2s2 2p1/2^2 2p3/2^4).
+!
+! REWRITE (the previous draft propagated the RHS of the stationary
+! radial ODE pointwise in fictitious time — that flow has no derivative
+! coupling and its fixed point is NOT the Dirac equation; it could
+! never validate). This version is a shooting SCF built on the
+! dirac_radial.ergo-validated pieces:
+!   - analytic small-r series  F = r^s, G = q0 r^s,
+!     s = sqrt(kappa^2 - (Z/c)^2), q0 = c(s+kappa)/Z
+!   - inward decaying start  F=1, G = qinf,
+!     qinf = -lam c/(2c^2+eps), lam = sqrt(-eps(2c^2+eps))/c
+!   - RK4 in t = log r on a fixed grid, Wronskian match at RMID,
+!     eigenvalue by scan + bisection, state by radial node count.
+!
+! SCF structure: all orbitals live on the SAME log grid; densities
+! rho_b = F_b^2 + G_b^2; direct VH = sum_b occ_b Y^0_bb; exchange at
+! the documented NR angular level (the c->inf limit is then EXACT,
+! which is what the collapse test certifies):
+!   s<-s: (k=0, 1.0)     s<-p: (k=1, 1.0)
+!   p<-s: (k=1, 1/3)     p<-p: (k=0, 1.0) + (k=2, 0.4)
+! coefficients certified by the 1-sphere Gaunt quadrature (see
+! hf_radial.ergo). Occupation scaling for split subshells:
+! c_eff = c * occ_b / occ_std(l_b), occ_std = 2 (s) or 6 (p); in the
+! collapse limit 2p1/2 and 2p3/2 radial functions coincide and the
+! subshell coefficients sum back to the full-shell values exactly.
+! The b=a exchange is multiplicative in (F_a,G_a) and folds into the
+! local potential; b/=a terms are frozen sources inside the shooting
+! (inhomogeneous radial equations; the normalizable-solution condition
+! picks eps). Orbitals mixed 50/50 per cycle, deflated same-kappa,
+! normalized in int (F^2+G^2) dr. Fixed cycle/scan/bisection counts:
+! deterministic, run twice byte-identical.
+!
+! Each atom is solved twice in one run: IC=1 with c inflated x100
+! (collapse test: must reproduce the Stage-1 HF numbers), IC=2 with
+! physical c (DF deepening; Ne oracle ~ -128.69 Ha, He ~ -2.86181).
+! Compile: python -m core min/diracfock/df_radial.ergo -o <bin>
+!
+! DF_WIG fork (Stage W3, 2026-08-21): adds dual-coordinate radial
+! Wigner maps per (atom, c-scale) after the SCF report. SCF untouched
+! except ONE declaration fix: F(NR:NT,4) -> F(NT,4) (NR was never
+! defined; no index below 1 is ever used). Oracles: see
+! wigner_handshake_spec.md Stage W3.
+! ════════════════════════════════════════════════════════════════════
+
+IMPLICIT NONE
+
+REAL, PARAMETER :: C0 = 137.035999084
+INTEGER, PARAMETER :: NT = 20000
+INTEGER, PARAMETER :: NCYC = 60
+INTEGER, PARAMETER :: NSC0 = 400
+INTEGER, PARAMETER :: NSC1 = 31
+INTEGER, PARAMETER :: NBS = 50
+! Stage W3 map grids (mirror constants — wigner_mirror_w3.py must match)
+INTEGER, PARAMETER :: NRW = 2048
+INTEGER, PARAMETER :: NTM = 1024
+INTEGER, PARAMETER :: NPW = 4096
+REAL, PARAMETER :: RMINW = 1.0e-6
+REAL, PARAMETER :: RMAXW = 12.0
+REAL, PARAMETER :: PI = 3.14159265358979323846
+
+! two atoms: He (1 orbital), Ne (4 subshell orbitals)
+STATIC REAL :: ZT(2)
+STATIC INTEGER :: NBX(2)
+DATA ZT / 2.0, 10.0 /
+DATA NBX / 1, 4 /
+! per-orbital tables (max 4): n, kappa, occupation
+STATIC INTEGER :: NQ(4), KT(4), OC(4)
+DATA NQ / 1, 2, 2, 2 /
+DATA KT / -1, -1, 1, -2 /
+DATA OC / 2, 2, 2, 4 /
+! exchange coefficient table per (la, lb): (k, c), two slots
+! index: 1=(s,s) 2=(s,p) 3=(p,s) 4=(p,p)
+STATIC REAL :: CXK(4, 2), CXC(4, 2)
+DATA CXK / 0.0, 1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 2.0 /
+DATA CXC / 1.0, 1.0, 0.3333333333333333, 1.0, 0.0, 0.0, 0.0, 0.4 /
+! c scale: collapse (x100) then physical
+STATIC REAL :: CSC(2)
+DATA CSC / 100.0, 1.0 /
+
+STATIC REAL :: RG(NT), VH(NT), VL(NT), YK(NT), FK(NT), PY(NT)
+STATIC REAL :: F(NT, 4), G(NT, 4)
+STATIC REAL :: FO(NT), GO(NT), FI(NT), GI(NT)
+STATIC REAL :: SF(NT), SG(NT), SFM(NT), SGM(NT), VLM(NT)
+STATIC REAL :: EPSA(4), DEN(NT)
+
+! shared with SHOOT: grid step, per-orbital kappa/match index
+STATIC REAL :: H, EH1, KAP
+STATIC INTEGER :: NRT
+STATIC REAL :: CC, ZZ
+
+REAL :: DR, R, X, Q0, SS, VV, NRM, OV, DMP, CX, OST
+REAL :: E1, E2, EP, W0, W1, ELO, EHI, EM, WM, WLO, EROOT, EPREV
+REAL :: ESUM, EOLD, EDIFF, LAM, QINF, BSC
+REAL :: R0X, RMX
+INTEGER :: I, J, K, IA, IB, IC, IQ, ICYC, NB, NODES, LA, LB, ITAB
+INTEGER :: NFOUND, TT, KX
+STATIC REAL :: FRW(NRW, 4), GRW(NRW, 4), FTW(NTM, 4), GTW(NTM, 4)
+STATIC REAL :: SKW(2049)
+STATIC REAL :: CTBR(NPW, 1025)
+REAL :: DRW, DTW, DPW, RRW, TTW, W2F, WNS, WRO, WNRM2, W0A, W0B, ACC
+INTEGER :: IW, JW, KW, IA2, IXW, IMN
+
+! forward declaration of grid: built per atom
+ZZ := 0.0
+
+DO IC = 1, 2
+  CC := C0 * CSC(IC)
+  DO IQ = 1, 2
+    ZZ := ZT(IQ)
+    NB := NBX(IQ)
+    ! log grid: R0 = 1e-4/Z to RMAX = 60 n_max^2 / Z
+    R0X := 1.0e-4 / ZZ
+    RMX := 60.0 * REAL(NQ(NB) * NQ(NB)) / ZZ
+    H := (LOG(RMX) - LOG(R0X)) / REAL(NT - 1)
+    EH1 := EXP(H) - 1.0
+    RG(1) := R0X
+    DO I = 2, NT
+      RG(I) := RG(I - 1) * (1.0 + EH1)
+    ENDDO
+
+    ! initial packets: series start x exponential tail
+    DO IA = 1, NB
+      KAP := REAL(KT(IA))
+      SS := SQRT(KAP*KAP - (ZZ/CC)*(ZZ/CC))
+      Q0 := CC * (SS + KAP) / ZZ
+      DO I = 1, NT
+        R := RG(I)
+        X := (R ** SS) * EXP(-ZZ * R / REAL(NQ(IA)))
+        F(I, IA) := X
+        G(I, IA) := Q0 * X
+      ENDDO
+      EPSA(IA) := -ZZ * ZZ / (2.0 * REAL(NQ(IA) * NQ(IA)))
+    ENDDO
+
+    EOLD := 0.0
+    DO ICYC = 1, NCYC
+      DMP := 0.5
+      IF (ICYC == 1) THEN
+        DMP := 1.0
+      ENDIF
+      ! ── direct potential VH = sum_b occ_b Y^0_bb (log-grid trapz) ──
+      DO I = 1, NT
+        VH(I) := 0.0
+      ENDDO
+      DO IB = 1, NB
+        DO I = 1, NT
+          FK(I) := F(I, IB) * F(I, IB) + G(I, IB) * G(I, IB)
+        ENDDO
+        CALL YZERO(FK, YK, PY)
+        DO I = 2, NT
+          VH(I) := VH(I) + REAL(OC(IB)) * (YK(I) / RG(I) + PY(I))
+        ENDDO
+      ENDDO
+
+      ! ── shoot each orbital under the frozen operator ──
+      DO IA = 1, NB
+        KAP := REAL(KT(IA))
+        LA := KT(IA)
+        IF (KT(IA) < 0) THEN
+          LA := -KT(IA) - 1
+        ENDIF
+        ! node target: radial nodes of F = n - l - 1
+        NODES := NQ(IA) - LA - 1
+        ! local potential: -Z/r + VH - multiplicative self-exchange
+        DO I = 1, NT
+          VL(I) := -ZZ / RG(I) + VH(I)
+        ENDDO
+        ! self exchange (b = a): multiplicative, occupation-scaled
+        OST := 2.0
+        IF (LA > 0) THEN
+          OST := 6.0
+        ENDIF
+        DO IB = 1, NB
+          IF (IB == IA) THEN
+            ITAB := 1
+            IF (LA > 0) THEN
+              ITAB := 4
+            ENDIF
+            DO J = 1, 2
+              CX := CXC(ITAB, J) * REAL(OC(IA)) / OST
+              KX := INT(CXK(ITAB, J))
+              IF (CX /= 0.0) THEN
+                DO I = 1, NT
+                  DEN(I) := F(I, IA) * F(I, IA) + G(I, IA) * G(I, IA)
+                ENDDO
+                CALL YKPW(DEN, KX, YK, PY)
+                DO I = 2, NT
+                  VL(I) := VL(I) - CX * (YK(I) + PY(I))
+                ENDDO
+              ENDIF
+            ENDDO
+          ENDIF
+        ENDDO
+        ! exchange sources from b /= a: SF_a = sum c Y^k_ab F_b etc.
+        DO I = 1, NT
+          SF(I) := 0.0
+          SG(I) := 0.0
+        ENDDO
+        DO IB = 1, NB
+          IF (IB /= IA) THEN
+            LB := KT(IB)
+            IF (KT(IB) < 0) THEN
+              LB := -KT(IB) - 1
+            ENDIF
+            OST := 2.0
+            IF (LB > 0) THEN
+              OST := 6.0
+            ENDIF
+            ITAB := 1
+            IF (LA == 0) THEN
+              IF (LB > 0) THEN
+                ITAB := 2
+              ENDIF
+            ELSE
+              IF (LB == 0) THEN
+                ITAB := 3
+              ELSE
+                ITAB := 4
+              ENDIF
+            ENDIF
+            DO J = 1, 2
+              CX := CXC(ITAB, J) * REAL(OC(IB)) / OST
+              KX := INT(CXK(ITAB, J))
+              IF (CX /= 0.0) THEN
+                DO I = 1, NT
+                  DEN(I) := F(I, IA) * F(I, IB) + G(I, IA) * G(I, IB)
+                ENDDO
+                CALL YKPW(DEN, KX, YK, PY)
+                DO I = 2, NT
+                  SF(I) := SF(I) + CX * (YK(I) + PY(I)) * F(I, IB)
+                  SG(I) := SG(I) + CX * (YK(I) + PY(I)) * G(I, IB)
+                ENDDO
+              ENDIF
+            ENDDO
+          ENDIF
+        ENDDO
+        ! midpoint arrays for RK4
+        DO I = 1, NT - 1
+          VLM(I) := 0.5 * (VL(I) + VL(I + 1))
+          SFM(I) := 0.5 * (SF(I) + SF(I + 1))
+          SGM(I) := 0.5 * (SG(I) + SG(I + 1))
+        ENDDO
+        ! match radius for this orbital
+        NRT := INT((LOG(2.0 * REAL(NQ(IA)*NQ(IA)) / ZZ) &
+          - LOG(R0X)) / H) + 1
+
+        ! ── eigenvalue: scan + bisect, node-count selection ──
+        EPREV := EPSA(IA)
+        IF (ICYC == 1) THEN
+          E1 := -1.5 * ZZ * ZZ
+          E2 := -1.0e-6 * ZZ * ZZ
+          TT := NSC0
+        ELSE
+          E1 := EPREV * 1.08
+          E2 := EPREV / 1.08
+          TT := NSC1
+        ENDIF
+        EROOT := EPREV
+        NFOUND := 0
+        EP := E1
+        W0 := SHOOT(EP)
+        DO I = 2, TT
+          EP := E1 * ((E2 / E1) ** (REAL(I - 1) / REAL(TT - 1)))
+          W1 := SHOOT(EP)
+          IF (W0 * W1 < 0.0) THEN
+            ELO := E1 * ((E2 / E1) ** (REAL(I - 2) / REAL(TT - 1)))
+            EHI := EP
+            WLO := W0
+            DO K = 1, NBS
+              EM := -SQRT(-ELO * -EHI)
+              IF (ELO > 0.0) THEN
+                EM := SQRT(ELO * EHI)
+              ENDIF
+              WM := SHOOT(EM)
+              IF (WLO * WM < 0.0) THEN
+                EHI := EM
+              ELSE
+                ELO := EM
+                WLO := WM
+              ENDIF
+            ENDDO
+            ! node count of the matched solution at EM
+            CALL STORE(EM)
+            IF (NNODE() == NODES) THEN
+              IF (ICYC == 1) THEN
+                IF (NFOUND == 0) THEN
+                  EROOT := EM
+                  NFOUND := 1
+                ENDIF
+              ELSE
+                IF (NFOUND == 0) THEN
+                  EROOT := EM
+                  NFOUND := 1
+                ENDIF
+                IF (ABS(EM - EPREV) < ABS(EROOT - EPREV)) THEN
+                  EROOT := EM
+                ENDIF
+                NFOUND := NFOUND + 1
+              ENDIF
+            ENDIF
+          ENDIF
+          W0 := W1
+        ENDDO
+        EPSA(IA) := EROOT
+        ! store the matched eigenfunction into FO/GO (spliced)
+        CALL STORE(EROOT)
+        ! splice with scale match at NRT, normalize
+        BSC := FO(NRT) / FI(NRT)
+        NRM := 0.0
+        DO I = 1, NRT
+          X := FO(I) * FO(I) + GO(I) * GO(I)
+          NRM := NRM + X * RG(I)
+        ENDDO
+        DO I = NRT + 1, NT
+          X := BSC * BSC * (FI(I) * FI(I) + GI(I) * GI(I))
+          NRM := NRM + X * RG(I)
+        ENDDO
+        NRM := SQRT(NRM * H)
+        DO I = 1, NRT
+          FO(I) := FO(I) / NRM
+          GO(I) := GO(I) / NRM
+        ENDDO
+        DO I = NRT + 1, NT
+          FO(I) := BSC * FI(I) / NRM
+          GO(I) := BSC * GI(I) / NRM
+        ENDDO
+        ! mix with the previous iterate
+        DO I = 1, NT
+          F(I, IA) := (1.0 - DMP) * F(I, IA) + DMP * FO(I)
+          G(I, IA) := (1.0 - DMP) * G(I, IA) + DMP * GO(I)
+        ENDDO
+        ! deflate against lower same-kappa orbitals, renormalize
+        DO IB = 1, IA - 1
+          IF (KT(IB) == KT(IA)) THEN
+            OV := 0.0
+            DO I = 2, NT - 1
+              OV := OV + (F(I, IA) * F(I, IB) &
+                + G(I, IA) * G(I, IB)) * RG(I)
+            ENDDO
+            OV := OV * H
+            DO I = 1, NT
+              F(I, IA) := F(I, IA) - OV * F(I, IB)
+              G(I, IA) := G(I, IA) - OV * G(I, IB)
+            ENDDO
+          ENDIF
+        ENDDO
+        NRM := 0.0
+        DO I = 2, NT - 1
+          NRM := NRM + (F(I, IA) * F(I, IA) + G(I, IA) * G(I, IA)) &
+            * RG(I)
+        ENDDO
+        NRM := SQRT(NRM * H)
+        DO I = 1, NT
+          F(I, IA) := F(I, IA) / NRM
+          G(I, IA) := G(I, IA) / NRM
+        ENDDO
+      ENDDO
+
+      ESUM := 0.0
+      DO IA = 1, NB
+        ESUM := ESUM + REAL(OC(IA)) * EPSA(IA)
+      ENDDO
+      EDIFF := ESUM - EOLD
+      EOLD := ESUM
+      WRITE(*, "('DFSCF c=x%.1f Z=%.1f cyc=%d eps1s=%.10e sumeps=%.10e dE=%.3e')") &
+        CSC(IC), ZZ, ICYC, EPSA(1), ESUM, EDIFF
+    ENDDO
+
+    ! ── final report: orbital eps + R^k table over (F,G) densities ──
+    WRITE(*, "('ATOM Z=%.1f CSCALE=%.1f')") ZZ, CSC(IC)
+    DO IA = 1, NB
+      WRITE(*, "('DORB %d kappa=%d occ=%d eps=%.10e')") IA, KT(IA), &
+        OC(IA), EPSA(IA)
+    ENDDO
+    DO IA = 1, NB
+      DO IB = IA, NB
+        DO I = 1, NT
+          DEN(I) := F(I, IA) * F(I, IB) + G(I, IA) * G(I, IB)
+        ENDDO
+        DO KX = 0, 2
+          CALL YKPW(DEN, KX, YK, PY)
+          DO ICYC = 1, NB
+            DO J = ICYC, NB
+              X := 0.0
+              DO I = 2, NT - 1
+                X := X + (F(I, ICYC) * F(I, J) + G(I, ICYC) * G(I, J)) &
+                  * (YK(I) + PY(I)) * RG(I)
+              ENDDO
+              X := X * H
+              WRITE(*, "('INT %d %d %d %d %d %.12e')") IA, IB, ICYC, &
+                J, KX, X
+            ENDDO
+          ENDDO
+        ENDDO
+      ENDDO
+    ENDDO
+
+  ! ═══ Stage W3: dual-coordinate radial Wigner maps ═══════════════
+  DRW := (RMAXW - RMINW) / REAL(NRW)
+  DTW := (LOG(RMAXW) - LOG(RMINW)) / REAL(NTM - 1)
+  DO JW = 1, NPW
+    DO KW = 1, 1025
+      CTBR(JW, KW) := COS(2.0 * PI * REAL(JW - 1) * REAL(KW - 1) / REAL(NPW))
+    ENDDO
+  ENDDO
+  ! ── resample F,G: uniform-r (cell-centered) ──
+  DO IW = 1, NRW
+    RRW := RMINW + (REAL(IW) - 0.5) * DRW
+    IXW := INT((LOG(RRW) - LOG(R0X)) / H) + 1
+    IF (IXW < 1) THEN
+      IXW := 1
+    ENDIF
+    IF (IXW > NT - 1) THEN
+      IXW := NT - 1
+    ENDIF
+    W2F := (RRW - RG(IXW)) / (RG(IXW + 1) - RG(IXW))
+    IF (W2F < 0.0) THEN
+      W2F := 0.0
+    ENDIF
+    IF (W2F > 1.0) THEN
+      W2F := 1.0
+    ENDIF
+    DO IA2 = 1, NB
+      FRW(IW, IA2) := F(IXW, IA2) + W2F * (F(IXW + 1, IA2) - F(IXW, IA2))
+      GRW(IW, IA2) := G(IXW, IA2) + W2F * (G(IXW + 1, IA2) - G(IXW, IA2))
+    ENDDO
+  ENDDO
+  ! ── resample F,G: uniform-t (endpoints included) ──
+  DO IW = 1, NTM
+    TTW := LOG(RMINW) + REAL(IW - 1) * DTW
+    RRW := EXP(TTW)
+    IXW := INT((LOG(RRW) - LOG(R0X)) / H) + 1
+    IF (IXW < 1) THEN
+      IXW := 1
+    ENDIF
+    IF (IXW > NT - 1) THEN
+      IXW := NT - 1
+    ENDIF
+    W2F := (RRW - RG(IXW)) / (RG(IXW + 1) - RG(IXW))
+    IF (W2F < 0.0) THEN
+      W2F := 0.0
+    ENDIF
+    IF (W2F > 1.0) THEN
+      W2F := 1.0
+    ENDIF
+    DO IA2 = 1, NB
+      FTW(IW, IA2) := F(IXW, IA2) + W2F * (F(IXW + 1, IA2) - F(IXW, IA2))
+      GTW(IW, IA2) := G(IXW, IA2) + W2F * (G(IXW + 1, IA2) - G(IXW, IA2))
+    ENDDO
+  ENDDO
+  ! ── r-map: half-line Wigner, direct DFT via cosine table ──
+  DPW := PI / (REAL(NPW) * DRW)
+  WNS := 0.0
+  W0A := 0.0
+  W0B := 0.0
+  DO IW = 1, NRW
+    IMN := IW - 1
+    IF (NRW - IW < IMN) THEN
+      IMN := NRW - IW
+    ENDIF
+    ACC := 0.0
+    DO IA2 = 1, NB
+      ACC := ACC + REAL(OC(IA2)) * (FRW(IW, IA2) * FRW(IW, IA2) &
+        + GRW(IW, IA2) * GRW(IW, IA2))
+    ENDDO
+    SKW(1) := ACC
+    DO KW = 1, IMN
+      ACC := 0.0
+      DO IA2 = 1, NB
+        ACC := ACC + REAL(OC(IA2)) * (FRW(IW - KW, IA2) * FRW(IW + KW, IA2) &
+          + GRW(IW - KW, IA2) * GRW(IW + KW, IA2))
+      ENDDO
+      SKW(KW + 1) := 2.0 * ACC
+    ENDDO
+    DO JW = 1, NPW
+      ACC := SKW(1)
+      DO KW = 1, IMN
+        ACC := ACC + CTBR(JW, KW + 1) * SKW(KW + 1)
+      ENDDO
+      WRO := ACC * DRW / PI
+      WNS := WNS + WRO
+      IF (IW == 1) THEN
+        IF (JW == 1) THEN
+          W0A := WRO
+        ENDIF
+        IF (JW == NPW / 2 + 1) THEN
+          W0B := WRO
+        ENDIF
+      ENDIF
+      IF (MOD(IW - 1, 8) == 0) THEN
+        IF (MOD(JW - 1, 16) == 0) THEN
+          WRITE(*, "('W3MAP %.1f %.1f %d %.6e %.6e %.17e')") ZZ, CSC(IC), 0, &
+            RMINW + (REAL(IW) - 0.5) * DRW, &
+            PI * REAL(JW - 1) / (REAL(NPW) * DRW), WRO
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+  WNRM2 := DRW * DPW * WNS
+  WRITE(*, "('W3NORM %.1f %.1f %d %.17e')") ZZ, CSC(IC), 0, WNRM2
+  WRITE(*, "('W3W0R0 %.1f %.1f %.17e')") ZZ, CSC(IC), W0A
+  WRITE(*, "('W3W0RH %.1f %.1f %.17e')") ZZ, CSC(IC), W0B
+  ! ── t-map: same construction on the decimated log grid ──
+  DPW := PI / (REAL(NPW) * DTW)
+  WNS := 0.0
+  W0A := 0.0
+  W0B := 0.0
+  DO IW = 1, NTM
+    IMN := IW - 1
+    IF (NTM - IW < IMN) THEN
+      IMN := NTM - IW
+    ENDIF
+    ACC := 0.0
+    DO IA2 = 1, NB
+      ACC := ACC + REAL(OC(IA2)) * (FTW(IW, IA2) * FTW(IW, IA2) &
+        + GTW(IW, IA2) * GTW(IW, IA2))
+    ENDDO
+    SKW(1) := ACC
+    DO KW = 1, IMN
+      ACC := 0.0
+      DO IA2 = 1, NB
+        ACC := ACC + REAL(OC(IA2)) * (FTW(IW - KW, IA2) * FTW(IW + KW, IA2) &
+          + GTW(IW - KW, IA2) * GTW(IW + KW, IA2))
+      ENDDO
+      SKW(KW + 1) := 2.0 * ACC
+    ENDDO
+    DO JW = 1, NPW
+      ACC := SKW(1)
+      DO KW = 1, IMN
+        ACC := ACC + CTBR(JW, KW + 1) * SKW(KW + 1)
+      ENDDO
+      WRO := ACC * DTW / PI
+      WNS := WNS + WRO
+      IF (IW == NTM / 2 + 1) THEN
+        IF (JW == 1) THEN
+          W0A := WRO
+        ENDIF
+        IF (JW == NPW / 2 + 1) THEN
+          W0B := WRO
+        ENDIF
+      ENDIF
+      IF (MOD(IW - 1, 8) == 0) THEN
+        IF (MOD(JW - 1, 16) == 0) THEN
+          WRITE(*, "('W3MAP %.1f %.1f %d %.6e %.6e %.17e')") ZZ, CSC(IC), 1, &
+            LOG(RMINW) + REAL(IW - 1) * DTW, &
+            PI * REAL(JW - 1) / (REAL(NPW) * DTW), WRO
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+  WNRM2 := DTW * DPW * WNS
+  WRITE(*, "('W3NORM %.1f %.1f %d %.17e')") ZZ, CSC(IC), 1, WNRM2
+  WRITE(*, "('W3W0T0 %.1f %.1f %.17e')") ZZ, CSC(IC), W0A
+  WRITE(*, "('W3W0TH %.1f %.1f %.17e')") ZZ, CSC(IC), W0B
+  ENDDO
+ENDDO
+WRITE(*, "('DONE')")
+STOP
+
+! ════════════════════════════════════════════════════════════════════
+! YZERO(DEN, YK, PY): k=0 cumulative Poisson pair on the log grid.
+!   YK(i) = int_0^{r_i} DEN dr,  PY(i) = int_{r_i}^inf DEN/r dr
+! (trapezoid in t = log r: int f dr = int f r dt, H the t-step).
+! ════════════════════════════════════════════════════════════════════
+SUBROUTINE YZERO(DEN, YK, PY)
+   IMPLICIT NONE
+   REAL :: DEN(NT), YK(NT), PY(NT)
+   REAL :: AC, BC
+   INTEGER :: I, J
+   AC := 0.0
+   YK(1) := 0.0
+   DO I = 2, NT
+      AC := AC + 0.5 * (DEN(I-1) * RG(I-1) + DEN(I) * RG(I)) * H
+      YK(I) := AC
+   ENDDO
+   BC := 0.0
+   PY(NT) := 0.0
+   DO J = 1, NT - 1
+      I := NT - J
+      BC := BC + 0.5 * (DEN(I) + DEN(I+1)) * H
+      PY(I) := BC
+   ENDDO
+END
+
+! ════════════════════════════════════════════════════════════════════
+! YKPW(DEN, K, YK, PY): general-k Poisson pair on the log grid.
+!   YK(i) = r^(-k-1) int_0^r s^k DEN ds
+!   PY(i) = r^k int_r^inf DEN / s^(k+1) ds
+! returned as the SUMMED kernel pieces: YK + PY multiplies the
+! transition density directly (r^k factors folded in).
+! ════════════════════════════════════════════════════════════════════
+SUBROUTINE YKPW(DEN, K, YK, PY)
+   IMPLICIT NONE
+   REAL :: DEN(NT), YK(NT), PY(NT)
+   INTEGER :: K
+   REAL :: AC, BC, FA, FB, R0L, R1L
+   INTEGER :: I, J
+   AC := 0.0
+   YK(1) := 0.0
+   DO I = 2, NT
+      R0L := RG(I - 1)
+      R1L := RG(I)
+      FA := DEN(I - 1) * R0L
+      FB := DEN(I) * R1L
+      IF (K == 1) THEN
+        FA := FA * R0L
+        FB := FB * R1L
+      ENDIF
+      IF (K == 2) THEN
+        FA := FA * R0L * R0L
+        FB := FB * R1L * R1L
+      ENDIF
+      AC := AC + 0.5 * (FA + FB) * H
+      IF (K == 0) THEN
+        YK(I) := AC / R1L
+      ENDIF
+      IF (K == 1) THEN
+        YK(I) := AC / (R1L * R1L)
+      ENDIF
+      IF (K == 2) THEN
+        YK(I) := AC / (R1L * R1L * R1L)
+      ENDIF
+   ENDDO
+   BC := 0.0
+   PY(NT) := 0.0
+   DO J = 1, NT - 1
+      I := NT - J
+      R0L := RG(I)
+      R1L := RG(I + 1)
+      FA := DEN(I) / R0L
+      FB := DEN(I + 1) / R1L
+      IF (K == 1) THEN
+        FA := FA / R0L
+        FB := FB / R1L
+      ENDIF
+      IF (K == 2) THEN
+        FA := FA / (R0L * R0L)
+        FB := FB / (R1L * R1L)
+      ENDIF
+      BC := BC + 0.5 * (FA * R0L + FB * R1L) * H
+      IF (K == 0) THEN
+        PY(I) := BC
+      ENDIF
+      IF (K == 1) THEN
+        PY(I) := BC * R0L
+      ENDIF
+      IF (K == 2) THEN
+        PY(I) := BC * R0L * R0L
+      ENDIF
+   ENDDO
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SHOOT(EP): Wronskian of outward (series) and inward (decaying)
+! integrations at the match index NRT, WITH the frozen exchange
+! sources SF/SG (inhomogeneous terms). Equations in t = log r:
+!   F' = -kappa F + BB G - r SG/c,  G' = -AA F + kappa G - r SF/c
+!   AA = (eps - V) r / c,  BB = 2 c r + AA.
+! Legs are retained in FO/GO/FI/GI for STORE/NNODE.
+! ════════════════════════════════════════════════════════════════════
+REAL FUNCTION SHOOT(EP)
+   IMPLICIT NONE
+   REAL :: EP
+   REAL :: FF, GG, R, AA, BB, XS, XT
+   REAL :: K1F, K1G, K2F, K2G, K3F, K3G, K4F, K4G
+   REAL :: LAM, QINF, SS, Q0, WN
+   INTEGER :: I
+   SS := SQRT(KAP*KAP - (ZZ/CC)*(ZZ/CC))
+   Q0 := CC * (SS + KAP) / ZZ
+   FF := RG(1) ** SS
+   GG := Q0 * FF
+   R := RG(1)
+   DO I = 1, NRT - 1
+      AA := (EP - VL(I)) * R / CC
+      BB := 2.0 * CC * R + AA
+      XS := R * SG(I) / CC
+      XT := R * SF(I) / CC
+      K1F := -KAP * FF + BB * GG - XS
+      K1G := -AA * FF + KAP * GG - XT
+      AA := (EP - VLM(I)) * R * EXP(0.5 * H) / CC
+      BB := 2.0 * CC * R * EXP(0.5 * H) + AA
+      XS := R * EXP(0.5 * H) * SGM(I) / CC
+      XT := R * EXP(0.5 * H) * SFM(I) / CC
+      K2F := -KAP * (FF + 0.5*H*K1F) + BB * (GG + 0.5*H*K1G) - XS
+      K2G := -AA * (FF + 0.5*H*K1F) + KAP * (GG + 0.5*H*K1G) - XT
+      K3F := -KAP * (FF + 0.5*H*K2F) + BB * (GG + 0.5*H*K2G) - XS
+      K3G := -AA * (FF + 0.5*H*K2F) + KAP * (GG + 0.5*H*K2G) - XT
+      R := R * EXP(H)
+      AA := (EP - VL(I + 1)) * R / CC
+      BB := 2.0 * CC * R + AA
+      XS := R * SG(I + 1) / CC
+      XT := R * SF(I + 1) / CC
+      K4F := -KAP * (FF + H*K3F) + BB * (GG + H*K3G) - XS
+      K4G := -AA * (FF + H*K3F) + KAP * (GG + H*K3G) - XT
+      FF := FF + H * (K1F + 2.0*K2F + 2.0*K3F + K4F) / 6.0
+      GG := GG + H * (K1G + 2.0*K2G + 2.0*K3G + K4G) / 6.0
+      FO(I) := FF
+      GO(I) := GG
+   ENDDO
+   FO(NRT) := FF
+   GO(NRT) := GG
+   LAM := SQRT(-EP * (2.0*CC*CC + EP)) / CC
+   QINF := -LAM * CC / (2.0*CC*CC + EP)
+   FF := 1.0
+   GG := QINF
+   FI(NT) := FF
+   GI(NT) := GG
+   R := RG(NT)
+   DO I = NT - 1, NRT, -1
+      AA := (EP - VL(I + 1)) * R / CC
+      BB := 2.0 * CC * R + AA
+      XS := R * SG(I + 1) / CC
+      XT := R * SF(I + 1) / CC
+      K1F := -KAP * FF + BB * GG - XS
+      K1G := -AA * FF + KAP * GG - XT
+      AA := (EP - VLM(I)) * R * EXP(-0.5 * H) / CC
+      BB := 2.0 * CC * R * EXP(-0.5 * H) + AA
+      XS := R * EXP(-0.5 * H) * SGM(I) / CC
+      XT := R * EXP(-0.5 * H) * SFM(I) / CC
+      K2F := -KAP * (FF - 0.5*H*K1F) + BB * (GG - 0.5*H*K1G) - XS
+      K2G := -AA * (FF - 0.5*H*K1F) + KAP * (GG - 0.5*H*K1G) - XT
+      K3F := -KAP * (FF - 0.5*H*K2F) + BB * (GG - 0.5*H*K2G) - XS
+      K3G := -AA * (FF - 0.5*H*K2F) + KAP * (GG - 0.5*H*K2G) - XT
+      R := R * EXP(-H)
+      AA := (EP - VL(I)) * R / CC
+      BB := 2.0 * CC * R + AA
+      XS := R * SG(I) / CC
+      XT := R * SF(I) / CC
+      K4F := -KAP * (FF - H*K3F) + BB * (GG - H*K3G) - XS
+      K4G := -AA * (FF - H*K3F) + KAP * (GG - H*K3G) - XT
+      FF := FF - H * (K1F + 2.0*K2F + 2.0*K3F + K4F) / 6.0
+      GG := GG - H * (K1G + 2.0*K2G + 2.0*K3G + K4G) / 6.0
+      FI(I) := FF
+      GI(I) := GG
+   ENDDO
+   WN := (FO(NRT) * GI(NRT) - FI(NRT) * GO(NRT)) / &
+     (ABS(FO(NRT) * FI(NRT)) + ABS(GO(NRT) * GI(NRT)) + 1.0e-300)
+   SHOOT := WN
+END
+
+! ════════════════════════════════════════════════════════════════════
+! STORE(EP): re-run SHOOT at EP (legs already in FO/GO/FI/GI).
+! ════════════════════════════════════════════════════════════════════
+SUBROUTINE STORE(EP)
+   IMPLICIT NONE
+   REAL :: EP, W
+   W := SHOOT(EP)
+END
+
+! ════════════════════════════════════════════════════════════════════
+! NNODE(): radial node count of F over the stored matched legs.
+! ════════════════════════════════════════════════════════════════════
+INTEGER FUNCTION NNODE()
+   IMPLICIT NONE
+   INTEGER :: I, NN
+   NN := 0
+   DO I = 2, NRT
+      IF (FO(I - 1) * FO(I) < 0.0) THEN
+        NN := NN + 1
+      ENDIF
+   ENDDO
+   DO I = NRT + 1, NT
+      IF (FI(I - 1) * FI(I) < 0.0) THEN
+        NN := NN + 1
+      ENDIF
+   ENDDO
+   NNODE := NN
+END

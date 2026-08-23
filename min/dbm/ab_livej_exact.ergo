@@ -1,0 +1,270 @@
+! ============================================================
+! ab_livej_exact.ergo  --  Stage 7b: recoiling coil, clean flux
+!
+! ab_livej (Stage 6) with EXACT Peierls links (atan2 angle
+! differences, identically zero plaquette flux outside core) in
+! BOTH the initial build and the per-step moving rebuild, and
+! the sweep extended to +-2pi. MCFAC=5, geometry r=52,
+! NSTEPS=2200, sponge ON. ATAN2 needs REAL args: nodes are
+! written as midpoint +- 0.5 (DX/DY are REAL midpoints).
+!
+! MIRROR ORACLES (C mirror, exact links, MCFAC=5) -- finals:
+!   FL        V          Q       dP = MC*dV
+!   0         0.0102164  9.081   --
+!   +pi/2     0.0067193  5.958   23.1
+!   -pi/2     0.0067936  6.030   22.6
+!   +pi       0.0022339  1.934   52.7
+!   -pi       0.0022346  1.926   52.7
+!   +2pi      0.0097185  8.580   3.29
+!   -2pi      0.0096238  8.532   3.91
+! The (1-cos FL) gate holds on the SOURCE side: recoil nearly
+! extinguished at pi (transparency), restored at 2pi.
+! +-pi symmetric to 0.02 units. The 2pi winding asymmetry
+! persists live (3.29 vs 3.91): the coil too distinguishes
+! winding direction.
+! Trajectory prints (every 400) have no mirror oracle this
+! pass -- finals are the score column.
+!
+! NOTE: arrays are stack-allocated; run with:
+!   ulimit -s unlimited
+!
+! Rename: ab_livej_exact.ergo.txt -> ab_livej_exact.ergo
+! Run: python -m core min/ab/ab_livej_exact.ergo -o /tmp/ljx
+!      ulimit -s unlimited && /tmp/ljx
+! ============================================================
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 512, NY = 512
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 2200
+INTEGER, PARAMETER :: NSP = 48
+REAL, PARAMETER :: AA = 0.20
+REAL, PARAMETER :: SIG = 14.0
+REAL, PARAMETER :: K0 = 0.3
+INTEGER, PARAMETER :: X0 = 100
+INTEGER, PARAMETER :: Y1 = 204, Y2 = 308
+REAL, PARAMETER :: XC0 = 256.0, YC0 = 256.0
+REAL, PARAMETER :: PI2 = 6.283185307179586
+REAL, PARAMETER :: PIH = 3.14159265358979
+REAL, PARAMETER :: MCFAC = 5.0
+
+REAL :: R(NPTS), I(NPTS), ABSORB(NPTS), WALL(NPTS)
+REAL :: CXL(NPTS), SXL(NPTS), CYL(NPTS), SYL(NPTS)
+
+INTEGER :: J, K, KK, T, CS, IDX
+REAL :: FLV, SV, DX, DY, R2C, TH, CXC
+REAL :: M0, MC, PK, PK0, Q, V
+REAL :: RH, DRX, DIX
+
+DO CS = 1, 7
+
+   FLV := 0.0
+   IF (CS = 2) THEN
+      FLV := PIH/2.0
+   ENDIF
+   IF (CS = 3) THEN
+      FLV := -PIH/2.0
+   ENDIF
+   IF (CS = 4) THEN
+      FLV := PIH
+   ENDIF
+   IF (CS = 5) THEN
+      FLV := -PIH
+   ENDIF
+   IF (CS = 6) THEN
+      FLV := PI2
+   ENDIF
+   IF (CS = 7) THEN
+      FLV := -PI2
+   ENDIF
+
+   ! --- clear grid, absorber ---
+   DO KK = 1, NX*NY
+      R(KK) := 0.0
+      I(KK) := 0.0
+      ABSORB(KK) := 1.0
+   ENDDO
+
+   ! --- sponge: symmetric on all four edges ---
+   DO J = 1, NSP
+      SV := 1.0 - 0.35*(1.0 - J/49.0)*(1.0 - J/49.0)
+      DO K = 1, NX
+         ABSORB(K + (J-1)*NX) := ABSORB(K + (J-1)*NX) * SV
+         ABSORB(K + (NY-J)*NX) := ABSORB(K + (NY-J)*NX) * SV
+      ENDDO
+      DO K = 1, NY
+         ABSORB(J + (K-1)*NX) := ABSORB(J + (K-1)*NX) * SV
+         ABSORB(NX+1-J + (K-1)*NX) := ABSORB(NX+1-J + (K-1)*NX) * SV
+      ENDDO
+   ENDDO
+
+   Q := 0.0
+   V := 0.0
+
+   ! --- initial wall + links around 256,256 ---
+   DO KK = 1, NX*NY
+      WALL(KK) := 1.0
+      CXL(KK) := 1.0
+      SXL(KK) := 0.0
+      CYL(KK) := 1.0
+      SYL(KK) := 0.0
+   ENDDO
+   DO J = 240, 276
+      DO K = 240, 276
+         DX := K - XC0
+         DY := J - YC0
+         IF (DX*DX + DY*DY < 64.0) THEN
+            WALL(K + (J-1)*NX) := 0.0
+         ENDIF
+      ENDDO
+   ENDDO
+   IF (FLV /= 0.0) THEN
+      TH := FLV / PI2
+      DO J = 2, NY-1
+         DO K = 2, NX-1
+            DX := K - XC0 + 0.5
+            DY := J - YC0
+            R2C := DX*DX + DY*DY
+            IF (R2C > 36.0) THEN
+               SV := TH*(ATAN2(DY, DX + 0.5) - ATAN2(DY, DX - 0.5))
+               IDX := K + (J-1)*NX
+               CXL(IDX) := COS(SV)
+               SXL(IDX) := SIN(SV)
+            ENDIF
+            DX := K - XC0
+            DY := J - YC0 + 0.5
+            R2C := DX*DX + DY*DY
+            IF (R2C > 36.0) THEN
+               SV := TH*(ATAN2(DY + 0.5, DX) - ATAN2(DY - 0.5, DX))
+               IDX := K + (J-1)*NX
+               CYL(IDX) := COS(SV)
+               SYL(IDX) := SIN(SV)
+            ENDIF
+         ENDDO
+      ENDDO
+   ENDIF
+
+   ! --- two Gaussian packets, rows 204 / 308 ---
+   DO J = 1, NY
+      DO K = 1, NX
+         IDX := K + (J-1)*NX
+         SV := EXP(-(((K-X0)/30.0)*((K-X0)/30.0) + ((J-Y1)/SIG)*((J-Y1)/SIG)))
+         R(IDX) := SV*COS(K0*(K-X0))
+         I(IDX) := SV*SIN(K0*(K-X0))
+         SV := EXP(-(((K-X0)/30.0)*((K-X0)/30.0) + ((J-Y2)/SIG)*((J-Y2)/SIG)))
+         R(IDX) := R(IDX) + SV*COS(K0*(K-X0))
+         I(IDX) := I(IDX) + SV*SIN(K0*(K-X0))
+      ENDDO
+   ENDDO
+
+   M0 := 0.0
+   DO KK = 1, NX*NY
+      M0 := M0 + R(KK)*R(KK) + I(KK)*I(KK)
+   ENDDO
+   MC := MCFAC*M0
+
+   ! --- initial PKX ---
+   PK0 := 0.0
+   DO J = 2, NY-1
+      DO K = 2, NX-1
+         IDX := K + (J-1)*NX
+         DRX := 0.5*((CXL(IDX)*R(IDX+1) - SXL(IDX)*I(IDX+1)) &
+            - (CXL(IDX-1)*R(IDX-1) + SXL(IDX-1)*I(IDX-1)))
+         DIX := 0.5*((CXL(IDX)*I(IDX+1) + SXL(IDX)*R(IDX+1)) &
+            - (CXL(IDX-1)*I(IDX-1) - SXL(IDX-1)*R(IDX-1)))
+         PK0 := PK0 + R(IDX)*DIX - I(IDX)*DRX
+      ENDDO
+   ENDDO
+
+   ! --- integration with live coil ---
+   DO T = 1, NSTEPS
+
+      DO K = NX+2, NEND
+         I(K) := (I(K) + AA*(CXL(K)*R(K+1) + CXL(K-1)*R(K-1) &
+            + CYL(K)*R(K+NX) + CYL(K-NX)*R(K-NX) - 4.0*R(K) &
+            - SXL(K)*I(K+1) + SXL(K-1)*I(K-1) &
+            - SYL(K)*I(K+NX) + SYL(K-NX)*I(K-NX))) &
+            * ABSORB(K) * WALL(K)
+      ENDDO
+      DO K = NX+2, NEND
+         R(K) := (R(K) - AA*(SXL(K)*R(K+1) - SXL(K-1)*R(K-1) &
+            + SYL(K)*R(K+NX) - SYL(K-NX)*R(K-NX) &
+            + CXL(K)*I(K+1) + CXL(K-1)*I(K-1) &
+            + CYL(K)*I(K+NX) + CYL(K-NX)*I(K-NX) - 4.0*I(K))) &
+            * ABSORB(K) * WALL(K)
+      ENDDO
+
+      ! --- total kinetic momentum ---
+      PK := 0.0
+      DO J = 2, NY-1
+         DO K = 2, NX-1
+            IDX := K + (J-1)*NX
+            DRX := 0.5*((CXL(IDX)*R(IDX+1) - SXL(IDX)*I(IDX+1)) &
+               - (CXL(IDX-1)*R(IDX-1) + SXL(IDX-1)*I(IDX-1)))
+            DIX := 0.5*((CXL(IDX)*I(IDX+1) + SXL(IDX)*R(IDX+1)) &
+               - (CXL(IDX-1)*I(IDX-1) - SXL(IDX-1)*R(IDX-1)))
+            PK := PK + R(IDX)*DIX - I(IDX)*DRX
+         ENDDO
+      ENDDO
+
+      ! --- coil ODE (impulse form, dt=1) ---
+      V := V + (PK0 - PK)/MC
+      Q := Q + V
+      PK0 := PK
+
+      ! --- rebuild wall around moving center ---
+      CXC := XC0 + Q
+      DO J = 240, 276
+         DO K = 240, 276
+            WALL(K + (J-1)*NX) := 1.0
+         ENDDO
+      ENDDO
+      DO J = 240, 276
+         DO K = 240, 276
+            DX := K - CXC
+            DY := J - YC0
+            IF (DX*DX + DY*DY < 64.0) THEN
+               WALL(K + (J-1)*NX) := 0.0
+            ENDIF
+         ENDDO
+      ENDDO
+
+      ! --- rebuild links around moving center ---
+      IF (FLV /= 0.0) THEN
+         DO J = 2, NY-1
+            DO K = 2, NX-1
+               IDX := K + (J-1)*NX
+               DX := K - CXC + 0.5
+               DY := J - YC0
+               R2C := DX*DX + DY*DY
+               IF (R2C > 36.0) THEN
+                  SV := TH*(ATAN2(DY, DX + 0.5) - ATAN2(DY, DX - 0.5))
+                  CXL(IDX) := COS(SV)
+                  SXL(IDX) := SIN(SV)
+               ENDIF
+               DX := K - CXC
+               DY := J - YC0 + 0.5
+               R2C := DX*DX + DY*DY
+               IF (R2C > 36.0) THEN
+                  SV := TH*(ATAN2(DY + 0.5, DX) - ATAN2(DY - 0.5, DX))
+                  CYL(IDX) := COS(SV)
+                  SYL(IDX) := SIN(SV)
+               ENDIF
+            ENDDO
+         ENDDO
+      ENDIF
+
+      IF (MOD(T,200) = 0) THEN
+         WRITE(*,"('cs %d t %d Q %.4f V %.6f PKX %.3f')") CS, T, Q, V, PK
+      ENDIF
+
+   ENDDO
+
+   WRITE(*,"('case %d FL %.4f final Q %.4f V %.6f')") CS, FLV, Q, V
+
+ENDDO
+
+WRITE(*,"('-- exact-link oracles: V 0.0102164/0.0067193/0.0067936/0.0022339/0.0022346/0.0097185/0.0096238 --')")
+WRITE(*,"('-- exact-link oracles: Q 9.081/5.958/6.030/1.934/1.926/8.580/8.532 --')")
+WRITE(*,"('-- gate: dP 23.1/22.6 at pi/2, 52.7/52.7 at pi, 3.29/3.91 at 2pi --')")

@@ -1,0 +1,1204 @@
+! ════════════════════════════════════════════════════════════════════
+! df_radial2.ergo -- Stage 2 Dirac-Fock radial SCF, REPAIRED.
+!
+! Rebuilt 2026-08-21 from the df_radial prototype (which never compiled:
+! colon-bounds F(NR:NT,4)) plus the autopsy/repair mirror df_mirror.py.
+! Same skeleton: shooting SCF on t = log r, NT=20000, RK4, log-grid
+! Y^k quadrature, NR angular exchange coefficients with subshell
+! occupation scaling, 50/50 mixing, same-kappa deflation.
+!
+! The four repairs (all verified in the mirror against Clementi-Roetti):
+!
+!  FIX 1: initial packets NORMALIZED before the first potential build,
+!         with the PHYSICAL small component G = (F' + kappa F/r)/(2c).
+!         (The q0*r^s series start puts kappa>0 packets entirely in an
+!         unphysical branch, norm ~ (2c/Z)^2: Ne x100 cycle-1 found no
+!         root at all.)
+!  FIX 2: adaptive rescan: +-8% window -> x8 widen -> full range;
+!         SCANFAIL is printed, EPREV is never kept silently.
+!  FIX 3: E_total assembled and printed (ETOT line) so the
+!         Clementi-Roetti / DF-deepening oracles are computable.
+!  FIX 4: NEW ORBITAL SOLVER. The prototype's particular-particular
+!         Wronskian detector is numerically broken once exchange
+!         sources are present (its zeros are source-amplitude-
+!         dependent artifacts; He passed only because it has none).
+!         Replaced by variation of parameters: homogeneous
+!         regular/decaying pair (U,W), W0 = U x W (constant in t),
+!         X = a(t) U + b(t) W with
+!           a' = (SFv WG - SGv WF)/W0,  a(inf)=0
+!           b' = (UF SGv - UG SFv)/W0,  b(0)=0
+!         and the orbital energy is the root of ||X(eps)|| = 1
+!         (eps = normalization Lagrange multiplier of the frozen-
+!         source problem). Poles of N(eps) sit at the homogeneous
+!         eigenvalues (W0 -> 0); branch selection is anchored by
+!         Sturm ordering (k-th pole = k nodes) on the full-range
+!         scan, nearest-pole-to-EPREV inside windows. Sign changes
+!         are detected with LOGICAL sign tests, never products
+!         (W0 ~ 1e180 overflows).
+!         The legacy Wronskian path is kept for source-free orbitals
+!         (He) where it is exact.
+!
+! Mirror certification (NT=4000):
+!   He x100: eps -0.91795762, E -2.861686  (CR -2.861680)
+!   Ne x100: eps -32.77253/-1.93040/-0.85042/-0.85042, E -128.547444
+!            (CR -128.5471)
+!   He x1:   eps -0.91799274, E -2.861819  (deepening -1.39e-4)
+!   Ne x1:   eps -32.81760/-1.93541/-0.85210/-0.84866, E -128.690466
+!            (deepening -0.143; 2p fine split 3.43e-3)
+!
+! Compile: python -m core min/diracfock/df_radial2.ergo -o <bin>
+!
+! DF_WIG2 fork (Stage W3, 2026-08-22): dual-coordinate radial Wigner
+! maps per (atom, c-scale) appended after the SCF report. The SCF is
+! the CERTIFIED df_radial2, byte-identical (the old df_wig sat on the
+! broken prototype: its Ne input orbitals were detector artifacts, so
+! its Ne W3 maps are superseded by this run). W3 block, grids and
+! oracles unchanged from df_wig / wigner_handshake_spec.md.
+! ════════════════════════════════════════════════════════════════════
+
+IMPLICIT NONE
+
+REAL, PARAMETER :: C0 = 137.035999084
+INTEGER, PARAMETER :: NT = 20000
+INTEGER, PARAMETER :: NCYC = 60
+INTEGER, PARAMETER :: NSC0 = 240
+INTEGER, PARAMETER :: NSC1 = 31
+INTEGER, PARAMETER :: NBS = 50
+! Stage W3 map grids (mirror constants -- wigner_mirror_w3.py must match)
+INTEGER, PARAMETER :: NRW = 2048
+INTEGER, PARAMETER :: NTM = 1024
+INTEGER, PARAMETER :: NPW = 4096
+REAL, PARAMETER :: RMINW = 1.0e-6
+REAL, PARAMETER :: RMAXW = 12.0
+REAL, PARAMETER :: PI = 3.14159265358979323846
+
+! two atoms: He (1 orbital), Ne (4 subshell orbitals)
+STATIC REAL :: ZT(2)
+STATIC INTEGER :: NBX(2)
+DATA ZT / 2.0, 10.0 /
+DATA NBX / 1, 4 /
+STATIC INTEGER :: NQ(4), KT(4), OC(4)
+DATA NQ / 1, 2, 2, 2 /
+DATA KT / -1, -1, 1, -2 /
+DATA OC / 2, 2, 2, 4 /
+! exchange coefficient table per (la, lb): (k, c), two slots
+! index: 1=(s,s) 2=(s,p) 3=(p,s) 4=(p,p);  k=-1 entries are dummies
+! parked behind c=0.
+STATIC REAL :: CXK(4, 2), CXC(4, 2)
+DATA CXK / 0.0, 1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 2.0 /
+DATA CXC / 1.0, 1.0, 0.3333333333333333, 1.0, 0.0, 0.0, 0.0, 0.4 /
+! c scale: collapse (x100) then physical
+STATIC REAL :: CSC(2)
+DATA CSC / 100.0, 1.0 /
+
+STATIC REAL :: RG(NT), VH(NT), VL(NT), YK(NT), PY(NT), DEN(NT), FK(NT)
+STATIC REAL :: F(NT, 4), G(NT, 4)
+STATIC REAL :: FO(NT), GO(NT), FI(NT), GI(NT)
+STATIC REAL :: UF(NT), UG(NT), WF(NT), WG(NT)
+STATIC REAL :: AV(NT), BV(NT), XF(NT), XG(NT), APV(NT), BPV(NT)
+STATIC REAL :: SF(NT), SG(NT), SFM(NT), SGM(NT), VLM(NT)
+STATIC REAL :: EPSA(4), SSA(4), Q0A(4)
+STATIC INTEGER :: NRTA(4), NINA(4), NDA(4)
+
+! scan state
+STATIC REAL :: EPV(260), LNV(260), W0V(260), POLE(64)
+STATIC REAL :: FRW(NRW, 4), GRW(NRW, 4), FTW(NTM, 4), GTW(NTM, 4)
+STATIC REAL :: SKW(2049)
+STATIC REAL :: CTBR(NPW, 1025)
+
+! shared with subroutines/functions (STATIC by name, never as args)
+STATIC REAL :: H, T0L, KAP, SS, Q0, CC, ZZ, W0S
+STATIC INTEGER :: NRT, NIN, NODES
+
+REAL :: R0X, RMX, RSTART, EH1, R, X, DXF, NRM, OV, DMP, CX, OST
+REAL :: E1, E2, EP, W0, W1, ELO, EHI, EM, WM, WLO, EROOT, EPREV
+REAL :: ESUM, EOLD, EDIFF, LAM, QINF, BSC, SRCMAX, SMX
+REAL :: POLE0, DP, BLO, BHI, EM0, FLO, FM, VN, N2, ET2, JV, KV, ET
+REAL :: XM, SP, SC
+INTEGER :: I, J, K, IA, IB, IC, IQ, ICYC, NB, LA, LB, ITAB, J2, K2
+INTEGER :: NFOUND, TT, KX, ITRY, IW, NP, IP0, NN, I0, I1
+LOGICAL :: S1, S2, CHG
+REAL :: DRW, DTW, DPW, RRW, TTW, W2F, WNS, WRO, WNRM2, W0A, W0B, ACC
+INTEGER :: JW, KW, IA2, IXW, IMN
+
+! ════════════════════════════════════════════════════════════════════
+! MAIN: per c-scale, per atom
+! ════════════════════════════════════════════════════════════════════
+DO IC = 1, 2
+  CC := C0 * CSC(IC)
+  DO IQ = 1, 2
+    ZZ := ZT(IQ)
+    NB := NBX(IQ)
+    ! log grid: R0 = 1e-4/Z to RMAX = 60 n_max^2 / Z
+    R0X := 1.0e-4 / ZZ
+    RMX := 60.0 * REAL(NQ(NB) * NQ(NB)) / ZZ
+    H := (LOG(RMX) - LOG(R0X)) / REAL(NT - 1)
+    T0L := LOG(R0X)
+    EH1 := EXP(H) - 1.0
+    RG(1) := R0X
+    DO I = 2, NT
+      RG(I) := RG(I - 1) * (1.0 + EH1)
+    ENDDO
+
+    ! per-orbital constants + FIX 1 physical normalized packets
+    DO IA = 1, NB
+      KAP := REAL(KT(IA))
+      SS := SQRT(KAP*KAP - (ZZ/CC)*(ZZ/CC))
+      Q0 := CC * (SS + KAP) / ZZ
+      SSA(IA) := SS
+      Q0A(IA) := Q0
+      LA := KT(IA)
+      IF (KT(IA) < 0) THEN
+        LA := -KT(IA) - 1
+      ENDIF
+      NDA(IA) := NQ(IA) - LA - 1
+      NRTA(IA) := INT((LOG(2.0 * REAL(NQ(IA)*NQ(IA)) / ZZ) &
+        - T0L) / H) + 1
+      ! inward start: min(grid end, 62 n^2/Z) — dirac_radial's
+      ! per-orbital RMAX; keeps the inward amplification resolvable
+      RSTART := 62.0 * REAL(NQ(IA)*NQ(IA)) / ZZ
+      IF (RSTART > RMX) THEN
+        RSTART := RMX
+      ENDIF
+      NINA(IA) := INT((LOG(RSTART) - T0L) / H) + 1
+      IF (NINA(IA) > NT) THEN
+        NINA(IA) := NT
+      ENDIF
+      DO I = 1, NT
+        R := RG(I)
+        X := (R ** SS) * EXP(-ZZ * R / REAL(NQ(IA)))
+        DXF := (SS / R - ZZ / REAL(NQ(IA))) * X
+        F(I, IA) := X
+        G(I, IA) := (DXF + KAP * X / R) / (2.0 * CC)
+      ENDDO
+      NRM := 0.0
+      DO I = 1, NT
+        NRM := NRM + (F(I, IA)*F(I, IA) + G(I, IA)*G(I, IA)) * RG(I)
+      ENDDO
+      NRM := SQRT(NRM * H)
+      DO I = 1, NT
+        F(I, IA) := F(I, IA) / NRM
+        G(I, IA) := G(I, IA) / NRM
+      ENDDO
+      EPSA(IA) := -ZZ * ZZ / (2.0 * REAL(NQ(IA) * NQ(IA)))
+    ENDDO
+
+    ! ════════════════════════════════════════════════════════════════
+    ! SCF loop
+    ! ════════════════════════════════════════════════════════════════
+    EOLD := 0.0
+    DO ICYC = 1, NCYC
+      DMP := 0.5
+      IF (ICYC == 1) THEN
+        DMP := 1.0
+      ENDIF
+      ! direct potential VH = sum_b occ_b Y^0_bb (log-grid trapz)
+      DO I = 1, NT
+        VH(I) := 0.0
+      ENDDO
+      DO IB = 1, NB
+        DO I = 1, NT
+          DEN(I) := F(I, IB) * F(I, IB) + G(I, IB) * G(I, IB)
+        ENDDO
+        CALL YZ
+        DO I = 2, NT
+          VH(I) := VH(I) + REAL(OC(IB)) * (YK(I) / RG(I) + PY(I))
+        ENDDO
+      ENDDO
+
+      DO IA = 1, NB
+        KAP := REAL(KT(IA))
+        SS := SSA(IA)
+        Q0 := Q0A(IA)
+        NRT := NRTA(IA)
+        NIN := NINA(IA)
+        NODES := NDA(IA)
+        LA := KT(IA)
+        IF (KT(IA) < 0) THEN
+          LA := -KT(IA) - 1
+        ENDIF
+        ! local potential: -Z/r + VH - multiplicative self-exchange
+        DO I = 1, NT
+          VL(I) := -ZZ / RG(I) + VH(I)
+        ENDDO
+        OST := 2.0
+        ITAB := 1
+        IF (LA > 0) THEN
+          OST := 6.0
+          ITAB := 4
+        ENDIF
+        DO J = 1, 2
+          CX := CXC(ITAB, J) * REAL(OC(IA)) / OST
+          KX := INT(CXK(ITAB, J))
+          IF (CX /= 0.0) THEN
+            IF (KX >= 0) THEN
+              DO I = 1, NT
+                DEN(I) := F(I, IA) * F(I, IA) + G(I, IA) * G(I, IA)
+              ENDDO
+              CALL YKP(KX)
+              DO I = 2, NT
+                VL(I) := VL(I) - CX * (YK(I) + PY(I))
+              ENDDO
+            ENDIF
+          ENDIF
+        ENDDO
+        ! exchange sources from b /= a
+        DO I = 1, NT
+          SF(I) := 0.0
+          SG(I) := 0.0
+        ENDDO
+        DO IB = 1, NB
+          IF (IB /= IA) THEN
+            LB := KT(IB)
+            IF (KT(IB) < 0) THEN
+              LB := -KT(IB) - 1
+            ENDIF
+            OST := 2.0
+            IF (LB > 0) THEN
+              OST := 6.0
+            ENDIF
+            ITAB := 1
+            IF (LA == 0) THEN
+              IF (LB > 0) THEN
+                ITAB := 2
+              ENDIF
+            ELSE
+              IF (LB == 0) THEN
+                ITAB := 3
+              ELSE
+                ITAB := 4
+              ENDIF
+            ENDIF
+            DO J = 1, 2
+              CX := CXC(ITAB, J) * REAL(OC(IB)) / OST
+              KX := INT(CXK(ITAB, J))
+              IF (CX /= 0.0) THEN
+                IF (KX >= 0) THEN
+                  DO I = 1, NT
+                    DEN(I) := F(I, IA) * F(I, IB) &
+                      + G(I, IA) * G(I, IB)
+                  ENDDO
+                  CALL YKP(KX)
+                  DO I = 2, NT
+                    SF(I) := SF(I) + CX * (YK(I) + PY(I)) * F(I, IB)
+                    SG(I) := SG(I) + CX * (YK(I) + PY(I)) * G(I, IB)
+                  ENDDO
+                ENDIF
+              ENDIF
+            ENDDO
+          ENDIF
+        ENDDO
+        ! midpoint arrays for RK4
+        DO I = 1, NT - 1
+          VLM(I) := 0.5 * (VL(I) + VL(I + 1))
+          SFM(I) := 0.5 * (SF(I) + SF(I + 1))
+          SGM(I) := 0.5 * (SG(I) + SG(I + 1))
+        ENDDO
+        SRCMAX := 0.0
+        DO I = 1, NT
+          SMX := ABS(SF(I))
+          IF (SMX > SRCMAX) THEN
+            SRCMAX := SMX
+          ENDIF
+          SMX := ABS(SG(I))
+          IF (SMX > SRCMAX) THEN
+            SRCMAX := SMX
+          ENDIF
+        ENDDO
+
+        ! ══ eigenvalue: adaptive scan, VoP or legacy detector ══
+        EPREV := EPSA(IA)
+        EROOT := EPREV
+        NFOUND := 0
+        DO ITRY = 1, 3
+          IF (ITRY == 1) THEN
+            IF (ICYC > 1) THEN
+              E1 := EPREV * 1.08
+              E2 := EPREV / 1.08
+              TT := NSC1
+              IW := 0
+            ELSE
+              E1 := -1.5 * ZZ * ZZ
+              E2 := -1.0e-6 * ZZ * ZZ
+              TT := NSC0
+              IW := 1
+            ENDIF
+          ELSEIF (ITRY == 2) THEN
+            E1 := EPREV * 1.64
+            E2 := EPREV / 1.64
+            TT := NSC1
+            IW := 0
+          ELSE
+            E1 := -1.5 * ZZ * ZZ
+            E2 := -1.0e-6 * ZZ * ZZ
+            TT := NSC0
+            IW := 1
+          ENDIF
+          DO J = 1, TT
+            EPV(J) := E1 * ((E2 / E1) ** (REAL(J - 1) / REAL(TT - 1)))
+          ENDDO
+
+          IF (SRCMAX > 1.0e-10) THEN
+            ! ── VoP norm detector (FIX 4) ──
+            DO J = 1, TT
+              LNV(J) := VOPN(EPV(J))
+              W0V(J) := W0S
+            ENDDO
+            ! poles = sign changes of W0 (LOGICAL tests: W0 ~ 1e180,
+            ! products overflow). Sturm: k-th pole has k nodes.
+            NP := 0
+            DO J = 2, TT
+              S1 := W0V(J - 1) < 0.0
+              S2 := W0V(J) < 0.0
+              IF ((S1 .AND. .NOT. S2) .OR. (.NOT. S1 .AND. S2)) THEN
+                IF (NP < 64) THEN
+                  NP := NP + 1
+                  POLE(NP) := -SQRT(EPV(J - 1) * EPV(J))
+                ENDIF
+              ENDIF
+            ENDDO
+            ! target pole: full scan -> Sturm index NODES+1;
+            ! windowed  -> pole nearest EPREV
+            POLE0 := 0.0
+            IP0 := 0
+            IF (IW == 1) THEN
+              IF (NP >= NODES + 1) THEN
+                IP0 := NODES + 1
+                POLE0 := POLE(IP0)
+              ENDIF
+            ELSE
+              DP := 1.0e300
+              DO J = 1, NP
+                IF (ABS(POLE(J) - EPREV) < DP) THEN
+                  DP := ABS(POLE(J) - EPREV)
+                  POLE0 := POLE(J)
+                  IP0 := J
+                ENDIF
+              ENDDO
+            ENDIF
+            IF (IP0 > 0) THEN
+              ! basin: midpoints to neighboring poles
+              IF (IP0 > 1) THEN
+                BLO := 0.5 * (POLE(IP0 - 1) + POLE0)
+              ELSE
+                BLO := EPV(1) * 1.5
+              ENDIF
+              IF (IP0 < NP) THEN
+                BHI := 0.5 * (POLE0 + POLE(IP0 + 1))
+              ELSE
+                BHI := EPV(TT) * 0.3
+              ENDIF
+              ! unit-norm roots inside the basin
+              DO J = 2, TT
+                S1 := LNV(J - 1) < 0.0
+                S2 := LNV(J) < 0.0
+                CHG := .FALSE.
+                IF ((S1 .AND. .NOT. S2) .OR. (.NOT. S1 .AND. S2)) THEN
+                  CHG := .TRUE.
+                ENDIF
+                IF (CHG) THEN
+                  EM0 := -SQRT(EPV(J - 1) * EPV(J))
+                  IF (EM0 > BLO) THEN
+                    IF (EM0 < BHI) THEN
+                      ELO := EPV(J - 1)
+                      EHI := EPV(J)
+                      FLO := LNV(J - 1)
+                      DO K = 1, NBS
+                        EM := -SQRT(ELO * EHI)
+                        FM := VOPN(EM)
+                        S1 := FLO < 0.0
+                        S2 := FM < 0.0
+                        IF ((S1 .AND. .NOT. S2) .OR. &
+                          (.NOT. S1 .AND. S2)) THEN
+                          EHI := EM
+                        ELSE
+                          ELO := EM
+                          FLO := FM
+                        ENDIF
+                      ENDDO
+                      NN := NODEX()
+                      IF (NN == NODES) THEN
+                        IF (NFOUND == 0) THEN
+                          EROOT := EM
+                          NFOUND := 1
+                        ELSE
+                          IF (ABS(EM - POLE0) < ABS(EROOT - POLE0)) THEN
+                            EROOT := EM
+                          ENDIF
+                          NFOUND := NFOUND + 1
+                        ENDIF
+                      ENDIF
+                    ENDIF
+                  ENDIF
+                ENDIF
+              ENDDO
+            ENDIF
+          ELSE
+            ! ── legacy Wronskian detector (source-free orbitals) ──
+            W0 := SHOOT(EPV(1))
+            DO J = 2, TT
+              EP := EPV(J)
+              W1 := SHOOT(EP)
+              S1 := W0 < 0.0
+              S2 := W1 < 0.0
+              IF ((S1 .AND. .NOT. S2) .OR. (.NOT. S1 .AND. S2)) THEN
+                ELO := EPV(J - 1)
+                EHI := EP
+                WLO := W0
+                DO K = 1, NBS
+                  EM := -SQRT(ELO * EHI)
+                  WM := SHOOT(EM)
+                  S1 := WLO < 0.0
+                  S2 := WM < 0.0
+                  IF ((S1 .AND. .NOT. S2) .OR. (.NOT. S1 .AND. S2)) THEN
+                    EHI := EM
+                  ELSE
+                    ELO := EM
+                    WLO := WM
+                  ENDIF
+                ENDDO
+                NN := NNODE()
+                IF (NN == NODES) THEN
+                  IF (NFOUND == 0) THEN
+                    EROOT := EM
+                    NFOUND := 1
+                  ELSE
+                    IF (ABS(EM - EPREV) < ABS(EROOT - EPREV)) THEN
+                      EROOT := EM
+                    ENDIF
+                    NFOUND := NFOUND + 1
+                  ENDIF
+                ENDIF
+              ENDIF
+              W0 := W1
+            ENDDO
+          ENDIF
+          IF (NFOUND > 0) THEN
+            EXIT
+          ENDIF
+        ENDDO
+
+        IF (NFOUND == 0) THEN
+          WRITE(*, "('SCANFAIL cyc=%d orb=%d eps kept %.10e poles=%d')") &
+            ICYC, IA, EPREV, NP
+        ELSE
+          EPSA(IA) := EROOT
+          IF (SRCMAX > 1.0e-10) THEN
+            ! VoP: XF/XG already at EROOT from the last bisection
+            ! mid; refresh exactly at EROOT and normalize
+            FM := VOPN(EROOT)
+            NRM := 0.0
+            DO I = 1, NT
+              NRM := NRM + (XF(I)*XF(I) + XG(I)*XG(I)) * RG(I)
+            ENDDO
+            NRM := SQRT(NRM * H)
+            DO I = 1, NT
+              FO(I) := XF(I) / NRM
+              GO(I) := XG(I) / NRM
+            ENDDO
+          ELSE
+            WM := SHOOT(EROOT)
+            ! splice with scale match at NRT, normalize
+            BSC := FO(NRT) / FI(NRT)
+            NRM := 0.0
+            DO I = 1, NRT
+              X := FO(I) * FO(I) + GO(I) * GO(I)
+              NRM := NRM + X * RG(I)
+            ENDDO
+            DO I = NRT + 1, NT
+              X := BSC * BSC * (FI(I) * FI(I) + GI(I) * GI(I))
+              NRM := NRM + X * RG(I)
+            ENDDO
+            NRM := SQRT(NRM * H)
+            DO I = 1, NRT
+              FO(I) := FO(I) / NRM
+              GO(I) := GO(I) / NRM
+            ENDDO
+            DO I = NRT + 1, NT
+              FO(I) := BSC * FI(I) / NRM
+              GO(I) := BSC * GI(I) / NRM
+            ENDDO
+          ENDIF
+          ! mix with the previous iterate
+          DO I = 1, NT
+            F(I, IA) := (1.0 - DMP) * F(I, IA) + DMP * FO(I)
+            G(I, IA) := (1.0 - DMP) * G(I, IA) + DMP * GO(I)
+          ENDDO
+          ! deflate against lower same-kappa orbitals, renormalize
+          DO IB = 1, IA - 1
+            IF (KT(IB) == KT(IA)) THEN
+              OV := 0.0
+              DO I = 2, NT - 1
+                OV := OV + (F(I, IA) * F(I, IB) &
+                  + G(I, IA) * G(I, IB)) * RG(I)
+              ENDDO
+              OV := OV * H
+              DO I = 1, NT
+                F(I, IA) := F(I, IA) - OV * F(I, IB)
+                G(I, IA) := G(I, IA) - OV * G(I, IB)
+              ENDDO
+            ENDIF
+          ENDDO
+          NRM := 0.0
+          DO I = 2, NT - 1
+            NRM := NRM + (F(I, IA) * F(I, IA) + G(I, IA) * G(I, IA)) &
+              * RG(I)
+          ENDDO
+          NRM := SQRT(NRM * H)
+          DO I = 1, NT
+            F(I, IA) := F(I, IA) / NRM
+            G(I, IA) := G(I, IA) / NRM
+          ENDDO
+        ENDIF
+      ENDDO
+
+      ESUM := 0.0
+      DO IA = 1, NB
+        ESUM := ESUM + REAL(OC(IA)) * EPSA(IA)
+      ENDDO
+      EDIFF := ESUM - EOLD
+      EOLD := ESUM
+      WRITE(*, "('DFSCF c=x%.1f Z=%.1f cyc=%d eps1s=%.10e sumeps=%.10e dE=%.3e')") &
+        CSC(IC), ZZ, ICYC, EPSA(1), ESUM, EDIFF
+    ENDDO
+
+    ! ════════════════════════════════════════════════════════════════
+    ! final report: orbital eps, E_total (FIX 3), INT table
+    ! ════════════════════════════════════════════════════════════════
+    WRITE(*, "('ATOM Z=%.1f CSCALE=%.1f')") ZZ, CSC(IC)
+    DO IA = 1, NB
+      WRITE(*, "('DORB %d kappa=%d occ=%d eps=%.10e')") IA, KT(IA), &
+        OC(IA), EPSA(IA)
+    ENDDO
+    ! E_total = sum occ*eps - E2 (double counting), same
+    ! occupation-scaled coefficients as the potential build
+    ET2 := 0.0
+    DO IA = 1, NB
+      LA := KT(IA)
+      IF (KT(IA) < 0) THEN
+        LA := -KT(IA) - 1
+      ENDIF
+      DO IB = 1, NB
+        LB := KT(IB)
+        IF (KT(IB) < 0) THEN
+          LB := -KT(IB) - 1
+        ENDIF
+        OST := 2.0
+        IF (LB > 0) THEN
+          OST := 6.0
+        ENDIF
+        ITAB := 1
+        IF (LA == 0) THEN
+          IF (LB > 0) THEN
+            ITAB := 2
+          ENDIF
+        ELSE
+          IF (LB == 0) THEN
+            ITAB := 3
+          ELSE
+            ITAB := 4
+          ENDIF
+        ENDIF
+        ! direct (k=0, coefficient 1)
+        DO I = 1, NT
+          DEN(I) := F(I, IB) * F(I, IB) + G(I, IB) * G(I, IB)
+        ENDDO
+        CALL YKP(0)
+        JV := 0.0
+        DO I = 2, NT - 1
+          JV := JV + (F(I, IA) * F(I, IA) + G(I, IA) * G(I, IA)) &
+            * (YK(I) + PY(I)) * RG(I)
+        ENDDO
+        JV := JV * H
+        ET2 := ET2 + 0.5 * REAL(OC(IA)) * REAL(OC(IB)) * JV
+        ! exchange
+        DO I = 1, NT
+          DEN(I) := F(I, IA) * F(I, IB) + G(I, IA) * G(I, IB)
+        ENDDO
+        DO J = 1, 2
+          CX := CXC(ITAB, J) * REAL(OC(IB)) / OST
+          KX := INT(CXK(ITAB, J))
+          IF (CX /= 0.0) THEN
+            IF (KX >= 0) THEN
+              CALL YKP(KX)
+              KV := 0.0
+              DO I = 2, NT - 1
+                KV := KV + DEN(I) * (YK(I) + PY(I)) * RG(I)
+              ENDDO
+              KV := KV * H
+              ET2 := ET2 - 0.5 * REAL(OC(IA)) * CX * KV
+            ENDIF
+          ENDIF
+        ENDDO
+      ENDDO
+    ENDDO
+    ESUM := 0.0
+    DO IA = 1, NB
+      ESUM := ESUM + REAL(OC(IA)) * EPSA(IA)
+    ENDDO
+    ET := ESUM - ET2
+    WRITE(*, "('ETOT Z=%.1f CSCALE=%.1f E=%.10e sumeps=%.10e E2=%.10e')") &
+      ZZ, CSC(IC), ET, ESUM, ET2
+    ! Slater-Condon integral table for external analysis
+    DO IA = 1, NB
+      DO IB = IA, NB
+        DO I = 1, NT
+          DEN(I) := F(I, IA) * F(I, IB) + G(I, IA) * G(I, IB)
+        ENDDO
+        DO KX = 0, 2
+          CALL YKP(KX)
+          DO J2 = 1, NB
+            DO K2 = J2, NB
+              X := 0.0
+              DO I = 2, NT - 1
+                X := X + (F(I, J2) * F(I, K2) + G(I, J2) * G(I, K2)) &
+                  * (YK(I) + PY(I)) * RG(I)
+              ENDDO
+              X := X * H
+              WRITE(*, "('INT %d %d %d %d %d %.12e')") IA, IB, J2, &
+                K2, KX, X
+            ENDDO
+          ENDDO
+        ENDDO
+      ENDDO
+    ENDDO
+  ! ═══ Stage W3: dual-coordinate radial Wigner maps ═══════════════
+  DRW := (RMAXW - RMINW) / REAL(NRW)
+  DTW := (LOG(RMAXW) - LOG(RMINW)) / REAL(NTM - 1)
+  DO JW = 1, NPW
+    DO KW = 1, 1025
+      CTBR(JW, KW) := COS(2.0 * PI * REAL(JW - 1) * REAL(KW - 1) / REAL(NPW))
+    ENDDO
+  ENDDO
+  ! ── resample F,G: uniform-r (cell-centered) ──
+  DO IW = 1, NRW
+    RRW := RMINW + (REAL(IW) - 0.5) * DRW
+    IXW := INT((LOG(RRW) - LOG(R0X)) / H) + 1
+    IF (IXW < 1) THEN
+      IXW := 1
+    ENDIF
+    IF (IXW > NT - 1) THEN
+      IXW := NT - 1
+    ENDIF
+    W2F := (RRW - RG(IXW)) / (RG(IXW + 1) - RG(IXW))
+    IF (W2F < 0.0) THEN
+      W2F := 0.0
+    ENDIF
+    IF (W2F > 1.0) THEN
+      W2F := 1.0
+    ENDIF
+    DO IA2 = 1, NB
+      FRW(IW, IA2) := F(IXW, IA2) + W2F * (F(IXW + 1, IA2) - F(IXW, IA2))
+      GRW(IW, IA2) := G(IXW, IA2) + W2F * (G(IXW + 1, IA2) - G(IXW, IA2))
+    ENDDO
+  ENDDO
+  ! ── resample F,G: uniform-t (endpoints included) ──
+  DO IW = 1, NTM
+    TTW := LOG(RMINW) + REAL(IW - 1) * DTW
+    RRW := EXP(TTW)
+    IXW := INT((LOG(RRW) - LOG(R0X)) / H) + 1
+    IF (IXW < 1) THEN
+      IXW := 1
+    ENDIF
+    IF (IXW > NT - 1) THEN
+      IXW := NT - 1
+    ENDIF
+    W2F := (RRW - RG(IXW)) / (RG(IXW + 1) - RG(IXW))
+    IF (W2F < 0.0) THEN
+      W2F := 0.0
+    ENDIF
+    IF (W2F > 1.0) THEN
+      W2F := 1.0
+    ENDIF
+    DO IA2 = 1, NB
+      FTW(IW, IA2) := F(IXW, IA2) + W2F * (F(IXW + 1, IA2) - F(IXW, IA2))
+      GTW(IW, IA2) := G(IXW, IA2) + W2F * (G(IXW + 1, IA2) - G(IXW, IA2))
+    ENDDO
+  ENDDO
+  ! ── r-map: half-line Wigner, direct DFT via cosine table ──
+  DPW := PI / (REAL(NPW) * DRW)
+  WNS := 0.0
+  W0A := 0.0
+  W0B := 0.0
+  DO IW = 1, NRW
+    IMN := IW - 1
+    IF (NRW - IW < IMN) THEN
+      IMN := NRW - IW
+    ENDIF
+    ACC := 0.0
+    DO IA2 = 1, NB
+      ACC := ACC + REAL(OC(IA2)) * (FRW(IW, IA2) * FRW(IW, IA2) &
+        + GRW(IW, IA2) * GRW(IW, IA2))
+    ENDDO
+    SKW(1) := ACC
+    DO KW = 1, IMN
+      ACC := 0.0
+      DO IA2 = 1, NB
+        ACC := ACC + REAL(OC(IA2)) * (FRW(IW - KW, IA2) * FRW(IW + KW, IA2) &
+          + GRW(IW - KW, IA2) * GRW(IW + KW, IA2))
+      ENDDO
+      SKW(KW + 1) := 2.0 * ACC
+    ENDDO
+    DO JW = 1, NPW
+      ACC := SKW(1)
+      DO KW = 1, IMN
+        ACC := ACC + CTBR(JW, KW + 1) * SKW(KW + 1)
+      ENDDO
+      WRO := ACC * DRW / PI
+      WNS := WNS + WRO
+      IF (IW == 1) THEN
+        IF (JW == 1) THEN
+          W0A := WRO
+        ENDIF
+        IF (JW == NPW / 2 + 1) THEN
+          W0B := WRO
+        ENDIF
+      ENDIF
+      IF (MOD(IW - 1, 8) == 0) THEN
+        IF (MOD(JW - 1, 16) == 0) THEN
+          WRITE(*, "('W3MAP %.1f %.1f %d %.6e %.6e %.17e')") ZZ, CSC(IC), 0, &
+            RMINW + (REAL(IW) - 0.5) * DRW, &
+            PI * REAL(JW - 1) / (REAL(NPW) * DRW), WRO
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+  WNRM2 := DRW * DPW * WNS
+  WRITE(*, "('W3NORM %.1f %.1f %d %.17e')") ZZ, CSC(IC), 0, WNRM2
+  WRITE(*, "('W3W0R0 %.1f %.1f %.17e')") ZZ, CSC(IC), W0A
+  WRITE(*, "('W3W0RH %.1f %.1f %.17e')") ZZ, CSC(IC), W0B
+  ! ── t-map: same construction on the decimated log grid ──
+  DPW := PI / (REAL(NPW) * DTW)
+  WNS := 0.0
+  W0A := 0.0
+  W0B := 0.0
+  DO IW = 1, NTM
+    IMN := IW - 1
+    IF (NTM - IW < IMN) THEN
+      IMN := NTM - IW
+    ENDIF
+    ACC := 0.0
+    DO IA2 = 1, NB
+      ACC := ACC + REAL(OC(IA2)) * (FTW(IW, IA2) * FTW(IW, IA2) &
+        + GTW(IW, IA2) * GTW(IW, IA2))
+    ENDDO
+    SKW(1) := ACC
+    DO KW = 1, IMN
+      ACC := 0.0
+      DO IA2 = 1, NB
+        ACC := ACC + REAL(OC(IA2)) * (FTW(IW - KW, IA2) * FTW(IW + KW, IA2) &
+          + GTW(IW - KW, IA2) * GTW(IW + KW, IA2))
+      ENDDO
+      SKW(KW + 1) := 2.0 * ACC
+    ENDDO
+    DO JW = 1, NPW
+      ACC := SKW(1)
+      DO KW = 1, IMN
+        ACC := ACC + CTBR(JW, KW + 1) * SKW(KW + 1)
+      ENDDO
+      WRO := ACC * DTW / PI
+      WNS := WNS + WRO
+      IF (IW == NTM / 2 + 1) THEN
+        IF (JW == 1) THEN
+          W0A := WRO
+        ENDIF
+        IF (JW == NPW / 2 + 1) THEN
+          W0B := WRO
+        ENDIF
+      ENDIF
+      IF (MOD(IW - 1, 8) == 0) THEN
+        IF (MOD(JW - 1, 16) == 0) THEN
+          WRITE(*, "('W3MAP %.1f %.1f %d %.6e %.6e %.17e')") ZZ, CSC(IC), 1, &
+            LOG(RMINW) + REAL(IW - 1) * DTW, &
+            PI * REAL(JW - 1) / (REAL(NPW) * DTW), WRO
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+  WNRM2 := DTW * DPW * WNS
+  WRITE(*, "('W3NORM %.1f %.1f %d %.17e')") ZZ, CSC(IC), 1, WNRM2
+  WRITE(*, "('W3W0T0 %.1f %.1f %.17e')") ZZ, CSC(IC), W0A
+  WRITE(*, "('W3W0TH %.1f %.1f %.17e')") ZZ, CSC(IC), W0B
+  ENDDO
+ENDDO
+WRITE(*, "('DONE')")
+STOP
+
+! ════════════════════════════════════════════════════════════════════
+! YZ: k=0 cumulative Poisson pair of DEN -> YK, PY (by name).
+!   YK(i) = int_0^{r_i} DEN dr (RAW, divide by r at use),
+!   PY(i) = int_{r_i}^inf DEN/r dr.
+! ════════════════════════════════════════════════════════════════════
+SUBROUTINE YZ
+   IMPLICIT NONE
+   REAL :: AC, BC
+   INTEGER :: I, J
+   AC := 0.0
+   YK(1) := 0.0
+   DO I = 2, NT
+      AC := AC + 0.5 * (DEN(I-1) * RG(I-1) + DEN(I) * RG(I)) * H
+      YK(I) := AC
+   ENDDO
+   BC := 0.0
+   PY(NT) := 0.0
+   DO J = 1, NT - 1
+      I := NT - J
+      BC := BC + 0.5 * (DEN(I) + DEN(I+1)) * H
+      PY(I) := BC
+   ENDDO
+END
+
+! ════════════════════════════════════════════════════════════════════
+! YKP(K): general-k Poisson pair of DEN -> YK, PY (by name).
+!   YK(i) = r^(-k-1) int_0^r s^k DEN ds
+!   PY(i) = r^k int_r^inf DEN / s^(k+1) ds
+! verified against hf_radial's uniform-grid form for k=0,1,2.
+! ════════════════════════════════════════════════════════════════════
+SUBROUTINE YKP(K)
+   IMPLICIT NONE
+   INTEGER :: K
+   REAL :: AC, BC, FA, FB, R0L, R1L
+   INTEGER :: I, J
+   AC := 0.0
+   YK(1) := 0.0
+   DO I = 2, NT
+      R0L := RG(I - 1)
+      R1L := RG(I)
+      FA := DEN(I - 1) * R0L
+      FB := DEN(I) * R1L
+      IF (K == 1) THEN
+        FA := FA * R0L
+        FB := FB * R1L
+      ENDIF
+      IF (K == 2) THEN
+        FA := FA * R0L * R0L
+        FB := FB * R1L * R1L
+      ENDIF
+      AC := AC + 0.5 * (FA + FB) * H
+      IF (K == 0) THEN
+        YK(I) := AC / R1L
+      ENDIF
+      IF (K == 1) THEN
+        YK(I) := AC / (R1L * R1L)
+      ENDIF
+      IF (K == 2) THEN
+        YK(I) := AC / (R1L * R1L * R1L)
+      ENDIF
+   ENDDO
+   BC := 0.0
+   PY(NT) := 0.0
+   DO J = 1, NT - 1
+      I := NT - J
+      R0L := RG(I)
+      R1L := RG(I + 1)
+      FA := DEN(I) / R0L
+      FB := DEN(I + 1) / R1L
+      IF (K == 1) THEN
+        FA := FA / R0L
+        FB := FB / R1L
+      ENDIF
+      IF (K == 2) THEN
+        FA := FA / (R0L * R0L)
+        FB := FB / (R1L * R1L)
+      ENDIF
+      BC := BC + 0.5 * (FA * R0L + FB * R1L) * H
+      IF (K == 0) THEN
+        PY(I) := BC
+      ENDIF
+      IF (K == 1) THEN
+        PY(I) := BC * R0L
+      ENDIF
+      IF (K == 2) THEN
+        PY(I) := BC * R0L * R0L
+      ENDIF
+   ENDDO
+END
+
+! ════════════════════════════════════════════════════════════════════
+! LEGS(EP): homogeneous outward/regular (UF,UG) and inward/decaying
+! (WF,WG) legs of the current orbital (KAP/SS/Q0/NRT/NIN shared).
+! Equations in t = log r:
+!   F' = -kappa F + BB G,  G' = -AA F + kappa G
+!   AA = (eps - V) r / c,  BB = 2 c r + AA.
+! Clean 1-based indexing: UF(I) is F at grid I.
+! ════════════════════════════════════════════════════════════════════
+SUBROUTINE LEGS(EP)
+   IMPLICIT NONE
+   REAL :: EP
+   REAL :: FF, GG, R, AA, BB
+   REAL :: K1F, K1G, K2F, K2G, K3F, K3G, K4F, K4G
+   REAL :: LAM, QINF
+   INTEGER :: I, J
+   FF := RG(1) ** SS
+   GG := Q0 * FF
+   UF(1) := FF
+   UG(1) := GG
+   R := RG(1)
+   DO I = 1, NT - 1
+      AA := (EP - VL(I)) * R / CC
+      BB := 2.0 * CC * R + AA
+      K1F := -KAP * FF + BB * GG
+      K1G := -AA * FF + KAP * GG
+      AA := (EP - VLM(I)) * R * EXP(0.5 * H) / CC
+      BB := 2.0 * CC * R * EXP(0.5 * H) + AA
+      K2F := -KAP * (FF + 0.5*H*K1F) + BB * (GG + 0.5*H*K1G)
+      K2G := -AA * (FF + 0.5*H*K1F) + KAP * (GG + 0.5*H*K1G)
+      K3F := -KAP * (FF + 0.5*H*K2F) + BB * (GG + 0.5*H*K2G)
+      K3G := -AA * (FF + 0.5*H*K2F) + KAP * (GG + 0.5*H*K2G)
+      R := R * EXP(H)
+      AA := (EP - VL(I + 1)) * R / CC
+      BB := 2.0 * CC * R + AA
+      K4F := -KAP * (FF + H*K3F) + BB * (GG + H*K3G)
+      K4G := -AA * (FF + H*K3F) + KAP * (GG + H*K3G)
+      FF := FF + H * (K1F + 2.0*K2F + 2.0*K3F + K4F) / 6.0
+      GG := GG + H * (K1G + 2.0*K2G + 2.0*K3G + K4G) / 6.0
+      UF(I + 1) := FF
+      UG(I + 1) := GG
+   ENDDO
+   LAM := SQRT(-EP * (2.0*CC*CC + EP)) / CC
+   QINF := -LAM * CC / (2.0*CC*CC + EP)
+   DO I = NIN + 1, NT
+      WF(I) := 0.0
+      WG(I) := 0.0
+   ENDDO
+   FF := 1.0
+   GG := QINF
+   WF(NIN) := FF
+   WG(NIN) := GG
+   R := RG(NIN)
+   DO J = 1, NIN - 1
+      I := NIN - J
+      ! step from grid I+1 down to grid I
+      AA := (EP - VL(I + 1)) * R / CC
+      BB := 2.0 * CC * R + AA
+      K1F := -KAP * FF + BB * GG
+      K1G := -AA * FF + KAP * GG
+      AA := (EP - VLM(I)) * R * EXP(-0.5 * H) / CC
+      BB := 2.0 * CC * R * EXP(-0.5 * H) + AA
+      K2F := -KAP * (FF - 0.5*H*K1F) + BB * (GG - 0.5*H*K1G)
+      K2G := -AA * (FF - 0.5*H*K1F) + KAP * (GG - 0.5*H*K1G)
+      K3F := -KAP * (FF - 0.5*H*K2F) + BB * (GG - 0.5*H*K2G)
+      K3G := -AA * (FF - 0.5*H*K2F) + KAP * (GG - 0.5*H*K2G)
+      R := R * EXP(-H)
+      AA := (EP - VL(I)) * R / CC
+      BB := 2.0 * CC * R + AA
+      K4F := -KAP * (FF - H*K3F) + BB * (GG - H*K3G)
+      K4G := -AA * (FF - H*K3F) + KAP * (GG - H*K3G)
+      FF := FF - H * (K1F + 2.0*K2F + 2.0*K3F + K4F) / 6.0
+      GG := GG - H * (K1G + 2.0*K2G + 2.0*K3G + K4G) / 6.0
+      WF(I) := FF
+      WG(I) := GG
+   ENDDO
+END
+
+! ════════════════════════════════════════════════════════════════════
+! VOPN(EP): log10 N(eps) of the variation-of-parameters solution
+! X = a U + b W for the frozen exchange sources SF/SG (FIX 4).
+! Leaves XF/XG filled and W0S = U x W at NRT (for pole detection).
+! ════════════════════════════════════════════════════════════════════
+REAL FUNCTION VOPN(EP)
+   IMPLICIT NONE
+   REAL :: EP
+   REAL :: VN
+   INTEGER :: I, J
+   CALL LEGS(EP)
+   W0S := UF(NRT) * WG(NRT) - UG(NRT) * WF(NRT)
+   DO I = 1, NT
+      DEN(I) := -RG(I) * SG(I) / CC
+      FK(I) := -RG(I) * SF(I) / CC
+   ENDDO
+   DO I = 1, NT
+      APV(I) := (DEN(I) * WG(I) - FK(I) * WF(I)) / W0S
+      BPV(I) := (UF(I) * FK(I) - UG(I) * DEN(I)) / W0S
+   ENDDO
+   BV(1) := 0.0
+   DO I = 2, NT
+      BV(I) := BV(I - 1) + 0.5 * H * (BPV(I - 1) + BPV(I))
+   ENDDO
+   AV(NT) := 0.0
+   DO J = 1, NT - 1
+      I := NT - J
+      AV(I) := AV(I + 1) - 0.5 * H * (APV(I) + APV(I + 1))
+   ENDDO
+   VN := 0.0
+   DO I = 1, NT
+      XF(I) := AV(I) * UF(I) + BV(I) * WF(I)
+      XG(I) := AV(I) * UG(I) + BV(I) * WG(I)
+      VN := VN + (XF(I) * XF(I) + XG(I) * XG(I)) * RG(I)
+   ENDDO
+   VN := SQRT(VN * H)
+   VOPN := LOG10(VN)
+END
+
+! ════════════════════════════════════════════════════════════════════
+! NODEX(): radial node count of XF (VoP solution), thresholded at
+! 1e-6 of max|XF|, zeros skipped.
+! ════════════════════════════════════════════════════════════════════
+INTEGER FUNCTION NODEX()
+   IMPLICIT NONE
+   REAL :: XM, SP, SC
+   INTEGER :: I, I0, I1, NN
+   XM := 0.0
+   DO I = 1, NT
+      IF (ABS(XF(I)) > XM) THEN
+        XM := ABS(XF(I))
+      ENDIF
+   ENDDO
+   I0 := 1
+   I1 := NT
+   DO I = 1, NT
+      IF (ABS(XF(I)) > 1.0e-6 * XM) THEN
+        I0 := I
+        EXIT
+      ENDIF
+   ENDDO
+   I1 := I0
+   DO I = I0, NT
+      IF (ABS(XF(I)) > 1.0e-6 * XM) THEN
+        I1 := I
+      ENDIF
+   ENDDO
+   NN := 0
+   SP := 0.0
+   DO I = I0, I1
+      SC := 0.0
+      IF (XF(I) > 0.0) THEN
+        SC := 1.0
+      ENDIF
+      IF (XF(I) < 0.0) THEN
+        SC := -1.0
+      ENDIF
+      IF (SC /= 0.0) THEN
+        IF (SP /= 0.0) THEN
+          IF (SC /= SP) THEN
+            NN := NN + 1
+          ENDIF
+        ENDIF
+        SP := SC
+      ENDIF
+   ENDDO
+   NODEX := NN
+END
+
+! ════════════════════════════════════════════════════════════════════
+! SHOOT(EP): legacy Wronskian of outward (series) and inward
+! (decaying) integrations at NRT, WITH the frozen exchange sources
+! (inhomogeneous terms).  Used only for source-free orbitals.
+! Legs retained in FO/GO/FI/GI for the splice.
+! ════════════════════════════════════════════════════════════════════
+REAL FUNCTION SHOOT(EP)
+   IMPLICIT NONE
+   REAL :: EP
+   REAL :: FF, GG, R, AA, BB, XS, XT
+   REAL :: K1F, K1G, K2F, K2G, K3F, K3G, K4F, K4G
+   REAL :: LAM, QINF
+   INTEGER :: I, J
+   FF := RG(1) ** SS
+   GG := Q0 * FF
+   FO(1) := FF
+   GO(1) := GG
+   R := RG(1)
+   DO I = 1, NRT - 1
+      AA := (EP - VL(I)) * R / CC
+      BB := 2.0 * CC * R + AA
+      XS := R * SG(I) / CC
+      XT := R * SF(I) / CC
+      K1F := -KAP * FF + BB * GG - XS
+      K1G := -AA * FF + KAP * GG - XT
+      AA := (EP - VLM(I)) * R * EXP(0.5 * H) / CC
+      BB := 2.0 * CC * R * EXP(0.5 * H) + AA
+      XS := R * EXP(0.5 * H) * SGM(I) / CC
+      XT := R * EXP(0.5 * H) * SFM(I) / CC
+      K2F := -KAP * (FF + 0.5*H*K1F) + BB * (GG + 0.5*H*K1G) - XS
+      K2G := -AA * (FF + 0.5*H*K1F) + KAP * (GG + 0.5*H*K1G) - XT
+      K3F := -KAP * (FF + 0.5*H*K2F) + BB * (GG + 0.5*H*K2G) - XS
+      K3G := -AA * (FF + 0.5*H*K2F) + KAP * (GG + 0.5*H*K2G) - XT
+      R := R * EXP(H)
+      AA := (EP - VL(I + 1)) * R / CC
+      BB := 2.0 * CC * R + AA
+      XS := R * SG(I + 1) / CC
+      XT := R * SF(I + 1) / CC
+      K4F := -KAP * (FF + H*K3F) + BB * (GG + H*K3G) - XS
+      K4G := -AA * (FF + H*K3F) + KAP * (GG + H*K3G) - XT
+      FF := FF + H * (K1F + 2.0*K2F + 2.0*K3F + K4F) / 6.0
+      GG := GG + H * (K1G + 2.0*K2G + 2.0*K3G + K4G) / 6.0
+      FO(I + 1) := FF
+      GO(I + 1) := GG
+   ENDDO
+   LAM := SQRT(-EP * (2.0*CC*CC + EP)) / CC
+   QINF := -LAM * CC / (2.0*CC*CC + EP)
+   DO I = NIN + 1, NT
+      FI(I) := 0.0
+      GI(I) := 0.0
+   ENDDO
+   FF := 1.0
+   GG := QINF
+   FI(NIN) := FF
+   GI(NIN) := GG
+   R := RG(NIN)
+   DO J = 1, NIN - NRT
+      I := NIN - J
+      AA := (EP - VL(I + 1)) * R / CC
+      BB := 2.0 * CC * R + AA
+      XS := R * SG(I + 1) / CC
+      XT := R * SF(I + 1) / CC
+      K1F := -KAP * FF + BB * GG - XS
+      K1G := -AA * FF + KAP * GG - XT
+      AA := (EP - VLM(I)) * R * EXP(-0.5 * H) / CC
+      BB := 2.0 * CC * R * EXP(-0.5 * H) + AA
+      XS := R * EXP(-0.5 * H) * SGM(I) / CC
+      XT := R * EXP(-0.5 * H) * SFM(I) / CC
+      K2F := -KAP * (FF - 0.5*H*K1F) + BB * (GG - 0.5*H*K1G) - XS
+      K2G := -AA * (FF - 0.5*H*K1F) + KAP * (GG - 0.5*H*K1G) - XT
+      K3F := -KAP * (FF - 0.5*H*K2F) + BB * (GG - 0.5*H*K2G) - XS
+      K3G := -AA * (FF - 0.5*H*K2F) + KAP * (GG - 0.5*H*K2G) - XT
+      R := R * EXP(-H)
+      AA := (EP - VL(I)) * R / CC
+      BB := 2.0 * CC * R + AA
+      XS := R * SG(I) / CC
+      XT := R * SF(I) / CC
+      K4F := -KAP * (FF - H*K3F) + BB * (GG - H*K3G) - XS
+      K4G := -AA * (FF - H*K3F) + KAP * (GG - H*K3G) - XT
+      FF := FF - H * (K1F + 2.0*K2F + 2.0*K3F + K4F) / 6.0
+      GG := GG - H * (K1G + 2.0*K2G + 2.0*K3G + K4G) / 6.0
+      FI(I) := FF
+      GI(I) := GG
+   ENDDO
+   SHOOT := (FO(NRT) * GI(NRT) - FI(NRT) * GO(NRT)) / &
+     (ABS(FO(NRT) * FI(NRT)) + ABS(GO(NRT) * GI(NRT)) + 1.0e-300)
+END
+
+! ════════════════════════════════════════════════════════════════════
+! NNODE(): radial node count of the spliced SHOOT solution:
+! sign changes of FO(1..NRT) plus FI(NRT+1..NIN), zeros skipped.
+! ════════════════════════════════════════════════════════════════════
+INTEGER FUNCTION NNODE()
+   IMPLICIT NONE
+   REAL :: SP, SC, VV
+   INTEGER :: I, NN
+   NN := 0
+   SP := 0.0
+   DO I = 1, NIN
+      IF (I <= NRT) THEN
+        VV := FO(I)
+      ELSE
+        VV := FI(I)
+      ENDIF
+      SC := 0.0
+      IF (VV > 0.0) THEN
+        SC := 1.0
+      ENDIF
+      IF (VV < 0.0) THEN
+        SC := -1.0
+      ENDIF
+      IF (SC /= 0.0) THEN
+        IF (SP /= 0.0) THEN
+          IF (SC /= SP) THEN
+            NN := NN + 1
+          ENDIF
+        ENDIF
+        SP := SC
+      ENDIF
+   ENDDO
+   NNODE := NN
+END

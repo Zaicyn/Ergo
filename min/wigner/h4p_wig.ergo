@@ -1,0 +1,254 @@
+! ════════════════════════════════════════════════════════════════════
+! H4P_WIG — Stage W4a: heteronuclear handshake instrument, HeH2+
+! (one electron; He Z=2 at z=-R/2, H Z=1 at z=+R/2).
+! Rename: h4p_wig.ergo.txt -> h4p_wig.ergo
+! Run: python -m core min/handshake/h4p_wig.ergo -o /tmp/h4w && /tmp/h4w
+!      (6 R x 2 states x 2500 imag-time steps on 128^3; tens of minutes)
+!
+! Fork of h2p_wig.ergo (Stage W1). Identical solver physics: NX=128,
+! BOX=16, exact Coulomb, cell centers, masked stencil, DTAU=0.008,
+! NSTEPS=2500, no RNG. The heteronuclear deltas:
+!   1. Two-Z potential: V = -2/rA - 1/rB.
+!   2. NO PARITY (no inversion symmetry). States are 1sigma (ground,
+!      IP=1: plain imaginary time from a He-weighted start packet) and
+!      2sigma (excited, IP=2: imaginary time from an H-weighted
+!      antibonding packet WITH deflation against the converged 1sigma
+!      every step -- the df_radial2-proven pattern).
+!   3. IP now means STATE (1 or 2), not parity; all W lines unchanged
+!      in format so wigner_mirror_w4.py compare mode reads them.
+!
+! ORACLES (wigner_mirror_w4.py, heteronuclear 1s-STO LCAO, He zeta=2 /
+! H zeta=1; tolerances per wigner_handshake_spec.md adapted: W0 to
+! 2e-2 relative -- W(0,0) is no longer +/-1/pi, it is the midpoint
+! coherence of an ASYMMETRIC bond; fringe p to 5-10%, depth to 15%):
+!   R     st   E_LCAO      W(0,0)      p_fringe   W_fringe
+!   0.75  1   -3.1674     +0.22034    +2.983     +0.0017
+!   0.75  2   -1.0690     +0.05598    +0.709     -0.0212
+!   1.00  1   -2.9487     +0.19393    +2.983     -0.0035
+!   1.00  2   -1.1712     +0.00199    +0.513     -0.0265
+!   1.50  1   -2.6662     +0.13572    +2.151     -0.0061
+!   1.50  2   -1.2769     -0.02250    +0.171     -0.0228
+!   2.00  1   -2.5023     +0.08178    +1.638     -0.0065
+!   2.00  2   -1.2655     -0.00345    +2.836     -0.0091
+!   3.00  1   -2.3336     +0.02249    +1.100     -0.0034
+!   3.00  2   -1.1263     +0.02690    -1.931     -0.0115
+!   4.00  1   -2.2500     +0.00533    +0.831     -0.0012
+!   4.00  2   -0.9935     +0.02699    +1.467     -0.0088
+! Physics notes: HeH2+ has NO bound equilibrium (repulsive ground
+! curve; literature-confirmed) -- R list spans the charge-localization
+! transition instead (Mulliken popA(He): 0.96 at R=1 -> 0.9997 at R=4).
+! The 2sigma node pocket drifts off origin toward the H side; fringes
+! are asymmetric in +/-p -- both are the heteronuclear signatures.
+! Engine E (ECONV) is the EXACT grid energy and will sit below the
+! LCAO mirror value; it is a self-consistency diagnostic, not an oracle.
+! ════════════════════════════════════════════════════════════════════
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 128
+REAL, PARAMETER :: BOX = 16.0
+INTEGER, PARAMETER :: NPTS = 2097152
+INTEGER, PARAMETER :: NXY = 16384
+INTEGER, PARAMETER :: NSTEPS = 2500
+REAL, PARAMETER :: DTAU = 0.008
+INTEGER, PARAMETER :: NP = 256
+
+STATIC REAL :: RLIST(6)
+DATA RLIST / 0.75, 1.0, 1.5, 2.0, 3.0, 4.0 /
+
+STATIC REAL :: PSI(NPTS), PSIN(NPTS), PSG(NPTS), V(NPTS)
+STATIC INTEGER :: BND(NPTS)
+STATIC REAL :: RZ(128,128), WG(128,256)
+
+REAL :: DX, DX2, IDX2, DV, X, Y, Z, R, RZD, RL, RR
+REAL :: LAP, NRM, T_KE, V_PE, E_TOT, PI, PMAX, PV, WV
+REAL :: W00, WMIN, WMAX, PMIN, ACC, WN, OV
+INTEGER :: I, J, K, IR, IP, T, IC, JC, KC, KC2, M2, MM, IPL
+INTEGER :: KA, KB
+
+PI := 3.14159265358979323846
+DX := 2.0 * BOX / REAL(NX)
+DX2 := DX * DX
+IDX2 := 1.0 / DX2
+DV := DX * DX * DX
+PMAX := PI / (2.0 * DX)
+
+! boundary mask (face cells zeroed and never used by interior stencils)
+DO K = 1, NPTS
+  BND(K) := 0
+  V(K) := 0.0
+ENDDO
+DO KC = 2, NX - 1
+  DO JC = 2, NX - 1
+    DO IC = 2, NX - 1
+      K := IC + (JC - 1) * NX + (KC - 1) * NXY
+      BND(K) := 1
+    ENDDO
+  ENDDO
+ENDDO
+
+DO IR = 1, 6
+  R := RLIST(IR)
+  RZD := 0.5 * R
+  DO IP = 1, 2
+    ! heteronuclear two-center potential + state-selected start packet
+    DO K = 1, NPTS
+      KC := 1 + (K - 1) / NXY
+      JC := 1 + MOD((K - 1) / NX, NX)
+      IC := 1 + MOD(K - 1, NX)
+      X := -BOX + (REAL(IC) - 0.5) * DX
+      Y := -BOX + (REAL(JC) - 0.5) * DX
+      Z := -BOX + (REAL(KC) - 0.5) * DX
+      RL := SQRT(X * X + Y * Y + (Z + RZD) * (Z + RZD))
+      RR := SQRT(X * X + Y * Y + (Z - RZD) * (Z - RZD))
+      V(K) := -2.0 / RL - 1.0 / RR
+      IF (IP = 1) THEN
+        ! 1sigma: He-weighted bonding start
+        PSI(K) := EXP(-2.0 * RL) + 0.5 * EXP(-RR)
+      ELSE
+        ! 2sigma: H-weighted antibonding start (deflated below)
+        PSI(K) := EXP(-RR) - 0.5 * EXP(-2.0 * RL)
+      ENDIF
+    ENDDO
+    NRM := 0.0
+    DO K = 1, NPTS
+      NRM := NRM + PSI(K) * PSI(K) * DV
+    ENDDO
+    NRM := SQRT(NRM)
+    DO K = 1, NPTS
+      PSI(K) := PSI(K) / NRM
+    ENDDO
+
+    ! imaginary time (identical solver physics to h2p.ergo); for the
+    ! excited state, deflate against the converged 1sigma every step
+    DO T = 1, NSTEPS
+      DO K = NXY + 2, NPTS - NXY - 1
+        LAP := (PSI(K - 1) + PSI(K + 1) + PSI(K - NX) + PSI(K + NX) &
+          + PSI(K - NXY) + PSI(K + NXY) - 6.0 * PSI(K)) * IDX2
+        PSIN(K) := (PSI(K) + DTAU * (0.5 * LAP - V(K) * PSI(K))) &
+          * REAL(BND(K))
+      ENDDO
+      IF (IP = 2) THEN
+        OV := 0.0
+        DO K = 1, NPTS
+          OV := OV + PSIN(K) * PSG(K) * DV
+        ENDDO
+        DO K = 1, NPTS
+          PSIN(K) := PSIN(K) - OV * PSG(K)
+        ENDDO
+      ENDIF
+      NRM := 0.0
+      DO K = 1, NPTS
+        NRM := NRM + PSIN(K) * PSIN(K) * DV
+      ENDDO
+      NRM := SQRT(NRM)
+      DO K = 1, NPTS
+        PSI(K) := PSIN(K) / NRM
+      ENDDO
+    ENDDO
+    IF (IP = 1) THEN
+      DO K = 1, NPTS
+        PSG(K) := PSI(K)
+      ENDDO
+    ENDIF
+
+    ! convergence energy line (diagnostic; EXACT grid energy, sits
+    ! below the LCAO mirror value -- not an oracle)
+    T_KE := 0.0
+    V_PE := 0.0
+    DO K = NXY + 2, NPTS - NXY - 1
+      LAP := (PSI(K - 1) + PSI(K + 1) + PSI(K - NX) + PSI(K + NX) &
+        + PSI(K - NXY) + PSI(K + NXY) - 6.0 * PSI(K)) * IDX2
+      T_KE := T_KE - 0.5 * PSI(K) * LAP * DV
+      V_PE := V_PE + V(K) * PSI(K) * PSI(K) * DV
+    ENDDO
+    E_TOT := T_KE + V_PE
+    WRITE(*, "('ECONV %.3f %d %.10e')") R, IP, E_TOT
+
+    ! ── Wigner block (unchanged from h2p_wig) ─────────────────────
+    DO KC = 1, NX
+      DO KC2 = 1, NX
+        RZ(KC, KC2) := 0.0
+      ENDDO
+    ENDDO
+    DO JC = 2, NX - 1
+      DO IC = 2, NX - 1
+        DO KC = 1, NX
+          KA := IC + (JC - 1) * NX + (KC - 1) * NXY
+          DO KC2 = KC, NX
+            KB := IC + (JC - 1) * NX + (KC2 - 1) * NXY
+            RZ(KC, KC2) := RZ(KC, KC2) + PSI(KA) * PSI(KB) * DX2
+          ENDDO
+        ENDDO
+      ENDDO
+    ENDDO
+    DO KC = 1, NX
+      IF (KC > 1) THEN
+        DO KC2 = 1, KC - 1
+          RZ(KC, KC2) := RZ(KC2, KC)
+        ENDDO
+      ENDIF
+    ENDDO
+
+    ! DFT: W(KC, IPL) over full Nyquist p range
+    DO KC = 1, NX
+      MM := KC - 1
+      IF (NX - KC < MM) THEN
+        MM := NX - KC
+      ENDIF
+      DO IPL = 1, NP
+        PV := -PMAX + (REAL(IPL) - 0.5) * 2.0 * PMAX / REAL(NP)
+        ACC := 0.0
+        DO M2 = -MM, MM
+          ACC := ACC + RZ(KC - M2, KC + M2) * COS(2.0 * PV * REAL(M2) * DX)
+        ENDDO
+        WG(KC, IPL) := ACC * DX / PI
+      ENDDO
+    ENDDO
+
+    ! scalar oracles
+    ! WNORM = sum W dz dp (exact: 1.0)
+    WN := 0.0
+    DO KC = 1, NX
+      DO IPL = 1, NP
+        WN := WN + WG(KC, IPL)
+      ENDDO
+    ENDDO
+    WN := WN * DX * 2.0 * PMAX / REAL(NP)
+    WRITE(*, "('WNORM %.3f %d %.17e')") R, IP, WN
+
+    ! midpoint row: z=0 lies between KC=64 and 65; average
+    KC := NX / 2
+    W00 := 0.25 * (WG(KC, NP / 2) + WG(KC, NP / 2 + 1) &
+      + WG(KC + 1, NP / 2) + WG(KC + 1, NP / 2 + 1))
+    WMIN := WG(KC, 1)
+    WMAX := WG(KC, 1)
+    PMIN := -PMAX + 0.5 * 2.0 * PMAX / REAL(NP)
+    DO IPL = 1, NP
+      PV := -PMAX + (REAL(IPL) - 0.5) * 2.0 * PMAX / REAL(NP)
+      WV := 0.5 * (WG(KC, IPL) + WG(KC + 1, IPL))
+      IF (WV < WMIN) THEN
+        WMIN := WV
+        PMIN := PV
+      ENDIF
+      IF (WV > WMAX) THEN
+        WMAX := WV
+      ENDIF
+    ENDDO
+    WRITE(*, "('W0 %.3f %d %.17e')") R, IP, W00
+    WRITE(*, "('WFR %.3f %d %.17e %.17e')") R, IP, WMIN, PMIN
+    WRITE(*, "('WVIS %.3f %d %.17e')") R, IP, ABS(WMIN) / WMAX
+
+    ! coarse map: every 2nd z, every 2nd p
+    DO KC = 1, NX, 2
+      Z := -BOX + (REAL(KC) - 0.5) * DX
+      DO IPL = 1, NP, 2
+        PV := -PMAX + (REAL(IPL) - 0.5) * 2.0 * PMAX / REAL(NP)
+        WRITE(*, "('WMAP %.3f %d %.4f %.4f %.17e')") R, IP, Z, PV, &
+          WG(KC, IPL)
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+WRITE(*, "('DONE')")
+STOP

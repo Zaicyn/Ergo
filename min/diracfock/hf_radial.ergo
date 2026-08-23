@@ -1,0 +1,414 @@
+! ════════════════════════════════════════════════════════════════════
+! HF_RADIAL — nonrelativistic closed-shell Hartree-Fock SCF on the
+! radial grid (Stage 1 of the Dirac-Fock campaign), for He, Be, Ne.
+!
+! Grid discipline from the helium engine (min/helium/he_orb.ergo):
+! u(r) = r*R(r) on a uniform grid with the node exactly at r=0,
+! 5-point Laplacian, imaginary-time propagation, Gram-Schmidt
+! deflation within l-blocks.
+!
+! SCF structure (MCTDHF-style continuous relaxation): per
+! imaginary-time step the Fock operator is rebuilt from the CURRENT
+! orbitals — direct potential VH(r) = sum_b 2 Y^0_bb(r), and the
+! nonlocal exchange applied pointwise per orbital:
+!   (F u_a) = [h + VH] u_a - sum_b sum_k c^k_ab Y^k_ab(r) u_b(r)
+! with Y^k_ab the cumulative-Poisson function of the transition
+! density u_a u_b (same O(NR) form as the helium engine) and the
+! closed-shell angular coefficients c^k_ab (computed by the certified
+! 1-sphere Gaunt quadrature — see diracfock/DIRACFOCK_FINDINGS.md):
+!   s<-s: (k=0, 1.0)     s<-p: (k=1, 1.0)
+!   p<-s: (k=1, 1/3)     p<-p: (k=0, 1.0) + (k=2, 0.4)
+! (the p-shell k=0 coefficient is self-exchange and cancels the
+! self-direct term exactly).
+!
+! Occupations (closed-shell Aufbau, hard-coded): He: 1s2; Be: 1s2 2s2;
+! Ne: 1s2 2s2 2p6. Oracles (Clementi-Roetti HF limits): He -2.861680,
+! Be -14.57302, Ne -128.5471 Ha; virial -V/T = 2; determinism: fixed
+! step counts, twice byte-identical.
+! Compile: python -m core min/diracfock/hf_radial.ergo -o <bin>
+! ════════════════════════════════════════════════════════════════════
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NR = 16000
+REAL, PARAMETER :: RMAX = 40.0
+INTEGER, PARAMETER :: NSTEP = 1500000
+REAL, PARAMETER :: DT = 4.0e-6
+INTEGER, PARAMETER :: NPRINT = 100000
+
+! three atoms in one run
+STATIC REAL :: ZT(3)
+STATIC INTEGER :: NB(3)
+DATA ZT / 2.0, 4.0, 10.0 /
+DATA NB / 1, 2, 3 /
+
+! orbital l table: 1s, 2s, 2p; occupation per spatial orbital
+! (closed shells: 2 per s shell, 6 for the p^6 shell)
+STATIC INTEGER :: LTAB(3), OTAB(3)
+DATA LTAB / 0, 0, 1 /
+DATA OTAB / 2, 2, 6 /
+
+! exchange coefficient table per (la, lb): (k, c) — up to 2 entries
+! index: 1=(s,s) 2=(s,p) 3=(p,s) 4=(p,p); two (k,c) slots each
+STATIC REAL :: CXK(4, 2), CXC(4, 2)
+DATA CXK / 0.0, 1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 2.0 /
+DATA CXC / 1.0, 1.0, 0.3333333333333333, 1.0, 0.0, 0.0, 0.0, 0.4 /
+
+STATIC REAL :: U(NR, 3), VH(NR), YK(NR), FK(NR), PY(NR), XA(NR, 3)
+STATIC REAL :: EPS(3)
+
+REAL :: DR, DR2, ZZ, R, NRM, LAP, VV, EKIN, EPOT, ETOT, OV
+REAL :: DTLOC, AC, BC, FA, FB, R0, R1, X, CX, TSUM
+REAL :: ESUM, TALL, EDIFF, EOLD
+INTEGER :: I, J, K, IA, IB, IC, T, LA, LB, NA, NBB, ITAB, JTAB
+INTEGER :: IQ, NBX
+
+DR := RMAX / REAL(NR - 1)
+DR2 := DR * DR
+
+DO IQ = 1, 3
+  ZZ := ZT(IQ)
+  NBX := NB(IQ)
+
+  ! initial packets: hydrogenic-ish, u ~ r^(l+1) exp(-Z r / n_a)
+  DO IA = 1, NBX
+    LA := LTAB(IA)
+    DO I = 1, NR
+      R := REAL(I - 1) * DR
+      U(I, IA) := (R ** (LA + 1)) * EXP(-ZZ * R / REAL(IA))
+    ENDDO
+  ENDDO
+
+  EOLD := 0.0
+  ! ── SCF flow: Fock operator rebuilt every 25 steps (delayed update;
+  ! between rebuilds the propagation runs on the frozen operator) ──
+  DO T = 1, NSTEP
+  IF (MOD(T, 25) == 1) THEN
+    ! direct potential: VH = sum_b 2 Y^0_bb (cumulative Poisson, k=0)
+    DO I = 1, NR
+      VH(I) := 0.0
+    ENDDO
+    DO IB = 1, NBX
+      DO I = 1, NR
+        FK(I) := U(I, IB) * U(I, IB)
+      ENDDO
+      AC := 0.0
+      YK(1) := 0.0
+      DO I = 2, NR
+        AC := AC + 0.5 * (FK(I-1) + FK(I)) * DR
+        YK(I) := AC
+      ENDDO
+      BC := 0.0
+      PY(NR) := 0.0
+      DO J = 1, NR - 1
+        I := NR - J
+        BC := BC + 0.5 * (FK(I)/REAL(I-1)/DR + FK(I+1)/REAL(I)/DR) * DR
+        PY(I) := BC
+      ENDDO
+      DO I = 2, NR
+        VH(I) := VH(I) + REAL(OTAB(IB)) * (YK(I)/REAL(I-1)/DR + PY(I))
+      ENDDO
+    ENDDO
+
+    ! exchange accumulation XA = sum_b sum_k c Y^k_ab u_b (per orbital)
+    DO IA = 1, NBX
+      LA := LTAB(IA)
+      DO I = 1, NR
+        XA(I, IA) := 0.0
+      ENDDO
+      DO IB = 1, NBX
+        LB := LTAB(IB)
+        ITAB := 0
+        IF (LA == 0) THEN
+          IF (LB == 0) THEN
+            ITAB := 1
+          ELSE
+            ITAB := 2
+          ENDIF
+        ELSE
+          IF (LB == 0) THEN
+            ITAB := 3
+          ELSE
+            ITAB := 4
+          ENDIF
+        ENDIF
+        DO JTAB = 1, 2
+          CX := CXC(ITAB, JTAB)
+          K := INT(CXK(ITAB, JTAB))
+          IF (CX /= 0.0) THEN
+            DO I = 1, NR
+              FK(I) := U(I, IA) * U(I, IB)
+            ENDDO
+            ! Y^k via cumulative sums; explicit powers (no pow() calls)
+            AC := 0.0
+            YK(1) := 0.0
+            DO I = 2, NR
+              R0 := REAL(I - 2) * DR
+              R1 := REAL(I - 1) * DR
+              IF (K == 0) THEN
+                FA := FK(I-1)
+                FB := FK(I)
+              ENDIF
+              IF (K == 1) THEN
+                FA := FK(I-1) * R0
+                FB := FK(I) * R1
+              ENDIF
+              IF (K == 2) THEN
+                FA := FK(I-1) * R0 * R0
+                FB := FK(I) * R1 * R1
+              ENDIF
+              AC := AC + 0.5 * (FA + FB) * DR
+              IF (K == 0) THEN
+                YK(I) := AC / R1
+              ENDIF
+              IF (K == 1) THEN
+                YK(I) := AC / (R1 * R1)
+              ENDIF
+              IF (K == 2) THEN
+                YK(I) := AC / (R1 * R1 * R1)
+              ENDIF
+            ENDDO
+            BC := 0.0
+            PY(NR) := 0.0
+            DO J = 1, NR - 1
+              I := NR - J
+              R0 := REAL(I - 1) * DR
+              R1 := REAL(I) * DR
+              IF (K == 0) THEN
+                FA := FK(I) / R0
+                FB := FK(I+1) / R1
+              ENDIF
+              IF (K == 1) THEN
+                FA := FK(I) / (R0 * R0)
+                FB := FK(I+1) / (R1 * R1)
+              ENDIF
+              IF (K == 2) THEN
+                FA := FK(I) / (R0 * R0 * R0)
+                FB := FK(I+1) / (R1 * R1 * R1)
+              ENDIF
+              BC := BC + 0.5 * (FA + FB) * DR
+              PY(I) := BC
+            ENDDO
+            DO I = 2, NR
+              R1 := REAL(I - 1) * DR
+              IF (K == 0) THEN
+                XA(I, IA) := XA(I, IA) + CX * (YK(I) + PY(I)) * U(I, IB)
+              ENDIF
+              IF (K == 1) THEN
+                XA(I, IA) := XA(I, IA) + CX * (YK(I) + R1 * PY(I)) &
+                  * U(I, IB)
+              ENDIF
+              IF (K == 2) THEN
+                XA(I, IA) := XA(I, IA) + CX * (YK(I) + R1 * R1 * PY(I)) &
+                  * U(I, IB)
+              ENDIF
+            ENDDO
+          ENDIF
+        ENDDO
+      ENDDO
+      ENDDO
+    ENDIF
+    ! propagate each orbital one step under the FROZEN operator
+    ! (Rayleigh-shifted: the +eps*u term makes fixed points true Fock
+    ! eigenstates; without it the source-carrying 2s lands on the
+    ! resolvent point — measured as a wrong Ne total/virial)
+    DO IA = 1, NBX
+      LA := LTAB(IA)
+      ! Rayleigh quotient eps_a = <u|F|u> under the frozen operator
+      AC := 0.0
+      DO I = 3, NR - 2
+        R := REAL(I - 1) * DR
+        LAP := (-U(I-2, IA) + 16.0*U(I-1, IA) - 30.0*U(I, IA) &
+          + 16.0*U(I+1, IA) - U(I+2, IA)) / (12.0 * DR2)
+        VV := -ZZ / R + REAL(LA*(LA+1)) / (2.0 * R * R) + VH(I)
+        AC := AC + U(I, IA) * (-0.5 * LAP + VV * U(I, IA) &
+          - XA(I, IA)) * DR
+      ENDDO
+      EPS(IA) := AC
+      ! Euler step + deflate (same l) + normalize
+      U(1, IA) := 0.0
+      U(NR, IA) := 0.0
+      DO I = 3, NR - 2
+        R := REAL(I - 1) * DR
+        LAP := (-U(I-2, IA) + 16.0*U(I-1, IA) - 30.0*U(I, IA) &
+          + 16.0*U(I+1, IA) - U(I+2, IA)) / (12.0 * DR2)
+        VV := -ZZ / R + REAL(LA*(LA+1)) / (2.0 * R * R) + VH(I)
+        U(I, IA) := U(I, IA) + DT * (0.5 * LAP - VV * U(I, IA) &
+          + XA(I, IA) + EPS(IA) * U(I, IA))
+      ENDDO
+      I := 2
+      R := REAL(I - 1) * DR
+      LAP := (U(I-1, IA) + U(I+1, IA) - 2.0*U(I, IA)) / DR2
+      VV := -ZZ / R + REAL(LA*(LA+1)) / (2.0 * R * R) + VH(I)
+      U(I, IA) := U(I, IA) + DT * (0.5 * LAP - VV * U(I, IA) + XA(I, IA) &
+        + EPS(IA) * U(I, IA))
+      I := NR - 1
+      R := REAL(I - 1) * DR
+      LAP := (U(I-1, IA) + U(I+1, IA) - 2.0*U(I, IA)) / DR2
+      VV := -ZZ / R + REAL(LA*(LA+1)) / (2.0 * R * R) + VH(I)
+      U(I, IA) := U(I, IA) + DT * (0.5 * LAP - VV * U(I, IA) + XA(I, IA) &
+        + EPS(IA) * U(I, IA))
+      ! deflate against lower same-l orbitals
+      DO IB = 1, IA - 1
+        IF (LTAB(IB) == LA) THEN
+          OV := 0.0
+          DO I = 1, NR
+            OV := OV + U(I, IA) * U(I, IB) * DR
+          ENDDO
+          DO I = 1, NR
+            U(I, IA) := U(I, IA) - OV * U(I, IB)
+          ENDDO
+        ENDIF
+      ENDDO
+      NRM := 0.0
+      DO I = 1, NR
+        NRM := NRM + U(I, IA) * U(I, IA) * DR
+      ENDDO
+      NRM := SQRT(NRM)
+      DO I = 1, NR
+        U(I, IA) := U(I, IA) / NRM
+      ENDDO
+    ENDDO
+
+    ! per-print diagnostics: orbital energies + total energy
+    IF (MOD(T, NPRINT) == 0) THEN
+      TSUM := 0.0
+      ESUM := 0.0
+      TALL := 0.0
+      DO IA = 1, NBX
+        ! one-electron expectation eps_a = <h_a> = T_a + V_nuc (NOT the
+        ! Fock eigenvalue; the Fock eps is the RESID block below).
+        ! EKIN is the FULL kinetic (radial + centrifugal); the
+        ! centrifugal part l(l+1)/2r^2 is kinetic, not potential —
+        ! leaving it in EPOT breaks the printed virial for l>0
+        ! (the Ne "virial anomaly" was exactly this accounting bug).
+        LA := LTAB(IA)
+        EKIN := 0.0
+        EPOT := 0.0
+        DO I = 3, NR - 2
+          R := REAL(I - 1) * DR
+          LAP := (-U(I-2, IA) + 16.0*U(I-1, IA) - 30.0*U(I, IA) &
+            + 16.0*U(I+1, IA) - U(I+2, IA)) / (12.0 * DR2)
+          VV := -ZZ / R
+          EKIN := EKIN + (-0.5 * U(I, IA) * LAP + REAL(LA*(LA+1)) &
+            * U(I, IA) * U(I, IA) / (2.0 * R * R)) * DR
+          EPOT := EPOT + VV * U(I, IA) * U(I, IA) * DR
+        ENDDO
+        I := 2
+        R := REAL(I - 1) * DR
+        LAP := (U(I-1, IA) + U(I+1, IA) - 2.0*U(I, IA)) / DR2
+        VV := -ZZ / R
+        EKIN := EKIN + (-0.5 * U(I, IA) * LAP + REAL(LA*(LA+1)) &
+          * U(I, IA) * U(I, IA) / (2.0 * R * R)) * DR
+        EPOT := EPOT + VV * U(I, IA) * U(I, IA) * DR
+        I := NR - 1
+        R := REAL(I - 1) * DR
+        LAP := (U(I-1, IA) + U(I+1, IA) - 2.0*U(I, IA)) / DR2
+        VV := -ZZ / R
+        EKIN := EKIN + (-0.5 * U(I, IA) * LAP + REAL(LA*(LA+1)) &
+          * U(I, IA) * U(I, IA) / (2.0 * R * R)) * DR
+        EPOT := EPOT + VV * U(I, IA) * U(I, IA) * DR
+        EPS(IA) := EKIN + EPOT
+        TSUM := TSUM + REAL(OTAB(IA)) * EKIN
+      ENDDO
+      ! one- and two-electron pieces for the total energy:
+      ! E = sum_a 2 h_a + sum_{a<=b} (2 J_ab - K_ab)-style pair sums,
+      ! assembled in the Python analyzer from the R^k table; here we
+      ! print the monitor combination sum_a 2 eps_a.
+      ESUM := 0.0
+      DO IA = 1, NBX
+        ESUM := ESUM + 2.0 * EPS(IA)
+      ENDDO
+      EDIFF := ESUM - EOLD
+      EOLD := ESUM
+      WRITE(*, "('SCF Z=%.1f T=%d eps1s=%.10e sumeps=%.10e dE=%.3e')") &
+        ZZ, T, EPS(1), ESUM, EDIFF
+    ENDIF
+  ENDDO
+
+  ! ── final: orbital energies + kinetic (virial) + R^k dump ──
+  WRITE(*, "('ATOM Z=%.1f')") ZZ
+  DO IA = 1, NBX
+    WRITE(*, "('ORB %d %d %.10e')") IA, LTAB(IA), EPS(IA)
+  ENDDO
+  WRITE(*, "('TSUM %.10e')") TSUM
+  ! SCF residual: per orbital, one Fock application with the frozen
+  ! operator, residual = sqrt(int (F u - eps u)^2 dr / int u^2 dr)
+  DO IA = 1, NBX
+    LA := LTAB(IA)
+    ! recompute eps_a = <u|F|u> with the frozen operator
+    AC := 0.0
+    BC := 0.0
+    DO I = 3, NR - 2
+      R := REAL(I - 1) * DR
+      LAP := (-U(I-2, IA) + 16.0*U(I-1, IA) - 30.0*U(I, IA) &
+        + 16.0*U(I+1, IA) - U(I+2, IA)) / (12.0 * DR2)
+      VV := -ZZ / R + REAL(LA*(LA+1)) / (2.0 * R * R) + VH(I)
+      FK(I) := -0.5 * LAP + VV * U(I, IA) - XA(I, IA)
+    ENDDO
+    I := 2
+    R := REAL(I - 1) * DR
+    LAP := (U(I-1, IA) + U(I+1, IA) - 2.0*U(I, IA)) / DR2
+    VV := -ZZ / R + REAL(LA*(LA+1)) / (2.0 * R * R) + VH(I)
+    FK(I) := -0.5 * LAP + VV * U(I, IA) - XA(I, IA)
+    I := NR - 1
+    R := REAL(I - 1) * DR
+    LAP := (U(I-1, IA) + U(I+1, IA) - 2.0*U(I, IA)) / DR2
+    VV := -ZZ / R + REAL(LA*(LA+1)) / (2.0 * R * R) + VH(I)
+    FK(I) := -0.5 * LAP + VV * U(I, IA) - XA(I, IA)
+    FK(1) := 0.0
+    FK(NR) := 0.0
+    DO I = 2, NR - 1
+      AC := AC + U(I, IA) * FK(I) * DR
+    ENDDO
+    BC := 0.0
+    DO I = 2, NR - 1
+      BC := BC + (FK(I) - AC * U(I, IA)) * (FK(I) - AC * U(I, IA)) * DR
+    ENDDO
+    WRITE(*, "('RESID Z=%.1f orb=%d eps=%.10e resid=%.3e')") &
+      ZZ, IA, AC, SQRT(BC)
+  ENDDO
+  ! Slater integral table R^k[ab,cd] for all pairs, k=0..2
+  DO IA = 1, NBX
+    DO IB = IA, NBX
+      DO I = 1, NR
+        FK(I) := U(I, IA) * U(I, IB)
+      ENDDO
+      DO K = 0, 2
+        AC := 0.0
+        YK(1) := 0.0
+        DO I = 2, NR
+          R0 := REAL(I - 2) * DR
+          R1 := REAL(I - 1) * DR
+          FA := FK(I-1) * (R0 ** K)
+          FB := FK(I) * (R1 ** K)
+          AC := AC + 0.5 * (FA + FB) * DR
+          YK(I) := AC / (R1 ** (K + 1))
+        ENDDO
+        BC := 0.0
+        PY(NR) := 0.0
+        DO J = 1, NR - 1
+          I := NR - J
+          R0 := REAL(I - 1) * DR
+          R1 := REAL(I) * DR
+          FA := FK(I) / (R0 ** (K + 1))
+          FB := FK(I+1) / (R1 ** (K + 1))
+          BC := BC + 0.5 * (FA + FB) * DR
+          PY(I) := BC
+        ENDDO
+        DO IC = 1, NBX
+          DO J = IC, NBX
+            X := 0.0
+            DO I = 2, NR - 1
+              X := X + U(I, IC) * U(I, J) * (YK(I) &
+                + (REAL(I - 1) * DR) ** K * PY(I)) * DR
+            ENDDO
+            WRITE(*, "('INT %d %d %d %d %d %.12e')") IA, IB, IC, J, K, X
+          ENDDO
+        ENDDO
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+WRITE(*, "('DONE')")
+STOP

@@ -1,0 +1,266 @@
+! ============================================================
+! ab_recoil_radius.ergo  --  T2: core-radius sweep at fixed grid
+!
+! Stage 7 exact-link instrument, 512^2, K0=0.3, standoff 52,
+! NSTEPS=2200 -- everything fixed except the shield disk radius:
+!   RS=1: r=8   (DX2+DY2 < 64)
+!   RS=2: r=12  (DX2+DY2 < 144)
+!   RS=3: r=16  (DX2+DY2 < 256)
+! Cases per radius: 1=0  2=+pi  3=-pi  4=+2pi  5=-2pi
+!
+! QUESTIONS:
+!  A) +-2pi winding split vs r. T1 (1024^2, r=16) gave 2.11
+!     sites vs 1.75 at 512^2 r=8 -- lattice-pinned, artifact-
+!     leaning. If the split stays ~constant across r=8/12/16
+!     at FIXED wavelength: staircase-scale origin confirmed,
+!     demote from open physics. If it grows with r: finite-core
+!     boundary physics lives after all.
+!  B) Gate amplitude vs r. The pi transparency collapsed from
+!     +17.4 (r=8) to +3.6 (r=16 hi-res). r=12 is the midpoint
+!     of the resonance map: does dcx1(+pi) fall smoothly
+!     (~10) or sharply (resonance narrow in r/lambda)?
+!
+! Link cutoff r>6 kept FIXED for all radii (comparability).
+!
+! Arrays STATIC -- no ulimit needed.
+!
+! MIRROR ORACLES (C mirror, gcc -O2, 2026-08-12; cx +1.00 indexing):
+!  r8 : null 342.00/341.90 | +pi 359.37/354.64 | -pi 354.97/359.66
+!       +2pi 342.34/343.49 | -2pi 344.09/342.95
+!  r12: null 337.59/337.54 | +pi 354.91/347.83 | -pi 348.21/355.27
+!       +2pi 336.08/341.06 | -2pi 341.47/336.55
+!  r16: null 334.19/334.25 | +pi 347.73/339.09 | -pi 339.46/348.12
+!       +2pi 331.01/338.75 | -2pi 339.04/331.41
+! Key derived: 2pi split 1.75 / 5.39 / 8.03 (grows ~r^1.8: core-
+! boundary physics, NOT staircase); sumpi 30.11/27.61/18.38 (gate
+! survives at r16 -- the hi-res collapse was STANDOFF dilution).
+!
+! Rename: ab_recoil_radius.ergo.txt -> ab_recoil_radius.ergo
+! Run: python -m core min/ab/ab_recoil_radius.ergo -o /tmp/rrad
+!      /tmp/rrad
+! ============================================================
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 512, NY = 512
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 2200
+INTEGER, PARAMETER :: NSP = 48
+REAL, PARAMETER :: AA = 0.20
+REAL, PARAMETER :: SIG = 14.0
+REAL, PARAMETER :: K0 = 0.3
+INTEGER, PARAMETER :: X0 = 100
+INTEGER, PARAMETER :: Y1 = 204, Y2 = 308
+INTEGER, PARAMETER :: XC = 256, YC = 256
+REAL, PARAMETER :: PI2 = 6.283185307179586
+REAL, PARAMETER :: PIH = 3.14159265358979
+
+STATIC REAL :: R(NPTS), I(NPTS), ABSORB(NPTS), WALL(NPTS)
+STATIC REAL :: CXL(NPTS), SXL(NPTS), CYL(NPTS), SYL(NPTS)
+REAL :: RT(3), FT(5), X1T(3,5), X2T(3,5), Y1T(3,5), Y2T(3,5)
+REAL :: K1T(3,5), K2T(3,5)
+
+INTEGER :: J, K, KK, T, CS, RS, IDX
+REAL :: FLV, SV, DX, DY, R2C, TH, RAD2
+REAL :: W1, WX1, WY1, WK1, W2, WX2, WY2, WK2, MC, M0
+REAL :: RH, DRX, DIX, KM
+REAL :: CX1, CY1, CX2, CY2, KX1, KX2
+
+RT(1) := 8.0
+RT(2) := 12.0
+RT(3) := 16.0
+
+DO RS = 1, 3
+   RAD2 := RT(RS)*RT(RS)
+DO CS = 1, 5
+
+   FLV := 0.0
+   IF (CS = 2) THEN
+      FLV := PIH
+   ENDIF
+   IF (CS = 3) THEN
+      FLV := -PIH
+   ENDIF
+   IF (CS = 4) THEN
+      FLV := PI2
+   ENDIF
+   IF (CS = 5) THEN
+      FLV := -PI2
+   ENDIF
+   FT(CS) := FLV
+
+   ! --- clear grid, absorber, wall ---
+   DO KK = 1, NX*NY
+      R(KK) := 0.0
+      I(KK) := 0.0
+      ABSORB(KK) := 1.0
+      WALL(KK) := 1.0
+   ENDDO
+
+   ! --- sponge: symmetric on all four edges ---
+   DO J = 1, NSP
+      SV := 1.0 - 0.35*(1.0 - J/49.0)*(1.0 - J/49.0)
+      DO K = 1, NX
+         ABSORB(K + (J-1)*NX) := ABSORB(K + (J-1)*NX) * SV
+         ABSORB(K + (NY-J)*NX) := ABSORB(K + (NY-J)*NX) * SV
+      ENDDO
+      DO K = 1, NY
+         ABSORB(J + (K-1)*NX) := ABSORB(J + (K-1)*NX) * SV
+         ABSORB(NX+1-J + (K-1)*NX) := ABSORB(NX+1-J + (K-1)*NX) * SV
+      ENDDO
+   ENDDO
+
+   ! --- flux shield: disk of radius RT(RS), WALL=0 ---
+   DO J = 240, 272
+      DO K = 240, 272
+         DX := K - XC
+         DY := J - YC
+         IF (DX*DX + DY*DY < RAD2) THEN
+            WALL(K + (J-1)*NX) := 0.0
+         ENDIF
+      ENDDO
+   ENDDO
+
+   ! --- EXACT Peierls links, r>6 cutoff (fixed) ---
+   DO KK = 1, NX*NY
+      CXL(KK) := 1.0
+      SXL(KK) := 0.0
+      CYL(KK) := 1.0
+      SYL(KK) := 0.0
+   ENDDO
+   IF (FLV /= 0.0) THEN
+      TH := FLV / PI2
+      DO J = 2, NY-1
+         DO K = 2, NX-1
+            DX := K - XC + 0.5
+            DY := J - YC
+            R2C := DX*DX + DY*DY
+            IF (R2C > 36.0) THEN
+               SV := TH*(ATAN2(DY, DX + 0.5) - ATAN2(DY, DX - 0.5))
+               IDX := K + (J-1)*NX
+               CXL(IDX) := COS(SV)
+               SXL(IDX) := SIN(SV)
+            ENDIF
+            DX := K - XC
+            DY := J - YC + 0.5
+            R2C := DX*DX + DY*DY
+            IF (R2C > 36.0) THEN
+               SV := TH*(ATAN2(DY + 0.5, DX) - ATAN2(DY - 0.5, DX))
+               IDX := K + (J-1)*NX
+               CYL(IDX) := COS(SV)
+               SYL(IDX) := SIN(SV)
+            ENDIF
+         ENDDO
+      ENDDO
+   ENDIF
+
+   ! --- two Gaussian packets, rows 204 / 308 ---
+   DO J = 1, NY
+      DO K = 1, NX
+         IDX := K + (J-1)*NX
+         SV := EXP(-(((K-X0)/30.0)*((K-X0)/30.0) + ((J-Y1)/SIG)*((J-Y1)/SIG)))
+         R(IDX) := SV*COS(K0*(K-X0))
+         I(IDX) := SV*SIN(K0*(K-X0))
+         SV := EXP(-(((K-X0)/30.0)*((K-X0)/30.0) + ((J-Y2)/SIG)*((J-Y2)/SIG)))
+         R(IDX) := R(IDX) + SV*COS(K0*(K-X0))
+         I(IDX) := I(IDX) + SV*SIN(K0*(K-X0))
+      ENDDO
+   ENDDO
+
+   M0 := 0.0
+   DO KK = 1, NX*NY
+      M0 := M0 + R(KK)*R(KK) + I(KK)*I(KK)
+   ENDDO
+
+   ! --- integration + instrument pass ---
+   DO T = 1, NSTEPS
+
+      DO K = NX+2, NEND
+         I(K) := (I(K) + AA*(CXL(K)*R(K+1) + CXL(K-1)*R(K-1) &
+            + CYL(K)*R(K+NX) + CYL(K-NX)*R(K-NX) - 4.0*R(K) &
+            - SXL(K)*I(K+1) + SXL(K-1)*I(K-1) &
+            - SYL(K)*I(K+NX) + SYL(K-NX)*I(K-NX))) &
+            * ABSORB(K) * WALL(K)
+      ENDDO
+      DO K = NX+2, NEND
+         R(K) := (R(K) - AA*(SXL(K)*R(K+1) - SXL(K-1)*R(K-1) &
+            + SYL(K)*R(K+NX) - SYL(K-NX)*R(K-NX) &
+            + CXL(K)*I(K+1) + CXL(K-1)*I(K-1) &
+            + CYL(K)*I(K+NX) + CYL(K-NX)*I(K-NX) - 4.0*I(K))) &
+            * ABSORB(K) * WALL(K)
+      ENDDO
+
+      ! --- per-channel mass, centroid, kinetic momentum ---
+      W1 := 0.0
+      WX1 := 0.0
+      WY1 := 0.0
+      WK1 := 0.0
+      W2 := 0.0
+      WX2 := 0.0
+      WY2 := 0.0
+      WK2 := 0.0
+      MC := 0.0
+      DO J = 2, NY-1
+         DO K = 2, NX-1
+            IDX := K + (J-1)*NX
+            RH := R(IDX)*R(IDX) + I(IDX)*I(IDX)
+            MC := MC + RH
+            DRX := 0.5*((CXL(IDX)*R(IDX+1) - SXL(IDX)*I(IDX+1)) &
+               - (CXL(IDX-1)*R(IDX-1) + SXL(IDX-1)*I(IDX-1)))
+            DIX := 0.5*((CXL(IDX)*I(IDX+1) + SXL(IDX)*R(IDX+1)) &
+               - (CXL(IDX-1)*I(IDX-1) - SXL(IDX-1)*R(IDX-1)))
+            KM := R(IDX)*DIX - I(IDX)*DRX
+            IF (J <= 256) THEN
+               W1 := W1 + RH
+               WX1 := WX1 + RH*K
+               WY1 := WY1 + RH*J
+               WK1 := WK1 + KM
+            ELSE
+               W2 := W2 + RH
+               WX2 := WX2 + RH*K
+               WY2 := WY2 + RH*J
+               WK2 := WK2 + KM
+            ENDIF
+         ENDDO
+      ENDDO
+      CX1 := WX1/W1
+      CY1 := WY1/W1
+      KX1 := WK1/W1
+      CX2 := WX2/W2
+      CY2 := WY2/W2
+      KX2 := WK2/W2
+
+   ENDDO
+
+   X1T(RS,CS) := CX1
+   X2T(RS,CS) := CX2
+   Y1T(RS,CS) := CY1
+   Y2T(RS,CS) := CY2
+   K1T(RS,CS) := KX1
+   K2T(RS,CS) := KX2
+
+   WRITE(*,"('r %.1f case %d FL %.4f cx1 %.2f cx2 %.2f cy1 %.2f cy2 %.2f kx1 %.5f kx2 %.5f')") RT(RS), CS, FLV, CX1, CX2, CY1, CY2, KX1, KX2
+
+ENDDO
+ENDDO
+
+! ---------------- summary ----------------
+
+WRITE(*,"('-- displacement tables per radius (vs own null) --')")
+DO RS = 1, 3
+   DO CS = 2, 5
+      WRITE(*,"('r %.1f FL %.4f dcx1 %.3f dcx2 %.3f dcy1 %.3f dcy2 %.3f dkx1 %.5f dkx2 %.5f')") RT(RS), FT(CS), X1T(RS,CS)-X1T(RS,1), X2T(RS,CS)-X2T(RS,1), Y1T(RS,CS)-Y1T(RS,1), Y2T(RS,CS)-Y2T(RS,1), K1T(RS,CS)-K1T(RS,1), K2T(RS,CS)-K2T(RS,1)
+   ENDDO
+ENDDO
+
+WRITE(*,"('-- 2pi winding split: dcx1(+2pi)-dcx1(-2pi) per radius --')")
+DO RS = 1, 3
+   WRITE(*,"('r %.1f split %.3f  dcy1-odd %.3f')") RT(RS), (X1T(RS,4)-X1T(RS,1)) - (X1T(RS,5)-X1T(RS,1)), (Y1T(RS,4)-Y1T(RS,1)) - (Y1T(RS,5)-Y1T(RS,1))
+ENDDO
+
+WRITE(*,"('-- gate amplitude: channel-sum dcx1+dcx2 at +-pi per radius --')")
+DO RS = 1, 3
+   WRITE(*,"('r %.1f sumpi %.3f %.3f  sum2pi %.3f %.3f')") RT(RS), (X1T(RS,2)-X1T(RS,1)) + (X2T(RS,2)-X2T(RS,1)), (X1T(RS,3)-X1T(RS,1)) + (X2T(RS,3)-X2T(RS,1)), (X1T(RS,4)-X1T(RS,1)) + (X2T(RS,4)-X2T(RS,1)), (X1T(RS,5)-X1T(RS,1)) + (X2T(RS,5)-X2T(RS,1))
+ENDDO
+
+WRITE(*,"('-- refs: r8 512^2 split 1.75 sumpi 33.97; r16 hi-res split 2.11 sumpi 4.33/4.80 --')")

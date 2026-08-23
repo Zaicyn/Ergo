@@ -1,0 +1,242 @@
+! ============================================================
+! ab_single_2pi.ergo  --  Stage 9: aimed single-packet isolation
+!
+! ONE Gaussian packet below the core, no second channel.
+! Purpose: isolate the s=100 winding-split uptick from F10.
+! With a single packet there is no mirror channel and no
+! cross-channel interference: if the +-2pi split persists, it
+! is genuine single-packet physics (near-field residue or
+! far-tail circulation on the packet's own path); if it
+! collapses, the F10 s=100 uptick was a two-channel/instrument
+! effect.
+!
+! Geometry: core r=8 at (256,256); packet at row YP below core:
+!   SS=1: YP=308 (standoff 52, = Stage 7 channel-2 row)
+!   SS=2: YP=356 (standoff 100, the F10 uptick point)
+! Cases per standoff: 1=0  2=+pi  3=-pi  4=+2pi  5=-2pi
+! (pi pair kept as gate-amplitude reference for one packet:
+!  two-packet channel-2 gave dcx2 +12.74/+17.76 at s52.)
+!
+! Instrument: whole-interior mass/centroid/covariant kx
+! (single "channel" = all rows 2..NY-1).
+!
+! 512^2, K0=0.3, SIG=14, X0=100, NSTEPS=2200, cutoff r>6.
+! Arrays STATIC -- no ulimit needed.
+!
+! MIRROR ORACLES (C mirror, gcc -O2, 2026-08-12; cx +1.00 indexing):
+!  s52 : null 349.71/312.12/0.26467 | +pi 348.07/309.79/0.26171
+!        -pi 351.34/314.46/0.26757 | +2pi 346.41/307.46/0.25868
+!        -2pi 352.96/316.80/0.27039
+!  s100: null 360.00/352.42/0.29246 | +pi 358.49/350.67/0.29063
+!        -pi 361.49/354.15/0.29426 | +2pi 356.98/348.93/0.28877
+!        -2pi 362.98/355.88/0.29604
+! Derived: FL-even sums ~0 (NO gate single-packet); deflection
+!   winding-odd, ~linear in FL (1.6 at pi, 3.3 at 2pi), split
+!   6.55 (s52) / 6.00 (s100) -- standoff-insensitive. The F10
+!   U-shape was THIS push through the two-channel interference
+!   mask, not a second physical component.
+!
+! Rename: ab_single_2pi.ergo.txt -> ab_single_2pi.ergo
+! Run: python -m core min/ab/ab_single_2pi.ergo -o /tmp/rsg
+!      /tmp/rsg
+! ============================================================
+
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 512, NY = 512
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 2200
+INTEGER, PARAMETER :: NSP = 48
+REAL, PARAMETER :: AA = 0.20
+REAL, PARAMETER :: SIG = 14.0
+REAL, PARAMETER :: K0 = 0.3
+INTEGER, PARAMETER :: X0 = 100
+INTEGER, PARAMETER :: XC = 256, YC = 256
+REAL, PARAMETER :: PI2 = 6.283185307179586
+REAL, PARAMETER :: PIH = 3.14159265358979
+
+STATIC REAL :: R(NPTS), I(NPTS), ABSORB(NPTS), WALL(NPTS)
+STATIC REAL :: CXL(NPTS), SXL(NPTS), CYL(NPTS), SYL(NPTS)
+INTEGER :: YPV(2)
+REAL :: ST(2), FT(5), XT(2,5), YT(2,5), KT(2,5)
+
+INTEGER :: J, K, KK, T, CS, SS, IDX
+INTEGER :: YP
+REAL :: FLV, SV, DX, DY, R2C, TH
+REAL :: W1, WX1, WY1, WK1, MC, M0
+REAL :: RH, DRX, DIX, KM
+REAL :: CX1, CY1, KX1
+
+YPV(1) := 308
+ST(1) := 52.0
+YPV(2) := 356
+ST(2) := 100.0
+
+DO SS = 1, 2
+   YP := YPV(SS)
+DO CS = 1, 5
+
+   FLV := 0.0
+   IF (CS = 2) THEN
+      FLV := PIH
+   ENDIF
+   IF (CS = 3) THEN
+      FLV := -PIH
+   ENDIF
+   IF (CS = 4) THEN
+      FLV := PI2
+   ENDIF
+   IF (CS = 5) THEN
+      FLV := -PI2
+   ENDIF
+   FT(CS) := FLV
+
+   ! --- clear grid, absorber, wall ---
+   DO KK = 1, NX*NY
+      R(KK) := 0.0
+      I(KK) := 0.0
+      ABSORB(KK) := 1.0
+      WALL(KK) := 1.0
+   ENDDO
+
+   ! --- sponge: symmetric on all four edges ---
+   DO J = 1, NSP
+      SV := 1.0 - 0.35*(1.0 - J/49.0)*(1.0 - J/49.0)
+      DO K = 1, NX
+         ABSORB(K + (J-1)*NX) := ABSORB(K + (J-1)*NX) * SV
+         ABSORB(K + (NY-J)*NX) := ABSORB(K + (NY-J)*NX) * SV
+      ENDDO
+      DO K = 1, NY
+         ABSORB(J + (K-1)*NX) := ABSORB(J + (K-1)*NX) * SV
+         ABSORB(NX+1-J + (K-1)*NX) := ABSORB(NX+1-J + (K-1)*NX) * SV
+      ENDDO
+   ENDDO
+
+   ! --- flux shield: r=8 disk, WALL=0 (Dirichlet pinning) ---
+   DO J = 248, 264
+      DO K = 248, 264
+         DX := K - XC
+         DY := J - YC
+         IF (DX*DX + DY*DY < 64.0) THEN
+            WALL(K + (J-1)*NX) := 0.0
+         ENDIF
+      ENDDO
+   ENDDO
+
+   ! --- EXACT Peierls links, r>6 cutoff ---
+   DO KK = 1, NX*NY
+      CXL(KK) := 1.0
+      SXL(KK) := 0.0
+      CYL(KK) := 1.0
+      SYL(KK) := 0.0
+   ENDDO
+   IF (FLV /= 0.0) THEN
+      TH := FLV / PI2
+      DO J = 2, NY-1
+         DO K = 2, NX-1
+            DX := K - XC + 0.5
+            DY := J - YC
+            R2C := DX*DX + DY*DY
+            IF (R2C > 36.0) THEN
+               SV := TH*(ATAN2(DY, DX + 0.5) - ATAN2(DY, DX - 0.5))
+               IDX := K + (J-1)*NX
+               CXL(IDX) := COS(SV)
+               SXL(IDX) := SIN(SV)
+            ENDIF
+            DX := K - XC
+            DY := J - YC + 0.5
+            R2C := DX*DX + DY*DY
+            IF (R2C > 36.0) THEN
+               SV := TH*(ATAN2(DY + 0.5, DX) - ATAN2(DY - 0.5, DX))
+               IDX := K + (J-1)*NX
+               CYL(IDX) := COS(SV)
+               SYL(IDX) := SIN(SV)
+            ENDIF
+         ENDDO
+      ENDDO
+   ENDIF
+
+   ! --- ONE Gaussian packet, row YP ---
+   DO J = 1, NY
+      DO K = 1, NX
+         IDX := K + (J-1)*NX
+         SV := EXP(-(((K-X0)/30.0)*((K-X0)/30.0) + ((J-YP)/SIG)*((J-YP)/SIG)))
+         R(IDX) := SV*COS(K0*(K-X0))
+         I(IDX) := SV*SIN(K0*(K-X0))
+      ENDDO
+   ENDDO
+
+   M0 := 0.0
+   DO KK = 1, NX*NY
+      M0 := M0 + R(KK)*R(KK) + I(KK)*I(KK)
+   ENDDO
+
+   ! --- integration + instrument pass (whole interior) ---
+   DO T = 1, NSTEPS
+
+      DO K = NX+2, NEND
+         I(K) := (I(K) + AA*(CXL(K)*R(K+1) + CXL(K-1)*R(K-1) &
+            + CYL(K)*R(K+NX) + CYL(K-NX)*R(K-NX) - 4.0*R(K) &
+            - SXL(K)*I(K+1) + SXL(K-1)*I(K-1) &
+            - SYL(K)*I(K+NX) + SYL(K-NX)*I(K-NX))) &
+            * ABSORB(K) * WALL(K)
+      ENDDO
+      DO K = NX+2, NEND
+         R(K) := (R(K) - AA*(SXL(K)*R(K+1) - SXL(K-1)*R(K-1) &
+            + SYL(K)*R(K+NX) - SYL(K-NX)*R(K-NX) &
+            + CXL(K)*I(K+1) + CXL(K-1)*I(K-1) &
+            + CYL(K)*I(K+NX) + CYL(K-NX)*I(K-NX) - 4.0*I(K))) &
+            * ABSORB(K) * WALL(K)
+      ENDDO
+
+      W1 := 0.0
+      WX1 := 0.0
+      WY1 := 0.0
+      WK1 := 0.0
+      MC := 0.0
+      DO J = 2, NY-1
+         DO K = 2, NX-1
+            IDX := K + (J-1)*NX
+            RH := R(IDX)*R(IDX) + I(IDX)*I(IDX)
+            MC := MC + RH
+            DRX := 0.5*((CXL(IDX)*R(IDX+1) - SXL(IDX)*I(IDX+1)) &
+               - (CXL(IDX-1)*R(IDX-1) + SXL(IDX-1)*I(IDX-1)))
+            DIX := 0.5*((CXL(IDX)*I(IDX+1) + SXL(IDX)*R(IDX+1)) &
+               - (CXL(IDX-1)*I(IDX-1) - SXL(IDX-1)*R(IDX-1)))
+            KM := R(IDX)*DIX - I(IDX)*DRX
+            W1 := W1 + RH
+            WX1 := WX1 + RH*K
+            WY1 := WY1 + RH*J
+            WK1 := WK1 + KM
+         ENDDO
+      ENDDO
+      CX1 := WX1/W1
+      CY1 := WY1/W1
+      KX1 := WK1/W1
+
+   ENDDO
+
+   XT(SS,CS) := CX1
+   YT(SS,CS) := CY1
+   KT(SS,CS) := KX1
+
+   WRITE(*,"('s %.1f case %d FL %.4f cx %.2f cy %.2f kx %.5f')") ST(SS), CS, FLV, CX1, CY1, KX1
+
+ENDDO
+ENDDO
+
+! ---------------- summary ----------------
+
+WRITE(*,"('-- displacement tables per standoff (vs own null) --')")
+DO SS = 1, 2
+   DO CS = 2, 5
+      WRITE(*,"('s %.1f FL %.4f dcx %.3f dcy %.3f dkx %.5f')") ST(SS), FT(CS), XT(SS,CS)-XT(SS,1), YT(SS,CS)-YT(SS,1), KT(SS,CS)-KT(SS,1)
+   ENDDO
+ENDDO
+
+WRITE(*,"('-- single-packet 2pi winding split: dcx(+2pi)-dcx(-2pi) --')")
+DO SS = 1, 2
+   WRITE(*,"('s %.1f split %.3f  dcy-odd %.3f  sumpi %.3f  sum2pi %.3f')") ST(SS), (XT(SS,4)-XT(SS,1)) - (XT(SS,5)-XT(SS,1)), (YT(SS,4)-YT(SS,1)) - (YT(SS,5)-YT(SS,1)), (XT(SS,2)-XT(SS,1)) + (XT(SS,3)-XT(SS,1)), (XT(SS,4)-XT(SS,1)) + (XT(SS,5)-XT(SS,1))
+ENDDO
+
+WRITE(*,"('-- F10 two-packet refs: ch2 at s52 dcx2 +12.74/+17.76 (pi), +1.59/+1.05 (2pi); s100 split +3.82 --')")
