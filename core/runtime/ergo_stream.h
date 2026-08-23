@@ -3,9 +3,13 @@
  * (Spec/Ergo_Stream_Format.md; language surface: Spec Part 10).
  *
  * Fixed 4096-byte frames; up to 8 logical channels multiplexed by the
- * Viviani scatter schedule (the v4 allocator bake); per-frame 3-axis
- * integrity residual. One ESF_WRITE = one frame = one eager fwrite —
- * no hidden buffering; flush points are ESF_CLOSE / program end.
+ * Viviani scatter schedule (the v4 allocator bake); per-frame
+ * integrity as three WEIGHTED SYNDROMES (ESF2): S0 = Σb, S1 = Σb·idx,
+ * S2 = Σb·idx² over the fixed region [4,16) ∪ [28,4096) with idx
+ * 1-based — detection floor |d| ≥ 1 plus exact single-byte repair
+ * (see the spec §3 for the uniqueness proof and the consistency
+ * gate). One ESF_WRITE = one frame = one eager fwrite — no hidden
+ * buffering; flush points are ESF_CLOSE / program end.
  *
  *   esf_open(unit, "path", nch)     nch in 1..8
  *   ch = esf_next(unit)             scheduled channel of next frame
@@ -101,26 +105,29 @@ static inline void esf_write(int unit, int ch, const void *payload,
         _esf_fail("ESF_WRITE: payload length out of range (0..4068)");
     static uint8_t frame[ESF_FRAME];
     memset(frame, 0, sizeof(frame));
-    memcpy(frame, "ESF1", 4);
+    memcpy(frame, "ESF2", 4);
     _esf_put32(frame + 4, k);
     _esf_put16(frame + 8, (uint32_t)ch);
     _esf_put16(frame + 10, (uint32_t)nbytes);
     _esf_put32(frame + 12, _esf_cseq[unit][ch]);
     if (nbytes > 0)
         memcpy(frame + 28, payload, (size_t)nbytes);
-    /* 3 rotated projections over [4,16) ∪ [28, 28+L): class (o-4)%3 */
+    /* Weighted syndromes over the fixed region [4,16) ∪ [28,4096):
+     * idx = o-3 (header, 1..12), idx = o-15 (payload, 13..4080);
+     * S0 = Σb, S1 = Σb·idx, S2 = Σb·idx² (mod 2^32). Bytes past
+     * nbytes are zero (memset) and contribute nothing. */
     uint32_t s0 = 0, s1 = 0, s2 = 0;
     for (uint32_t o = 4; o < 16; o++) {
-        uint32_t a = (o - 4) % 3;
-        if (a == 0) s0 += frame[o];
-        else if (a == 1) s1 += frame[o];
-        else s2 += frame[o];
+        uint32_t b = frame[o], idx = o - 3;
+        s0 += b;
+        s1 += b * idx;
+        s2 += (uint32_t)((uint64_t)b * idx * idx);
     }
-    for (uint32_t o = 28; o < 28u + (uint32_t)nbytes; o++) {
-        uint32_t a = (o - 4) % 3;
-        if (a == 0) s0 += frame[o];
-        else if (a == 1) s1 += frame[o];
-        else s2 += frame[o];
+    for (uint32_t o = 28; o < ESF_FRAME; o++) {
+        uint32_t b = frame[o], idx = o - 15;
+        s0 += b;
+        s1 += b * idx;
+        s2 += (uint32_t)((uint64_t)b * idx * idx);
     }
     _esf_put32(frame + 16, s0);
     _esf_put32(frame + 20, s1);
