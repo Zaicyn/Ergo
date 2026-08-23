@@ -136,6 +136,21 @@ def main():
             print("  " + ln)
         if any(ln.lstrip().startswith("FAIL ") for ln in tail):
             print("  stream suite FAIL — investigate before release.")
+
+    # Corpus regression (tests/golden/run_corpus.py): the audited
+    # tests/ corpus compiled+run and diffed against recorded
+    # baselines (SLOW class excluded from the default gate).
+    corpus = os.path.join(REPO, "tests", "golden", "run_corpus.py")
+    if os.path.exists(corpus):
+        r = sh([sys.executable, corpus], timeout=1800)
+        tail = r.stdout.decode(errors="replace").strip().splitlines()
+        print("-" * 68)
+        print("  CORPUS REGRESSION (tests/golden/run_corpus.py):")
+        for ln in tail:
+            print("  " + ln)
+        if r.returncode != 0:
+            print("  corpus regression FAILED — investigate before "
+                  "release; re-record baselines only after review.")
     return 0
 
 

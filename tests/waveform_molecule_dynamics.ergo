@@ -133,9 +133,7 @@ CALL INIT_ATOMS()
 CALL INIT_BONDS()
 
 ! CSV header
-WRITE(*, "frame,nbond,total_energy,mean_energy,max_energy,n_breaks, &
-            n_reforms,fingerprint,total_strength,coherence,mean_w,rgyr,thermal, &
-            deg0,deg1,deg2,deg3,deg4,max_component,n_fragments")
+WRITE(*, "frame,nbond,total_energy,mean_energy,max_energy,n_breaks,n_reforms,fingerprint,total_strength,coherence,mean_w,rgyr,thermal,deg0,deg1,deg2,deg3,deg4,max_component,n_fragments")
 
 ! ════════════════════════════════════════════════════════════
 ! MAIN LOOP

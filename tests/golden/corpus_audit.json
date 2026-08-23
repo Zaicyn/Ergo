@@ -1,0 +1,1855 @@
+{
+ "files": [
+  {
+   "cls": "PASS",
+   "compile_s": 0.15,
+   "file": "tests/alloc_smoke.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 12
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.16,
+   "file": "tests/allocate_bench.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 14
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.39,
+   "file": "tests/buc_colony.ergo",
+   "reason": "",
+   "run2_s": 2.3,
+   "run_s": 2.45,
+   "stdout_bytes": 8356279
+  },
+  {
+   "cls": "GPU-SLOW",
+   "compile_s": 0.22,
+   "file": "tests/buc_colony_gpu.ergo",
+   "gpu_compile_s": 0.79,
+   "reason": "62s GPU sim (marginal over the 60s default gate timeout); no stdout by design (zero WRITE/PRINT in source) \u2014 regression signal is exit-0 completion; runs under --slow with 300s",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 0
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.25,
+   "file": "tests/buc_membrane_unit.ergo",
+   "reason": "",
+   "run2_s": 0.02,
+   "run_s": 0.02,
+   "stdout_bytes": 471995
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.16,
+   "file": "tests/do_neg_step.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 19
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.17,
+   "file": "tests/dot_product.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 45
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.18,
+   "file": "tests/func_implicit_return.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 10
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.17,
+   "file": "tests/gpu_atan2.ergo",
+   "gpu_compile_s": 0.49,
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 47
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.21,
+   "file": "tests/gpu_clipmap.ergo",
+   "gpu_compile_s": 0.53,
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.02,
+   "stdout_bytes": 198
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.25,
+   "file": "tests/gpu_clipmap_amp.ergo",
+   "gpu_compile_s": 0.57,
+   "reason": "",
+   "run2_s": 0.06,
+   "run_s": 0.05,
+   "stdout_bytes": 142
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.17,
+   "file": "tests/gpu_dot_product.ergo",
+   "gpu_compile_s": 0.49,
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 19
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.2,
+   "file": "tests/gpu_index_patterns.ergo",
+   "gpu_compile_s": 0.53,
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 27
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.17,
+   "file": "tests/gpu_multired.ergo",
+   "gpu_compile_s": 0.51,
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 59
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.17,
+   "file": "tests/gpu_particle.ergo",
+   "gpu_compile_s": 0.48,
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 9
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.18,
+   "file": "tests/gpu_particle_render.ergo",
+   "gpu_compile_s": 0.49,
+   "reason": "",
+   "run2_s": 0.01,
+   "run_s": 0.01,
+   "stdout_bytes": 10
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.19,
+   "file": "tests/gpu_pingpong.ergo",
+   "gpu_compile_s": 0.49,
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 36
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.12,
+   "file": "tests/gpu_ring_shuffle.ergo",
+   "gpu_compile_s": 0.51,
+   "reason": "",
+   "stdout_bytes": 46
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.15,
+   "file": "tests/gpu_segred.ergo",
+   "gpu_compile_s": 0.5,
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 42
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.29,
+   "file": "tests/gpu_stencil2d.ergo",
+   "gpu_compile_s": 0.5,
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 45
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.18,
+   "file": "tests/gpu_tile.ergo",
+   "gpu_compile_s": 0.49,
+   "reason": "",
+   "run2_s": 0.01,
+   "run_s": 0.01,
+   "stdout_bytes": 45
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.19,
+   "file": "tests/int64.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 206
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.16,
+   "file": "tests/loopvar_after.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 31
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.22,
+   "file": "tests/prng.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 609
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.2,
+   "file": "tests/sq2core.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 18
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.21,
+   "file": "tests/sq3core.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 20
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.35,
+   "file": "tests/sq4core.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.01,
+   "stdout_bytes": 11554
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.19,
+   "file": "tests/stream/esf_bench_esf.ergo",
+   "reason": "",
+   "run2_s": 0.23,
+   "run_s": 0.18,
+   "stdout_bytes": 25
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.15,
+   "file": "tests/stream/esf_bench_raw.ergo",
+   "reason": "",
+   "run2_s": 0.19,
+   "run_s": 0.19,
+   "stdout_bytes": 25
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.26,
+   "file": "tests/stream/esf_oracle.ergo",
+   "reason": "",
+   "run2_s": 0.01,
+   "run_s": 0.0,
+   "stdout_bytes": 19
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.15,
+   "file": "tests/sub_scalar_ref.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 163
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.17,
+   "file": "tests/test_first.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 30
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.97,
+   "file": "tests/waveform_bba5.ergo",
+   "reason": "",
+   "run2_s": 0.05,
+   "run_s": 0.05,
+   "stdout_bytes": 42700
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.03,
+   "file": "tests/waveform_bba5_96k.ergo",
+   "reason": "",
+   "run2_s": 0.74,
+   "run_s": 0.72,
+   "stdout_bytes": 979713
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.86,
+   "file": "tests/waveform_bba5_lr.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 42292
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.9,
+   "file": "tests/waveform_bba5_lr_t02.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41902
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.88,
+   "file": "tests/waveform_bba5_nohb.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 42301
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.98,
+   "file": "tests/waveform_bba5_seed_0.0.ergo",
+   "reason": "",
+   "run2_s": 0.44,
+   "run_s": 0.47,
+   "stdout_bytes": 490111
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.0,
+   "file": "tests/waveform_bba5_seed_1.0.ergo",
+   "reason": "",
+   "run2_s": 0.38,
+   "run_s": 0.35,
+   "stdout_bytes": 490039
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.92,
+   "file": "tests/waveform_bba5_seed_2.0.ergo",
+   "reason": "",
+   "run2_s": 0.47,
+   "run_s": 0.43,
+   "stdout_bytes": 490056
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.07,
+   "file": "tests/waveform_bba5_seed_3.0.ergo",
+   "reason": "",
+   "run2_s": 0.38,
+   "run_s": 0.47,
+   "stdout_bytes": 490303
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.88,
+   "file": "tests/waveform_bba5_seed_4.0.ergo",
+   "reason": "",
+   "run2_s": 0.49,
+   "run_s": 0.47,
+   "stdout_bytes": 490106
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.02,
+   "file": "tests/waveform_bba5_t02.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.04,
+   "stdout_bytes": 41908
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.9,
+   "file": "tests/waveform_bba5_t02_long.ergo",
+   "reason": "",
+   "run2_s": 0.12,
+   "run_s": 0.12,
+   "stdout_bytes": 122908
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.91,
+   "file": "tests/waveform_bba5_v2.ergo",
+   "reason": "",
+   "run2_s": 0.2,
+   "run_s": 0.24,
+   "stdout_bytes": 245310
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.85,
+   "file": "tests/waveform_bba5_v3.ergo",
+   "reason": "",
+   "run2_s": 0.41,
+   "run_s": 0.44,
+   "stdout_bytes": 490111
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.39,
+   "file": "tests/waveform_bilayer.ergo",
+   "reason": "",
+   "run2_s": 0.71,
+   "run_s": 0.64,
+   "stdout_bytes": 4283
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.48,
+   "file": "tests/waveform_chain_fold.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 21261
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.5,
+   "file": "tests/waveform_chain_fold_25.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.02,
+   "stdout_bytes": 22909
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.51,
+   "file": "tests/waveform_chain_fold_28.ergo",
+   "reason": "",
+   "run2_s": 0.05,
+   "run_s": 0.05,
+   "stdout_bytes": 45911
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.46,
+   "file": "tests/waveform_chain_fold_95.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 21161
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.53,
+   "file": "tests/waveform_chain_fold_fix.ergo",
+   "reason": "",
+   "run2_s": 0.1,
+   "run_s": 0.11,
+   "stdout_bytes": 45938
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.62,
+   "file": "tests/waveform_chain_fold_vhs.ergo",
+   "reason": "",
+   "run2_s": 0.1,
+   "run_s": 0.12,
+   "stdout_bytes": 46059
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.79,
+   "file": "tests/waveform_chain_fold_vhs_rmsd.ergo",
+   "reason": "",
+   "run2_s": 0.07,
+   "run_s": 0.09,
+   "stdout_bytes": 39111
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.91,
+   "file": "tests/waveform_chignolin.ergo",
+   "reason": "",
+   "run2_s": 0.02,
+   "run_s": 0.02,
+   "stdout_bytes": 41618
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.85,
+   "file": "tests/waveform_cluster.ergo",
+   "reason": "",
+   "run2_s": 0.41,
+   "run_s": 0.41,
+   "stdout_bytes": 20392
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.62,
+   "file": "tests/waveform_gb1.ergo",
+   "reason": "",
+   "run2_s": 1.03,
+   "run_s": 0.81,
+   "stdout_bytes": 252596
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 2.19,
+   "file": "tests/waveform_gb1_seed_0.0.ergo",
+   "reason": "",
+   "run2_s": 0.86,
+   "run_s": 0.9,
+   "stdout_bytes": 252596
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.99,
+   "file": "tests/waveform_gb1_seed_1.0.ergo",
+   "reason": "",
+   "run2_s": 0.86,
+   "run_s": 0.74,
+   "stdout_bytes": 252351
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.57,
+   "file": "tests/waveform_gb1_seed_2.0.ergo",
+   "reason": "",
+   "run2_s": 0.94,
+   "run_s": 0.9,
+   "stdout_bytes": 253938
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.74,
+   "file": "tests/waveform_gb1_seed_3.0.ergo",
+   "reason": "",
+   "run2_s": 0.76,
+   "run_s": 0.83,
+   "stdout_bytes": 254193
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 2.13,
+   "file": "tests/waveform_gb1_seed_4.0.ergo",
+   "reason": "",
+   "run2_s": 0.89,
+   "run_s": 0.89,
+   "stdout_bytes": 252718
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.5,
+   "file": "tests/waveform_membrane.ergo",
+   "reason": "",
+   "run2_s": 1.18,
+   "run_s": 1.24,
+   "stdout_bytes": 7483
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.32,
+   "file": "tests/waveform_molecule.ergo",
+   "reason": "",
+   "run2_s": 0.01,
+   "run_s": 0.01,
+   "stdout_bytes": 9585
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.41,
+   "file": "tests/waveform_molecule_dynamics.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 16697
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.58,
+   "file": "tests/waveform_molecule_dynamics_geometric.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 19596
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.57,
+   "file": "tests/waveform_molecule_dynamics_geometric_strain.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 19729
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.56,
+   "file": "tests/waveform_molecule_dynamics_geometric_tall.ergo",
+   "reason": "",
+   "run2_s": 0.11,
+   "run_s": 0.11,
+   "stdout_bytes": 20240
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.43,
+   "file": "tests/waveform_molecule_repel.ergo",
+   "reason": "",
+   "run2_s": 0.02,
+   "run_s": 0.02,
+   "stdout_bytes": 9588
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 15.71,
+   "file": "tests/waveform_parkin_s223p_s0.0.ergo",
+   "reason": "",
+   "run2_s": 36.93,
+   "run_s": 35.78,
+   "stdout_bytes": 533305
+  },
+  {
+   "cls": "SLOW",
+   "compile_s": 15.28,
+   "file": "tests/waveform_parkin_s223p_s0_192k.ergo",
+   "reason": "exceeds 60s run timeout",
+   "run_s": 60.0
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 16.31,
+   "file": "tests/waveform_parkin_s223p_s1.0.ergo",
+   "reason": "",
+   "run2_s": 35.47,
+   "run_s": 28.39,
+   "stdout_bytes": 546307
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 11.3,
+   "file": "tests/waveform_parkin_s223p_s2.0.ergo",
+   "reason": "",
+   "run2_s": 39.24,
+   "run_s": 30.35,
+   "stdout_bytes": 537952
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 11.37,
+   "file": "tests/waveform_parkin_s223p_s3.0.ergo",
+   "reason": "",
+   "run2_s": 25.84,
+   "run_s": 29.54,
+   "stdout_bytes": 543546
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 12.02,
+   "file": "tests/waveform_parkin_s223p_s4.0.ergo",
+   "reason": "",
+   "run2_s": 28.54,
+   "run_s": 35.22,
+   "stdout_bytes": 536897
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 11.85,
+   "file": "tests/waveform_parkin_wt_cb.ergo",
+   "reason": "",
+   "run2_s": 35.19,
+   "run_s": 33.47,
+   "stdout_bytes": 533865
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 14.82,
+   "file": "tests/waveform_parkin_wt_s0.0.ergo",
+   "reason": "",
+   "run2_s": 28.58,
+   "run_s": 28.01,
+   "stdout_bytes": 533865
+  },
+  {
+   "cls": "SLOW",
+   "compile_s": 10.77,
+   "file": "tests/waveform_parkin_wt_s0_192k.ergo",
+   "reason": "exceeds 60s run timeout",
+   "run_s": 60.0
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 11.1,
+   "file": "tests/waveform_parkin_wt_s1.0.ergo",
+   "reason": "",
+   "run2_s": 26.94,
+   "run_s": 31.23,
+   "stdout_bytes": 578927
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 10.6,
+   "file": "tests/waveform_parkin_wt_s2.0.ergo",
+   "reason": "",
+   "run2_s": 37.26,
+   "run_s": 28.8,
+   "stdout_bytes": 540591
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 11.56,
+   "file": "tests/waveform_parkin_wt_s3.0.ergo",
+   "reason": "",
+   "run2_s": 33.77,
+   "run_s": 34.74,
+   "stdout_bytes": 545981
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 14.96,
+   "file": "tests/waveform_parkin_wt_s4.0.ergo",
+   "reason": "",
+   "run2_s": 26.94,
+   "run_s": 36.76,
+   "stdout_bytes": 536625
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 4.82,
+   "file": "tests/waveform_snase.ergo",
+   "reason": "",
+   "run2_s": 14.39,
+   "run_s": 13.96,
+   "stdout_bytes": 1013227
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 5.21,
+   "file": "tests/waveform_snase_seed_0.0.ergo",
+   "reason": "",
+   "run2_s": 7.79,
+   "run_s": 8.62,
+   "stdout_bytes": 509228
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.71,
+   "file": "tests/waveform_snase_seed_1.0.ergo",
+   "reason": "",
+   "run2_s": 9.02,
+   "run_s": 7.02,
+   "stdout_bytes": 511742
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.53,
+   "file": "tests/waveform_snase_seed_2.0.ergo",
+   "reason": "",
+   "run2_s": 6.39,
+   "run_s": 6.22,
+   "stdout_bytes": 512392
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.51,
+   "file": "tests/waveform_snase_seed_3.0.ergo",
+   "reason": "",
+   "run2_s": 7.34,
+   "run_s": 6.79,
+   "stdout_bytes": 518079
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.91,
+   "file": "tests/waveform_snase_seed_4.0.ergo",
+   "reason": "",
+   "run2_s": 9.35,
+   "run_s": 7.28,
+   "stdout_bytes": 515826
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 2.66,
+   "file": "tests/waveform_t4lyso_l99a_192k.ergo",
+   "reason": "",
+   "run2_s": 34.89,
+   "run_s": 36.56,
+   "stdout_bytes": 2002369
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.19,
+   "file": "tests/waveform_t4lyso_l99a_96k.ergo",
+   "reason": "",
+   "run2_s": 21.02,
+   "run_s": 19.08,
+   "stdout_bytes": 1004369
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.56,
+   "file": "tests/waveform_t4lyso_l99a_cb.ergo",
+   "reason": "",
+   "run2_s": 7.92,
+   "run_s": 8.68,
+   "stdout_bytes": 509965
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.65,
+   "file": "tests/waveform_t4lyso_l99a_h01.ergo",
+   "reason": "",
+   "run2_s": 10.44,
+   "run_s": 10.99,
+   "stdout_bytes": 512904
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 2.65,
+   "file": "tests/waveform_t4lyso_l99a_s0.0.ergo",
+   "reason": "",
+   "run2_s": 10.4,
+   "run_s": 7.84,
+   "stdout_bytes": 509965
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.48,
+   "file": "tests/waveform_t4lyso_l99a_s1.0.ergo",
+   "reason": "",
+   "run2_s": 12.62,
+   "run_s": 10.38,
+   "stdout_bytes": 508830
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.1,
+   "file": "tests/waveform_t4lyso_l99a_s2.0.ergo",
+   "reason": "",
+   "run2_s": 11.98,
+   "run_s": 10.15,
+   "stdout_bytes": 506518
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.64,
+   "file": "tests/waveform_t4lyso_l99a_s2_192k.ergo",
+   "reason": "",
+   "run2_s": 36.22,
+   "run_s": 40.85,
+   "stdout_bytes": 1998942
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 2.68,
+   "file": "tests/waveform_t4lyso_l99a_s3.0.ergo",
+   "reason": "",
+   "run2_s": 8.0,
+   "run_s": 8.5,
+   "stdout_bytes": 510180
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 2.83,
+   "file": "tests/waveform_t4lyso_l99a_s4.0.ergo",
+   "reason": "",
+   "run2_s": 10.65,
+   "run_s": 11.76,
+   "stdout_bytes": 512317
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.39,
+   "file": "tests/waveform_t4lyso_wt_192k.ergo",
+   "reason": "",
+   "run2_s": 38.94,
+   "run_s": 34.65,
+   "stdout_bytes": 2003347
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 2.53,
+   "file": "tests/waveform_t4lyso_wt_96k.ergo",
+   "reason": "",
+   "run2_s": 15.79,
+   "run_s": 16.77,
+   "stdout_bytes": 1005347
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.54,
+   "file": "tests/waveform_t4lyso_wt_cb.ergo",
+   "reason": "",
+   "run2_s": 8.49,
+   "run_s": 9.92,
+   "stdout_bytes": 510945
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.68,
+   "file": "tests/waveform_t4lyso_wt_h01.ergo",
+   "reason": "",
+   "run2_s": 8.86,
+   "run_s": 8.09,
+   "stdout_bytes": 509298
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.46,
+   "file": "tests/waveform_t4lyso_wt_s0.0.ergo",
+   "reason": "",
+   "run2_s": 9.68,
+   "run_s": 11.6,
+   "stdout_bytes": 510945
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.45,
+   "file": "tests/waveform_t4lyso_wt_s1.0.ergo",
+   "reason": "",
+   "run2_s": 9.4,
+   "run_s": 9.48,
+   "stdout_bytes": 509035
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.46,
+   "file": "tests/waveform_t4lyso_wt_s2.0.ergo",
+   "reason": "",
+   "run2_s": 9.69,
+   "run_s": 9.29,
+   "stdout_bytes": 508473
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 3.47,
+   "file": "tests/waveform_t4lyso_wt_s2_192k.ergo",
+   "reason": "",
+   "run2_s": 36.12,
+   "run_s": 35.62,
+   "stdout_bytes": 2000897
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 2.53,
+   "file": "tests/waveform_t4lyso_wt_s3.0.ergo",
+   "reason": "",
+   "run2_s": 8.22,
+   "run_s": 9.09,
+   "stdout_bytes": 514007
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 2.64,
+   "file": "tests/waveform_t4lyso_wt_s4.0.ergo",
+   "reason": "",
+   "run2_s": 8.79,
+   "run_s": 8.95,
+   "stdout_bytes": 508689
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.7,
+   "file": "tests/waveform_trpcage.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 42304
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.94,
+   "file": "tests/waveform_trpcage_cb.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41770
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.98,
+   "file": "tests/waveform_trpcage_cb2.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41770
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.77,
+   "file": "tests/waveform_trpcage_cb2_ar0.05.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41770
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.74,
+   "file": "tests/waveform_trpcage_cb2_ar0.1.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41789
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.75,
+   "file": "tests/waveform_trpcage_cb2_ar0.2.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41829
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.96,
+   "file": "tests/waveform_trpcage_cb2_ar0.5.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41872
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb2_ar1.0.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41891
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb2_ar2.0.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41948
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb3.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41751
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.94,
+   "file": "tests/waveform_trpcage_cb3_ar0.01.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41758
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb3_ar0.02.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41756
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.94,
+   "file": "tests/waveform_trpcage_cb3_ar0.05.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41751
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb3_ar0.1.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41755
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.94,
+   "file": "tests/waveform_trpcage_cb3_ar0.2.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41767
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb3_ar0.5.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41804
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.94,
+   "file": "tests/waveform_trpcage_cb3_ar1.0.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41917
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb4.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41750
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.72,
+   "file": "tests/waveform_trpcage_cb4_ar0.05.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41750
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb4_ar0.1.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41741
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.73,
+   "file": "tests/waveform_trpcage_cb4_ar0.2.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41738
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb4_ar0.5.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41821
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.93,
+   "file": "tests/waveform_trpcage_cb4_ar1.0.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41850
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.98,
+   "file": "tests/waveform_trpcage_cb4_ar2.0.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41898
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.94,
+   "file": "tests/waveform_trpcage_cb5.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41758
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.93,
+   "file": "tests/waveform_trpcage_cb5_ar0.05.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.03,
+   "stdout_bytes": 41758
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.72,
+   "file": "tests/waveform_trpcage_cb5_ar0.1.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41746
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb5_ar0.2.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41742
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.96,
+   "file": "tests/waveform_trpcage_cb5_ar0.5.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41736
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.76,
+   "file": "tests/waveform_trpcage_cb5_ar1.0.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41846
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb_ar0.05.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41770
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.94,
+   "file": "tests/waveform_trpcage_cb_ar0.1.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41779
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.73,
+   "file": "tests/waveform_trpcage_cb_ar0.2.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41798
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.73,
+   "file": "tests/waveform_trpcage_cb_ar0.5.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41919
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_cb_ar1.0.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41881
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.82,
+   "file": "tests/waveform_trpcage_cb_ar2.0.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41974
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.93,
+   "file": "tests/waveform_trpcage_w6f.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41761
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.93,
+   "file": "tests/waveform_trpcage_w6f_cb.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41768
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_w6f_cb2.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41771
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.94,
+   "file": "tests/waveform_trpcage_w6f_cb2_ar0.05.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.04,
+   "stdout_bytes": 41771
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.99,
+   "file": "tests/waveform_trpcage_w6f_cb2_ar0.1.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41770
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.79,
+   "file": "tests/waveform_trpcage_w6f_cb2_ar0.2.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41783
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.96,
+   "file": "tests/waveform_trpcage_w6f_cb2_ar0.5.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41822
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.96,
+   "file": "tests/waveform_trpcage_w6f_cb2_ar1.0.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.04,
+   "stdout_bytes": 41980
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.76,
+   "file": "tests/waveform_trpcage_w6f_cb2_ar2.0.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41960
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.74,
+   "file": "tests/waveform_trpcage_w6f_cb3.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.03,
+   "stdout_bytes": 41761
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.93,
+   "file": "tests/waveform_trpcage_w6f_cb3_ar0.01.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41761
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.95,
+   "file": "tests/waveform_trpcage_w6f_cb3_ar0.02.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41761
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.74,
+   "file": "tests/waveform_trpcage_w6f_cb3_ar0.05.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.02,
+   "stdout_bytes": 41761
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.72,
+   "file": "tests/waveform_trpcage_w6f_cb3_ar0.1.ergo",
+   "reason": "",
+   "run2_s": 0.02,
+   "run_s": 0.02,
+   "stdout_bytes": 41758
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.03,
+   "file": "tests/waveform_trpcage_w6f_cb3_ar0.2.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.04,
+   "stdout_bytes": 41757
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.99,
+   "file": "tests/waveform_trpcage_w6f_cb3_ar0.5.ergo",
+   "reason": "",
+   "run2_s": 0.02,
+   "run_s": 0.03,
+   "stdout_bytes": 41765
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.75,
+   "file": "tests/waveform_trpcage_w6f_cb3_ar1.0.ergo",
+   "reason": "",
+   "run2_s": 0.02,
+   "run_s": 0.02,
+   "stdout_bytes": 41766
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.04,
+   "file": "tests/waveform_trpcage_w6f_cb4.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41758
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.99,
+   "file": "tests/waveform_trpcage_w6f_cb4_ar0.05.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.03,
+   "stdout_bytes": 41758
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.77,
+   "file": "tests/waveform_trpcage_w6f_cb4_ar0.1.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41755
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.86,
+   "file": "tests/waveform_trpcage_w6f_cb4_ar0.2.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41749
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.99,
+   "file": "tests/waveform_trpcage_w6f_cb4_ar0.5.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41745
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.99,
+   "file": "tests/waveform_trpcage_w6f_cb4_ar1.0.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41746
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.02,
+   "file": "tests/waveform_trpcage_w6f_cb4_ar2.0.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41781
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.82,
+   "file": "tests/waveform_trpcage_w6f_cb5.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41757
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.8,
+   "file": "tests/waveform_trpcage_w6f_cb5_ar0.05.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41757
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.99,
+   "file": "tests/waveform_trpcage_w6f_cb5_ar0.1.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.04,
+   "stdout_bytes": 41758
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.04,
+   "file": "tests/waveform_trpcage_w6f_cb5_ar0.2.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41750
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.0,
+   "file": "tests/waveform_trpcage_w6f_cb5_ar0.5.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41745
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.78,
+   "file": "tests/waveform_trpcage_w6f_cb5_ar1.0.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41743
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.97,
+   "file": "tests/waveform_trpcage_w6f_cb_ar0.05.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41768
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.89,
+   "file": "tests/waveform_trpcage_w6f_cb_ar0.1.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41778
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.0,
+   "file": "tests/waveform_trpcage_w6f_cb_ar0.2.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41787
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.8,
+   "file": "tests/waveform_trpcage_w6f_cb_ar0.5.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41886
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.06,
+   "file": "tests/waveform_trpcage_w6f_cb_ar1.0.ergo",
+   "reason": "",
+   "run2_s": 0.04,
+   "run_s": 0.04,
+   "stdout_bytes": 41887
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.73,
+   "file": "tests/waveform_trpcage_w6f_cb_ar2.0.ergo",
+   "reason": "",
+   "run2_s": 0.03,
+   "run_s": 0.03,
+   "stdout_bytes": 41979
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 5.23,
+   "file": "tests/waveform_uchl1_i93m_cb.ergo",
+   "reason": "",
+   "run2_s": 19.99,
+   "run_s": 19.09,
+   "stdout_bytes": 518360
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 7.16,
+   "file": "tests/waveform_uchl1_i93m_s1.0.ergo",
+   "reason": "",
+   "run2_s": 19.89,
+   "run_s": 19.74,
+   "stdout_bytes": 527744
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 5.25,
+   "file": "tests/waveform_uchl1_i93m_s2.0.ergo",
+   "reason": "",
+   "run2_s": 15.81,
+   "run_s": 15.78,
+   "stdout_bytes": 520225
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 8.06,
+   "file": "tests/waveform_uchl1_i93m_s3.0.ergo",
+   "reason": "",
+   "run2_s": 15.07,
+   "run_s": 15.08,
+   "stdout_bytes": 522100
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 7.9,
+   "file": "tests/waveform_uchl1_i93m_s4.0.ergo",
+   "reason": "",
+   "run2_s": 19.29,
+   "run_s": 23.01,
+   "stdout_bytes": 514813
+  },
+  {
+   "cls": "SLOW",
+   "compile_s": 6.05,
+   "file": "tests/waveform_uchl1_i93m_s4_192k.ergo",
+   "reason": "exceeds 60s run timeout",
+   "run_s": 60.0
+  },
+  {
+   "cls": "SLOW",
+   "compile_s": 6.32,
+   "file": "tests/waveform_uchl1_i93m_s4_384k.ergo",
+   "reason": "exceeds 60s run timeout",
+   "run_s": 60.0
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 5.13,
+   "file": "tests/waveform_uchl1_i93m_s4_t06.ergo",
+   "reason": "",
+   "run2_s": 20.43,
+   "run_s": 23.83,
+   "stdout_bytes": 519678
+  },
+  {
+   "cls": "SLOW",
+   "compile_s": 5.1,
+   "file": "tests/waveform_uchl1_i93m_s4_t06_192k.ergo",
+   "reason": "exceeds 60s run timeout",
+   "run_s": 60.0
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 5.1,
+   "file": "tests/waveform_uchl1_wt_cb.ergo",
+   "reason": "",
+   "run2_s": 18.34,
+   "run_s": 19.62,
+   "stdout_bytes": 519806
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 7.7,
+   "file": "tests/waveform_uchl1_wt_s1.0.ergo",
+   "reason": "",
+   "run2_s": 17.48,
+   "run_s": 15.76,
+   "stdout_bytes": 520960
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 7.59,
+   "file": "tests/waveform_uchl1_wt_s2.0.ergo",
+   "reason": "",
+   "run2_s": 19.29,
+   "run_s": 15.9,
+   "stdout_bytes": 521978
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 5.58,
+   "file": "tests/waveform_uchl1_wt_s3.0.ergo",
+   "reason": "",
+   "run2_s": 20.86,
+   "run_s": 21.2,
+   "stdout_bytes": 523637
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 5.92,
+   "file": "tests/waveform_uchl1_wt_s4.0.ergo",
+   "reason": "",
+   "run2_s": 15.38,
+   "run_s": 20.81,
+   "stdout_bytes": 515086
+  },
+  {
+   "cls": "SLOW",
+   "compile_s": 5.15,
+   "file": "tests/waveform_uchl1_wt_s4_192k.ergo",
+   "reason": "exceeds 60s run timeout",
+   "run_s": 60.0
+  },
+  {
+   "cls": "SLOW",
+   "compile_s": 5.28,
+   "file": "tests/waveform_uchl1_wt_s4_384k.ergo",
+   "reason": "exceeds 60s run timeout",
+   "run_s": 60.0
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 6.94,
+   "file": "tests/waveform_uchl1_wt_s4_t06.ergo",
+   "reason": "",
+   "run2_s": 15.63,
+   "run_s": 16.03,
+   "stdout_bytes": 521077
+  },
+  {
+   "cls": "SLOW",
+   "compile_s": 5.06,
+   "file": "tests/waveform_uchl1_wt_s4_t06_192k.ergo",
+   "reason": "exceeds 60s run timeout",
+   "run_s": 60.0
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.75,
+   "file": "tests/waveform_ww.ergo",
+   "reason": "",
+   "run2_s": 0.06,
+   "run_s": 0.06,
+   "stdout_bytes": 44193
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.73,
+   "file": "tests/waveform_ww_lr.ergo",
+   "reason": "",
+   "run2_s": 0.05,
+   "run_s": 0.05,
+   "stdout_bytes": 43642
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.75,
+   "file": "tests/waveform_ww_nohb.ergo",
+   "reason": "",
+   "run2_s": 0.05,
+   "run_s": 0.05,
+   "stdout_bytes": 43383
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.75,
+   "file": "tests/waveform_ww_t02.ergo",
+   "reason": "",
+   "run2_s": 0.05,
+   "run_s": 0.05,
+   "stdout_bytes": 43566
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.79,
+   "file": "tests/waveform_ww_t02_long.ergo",
+   "reason": "",
+   "run2_s": 0.22,
+   "run_s": 0.22,
+   "stdout_bytes": 126967
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 1.46,
+   "file": "tests/waveform_ww_v2.ergo",
+   "reason": "",
+   "run2_s": 0.56,
+   "run_s": 0.56,
+   "stdout_bytes": 252988
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.17,
+   "file": "tests/write_formats.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 243
+  },
+  {
+   "cls": "PASS",
+   "compile_s": 0.17,
+   "file": "tests/xfer_range.ergo",
+   "reason": "",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 163
+  }
+ ],
+ "run_timeout_s": 60
+}
