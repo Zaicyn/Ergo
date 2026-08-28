@@ -165,6 +165,10 @@ def main():
             tokens = Lexer(source).tokenize()
             tree = Parser(tokens).parse()
             Checker().check(tree)
+            from .hhb_lint import HHBLinter
+            for v in HHBLinter(certified=False).lint(tree):
+                prefix = "HHB ERROR" if v.certified else "HHB WARNING"
+                print(f"{prefix} (line {v.line}): {v.message}", file=sys.stderr)
             mod = IRBuilder().build(tree, source_file=args.source)
             print(dump_module(mod))
             return

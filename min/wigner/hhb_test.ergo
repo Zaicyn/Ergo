@@ -1,0 +1,48 @@
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 128
+INTEGER, PARAMETER :: NP = 256
+INTEGER, PARAMETER :: NSTEPS = 100
+
+STATIC REAL :: PSI(NX), PSIN(NX)
+STATIC REAL :: AMP, PHASE, SIGN
+STATIC INTEGER :: SECTOR
+
+REAL :: NRM, LAP, DV, DX
+INTEGER :: I, T
+
+DX := 1.0 / REAL(NX)
+DV := DX
+
+VERIFY HANDSHAKE parity_bond DEPTH=2 FRAME_BYTES=256 MAXIT=100 CONSERVE PARITY SPIN NORM
+DO SECTOR = 1, 2
+  ! initialize parity-selected packet
+  DO I = 1, NX
+    IF (SECTOR = 1) THEN
+      PSI(I) := 1.0
+    ELSE
+      PSI(I) := -1.0
+    ENDIF
+  ENDDO
+
+  ! propagate A
+  DO T = 1, NSTEPS
+    DO I = 2, NX - 1
+      LAP := (PSI(I - 1) + PSI(I + 1) - 2.0 * PSI(I)) / (DX * DX)
+      PSIN(I) := PSI(I) - 0.001 * LAP
+    ENDDO
+    DO I = 1, NX
+      PSI(I) := PSIN(I)
+    ENDDO
+  ENDDO
+
+  ! mediator update
+  AMP := PSI(NX / 2)
+  PHASE := 0.0
+  SIGN := SECTOR
+
+  WRITE(*, "('SECTOR %d AMP %.6e')") SECTOR, AMP
+ENDDO
+
+WRITE(*, "('DONE')")
+STOP

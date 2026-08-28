@@ -1209,3 +1209,26 @@ quad2m; 2,5,8 in quad3m), balanced blocks, BREAK3=258.
 Pre-registered reads: (a) quad3m WT frac>5 vs trim2's 67%; (b) quad2m
 WT frac>5 near 0-17% = fraction model, near 67% = count model;
 (c) strip/marginality pattern per chain as in §41-42.
+
+## 44. Quad results + telemetry bug fix (2026-08-23)
+BUG (mine): COMPUTE_RMSD_CHAINS segment logic covered CHAIN_BREAK/2 only,
+so rmsd_c4 = 0.00 and rmsd_c3 spanned chains 3+4 in the first quad batch.
+Dynamics unaffected (BREAK3 guards were correct; physics columns valid).
+Fixed (segment logic extended to CHAIN_BREAK3), six quads regenerated.
+Finals recoverable offline from FINAL_STRUCTURE; time series needs the
+rerun for per-chain folding kinetics.
+
+Offline per-chain finals (Kabsch, verified offline path):
+- quad2m (WT = c3,c4): 4.81/4.94, 5.23/4.04, 3.99/5.71 -> frac>5 = 2/6 (33%)
+- quad3m (WT = c4):     4.90, 4.25, 6.36        -> frac>5 = 1/3 (33%)
+
+BASELINE DOSE LADDER (WT fold-failure fraction, frac RMSD>5):
+  0M/3: 11% (1/9) | 1M/3: 0% (0/6) | 2M/3: 67% (4/6) |
+  2M/4: 33% (2/6) | 3M/4: 33% (1/3)
+Neither pre-registered model wins cleanly: not pure fraction (2M/4 should
+have dropped near 0-17%; it did not) and not pure count (2M/4 should have
+held ~67%; it did not), and 3M/4 shows no escalation over 2M/4. Best
+current summary: toxicity peaks in compact clusters (2M/3) and dilutes
+with system size at fixed count; no universal threshold at n=3 seeds.
+n is small in the quad tiers — this is the baseline-for-others the user
+framed, not a rate estimate.

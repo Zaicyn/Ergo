@@ -376,10 +376,12 @@ class Checker:
             if v.name in skip:
                 continue
 
-            # Resolve shape to ints where possible
+            # Resolve shape to ints where possible; hard-error on undefined
+            # identifiers or non-PARAMETER variables in non-allocatable bounds.
             resolved_shape = None
             if v.shape:
                 resolved_shape = self._resolve_shape(v.shape)
+                self._check_shape_bounds(v.shape, decl.allocatable, decl_line)
 
             alloc_state = AllocState.ALWAYS
             if decl.allocatable:
@@ -435,6 +437,40 @@ class Checker:
                 val = self._const_eval(d)
                 result.append(val if val is not None else d)
         return tuple(result)
+
+    def _vars_in_expr(self, node):
+        """Collect all variable names referenced in an expression."""
+        names = []
+        if isinstance(node, ast.Variable):
+            names.append(node.name)
+        elif isinstance(node, ast.BinaryOp):
+            names.extend(self._vars_in_expr(node.left))
+            names.extend(self._vars_in_expr(node.right))
+        elif isinstance(node, ast.UnaryOp):
+            names.extend(self._vars_in_expr(node.operand))
+        return names
+
+    def _check_shape_bounds(self, shape: tuple, allocatable: bool, line: int):
+        """Validate that every identifier in a non-allocatable array bound is
+        a defined PARAMETER. Allocatable declarations use ':' and are checked
+        at ALLOCATE time."""
+        if allocatable:
+            return
+        for d in shape:
+            if d == ":":
+                continue
+            for name in self._vars_in_expr(d):
+                sym = self.symtab.lookup(name)
+                if sym is None:
+                    self._error(
+                        f"Array bound uses undefined identifier '{name}'",
+                        line)
+                elif not sym.is_parameter:
+                    self._error(
+                        f"Array bound '{name}' must be a PARAMETER; "
+                        f"non-allocatable arrays need compile-time constant "
+                        f"shapes (use ALLOCATABLE for runtime sizing)",
+                        line)
 
     def _const_eval(self, node) -> int | None:
         """Try to evaluate an expression as a compile-time integer constant."""
@@ -565,6 +601,15 @@ class Checker:
                 if not sym:
                     self._error(f"Undefined array '{arr_name}' in VERIFY",
                                 node.line)
+        elif isinstance(node, ast.VerifyHandshakeStmt):
+            # HHB lint directive: no type-checking action; the dedicated
+            # linter pass validates it after type checking.
+            pass
+        elif isinstance(node, ast.HandshakeStmt):
+            # Phase-3 HHB block: validate body normally; linter handles HHB
+            # policy after type checking.
+            for stmt in node.body:
+                self._check_stmt(stmt)
         elif isinstance(node, ast.SortByGenStmt):
             for arr_name in node.arrays:
                 sym = self.symtab.lookup(arr_name)

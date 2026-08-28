@@ -196,13 +196,56 @@ class IRCodeGen:
         # Pre-analyze subroutine array access for GPU sync around CPU calls.
         # Maps func_name -> (arrays_read, arrays_written)
         self._sub_array_access: dict[str, tuple[set[str], set[str]]] = {}
+        # Direct subroutine calls made from each function body.
+        self._sub_calls: dict[str, set[str]] = {}
         for func in module.functions:
             reads: set[str] = set()
             writes: set[str] = set()
+            calls: set[str] = set()
             self._collect_array_reads(func.body, reads)
             self._collect_array_writes(func.body, writes)
+            self._collect_sub_calls(func.body, calls)
             if reads or writes:
                 self._sub_array_access[func.name] = (reads, writes)
+            if calls:
+                self._sub_calls[func.name] = calls
+
+    def _sub_transitive_reads(self, func: str) -> set[str]:
+        """All arrays read by func plus every subroutine it calls,
+        recursively. Used so a top-level CPU subroutine sync downloads
+        arrays needed by nested subroutines as well."""
+        seen: set[str] = set()
+        stack = [func]
+        reads: set[str] = set()
+        while stack:
+            f = stack.pop()
+            if f in seen:
+                continue
+            seen.add(f)
+            acc = self._sub_array_access.get(f)
+            if acc:
+                reads |= acc[0]
+            for callee in self._sub_calls.get(f, ()):
+                stack.append(callee)
+        return reads
+
+    def _collect_sub_calls(self, items: list, calls: set[str]):
+        """Walk IR items and collect names of subroutines called."""
+        for item in items:
+            if isinstance(item, IRBlock):
+                for inst in item.insts:
+                    if inst.op in (Op.CALL, Op.CALL_VOID):
+                        f = inst.meta.get("func", "")
+                        if f and f in self._ir_subs:
+                            calls.add(f)
+            elif isinstance(item, IRIf):
+                self._collect_sub_calls(item.then_body, calls)
+                if item.else_body:
+                    self._collect_sub_calls(item.else_body, calls)
+            elif isinstance(item, IRLoop):
+                self._collect_sub_calls(item.body, calls)
+            elif isinstance(item, IRWhileLoop):
+                self._collect_sub_calls(item.body, calls)
 
     def _detect_particle_soa(self) -> dict | None:
         """Detect SoA particle simulation pattern.
@@ -274,10 +317,6 @@ class IRCodeGen:
         self._put_raw("#include \"ergo_io.h\"")
         if self._uses_esf(mod):
             self._put_raw("#include \"ergo_stream.h\"")
-        self._put_raw("")
-        self._put_raw("#ifndef ERGO_BUILD_VERSION")
-        self._put_raw('#define ERGO_BUILD_VERSION "unknown"')
-        self._put_raw("#endif")
         self._put_raw("")
 
         # FNV-1a hash helper for ERGO_HASH_FINAL=1 state-hash diagnostic.
@@ -376,7 +415,6 @@ class IRCodeGen:
         # Emit main
         self._put("int main(int argc, char *argv[]) {")
         self.indent += 1
-        self._put('fprintf(stderr, "[ergo] Ergo build: %s\\n", ERGO_BUILD_VERSION);')
 
         # Runtime CLI parsing
         self._emit_cli_parsing()
@@ -626,6 +664,56 @@ class IRCodeGen:
             self._put(f"{ct} {t} = {self._operand(arg)};")
             parts.append(f"&{t}")
         return ", ".join(parts)
+
+    def _emit_sub_call_sync(self, func: str, sub_fn):
+        """GPU sync around a CPU subroutine call.
+
+        Downloads GPU arrays the subroutine reads/writes, and records
+        arrays it writes so they can be uploaded afterwards. Used for both
+        function (with return value) and subroutine (void) calls.
+        """
+        has_gpu = self.gpu_plan and self.gpu_plan.kernels
+        gpu_arrays = set(self._gpu_arrays()) if has_gpu else set()
+        sub_access = self._sub_array_access.get(func)
+        need_sync = has_gpu and sub_access
+        dl_arrays = set()
+        ul_arrays = set()
+        if need_sync:
+            reads, writes = sub_access
+            # Include arrays read by nested subroutines so top-level sync
+            # downloads everything the call tree needs.
+            reads = reads | self._sub_transitive_reads(func)
+            pp = getattr(self, '_pp_arrays', set())
+            # Download GPU arrays this sub reads.  _gpu_current is static
+            # and unreliable for nested calls; _frame_gpu_dirty tracks
+            # runtime GPU writes, so include both.
+            gpu_dirty = self._frame_gpu_dirty if self._batched_frame else self._gpu_current
+            dl_arrays = (reads | writes) & gpu_arrays & (self._gpu_current | gpu_dirty)
+            if dl_arrays:
+                # Ensure GPU cmd buf is submitted and idle before transfer
+                if self._batched_frame and not self._frame_ended_early:
+                    self._put("ergo_vk_frame_end();")
+                    self._put("ergo_vk_frame_wait();")
+                    self._frame_ended_early = True
+                self._put(f"/* GPU→CPU sync for {func} */")
+                for arr in sorted(dl_arrays):
+                    shape = self._array_shapes.get(arr)
+                    if shape:
+                        size_expr = " * ".join(
+                            self._dim_expr(d) for d in shape)
+                        sz = self._gpu_sizeof(arr)
+                        if arr in pp:
+                            self._put(
+                                f"ergo_vk_download_at(d_{arr}, {arr}, "
+                                f"(size_t)_pp_wr_offset * {sz}, "
+                                f"{size_expr} * {sz});")
+                        else:
+                            self._put(
+                                f"ergo_vk_download(d_{arr}, {arr}, "
+                                f"{size_expr} * {sz});")
+            # Track arrays to upload after the call
+            ul_arrays = writes & gpu_arrays
+        return ul_arrays
 
     def _emit_forward_decl(self, fn: IRFunc):
         params = self._func_param_str(fn)
@@ -944,14 +1032,18 @@ class IRCodeGen:
                             if isinstance(future, IRLoop):
                                 if self._kernel_by_line.get(future.line):
                                     more_dispatches = True
-                                    break
+                                    # Do NOT break here: a CPU item after
+                                    # the next dispatch may still read a
+                                    # just-dispatched array (e.g. Wigner
+                                    # SCF: kernel writes VL, next kernel
+                                    # zeros SF, then CPU loop reads VL).
+                                    continue
                             self._collect_cpu_array_reads([future], pre_reads)
                             self._collect_cpu_array_writes([future], pre_reads)
-                        # Deferral is only valid when no intervening CPU
+                        # Deferral is only valid when no remaining CPU
                         # item reads (or overwrites) a just-dispatched
-                        # array before the next dispatch — otherwise that
-                        # CPU code would see a stale host copy (e.g. a
-                        # CPU-side reduction between two GPU kernels).
+                        # array — otherwise that CPU code would see a
+                        # stale host copy.
                         if more_dispatches and \
                                 (pre_reads & last_dispatch_arrays):
                             more_dispatches = False
@@ -2356,8 +2448,33 @@ class IRCodeGen:
         # Function call (with return value)
         if op == Op.CALL:
             func = inst.meta.get("func", "?")
+            sub_fn = self._ir_subs.get(func)
             a = ", ".join(self._operand(a) for a in args)
+            ul_arrays = self._emit_sub_call_sync(func, sub_fn)
             self._put(f"{result} = {func}({a});")
+            # Upload modified arrays back to GPU
+            if ul_arrays:
+                self._put(f"/* CPU→GPU sync after {func} */")
+                for arr in sorted(ul_arrays):
+                    shape = self._array_shapes.get(arr)
+                    if shape:
+                        size_expr = " * ".join(
+                            self._dim_expr(d) for d in shape)
+                        sz = self._gpu_sizeof(arr)
+                        pp = getattr(self, '_pp_arrays', set())
+                        if arr in pp:
+                            self._put(
+                                f"ergo_vk_upload_at(d_{arr}, {arr}, "
+                                f"(size_t)_pp_wr_offset * {sz}, "
+                                f"{size_expr} * {sz});")
+                        else:
+                            self._put_ranged_upload(arr, shape, sz)
+                self._gpu_current |= ul_arrays
+            # Re-open the batched frame if the sync ended it.
+            if self._batched_frame and self._frame_ended_early:
+                self._put("ergo_vk_frame_begin();")
+                self._frame_ended_early = False
+                self._frame_gpu_dirty.clear()
             return
 
         # Subroutine call (void)
@@ -2451,47 +2568,7 @@ class IRCodeGen:
             # scalar positions; temps for read-only constant arguments).
             sub_fn = self._ir_subs.get(func)
             a = self._sub_call_args(func, sub_fn, args)
-            # GPU sync: download arrays before CPU call, upload after.
-            # Not gated on _in_frame_loop (D18): a non-inlined subroutine
-            # outside the frame loop reads stale CPU copies otherwise.
-            # Downloads are filtered to arrays that are actually
-            # GPU-resident, so init-region calls (CPU data not yet
-            # uploaded) are not clobbered with GPU garbage.
-            has_gpu = self.gpu_plan and self.gpu_plan.kernels
-            gpu_arrays = set(self._gpu_arrays()) if has_gpu else set()
-            sub_access = self._sub_array_access.get(func)
-            need_sync = has_gpu and sub_access
-            dl_arrays = set()
-            ul_arrays = set()
-            if need_sync:
-                reads, writes = sub_access
-                pp = getattr(self, '_pp_arrays', set())
-                # Download GPU arrays this sub reads
-                dl_arrays = (reads | writes) & gpu_arrays & self._gpu_current
-                if dl_arrays:
-                    # Ensure GPU cmd buf is submitted and idle before transfer
-                    if self._batched_frame and not self._frame_ended_early:
-                        self._put("ergo_vk_frame_end();")
-                        self._put("ergo_vk_frame_wait();")
-                        self._frame_ended_early = True
-                    self._put(f"/* GPU→CPU sync for {func} */")
-                    for arr in sorted(dl_arrays):
-                        shape = self._array_shapes.get(arr)
-                        if shape:
-                            size_expr = " * ".join(
-                                self._dim_expr(d) for d in shape)
-                            sz = self._gpu_sizeof(arr)
-                            if arr in pp:
-                                self._put(
-                                    f"ergo_vk_download_at(d_{arr}, {arr}, "
-                                    f"(size_t)_pp_wr_offset * {sz}, "
-                                    f"{size_expr} * {sz});")
-                            else:
-                                self._put(
-                                    f"ergo_vk_download(d_{arr}, {arr}, "
-                                    f"{size_expr} * {sz});")
-                # Track arrays to upload after the call
-                ul_arrays = writes & gpu_arrays
+            ul_arrays = self._emit_sub_call_sync(func, sub_fn)
             self._put(f"{func}({a});")
             # Upload modified arrays back to GPU
             if ul_arrays:
@@ -2511,6 +2588,11 @@ class IRCodeGen:
                         else:
                             self._put_ranged_upload(arr, shape, sz)
                 self._gpu_current |= ul_arrays
+            # Re-open the batched frame if the sync ended it.
+            if self._batched_frame and self._frame_ended_early:
+                self._put("ergo_vk_frame_begin();")
+                self._frame_ended_early = False
+                self._frame_gpu_dirty.clear()
             # NET hook: send census packet after adaptive census call
             if func == "SIM_CENSUS_ADAPTIVE" and self._has_net:
                 self._put("if (_consensus_enabled) {")
@@ -2615,17 +2697,6 @@ class IRCodeGen:
                 self._put("ergo_vk_shutdown();")
             self._put("_ergo_io_shutdown();")
             self._put("exit(0);")
-            return
-
-        # HHB_FAIL — Hopf Handshake Bound check failure.
-        # The diagnostic message is emitted by the preceding WRITE; this op
-        # just performs the ordered shutdown and exits with code 1.
-        if op == Op.HHB_FAIL:
-            if self.gpu_plan and self.gpu_plan.kernels:
-                self._emit_final_hash_hook()
-                self._put("ergo_vk_shutdown();")
-            self._put("_ergo_io_shutdown();")
-            self._put("exit(1);")
             return
 
         # VERIFY — CPU oracle checkpoint
@@ -4090,18 +4161,24 @@ class IRCodeGen:
             if not tiled:
                 self._put(f"ergo_vk_frame_dispatch(pipe_{kid}, ({bound} + 255) / 256);")
             self._frame_gpu_dirty |= kernel.arrays_written
+            # Track that the GPU now holds the current copy of both the
+            # arrays it wrote and the arrays it read (they were uploaded
+            # before dispatch).  Without this, later CPU subroutine calls
+            # that read GPU-dirty arrays never trigger a download.
+            self._gpu_current |= kernel.arrays_written | kernel.arrays_read
             if red:
                 # Coalesced reduction: record the dispatch into the
                 # current frame and defer the host read-back — one drain
-                # + one combined download for the whole run of
+                # and one combined download for the whole run of
                 # consecutive reduction kernels (flushed before the next
                 # non-dispatch item; see _emit_body). Tiled reductions
                 # skip the combined multi-download at flush time (their
-                # partials use the [tile][acc][group] layout).
+                # partials use the [tile][group] layout).
                 self._pending_reductions.append(kernel)
         else:
             if not tiled:
                 self._put(f"ergo_vk_dispatch(pipe_{kid}, ({bound} + 255) / 256);")
+            self._gpu_current |= kernel.arrays_written | kernel.arrays_read
             if red:
                 self._emit_reduction_readback(kernel)
 

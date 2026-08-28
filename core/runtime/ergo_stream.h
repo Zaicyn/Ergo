@@ -22,6 +22,8 @@
 #define ERGO_STREAM_H
 
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ergo_io.h"
@@ -140,8 +142,7 @@ static inline void esf_write(int unit, int ch, const void *payload,
 
 static inline void esf_close(int unit) {
     FILE *fp = _esf_unit(unit);
-    fflush(fp);
-    fclose(fp);
+    _ergo_io_close_file(fp, "ERGO-ESF:");
     _ergo_unit_fp[unit] = NULL;
     _ergo_unit_kind[unit] = 0;
 }

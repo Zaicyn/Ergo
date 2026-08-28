@@ -2403,6 +2403,27 @@ def _try_split(loop: IRLoop, loop_idx: int,
             ))
             return False
 
+        # Same hazard in the CPU->GPU direction, for scalars: the flow
+        # prefix must not read a scalar that the structural suffix (or
+        # an untraversed middle item) writes — sequentially those are
+        # per-iteration values, but the GPU prefix would read the
+        # host's pre-loop value from the push-constant block. (This is
+        # the trna_gpu_0 coil-init NaN: CANDX/Y/Z were read as host
+        # inputs while the DO WHILE that computes them stayed on the
+        # CPU.)
+        suffix_scalar_writes: set[str] = set()
+        _collect_scalar_writes(suffix_items, suffix_scalar_writes)
+        stale_reads = scalars_read_before_write & suffix_scalar_writes
+        stale_reads.discard(loop.var)
+        if stale_reads:
+            plan.rejections.append((
+                loop.line,
+                f"SPLIT rejected: flow prefix reads scalar(s) "
+                f"{sorted(stale_reads)} written by the structural suffix "
+                f"(CPU->GPU boundary: prefix would see pre-loop values)"
+            ))
+            return False
+
     # Classify the flow prefix for real (Spec 9.5) — the split kernel
     # must not silently default to INJECTIVE. A prefix containing a
     # SHIFT pattern (e.g. A(I) := A(I-1)) has a cross-iteration
@@ -2564,6 +2585,9 @@ def _check_item(item, loop_var: str, array_shapes: dict,
 
     if isinstance(item, IRLoop):
         return False, f"nested loop"
+
+    if isinstance(item, IRWhileLoop):
+        return False, f"nested DO WHILE"
 
     if isinstance(item, IRSelect):
         return False, f"SELECT CASE"
@@ -3121,6 +3145,9 @@ def _check_body(items: list, loop_var: str, array_shapes: dict,
         elif isinstance(item, IRLoop):
             return False, f"nested loop at line {item.line}"
 
+        elif isinstance(item, IRWhileLoop):
+            return False, f"nested DO WHILE at line {item.line}"
+
         elif isinstance(item, IRSelect):
             return False, f"SELECT CASE inside loop at line {item.line}"
 
@@ -3446,6 +3473,30 @@ def _classify_body_dependence(body_items: list, loop_var: str,
                 atomic_arrays.add(arr)
 
     return loop_dep, shift_k, atomic_arrays, store_exprs
+
+
+def _collect_scalar_writes(items: list, writes: set[str]):
+    """Recursively collect scalar names WRITTEN in a list of IR items
+    (mirror of _collect_scalar_reads): instruction results and nested
+    loop variables. Used by _try_split for the CPU->GPU boundary
+    hazard (a flow prefix must not read values the suffix computes)."""
+    for item in items:
+        if isinstance(item, IRBlock):
+            for inst in item.insts:
+                if inst.result:
+                    writes.add(inst.result)
+        elif isinstance(item, IRIf):
+            _collect_scalar_writes(item.then_body, writes)
+            if item.else_body:
+                _collect_scalar_writes(item.else_body, writes)
+        elif isinstance(item, IRLoop):
+            writes.add(item.var)
+            _collect_scalar_writes(item.body, writes)
+        elif isinstance(item, IRWhileLoop):
+            _collect_scalar_writes(item.body, writes)
+        elif isinstance(item, IRSelect):
+            for _, case_body in item.cases:
+                _collect_scalar_writes(case_body, writes)
 
 
 def _collect_scalar_reads(items: list, reads: set[str]):

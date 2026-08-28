@@ -72,6 +72,9 @@ class IRBuilder:
         self._func_return_types: dict[str, IRType] = {}
         # Current function name (for Fortran-style return variable)
         self._in_function: str | None = None
+        # Current module and locals list, used for HHB capture variables
+        self._current_module: IRModule | None = None
+        self._current_locals: list[IRVar] | None = None
 
     def _fresh_temp(self, prefix: str = "t") -> str:
         self._temp_counter += 1
@@ -98,6 +101,14 @@ class IRBuilder:
 
     def build(self, tree: ast.Program, source_file: str = None) -> IRModule:
         mod = IRModule(source_file=source_file)
+        self._current_module = mod
+        self._current_locals = mod.main_locals
+
+        # Promote VERIFY HANDSHAKE <directive> + following statement into a
+        # HandshakeStmt AST node so that _lower_handshake emits entry capture
+        # and boundary checks.  This keeps the directive surface syntax while
+        # reusing the Phase-3b lowering path.
+        tree.units = self._promote_verify_handshakes(tree.units)
 
         # First pass: register functions and collect global state
         for unit in tree.units:
@@ -129,6 +140,60 @@ class IRBuilder:
                     mod.main_body.extend(items)
 
         return mod
+
+    # ── VERIFY HANDSHAKE promotion ───────────────────────────
+
+    def _promote_verify_handshakes(self, stmts: list) -> list:
+        """Rewrite VERIFY HANDSHAKE directives into explicit HandshakeStmt nodes.
+
+        A directive followed by a statement becomes a HandshakeStmt whose body
+        is that single statement.  The directive is left untouched if it has no
+        following statement (the linter will report this).  Nested statement
+        lists inside IF/DO/WHILE/SELECT/HANDSHAKE/functions/subroutines are
+        also transformed so VERIFY HANDSHAKE can be used inside any scope.
+        """
+        result = []
+        i = 0
+        while i < len(stmts):
+            stmt = stmts[i]
+            if isinstance(stmt, ast.VerifyHandshakeStmt):
+                if i + 1 < len(stmts):
+                    target = self._promote_stmt(stmts[i + 1])
+                    result.append(ast.HandshakeStmt(
+                        name=stmt.name,
+                        options=stmt.options,
+                        body=[target],
+                        line=stmt.line,
+                    ))
+                    i += 2
+                else:
+                    result.append(stmt)
+                    i += 1
+            else:
+                result.append(self._promote_stmt(stmt))
+                i += 1
+        return result
+
+    def _promote_stmt(self, stmt: Any) -> Any:
+        """Recursively promote VERIFY HANDSHAKE inside compound statements."""
+        if isinstance(stmt, ast.IfStmt):
+            stmt.then_body = self._promote_verify_handshakes(stmt.then_body)
+            if stmt.else_body:
+                stmt.else_body = self._promote_verify_handshakes(stmt.else_body)
+        elif isinstance(stmt, ast.DoLoop):
+            stmt.body = self._promote_verify_handshakes(stmt.body)
+        elif isinstance(stmt, ast.DoWhileStmt):
+            stmt.body = self._promote_verify_handshakes(stmt.body)
+        elif isinstance(stmt, ast.SelectCaseStmt):
+            stmt.cases = [
+                (val, self._promote_verify_handshakes(body))
+                for val, body in stmt.cases
+            ]
+        elif isinstance(stmt, ast.HandshakeStmt):
+            stmt.body = self._promote_verify_handshakes(stmt.body)
+        elif isinstance(stmt, (ast.FunctionDef, ast.SubroutineDef)):
+            stmt.body = self._promote_verify_handshakes(stmt.body)
+        return stmt
 
     # ── globals ──────────────────────────────────────────────
 
@@ -257,6 +322,8 @@ class IRBuilder:
         self._var_types[f"{fn.name}_"] = ret_type
 
         # Lower body
+        saved_locals = self._current_locals
+        self._current_locals = locals_
         body = []
         for stmt in fn.body:
             if isinstance(stmt, ast.DataStmt):
@@ -268,6 +335,7 @@ class IRBuilder:
                         break
                 continue
             body.extend(self._lower_stmt(stmt))
+        self._current_locals = saved_locals
 
         self._in_function = saved_func
         self._var_types = saved_types
@@ -317,6 +385,8 @@ class IRBuilder:
                     self._lower_local_decl_single(
                         v, decl.type_name, decl.allocatable, decl.parameter, locals_)
 
+        saved_locals = self._current_locals
+        self._current_locals = locals_
         body = []
         for stmt in fn.body:
             if isinstance(stmt, ast.DataStmt):
@@ -328,6 +398,7 @@ class IRBuilder:
                         break
                 continue
             body.extend(self._lower_stmt(stmt))
+        self._current_locals = saved_locals
 
         self._in_function = saved_func
         self._var_types = saved_types
@@ -1107,7 +1178,163 @@ class IRBuilder:
             ))
             return [block]
 
+        if isinstance(node, ast.VerifyHandshakeStmt):
+            # Phase-1 lint directive: no IR emission.
+            return []
+
+        if isinstance(node, ast.HandshakeStmt):
+            return self._lower_handshake(node)
+
         if isinstance(node, (ast.ImplicitNone, ast.DataStmt)):
             return []
 
         return []
+
+    def _lower_handshake(self, node: ast.HandshakeStmt) -> list:
+        """Lower a HANDSHAKE ... ENDHANDSHAKE block.
+
+        Emits:
+          - entry capture for each CONSERVE invariant (captured at handshake
+            entry, before any stage runs)
+          - the body statements
+          - CONSERVE + ORACLE checks after every top-level stage (counted
+            DO loop or IF block) and at the end of the handshake
+        """
+        opts = node.options
+        conserve = opts.get("CONSERVE", [])
+        oracles = opts.get("ORACLE", [])
+        handshake_name = node.name
+
+        # Entry-capture locals for CONSERVE invariants.
+        capture_vars: dict[str, tuple[str, IRType]] = {}
+        capture_block = IRBlock(self._fresh_block("hhb_capture"), line=node.line)
+        for inv_name, value_expr, tol in conserve:
+            entry_name = f"_hhb_{handshake_name}_{inv_name}_entry"
+            # Lower the expression once to determine its type and produce
+            # instructions; declare the capture variable with that type.
+            val_op = self._lower_expr(value_expr, capture_block)
+            val_type = self._operand_type(val_op)
+            capture_vars[inv_name] = (entry_name, val_type)
+            self._var_types[entry_name] = val_type
+            if self._current_locals is not None:
+                self._current_locals.append(
+                    IRVar(name=entry_name, type=val_type))
+            capture_block.insts.append(IRInst(
+                op=Op.COPY, result=entry_name, args=[val_op], type=val_type,
+                line=node.line,
+            ))
+
+        result: list = []
+        if capture_block.insts:
+            result.append(capture_block)
+
+        # Lower body and inject boundary checks after each stage.
+        for stmt in node.body:
+            result.extend(self._lower_stmt(stmt))
+            if isinstance(stmt, (ast.DoLoop, ast.IfStmt)):
+                # Stage boundary: emit checks.
+                result.extend(self._build_hhb_boundary_checks(
+                    node, conserve, oracles, capture_vars, stmt.line))
+
+        return result
+
+    def _build_hhb_boundary_checks(
+        self, node: ast.HandshakeStmt, conserve: list, oracles: list,
+        capture_vars: dict[str, tuple[str, IRType]], line: int
+    ) -> list:
+        """Build IR items for one boundary check point."""
+        items: list = []
+        handshake_name = node.name
+
+        # CONSERVE checks: |current_value - entry_value| > TOL  => fail
+        for inv_name, value_expr, tol in conserve:
+            entry_name, entry_type = capture_vars[inv_name]
+            check_block = IRBlock(self._fresh_block("hhb_check"), line=line)
+            cur_op = self._lower_expr(value_expr, check_block)
+            entry_op = IRRef(entry_name, entry_type)
+            diff_t = self._fresh_temp()
+            check_block.insts.append(IRInst(
+                op=Op.SUB, result=diff_t, args=[cur_op, entry_op],
+                type=entry_type, line=line,
+            ))
+            abs_t = self._fresh_temp()
+            check_block.insts.append(IRInst(
+                op=Op.ABS, result=abs_t, args=[IRRef(diff_t, entry_type)],
+                type=entry_type, line=line,
+            ))
+            tol_op = IRConst(entry_type, tol)
+            cond_t = self._fresh_temp()
+            check_block.insts.append(IRInst(
+                op=Op.GT, result=cond_t,
+                args=[IRRef(abs_t, entry_type), tol_op],
+                type=IRType.LOGICAL, line=line,
+            ))
+            fail_block = self._hhb_fail_block(
+                handshake_name, "CONSERVE", inv_name, line,
+                actual_op=cur_op, expected_op=entry_op, tol_op=tol_op)
+            items.append(check_block)
+            items.append(IRIf(
+                condition=IRRef(cond_t, IRType.LOGICAL),
+                then_body=[fail_block],
+                line=line,
+            ))
+
+        # ORACLE checks: |actual - expected| > LIMIT  => fail
+        for spec in oracles:
+            oracle_name = spec.get("name", "<unnamed>")
+            expected_expr = spec.get("VALUE")
+            limit = spec.get("LIMIT")
+            if expected_expr is None or limit is None:
+                continue
+            check_block = IRBlock(self._fresh_block("hhb_oracle"), line=line)
+            actual_op = self._lower_expr(
+                ast.Variable(oracle_name), check_block)
+            actual_type = self._operand_type(actual_op)
+            expected_op = self._lower_expr(expected_expr, check_block)
+            diff_t = self._fresh_temp()
+            check_block.insts.append(IRInst(
+                op=Op.SUB, result=diff_t, args=[actual_op, expected_op],
+                type=actual_type, line=line,
+            ))
+            abs_t = self._fresh_temp()
+            check_block.insts.append(IRInst(
+                op=Op.ABS, result=abs_t, args=[IRRef(diff_t, actual_type)],
+                type=actual_type, line=line,
+            ))
+            limit_op = IRConst(actual_type, limit)
+            cond_t = self._fresh_temp()
+            check_block.insts.append(IRInst(
+                op=Op.GT, result=cond_t,
+                args=[IRRef(abs_t, actual_type), limit_op],
+                type=IRType.LOGICAL, line=line,
+            ))
+            fail_block = self._hhb_fail_block(
+                handshake_name, "ORACLE", oracle_name, line,
+                actual_op=actual_op, expected_op=expected_op, tol_op=limit_op)
+            items.append(check_block)
+            items.append(IRIf(
+                condition=IRRef(cond_t, IRType.LOGICAL),
+                then_body=[fail_block],
+                line=line,
+            ))
+
+        return items
+
+    def _hhb_fail_block(self, handshake_name: str, kind: str, name: str,
+                        line: int, *, actual_op: Operand, expected_op: Operand,
+                        tol_op: Operand) -> IRBlock:
+        """Build a block that prints a rich HHB failure message and exits(1)."""
+        block = IRBlock(self._fresh_block("hhb_fail"), line=line)
+        label = (f"HHB_SCANFAIL handshake={handshake_name} kind={kind} "
+                 f"name={name} line={line}")
+        fmt = label + " actual=%.17e expected=%.17e tol=%.17e"
+        block.insts.append(IRInst(
+            op=Op.WRITE, args=[actual_op, expected_op, tol_op],
+            type=IRType.VOID, line=line,
+            meta={"unit": "0", "fmt": fmt, "advance": True},
+        ))
+        block.insts.append(IRInst(
+            op=Op.HHB_FAIL, type=IRType.VOID, line=line,
+            meta={"message": label},
+        ))
+        return block

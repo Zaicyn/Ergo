@@ -19,7 +19,7 @@ from __future__ import annotations
 import sys
 
 from ..ir import (
-    IRModule, IRVar, IRBlock, IRIf, IRLoop, IRSelect,
+    IRModule, IRVar, IRBlock, IRIf, IRLoop, IRWhileLoop, IRSelect,
     IRInst, IRConst, IRRef, IRType, StorageClass, Op, Operand,
 )
 from ..ir_gpu import KernelPlan, GPUPlan, SortByGenPlan
@@ -679,7 +679,7 @@ class SPIRVBackend(KernelBackend):
             lines.append(f"        struct {{ ")
             for s in scalars:
                 t = self._var_types.get(s, IRType.REAL)
-                c_type = "double" if t == IRType.REAL else "int"
+                c_type = IRType.REAL.c_type if t == IRType.REAL else "int"
                 lines.append(f"            {c_type} {s};")
             lines.append(f"        }} pc_{kid} = {{ {', '.join(scalars)} }};")
             lines.append(f"        ergo_vk_push_constants(pipe_{kid}, &pc_{kid}, sizeof(pc_{kid}));")
@@ -1159,7 +1159,7 @@ class _EmitContext:
                 for inst in item.insts:
                     if inst.op in GLSL_EXT:
                         self._needs_glsl_ext = True
-                    if inst.op == Op.CLAMP:
+                    if inst.op in (Op.CLAMP, Op.SIGN):
                         self._needs_glsl_ext = True
                     if inst.op == Op.LOG10:
                         self._needs_glsl_ext = True
@@ -2665,6 +2665,68 @@ class _EmitContext:
                 f"         {self._id(result)} = OpExtInst {self._id(self.id_real)} "
                 f"{self._id(glsl)} {GLSL_EXT[op]} {self._id(a)} {self._id(b)}")
             self._set_ssa_type(result, self.id_real)
+            if inst.result:
+                ssa_map[inst.result] = result
+            return False
+
+        # SIGN — Fortran SIGN(a, b) = |a| * (b >= 0 ? +1 : -1).
+        # (GLSL sign(b) would give 0 at b = 0; Fortran gives +|a| —
+        # the strictness of arithmetic masks built on SIGN(1.0, x)
+        # depends on exactly this.)
+        if op == Op.SIGN:
+            a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
+            b = self._resolve(inst.args[1], pc_member_ids, ssa_map)
+            glsl = self._named_ids["glsl_ext"]
+            if self._is_int_id(a) and self._is_int_id(b):
+                abs_a = self._alloc()
+                self._function.append(
+                    f"         {self._id(abs_a)} = OpExtInst {self._id(self.id_i32)} "
+                    f"{self._id(glsl)} SAbs {self._id(a)}")
+                self._set_ssa_type(abs_a, self.id_i32)
+                zc = self._get_const(IRType.INTEGER, 0)
+                oc = self._get_const(IRType.INTEGER, 1)
+                nc = self._get_const(IRType.INTEGER, -1)
+                cond = self._alloc()
+                self._function.append(
+                    f"         {self._id(cond)} = OpSLessThanEqual "
+                    f"{self._id(self.id_bool)} {self._id(zc)} {self._id(b)}")
+                self._set_ssa_type(cond, self.id_bool)
+                sel = self._alloc()
+                self._function.append(
+                    f"         {self._id(sel)} = OpSelect {self._id(self.id_i32)} "
+                    f"{self._id(cond)} {self._id(oc)} {self._id(nc)}")
+                self._set_ssa_type(sel, self.id_i32)
+                result = self._alloc()
+                self._function.append(
+                    f"         {self._id(result)} = OpIMul {self._id(self.id_i32)} "
+                    f"{self._id(abs_a)} {self._id(sel)}")
+                self._set_ssa_type(result, self.id_i32)
+            else:
+                a = self._ensure_f64(a)
+                b = self._ensure_f64(b)
+                abs_a = self._alloc()
+                self._function.append(
+                    f"         {self._id(abs_a)} = OpExtInst {self._id(self.id_real)} "
+                    f"{self._id(glsl)} {GLSL_EXT[Op.ABS]} {self._id(a)}")
+                self._set_ssa_type(abs_a, self.id_real)
+                zc = self._get_const(IRType.REAL, 0.0)
+                oc = self._get_const(IRType.REAL, 1.0)
+                nc = self._get_const(IRType.REAL, -1.0)
+                cond = self._alloc()
+                self._function.append(
+                    f"         {self._id(cond)} = OpFOrdGreaterThanEqual "
+                    f"{self._id(self.id_bool)} {self._id(b)} {self._id(zc)}")
+                self._set_ssa_type(cond, self.id_bool)
+                sel = self._alloc()
+                self._function.append(
+                    f"         {self._id(sel)} = OpSelect {self._id(self.id_real)} "
+                    f"{self._id(cond)} {self._id(oc)} {self._id(nc)}")
+                self._set_ssa_type(sel, self.id_real)
+                result = self._alloc()
+                self._function.append(
+                    f"         {self._id(result)} = OpFMul {self._id(self.id_real)} "
+                    f"{self._id(abs_a)} {self._id(sel)}")
+                self._set_ssa_type(result, self.id_real)
             if inst.result:
                 ssa_map[inst.result] = result
             return False

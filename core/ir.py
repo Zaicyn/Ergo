@@ -230,6 +230,7 @@ class Op(Enum):
     RETURN = "return"
     RETURN_VOID = "return_void"
     STOP = "stop"
+    HHB_FAIL = "hhb_fail"   # HHB boundary-check failure: print + exit(1)
     VERIFY = "verify"       # CPU oracle checkpoint
     SORT_BY_GEN = "sort_by_gen"  # compiler-generated sort kernels
 

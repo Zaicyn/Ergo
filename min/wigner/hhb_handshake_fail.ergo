@@ -1,0 +1,23 @@
+! HHB failure example: ORACLE check fires because X does not reach 0.8.
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: N = 8
+INTEGER :: I
+REAL :: X
+
+X := 0.0
+
+HANDSHAKE failing
+    DEPTH=1
+    FRAME_BYTES=256
+    MAXIT=10
+    PAYLOAD=(X)
+    ORACLE X VALUE=0.9 LIMIT=1.0E-3
+  DO I = 1, N
+    X := X + 0.1
+  ENDDO
+ENDHANDSHAKE
+
+WRITE(*, "('X = %.6e')") X
+STOP

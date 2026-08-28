@@ -1,0 +1,110 @@
+! ════════════════════════════════════════════════════════════════════
+! df_radial2 SCF loop as an explicit Hopf Handshake Bound (Phase 3 design)
+! ════════════════════════════════════════════════════════════════════
+!
+! Design note: this is the *weakest* case for the HANDSHAKE wrapper. A
+! DEPTH=1 handshake whose stage is one SCF cycle bounded by NCYC is, at
+! heart, a counted loop with a convergence check — exactly what the code
+! already is. The wrapper only earns its keep here because it *enforces*:
+!   1. FRAME_BYTES budget on the declared payload.
+!   2. MAXIT=NCYC is a compile-time constant.
+!   3. CONSERVE NORM checks auto-emitted each cycle.
+!   4. ORACLE CONVERGED check auto-emitted (not hand-written).
+!   5. Calls to YZ/YKP/LEGS/SHOOT are recursively verified HHB-clean.
+!
+! If these enforcements are not implemented, the wrapper is just ceremony
+! and a plain counted loop + hand-written VERIFY is preferable.
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NT = 20000
+INTEGER, PARAMETER :: NCYC = 60
+INTEGER, PARAMETER :: NB = 4          ! example: up to 4 occupied orbitals
+
+STATIC REAL :: F(NT,NB), G(NT,NB)
+STATIC REAL :: EPSA(NB)
+STATIC REAL :: VH(NT), DEN(NT), YK(NT), PY(NT), VL(NT), SF(NT), SG(NT)
+
+REAL :: ESUM, EDIFF, EOLD
+INTEGER :: ICYC, IA
+
+! ... setup grid, initial orbitals, etc. ...
+
+EOLD := 0.0
+
+HANDSHAKE df_radial_scf
+    DEPTH=1
+    FRAME_BYTES=256
+    MAXIT=NCYC
+    CONSERVE NORM
+
+  ! Orbital energies and total energy are the scalar payload.
+  PAYLOAD ORBITAL = (EPSA(1), EPSA(2), EPSA(3), EPSA(4), ESUM, EDIFF)
+
+  STAGE 1:
+    ! Build direct potential VH from current orbitals
+    DO I = 1, NT
+      VH(I) := 0.0
+    ENDDO
+    DO IB = 1, NB
+      DO I = 1, NT
+        DEN(I) := F(I,IB)*F(I,IB) + G(I,IB)*G(I,IB)
+      ENDDO
+      CALL YZ                       ! HHB-clean counted-loop Poisson solve
+      DO I = 2, NT
+        VH(I) := VH(I) + REAL(OC(IB)) * (YK(I)/RG(I) + PY(I))
+      ENDDO
+    ENDDO
+
+    ! Solve/update each orbital IA under VL + exchange
+    DO IA = 1, NB
+      ! ... build VL, exchange sources SF/SG ...
+      ! ... calls to HHB-clean YKP/LEGS/SHOOT ...
+      EPSA(IA) := EROOT
+    ENDDO
+
+    ! Total energy and convergence diagnostic
+    ESUM := 0.0
+    DO IA = 1, NB
+      ESUM := ESUM + REAL(OC(IA)) * EPSA(IA)
+    ENDDO
+    EDIFF := ESUM - EOLD
+    EOLD := ESUM
+
+    WRITE(*, "('DFSCF cyc=%d E=%.10e dE=%.3e')") ICYC, ESUM, EDIFF
+
+  ! Auto-emitted convergence oracle.
+  ORACLE CONVERGED VALUE=ABS(EDIFF) LIMIT=1.0E-10
+
+ENDHANDSHAKE
+
+WRITE(*, "('DONE')")
+STOP
+
+! ════════════════════════════════════════════════════════════════════
+! HHB-clean helper routines (counted loops only, no allocation)
+! ════════════════════════════════════════════════════════════════════
+SUBROUTINE YZ
+   IMPLICIT NONE
+   REAL :: AC, BC
+   INTEGER :: I, J
+   AC := 0.0
+   YK(1) := 0.0
+   DO I = 2, NT
+      AC := AC + 0.5 * (DEN(I-1) * RG(I-1) + DEN(I) * RG(I)) * H
+      YK(I) := AC
+   ENDDO
+   BC := 0.0
+   PY(NT) := 0.0
+   DO J = 1, NT - 1
+      I := NT - J
+      BC := BC + 0.5 * (DEN(I) + DEN(I+1)) * H
+      PY(I) := BC
+   ENDDO
+END
+
+SUBROUTINE YKP(K)
+   IMPLICIT NONE
+   INTEGER :: K
+   ! ... counted-loop Poisson solve for general k ...
+END

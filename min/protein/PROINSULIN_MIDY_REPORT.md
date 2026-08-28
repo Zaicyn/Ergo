@@ -91,6 +91,33 @@ Sustained thermal noise (floor 0.1/0.25/0.4 of folding-cycle peak) after frame
    negative claims rest on band-intensity co-expression assays, never structural
    measurement of the WT partner).
 
+### 6. Four-chain baseline (§43–§44) — proposed-universality starting point
+Two tiers × 3 seeds (seeds matched to the trimer series):
+
+| tier | WT chains | frac RMSD>5 |
+|---|---|---|
+| 2M/4 (quad2m) | 6 (2/run) | **33%** (2/6) |
+| 3M/4 (quad3m) | 3 (1/run) | **33%** (1/3) |
+
+**Baseline dose ladder (WT fold-failure fraction):**
+
+| mutant count / system size | 0M | 1M | 2M | 3M |
+|---|---|---|---|---|
+| 3-chain | 11% (1/9) | 0% (0/6) | 67% (4/6) | — |
+| 4-chain | — | — | 33% (2/6) | 33% (1/3) |
+
+Neither simple model wins: not pure dose-fraction (2M/4 should approach
+0–17%), not pure mutant-count (2M/4 should hold at 67%), and 3M/4 shows no
+escalation over 2M/4. Best current summary: toxicity peaks in compact
+clusters (2M/3) and dilutes with system size at fixed mutant count; no
+universal threshold resolved at n=3 seeds per tier. This ladder is the
+minimum viable baseline for replication — not a rate estimate.
+
+*Erratum noted: the first quad batch's per-chain telemetry mis-segmented
+chains 3–4 (rmsd_c4=0.00); dynamics were unaffected and finals were
+recovered offline. Fixed files regenerated; rerun restores the per-chain
+time series.*
+
 ## Limitations (stated plainly)
 
 - Cα-level Go-like field; no side chains, no ER membrane, chaperones, redox, or

@@ -153,6 +153,33 @@ class VerifyStmt:
 
 
 @dataclass
+class VerifyHandshakeStmt:
+    """VERIFY HANDSHAKE name [DEPTH=d] [FRAME_BYTES=b] [MAXIT=m]
+                         [CONSERVE invariant ...]
+    Static-schedule lint directive for Hopf Handshake Bound policy.
+    Applies to the following statement/block.
+    """
+    name: str
+    options: dict  # e.g. {"DEPTH": 2, "FRAME_BYTES": 256, "MAXIT": 240,
+                   #       "CONSERVE": [("NORM", 1.0E-10)]}
+    line: int = 0
+
+
+@dataclass
+class HandshakeStmt:
+    """HANDSHAKE name [options] ... ENDHANDSHAKE
+
+    Phase-3 explicit handshake block. For now this desugars to the same
+    validation and lowering as VerifyHandshakeStmt applied to the first
+    counted DO/IF block inside the body.
+    """
+    name: str
+    options: dict
+    body: list
+    line: int = 0
+
+
+@dataclass
 class SortByGenStmt:
     """SORT_BY_GEN arr1, arr2, ... — sort particles by GEN field.
     arrays: list of array names permuted together.

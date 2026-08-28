@@ -43,6 +43,33 @@ DETERMINISTIC_FLAGS = [
 _LARGE_CMODEL_THRESHOLD = 1 << 30  # bytes of static array data
 
 
+def _build_version() -> str:
+    """Return a git-describe string for the compiler tree.
+
+    Falls back to "unknown" when git is unavailable or the tree is not
+    under version control. The returned string is suitable for embedding
+    in generated executables via -DERGO_BUILD_VERSION.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--dirty", "--always", "--tags"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+# Embed the compiler version in every generated executable so certified
+# artifacts can be traced back to the exact tree state that built them.
+_BUILD_VERSION_DEFINE = f'-DERGO_BUILD_VERSION="{_build_version()}"'
+
+
 def _static_array_bytes(ir_module) -> int:
     """Total bytes of STATIC/LOCAL arrays with compile-time int shapes."""
     from .ir import IRType, get_real_precision
@@ -138,6 +165,16 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
                 print(e, file=sys.stderr)
             raise MCLError(f"Type checking failed ({len(errors)} error(s))")
 
+    # Hopf Handshake Bound static lint (Phase 1)
+    from .hhb_lint import HHBLinter
+    hhb_linter = HHBLinter(certified=False)
+    hhb_violations = hhb_linter.lint(tree)
+    for v in hhb_violations:
+        prefix = "HHB ERROR" if v.certified else "HHB WARNING"
+        print(f"{prefix} (line {v.line}): {v.message}", file=sys.stderr)
+    if any(v.certified for v in hhb_violations):
+        raise MCLError("HHB certified-mode violations found")
+
     # Codegen — IR path (default) or legacy AST path
     if use_ir:
         ir_module = IRBuilder().build(tree, source_file=source_path)
@@ -196,7 +233,7 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
     try:
         runtime_dir = os.path.join(os.path.dirname(__file__), "runtime")
         gcc_flags = (["gcc", "-o", output, c_path] + DETERMINISTIC_FLAGS +
-                     ["-lm", f"-I{runtime_dir}"])
+                     ["-lm", f"-I{runtime_dir}", _BUILD_VERSION_DEFINE])
         if use_ir and _static_array_bytes(ir_module) > _LARGE_CMODEL_THRESHOLD:
             gcc_flags.append("-mcmodel=large")
         if render:
@@ -296,6 +333,7 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
                 ] + DETERMINISTIC_FLAGS + [
                     "-lm", "-lvulkan", "-lglfw",
                     f"-I{runtime_dir}",
+                    _BUILD_VERSION_DEFINE,
                 ])
                 if cpu_fast_math:
                     gcc_flags.append("-ffast-math")
@@ -368,6 +406,7 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
         ] + DETERMINISTIC_FLAGS + [
             "-lm", "-lvulkan",
             f"-I{runtime_dir}",
+            _BUILD_VERSION_DEFINE,
         ])
         if _static_array_bytes(ir_module) > _LARGE_CMODEL_THRESHOLD:
             gcc_flags.append("-mcmodel=large")

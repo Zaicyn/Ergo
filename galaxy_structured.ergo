@@ -30,6 +30,21 @@ PARAMETER REAL :: SCALE_RATIO = 1.6875
 PARAMETER REAL :: STEER_RATE = 0.03
 PARAMETER REAL :: DENSITY_FORCE_SCALE = 0.01
 
+! ── Seed-direction mode (research instrument, compile-time) ───
+! 0 = PROGRADE: v = (-z, 0, x)/r_xz · v_circ. Clean bound orbits,
+!   v · r̂ = 0, kinetic energy conserved. Crystal v²-gate
+!   unreachable at populated radii — no death pathway. Default.
+! 1 = TANGENT: v = TANGENT(GEN) · v_circ (legacy Viviani-curve
+!   tangent used as velocity direction). Correct speed, wrong
+!   direction → degenerate plunges. v² transiently crosses 0.01
+!   at periapsis. The only seed mode in which crystallization
+!   fires regularly. Matches V22 cb9a5ba behavior.
+! See Spec/V22_Correction_And_Seed_Fix.md + V22 assistant's note
+! on the crystal-history finding (2026-05-14).
+PARAMETER INTEGER :: SEED_DIR_PROGRADE = 0
+PARAMETER INTEGER :: SEED_DIR_TANGENT  = 1
+PARAMETER INTEGER :: SEED_DIR_MODE = 0
+
 ! ── Metabolic thresholds (positive = gain, negative = decay)
 PARAMETER REAL :: OMEGA_BASE = 0.08
 PARAMETER REAL :: OMEGA_GAIN = 2.0
@@ -327,6 +342,14 @@ STATIC REAL :: SIG_RNORM(SIG_MAX)
 STATIC REAL :: SIG_MGATE(SIG_MAX)
 STATIC REAL :: SIG_ZC(SIG_MAX)
 STATIC REAL :: SIG_FW(SIG_MAX)
+! Extended signature fields (added 2026-05-14) — recover lost
+! information about WHERE in θ-space the death occurred (SIG_GEN),
+! the particle's orbital state at death (SIG_ENERGY, SIG_ANG_MOM),
+! and the cell's ring-completeness (SIG_BIN_PRESENCE).
+STATIC INTEGER :: SIG_GEN(SIG_MAX)
+STATIC REAL :: SIG_ENERGY(SIG_MAX)
+STATIC REAL :: SIG_ANG_MOM(SIG_MAX)
+STATIC INTEGER :: SIG_BIN_PRESENCE(SIG_MAX)
 
 ! ════════════════════════════════════════════════════════════════
 ! PRNG (deterministic, reproducible)
@@ -495,10 +518,20 @@ SUBROUTINE SIM_INIT(N, CAP, SEED)
 
     R_XZ := SQRT(X * X + Z * Z)
     V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
-    INV_RXZ := 1.0 / MAX(R_XZ, 1.0E-4)
-    VEL_X(I) := -Z * INV_RXZ * V_CIRC
-    VEL_Y(I) := 0.0
-    VEL_Z(I) :=  X * INV_RXZ * V_CIRC
+    IF SEED_DIR_MODE = SEED_DIR_TANGENT THEN
+      ! Legacy: Viviani-curve tangent as velocity direction.
+      ! Correct speed, wrong direction → eccentric plunges that
+      ! produce v² < 0.01 transiently → crystallization possible.
+      VEL_X(I) := TANGENT(1, GEN) * V_CIRC
+      VEL_Y(I) := TANGENT(2, GEN) * V_CIRC
+      VEL_Z(I) := TANGENT(3, GEN) * V_CIRC
+    ELSE
+      ! Prograde: clean bound orbits, v · r̂ = 0.
+      INV_RXZ := 1.0 / MAX(R_XZ, 1.0E-4)
+      VEL_X(I) := -Z * INV_RXZ * V_CIRC
+      VEL_Y(I) := 0.0
+      VEL_Z(I) :=  X * INV_RXZ * V_CIRC
+    ENDIF
 
     R_CLAMP := MAX(R_XZ, 1.0)
     OMEGA_NAT(I) := 0.1 * (50.0 / R_CLAMP) ** 1.5
@@ -539,10 +572,18 @@ SUBROUTINE SIM_SEED_SHELL()
 
     R_XZ := SQRT(PX * PX + PZ * PZ)
     V_CIRC := SQRT(BH_MASS / MAX(R_XZ, 1.0))
-    INV_RXZ := 1.0 / MAX(R_XZ, 1.0E-4)
-    VEL_X(I) := -PZ * INV_RXZ * V_CIRC
-    VEL_Y(I) := 0.0
-    VEL_Z(I) :=  PX * INV_RXZ * V_CIRC
+    IF SEED_DIR_MODE = SEED_DIR_TANGENT THEN
+      ! Legacy: Viviani-curve tangent as velocity direction.
+      VEL_X(I) := TANGENT(1, GEN) * V_CIRC
+      VEL_Y(I) := TANGENT(2, GEN) * V_CIRC
+      VEL_Z(I) := TANGENT(3, GEN) * V_CIRC
+    ELSE
+      ! Prograde: clean bound orbits, v · r̂ = 0.
+      INV_RXZ := 1.0 / MAX(R_XZ, 1.0E-4)
+      VEL_X(I) := -PZ * INV_RXZ * V_CIRC
+      VEL_Y(I) := 0.0
+      VEL_Z(I) :=  PX * INV_RXZ * V_CIRC
+    ENDIF
 
     OMEGA_NAT(I) := 0.1
     FLAGS(I) := IOR(IOR(PFLAG_ACTIVE, ISHFT(IAND(GEN - 1, GEN_MASK), &
@@ -616,14 +657,42 @@ SUBROUTINE SIM_PHYSICS_STEP(DT)
             CJ := CLAMP(INT(POS_Y(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
             CK := CLAMP(INT(POS_Z(I) / CELL_SIZE) + GRID_HALF, 1, GRID_SIZE)
 
+            ! Load particle state into locals for derived quantities.
+            ! Reuses physics-step locals (PX/PY/PZ/VX/VY/VZ etc.) declared
+            ! at top of subroutine; we're in dead time for crystal warps.
+            PX := POS_X(I)
+            PY := POS_Y(I)
+            PZ := POS_Z(I)
+            VX := VEL_X(I)
+            VY := VEL_Y(I)
+            VZ := VEL_Z(I)
+
             SIG_OMEGA(SIG_SLOT) := OMEGA_NAT(I)
             SIG_RHO(SIG_SLOT) := REAL(GRID_DENSITY(CI, CJ, CK)) / 32.0
             SIG_FMODE(SIG_SLOT) := REAL(FLOW_MODE(GEN))
-            SIG_VMAG(SIG_SLOT) := SQRT(VEL_X(I)*VEL_X(I) + VEL_Y(I)*VEL_Y(I) + VEL_Z(I)*VEL_Z(I))
-            SIG_RNORM(SIG_SLOT) := SQRT(POS_X(I)*POS_X(I) + POS_Y(I)*POS_Y(I) + POS_Z(I)*POS_Z(I)) / DISK_OUTER_R
+            SIG_VMAG(SIG_SLOT) := SQRT(VX*VX + VY*VY + VZ*VZ)
+            SIG_RNORM(SIG_SLOT) := SQRT(PX*PX + PY*PY + PZ*PZ) / DISK_OUTER_R
             SIG_MGATE(SIG_SLOT) := GRID_MET_GATE(CI, CJ, CK)
             SIG_ZC(SIG_SLOT) := ABS(Z_COUPLING(GEN))
             SIG_FW(SIG_SLOT) := ABS(FLOW_W(GEN))
+
+            ! Extended fields (2026-05-14):
+            !   GEN          — raw GEN bin (1..32), recovers identity lost
+            !                  when only |zc| and |fw| are stored.
+            !   ENERGY       — specific orbital energy ½v² − GM/r.
+            !                  Negative = bound; magnitude = depth in well.
+            !   ANG_MOM      — |r × v|. Distinguishes near-circular orbits
+            !                  (high L) from plunge orbits (low L).
+            !   BIN_PRESENCE — bitmask of GEN bins represented in this cell.
+            !                  bitcount → ring coverage (8 = full, 1 = sparse).
+            SIG_GEN(SIG_SLOT) := GEN
+            SIG_ENERGY(SIG_SLOT) := 0.5 * (VX*VX + VY*VY + VZ*VZ) &
+              - BH_MASS / MAX(SQRT(PX*PX + PY*PY + PZ*PZ), 1.0)
+            SIG_ANG_MOM(SIG_SLOT) := SQRT( &
+              (PY*VZ - PZ*VY) * (PY*VZ - PZ*VY) + &
+              (PZ*VX - PX*VZ) * (PZ*VX - PX*VZ) + &
+              (PX*VY - PY*VX) * (PX*VY - PY*VX))
+            SIG_BIN_PRESENCE(SIG_SLOT) := BIN_PRESENCE(CI, CJ, CK)
 
             FLAGS(I) := IOR(FLAGS(I), PFLAG_SIGNED)
           ENDIF

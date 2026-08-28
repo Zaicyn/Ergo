@@ -15,6 +15,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <string.h>
 
 #define ERGO_MAX_UNIT 64
 
@@ -25,6 +27,19 @@ static int   _ergo_unit_kind[ERGO_MAX_UNIT];
 static void _ergo_io_fail(const char *what) {
     fprintf(stderr, "ERGO-IO: %s\n", what);
     exit(1);
+}
+
+/* Flush and close a file stream; report a NAMED runtime error with
+ * errno if either fails. The `prefix` is "ERGO-IO:" or "ERGO-ESF:". */
+static inline void _ergo_io_close_file(FILE *fp, const char *prefix) {
+    if (fflush(fp) != 0) {
+        fprintf(stderr, "%s flush failed (%s)\n", prefix, strerror(errno));
+        exit(1);
+    }
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "%s close failed (%s)\n", prefix, strerror(errno));
+        exit(1);
+    }
 }
 
 /* Register `fp` on `unit` with kind `kind` (1=file, 2=esf).
@@ -88,8 +103,7 @@ static inline void _ergo_close(int unit) {
     if (_ergo_unit_kind[unit] != 1)
         _ergo_io_fail("CLOSE: unit is an .esf stream "
                       "(use ESF_CLOSE)");
-    fflush(_ergo_unit_fp[unit]);
-    fclose(_ergo_unit_fp[unit]);
+    _ergo_io_close_file(_ergo_unit_fp[unit], "ERGO-IO:");
     _ergo_unit_fp[unit] = NULL;
     _ergo_unit_kind[unit] = 0;
 }
@@ -100,8 +114,7 @@ static inline void _ergo_close(int unit) {
 static inline void _ergo_io_shutdown(void) {
     for (int u = 1; u < ERGO_MAX_UNIT; u++) {
         if (_ergo_unit_kind[u] != 0) {
-            fflush(_ergo_unit_fp[u]);
-            fclose(_ergo_unit_fp[u]);
+            _ergo_io_close_file(_ergo_unit_fp[u], "ERGO-IO:");
             _ergo_unit_fp[u] = NULL;
             _ergo_unit_kind[u] = 0;
         }

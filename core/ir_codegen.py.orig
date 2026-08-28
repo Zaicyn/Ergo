@@ -275,10 +275,6 @@ class IRCodeGen:
         if self._uses_esf(mod):
             self._put_raw("#include \"ergo_stream.h\"")
         self._put_raw("")
-        self._put_raw("#ifndef ERGO_BUILD_VERSION")
-        self._put_raw('#define ERGO_BUILD_VERSION "unknown"')
-        self._put_raw("#endif")
-        self._put_raw("")
 
         # FNV-1a hash helper for ERGO_HASH_FINAL=1 state-hash diagnostic.
         # Only emitted when GPU state needs to be hashable on exit.
@@ -376,7 +372,6 @@ class IRCodeGen:
         # Emit main
         self._put("int main(int argc, char *argv[]) {")
         self.indent += 1
-        self._put('fprintf(stderr, "[ergo] Ergo build: %s\\n", ERGO_BUILD_VERSION);')
 
         # Runtime CLI parsing
         self._emit_cli_parsing()
@@ -2615,17 +2610,6 @@ class IRCodeGen:
                 self._put("ergo_vk_shutdown();")
             self._put("_ergo_io_shutdown();")
             self._put("exit(0);")
-            return
-
-        # HHB_FAIL — Hopf Handshake Bound check failure.
-        # The diagnostic message is emitted by the preceding WRITE; this op
-        # just performs the ordered shutdown and exits with code 1.
-        if op == Op.HHB_FAIL:
-            if self.gpu_plan and self.gpu_plan.kernels:
-                self._emit_final_hash_hook()
-                self._put("ergo_vk_shutdown();")
-            self._put("_ergo_io_shutdown();")
-            self._put("exit(1);")
             return
 
         # VERIFY — CPU oracle checkpoint

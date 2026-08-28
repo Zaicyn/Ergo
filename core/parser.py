@@ -366,6 +366,8 @@ class Parser:
             return ast.FlushStmt()
         if self._at(TT.KW_VERIFY):
             return self._parse_verify()
+        if self._at(TT.KW_HANDSHAKE):
+            return self._parse_handshake()
         if self._at(TT.KW_SORT_BY_GEN):
             return self._parse_sort_by_gen()
         # Declaration (inside function body)
@@ -531,11 +533,165 @@ class Parser:
         self._eat_newline()
         return ast.DoLoop(var, start, end, step, body, line=line)
 
-    def _parse_verify(self) -> ast.VerifyStmt:
-        """Parse: VERIFY arr1, arr2, ... ORACLE n EVERY m TOL t"""
+    def _parse_hhb_options(self, context: str,
+                           multiline: bool = False) -> tuple[dict, list]:
+        """Parse Hopf Handshake Bound options shared by VERIFY HANDSHAKE and
+        HANDSHAKE ... ENDHANDSHAKE. Returns (options, conserve_list).
+
+        If multiline is True, newlines are treated as whitespace between
+        options (used by HANDSHAKE ... ENDHANDSHAKE). Otherwise options are
+        expected on a single line and the first NEWLINE terminates parsing
+        (used by VERIFY HANDSHAKE).
+        """
+        options: dict = {}
+        conserve: list[tuple[str, Any, float | None]] = []
+        while True:
+            if multiline:
+                self._skip_newlines()
+            if not self._at(TT.IDENT):
+                break
+            opt_tok = self._eat(TT.IDENT)
+            opt_key = opt_tok.value.upper()
+            if opt_key == "CONSERVE":
+                # Parse CONSERVE <name> VALUE=<expr> TOL=<value> triples
+                while self._at(TT.IDENT):
+                    inv_name = self._eat(TT.IDENT).value.upper()
+                    value_expr = None
+                    tol = None
+                    while self._at(TT.IDENT):
+                        sub_key = self._eat(TT.IDENT).value.upper()
+                        self._eat(TT.EQ)
+                        if sub_key == "VALUE":
+                            value_expr = self._parse_expression()
+                        elif sub_key == "TOL":
+                            tol_tok = self._cur()
+                            if tol_tok.type == TT.REAL_LIT:
+                                self._eat(TT.REAL_LIT)
+                                tol = tol_tok.value
+                            elif tol_tok.type == TT.INTEGER_LIT:
+                                self._eat(TT.INTEGER_LIT)
+                                tol = float(tol_tok.value)
+                            else:
+                                raise self._parse_error(
+                                    "Expected REAL_LIT or INTEGER_LIT after TOL=",
+                                    tol_tok)
+                        else:
+                            raise self._parse_error(
+                                f"Unknown CONSERVE sub-option '{sub_key}'",
+                                self._cur())
+                        # Stop if next token is an option keyword
+                        if (self._at(TT.IDENT) and
+                                self._cur().value.upper() in
+                                ("DEPTH", "FRAME_BYTES", "MAXIT", "MAX_REWIND",
+                                 "PAYLOAD", "ORACLE", "CONSERVE", "EVERY", "NET")):
+                            break
+                        # Stop if next token is the start of a new CONSERVE triple
+                        if (self._at(TT.IDENT) and
+                                self._peek().type == TT.IDENT and
+                                self._peek().value.upper() == "VALUE"):
+                            break
+                    conserve.append((inv_name, value_expr, tol))
+                    # Stop if next token is another option keyword
+                    if (self._at(TT.IDENT) and
+                            self._cur().value.upper() in
+                            ("DEPTH", "FRAME_BYTES", "MAXIT", "MAX_REWIND",
+                             "PAYLOAD", "ORACLE", "EVERY", "NET")):
+                        break
+                continue
+            if opt_key == "PAYLOAD":
+                self._eat(TT.EQ)
+                self._eat(TT.LPAREN)
+                payload_vars = [self._eat(TT.IDENT).value]
+                while self._match(TT.COMMA):
+                    payload_vars.append(self._eat(TT.IDENT).value)
+                self._eat(TT.RPAREN)
+                options["PAYLOAD"] = payload_vars
+                continue
+            if opt_key == "ORACLE":
+                # ORACLE <name> VALUE=... [P=...] LIMIT=...
+                oracle_name = self._eat(TT.IDENT).value
+                oracle_spec: dict = {"name": oracle_name}
+                while self._at(TT.IDENT):
+                    spec_key = self._eat(TT.IDENT).value.upper()
+                    self._eat(TT.EQ)
+                    if spec_key == "VALUE":
+                        # VALUE is an expression evaluated at the boundary.
+                        oracle_spec["VALUE"] = self._parse_expression()
+                    elif spec_key in ("LIMIT", "P"):
+                        # LIMIT/P are compile-time numeric tolerances.
+                        tol_tok = self._cur()
+                        if tol_tok.type == TT.REAL_LIT:
+                            self._eat(TT.REAL_LIT)
+                            oracle_spec[spec_key] = tol_tok.value
+                        elif tol_tok.type == TT.INTEGER_LIT:
+                            self._eat(TT.INTEGER_LIT)
+                            oracle_spec[spec_key] = float(tol_tok.value)
+                        else:
+                            raise self._parse_error(
+                                f"Expected numeric literal after {spec_key}=",
+                                tol_tok)
+                    else:
+                        raise self._parse_error(
+                            f"Unknown ORACLE sub-option '{spec_key}'",
+                            self._cur())
+                    # Stop if next token is an option keyword
+                    if (self._at(TT.IDENT) and
+                            self._cur().value.upper() in
+                            ("DEPTH", "FRAME_BYTES", "MAXIT", "MAX_REWIND",
+                             "PAYLOAD", "ORACLE", "CONSERVE", "EVERY", "NET")):
+                        break
+                options.setdefault("ORACLE", []).append(oracle_spec)
+                continue
+            if opt_key in ("DEPTH", "FRAME_BYTES", "MAXIT", "MAX_REWIND"):
+                self._eat(TT.EQ)
+                val_tok = self._cur()
+                if val_tok.type == TT.INTEGER_LIT:
+                    self._eat(TT.INTEGER_LIT)
+                    options[opt_key] = val_tok.value
+                elif val_tok.type == TT.IDENT:
+                    self._eat(TT.IDENT)
+                    options[opt_key] = val_tok.value  # PARAMETER reference
+                else:
+                    raise self._parse_error(
+                        f"Expected INTEGER_LIT or IDENT after {opt_key}=",
+                        val_tok)
+                continue
+            if opt_key in ("ORACLE", "EVERY", "TOL", "NET"):
+                # These belong to the regular VERIFY form; backtrack
+                # is not trivial, so treat as error here.
+                raise ParseError(
+                    f"Unexpected '{opt_key}' in {context} "
+                    f"(use VERIFY ... ORACLE ... for oracle checkpoints)",
+                    opt_tok.line, opt_tok.col)
+            if opt_key == "PAYLOAD":
+                # Should have been handled above; defensive error.
+                raise ParseError(
+                    f"Malformed PAYLOAD option in {context}",
+                    opt_tok.line, opt_tok.col)
+            raise ParseError(
+                f"Unknown {context} option '{opt_key}'",
+                opt_tok.line, opt_tok.col)
+        if conserve:
+            options["CONSERVE"] = conserve
+        return options, conserve
+
+    def _parse_verify(self) -> ast.VerifyStmt | ast.VerifyHandshakeStmt:
+        """Parse: VERIFY arr1, arr2, ... ORACLE n EVERY m TOL t
+                 OR VERIFY HANDSHAKE name [DEPTH=d] [FRAME_BYTES=b] ...
+        """
         line = self._cur().line
         self._eat(TT.KW_VERIFY)
-        # Parse comma-separated array names
+        # HHB directive form: VERIFY HANDSHAKE name [options]
+        if ((self._at(TT.IDENT) or self._at(TT.KW_HANDSHAKE)) and
+                self._cur().value.upper() == "HANDSHAKE"):
+            self._eat(self._cur().type)
+            name_tok = self._eat(TT.IDENT)
+            name = name_tok.value
+            options, _ = self._parse_hhb_options("VERIFY HANDSHAKE",
+                                                  multiline=False)
+            self._eat_newline()
+            return ast.VerifyHandshakeStmt(name, options, line=line)
+        # Standard VERIFY form
         arrays = [self._eat(TT.IDENT).value]
         while self._match(TT.COMMA):
             arrays.append(self._eat(TT.IDENT).value)
@@ -582,6 +738,28 @@ class Parser:
         return ast.VerifyStmt(arrays, oracle_size, every, tolerance,
                               net_host=net_host, net_gpu_id=net_gpu_id,
                               line=line)
+
+    def _parse_handshake(self) -> ast.HandshakeStmt:
+        """Parse: HANDSHAKE name [options] ... ENDHANDSHAKE
+
+        Minimal Phase-3 form: options followed by a body terminated by
+        ENDHANDSHAKE. The first counted DO/IF block inside the body is the
+        handshake target; the rest is setup/teardown.
+        """
+        line = self._cur().line
+        self._eat(TT.KW_HANDSHAKE)
+        name_tok = self._eat(TT.IDENT)
+        name = name_tok.value
+        options, _ = self._parse_hhb_options("HANDSHAKE", multiline=True)
+        self._skip_newlines()
+
+        body = []
+        while not self._at(TT.KW_ENDHANDSHAKE, TT.EOF):
+            body.append(self._parse_statement())
+            self._skip_newlines()
+        self._eat(TT.KW_ENDHANDSHAKE)
+        self._eat_newline()
+        return ast.HandshakeStmt(name, options, body, line=line)
 
     def _parse_sort_by_gen(self) -> ast.SortByGenStmt:
         """Parse: SORT_BY_GEN arr1, arr2, ..."""

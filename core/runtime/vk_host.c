@@ -22,6 +22,10 @@
 
 #include <math.h>
 
+#ifndef ERGO_BUILD_VERSION
+#define ERGO_BUILD_VERSION "unknown"
+#endif
+
 /*
  * ERGO_BENCH_VK_ALLOC — opt-in instrumentation for Pass 3 of the
  * allocator comparison. When defined at compile time, ergo_vk_create_buffer

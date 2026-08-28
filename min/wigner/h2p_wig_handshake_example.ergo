@@ -1,0 +1,97 @@
+! ════════════════════════════════════════════════════════════════════
+! H2P_WIG with explicit Hopf Handshake Bound syntax (Phase 3 design example)
+! ════════════════════════════════════════════════════════════════════
+!
+! Design iteration after review: trim ceremony, keep only what the compiler
+! cannot already enforce by convention.
+!
+! What the HANDSHAKE wrapper buys here:
+!   1. FRAME_BYTES hard-checked against PAYLOAD size.
+!   2. MAXIT verified to be a compile-time constant / PARAMETER.
+!   3. CONSERVE PARITY/SPIN/NORM checks auto-emitted at stage boundaries.
+!   4. ORACLE checks auto-emitted at stage end (not hand-written VERIFY).
+!   5. YZ/YKP/LEGS-style helpers recursively verified HHB-clean.
+!
+! What was removed:
+!   - ENDPOINT A/B keywords (the actual distinction is PARITY in each stage).
+!   - SIGNAL ... WHEN .TRUE. (statically true guard is noise; use MASK <expr>
+!     only when data-dependent activation can lower to a branchless mask).
+!   - Unified ORACLE grammar (VALUE=... LIMIT=... TOL=...).
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 128
+REAL, PARAMETER :: BOX = 16.0
+INTEGER, PARAMETER :: NPTS = 2097152
+INTEGER, PARAMETER :: NXY = 16384
+INTEGER, PARAMETER :: NSTEPS = 2500
+REAL, PARAMETER :: DTAU = 0.008
+INTEGER, PARAMETER :: NP = 256
+
+STATIC REAL :: RLIST(7)
+DATA RLIST / 0.5, 1.0, 1.401, 2.0, 3.0, 4.0, 6.0 /
+
+STATIC REAL :: PSI(NPTS), PSIN(NPTS), V(NPTS)
+STATIC INTEGER :: BND(NPTS)
+STATIC REAL :: RZ(128,128), WG(128,256)
+
+REAL :: DX, DX2, IDX2, DV, PMAX
+INTEGER :: IR
+
+DX := 2.0 * BOX / REAL(NX)
+DX2 := DX * DX
+IDX2 := 1.0 / DX2
+DV := DX * DX * DX
+PMAX := 3.14159265358979323846 / (2.0 * DX)
+
+! boundary mask
+DO K = 1, NPTS
+  BND(K) := 0
+ENDDO
+DO KC = 2, NX - 1
+  DO JC = 2, NX - 1
+    DO IC = 2, NX - 1
+      K := IC + (JC - 1) * NX + (KC - 1) * NXY
+      BND(K) := 1
+    ENDDO
+  ENDDO
+ENDDO
+
+! ── Per-R handshake block ──────────────────────────────────────────
+DO IR = 1, 7
+
+  HANDSHAKE h2bond
+      DEPTH=2
+      FRAME_BYTES=256
+      MAXIT=NSTEPS
+      CONSERVE PARITY SPIN NORM
+
+    ! Per-stage scalar payload (≤ FRAME_BYTES). The compiler sums the
+    ! declared scalars and hard-errors if the budget is exceeded.
+    PAYLOAD BOND = (R, E_TOT, W00, WMIN, PMIN, WMAX)
+
+    ! Stage 1: gerade parity endpoint
+    STAGE 1: PARITY=1
+      INITIALIZE PSI FOR PARITY
+      PROPAGATE PSI COUNT=NSTEPS ORACLE NORM TOL=1.0E-12
+      DIAGNOSTIC E_TOT
+      BUILD_MEDIATOR WG FROM PSI
+
+    ! Stage 2: ungerade parity endpoint
+    STAGE 2: PARITY=2
+      INITIALIZE PSI FOR PARITY
+      PROPAGATE PSI COUNT=NSTEPS ORACLE NORM TOL=1.0E-12
+      DIAGNOSTIC E_TOT
+      BUILD_MEDIATOR WG FROM PSI
+
+    ! Auto-emitted oracles (no hand-written VERIFY needed inside stages)
+    ORACLE W0        VALUE= 1.0/PI*(1-2*(PARITY-1))  LIMIT=2.0E-3
+    ORACLE WNORM     VALUE= 1.0                       LIMIT=1.0E-12
+    ORACLE FRINGE    VALUE= WMIN  P=PMIN             LIMIT=5.0E-2
+
+  ENDHANDSHAKE
+
+ENDDO
+
+WRITE(*, "('DONE')")
+STOP

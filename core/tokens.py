@@ -87,6 +87,8 @@ class TT(Enum):
     KW_VERIFY = auto()
     KW_SORT_BY_GEN = auto()
     KW_WHILE = auto()
+    KW_HANDSHAKE = auto()
+    KW_ENDHANDSHAKE = auto()
 
     # Structure
     NEWLINE = auto()
@@ -134,6 +136,8 @@ KEYWORDS = {
     "VERIFY": TT.KW_VERIFY,
     "SORT_BY_GEN": TT.KW_SORT_BY_GEN,
     "WHILE": TT.KW_WHILE,
+    "HANDSHAKE": TT.KW_HANDSHAKE,
+    "ENDHANDSHAKE": TT.KW_ENDHANDSHAKE,
 }
 
 
