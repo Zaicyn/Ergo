@@ -16,6 +16,13 @@
 !min/**/*.ergo
 !min/**/*.py
 !min/**/*.md
+!min/**/*.sh
+# min/ribosome certified reference CSVs — regression diff targets cited
+# by the md docs and core/test_stag5_hang_regression.py. The other ~143
+# trajectory-dump CSVs stay ignored (campaign outputs, regenerable).
+!min/ribosome/ul18_stag5.csv
+!min/ribosome/ul18_dom5.csv
+!min/ribosome/ul18_full_slot.csv
 !Spec/
 !Spec/**
 !tools/
@@ -90,5 +97,9 @@ __pycache__/
 *.spv
 *.o
 *.so
+
+# Hard ban, kept last so no whitelist rule above can override it:
+# reference PDFs live in the tree for reading but never enter git.
+*.pdf
 
 reference/

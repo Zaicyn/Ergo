@@ -1,0 +1,3439 @@
+! WAVEFORM_D5SEG_4170_4263 - d5seg_4170_4263 protein variant with native RMSD
+! =====================================================================
+! 92-residue protein variant
+! Design: helix(1-9) - turn/cage(10-20)
+! Includes hydrophobic attraction (L2,Y3,I4,W6,L7,P12,P17,P18,P19)
+! Computes RMSD to native PDB 1L2Y coordinates at each frame.
+!
+! CSV: frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,
+!      e_morse,e_angle,e_torsion,e_hydro,thermal,rmsd_native
+
+IMPLICIT NONE
+
+! ── Chain / run ─────────────────────────────────────────────
+PARAMETER INTEGER :: NRES = 92
+PARAMETER INTEGER :: MAXHB = 256
+PARAMETER INTEGER :: MAXFRAME = 96000
+
+! ── Time stepping / coupling ──────────────────────────────────
+PARAMETER REAL :: DT = 0.01
+PARAMETER REAL :: FORCE_SCALE = 6.0
+PARAMETER REAL :: VELOCITY_DAMP = 0.9
+PARAMETER REAL :: BASE_OMEGA = 1.0
+PARAMETER REAL :: COUPLING_K = 5.0
+PARAMETER REAL :: PHASE_NOISE_SCALE = 10.0
+PARAMETER REAL :: SEED = 0.0
+
+! ── Thermal schedule ─────────────────────────────────────────
+PARAMETER REAL :: HEAT_START = 0.001
+PARAMETER REAL :: HEAT_PEAK = 1.0
+! 0 = legacy: two heat/cool cycles hard-coded into frames 0-1200
+! 1 = scaled: two heat/cool cycles spanning the first half of MAXFRAME
+PARAMETER INTEGER :: SCHEDULE_SCALED = 0
+
+! ── Ultrasonic pulse (mechanical trap rescue; 1SNO/SdrD certified) ──
+! Mode-1 standing wave along the backbone; velocity kick per frame,
+! axes phase-shifted 2pi/3. AMP = 0 disables (bitwise-identical to no pulse).
+! Certified setting: OMEGA = 0.002 (period ~3100 frames), AMP = 0.05.
+PARAMETER REAL :: PULSE_AMP = 0.0
+PARAMETER REAL :: PULSE_OMEGA = 0.002
+
+! ── Domain rigid-body quaternion MC (post-gate docking moves) ──
+! Every MC_EVERY frames post-gate, each domain gets a small rigid-body
+! rotation about its COM (quaternion-sampled, hash-deterministic),
+! accepted iff inter-domain Go + steric energy does not increase.
+! Internal structure is preserved exactly (rigid transform).
+! MC_EVERY = 0 disables; with NDOM = 1 there are no inter-domain pairs,
+! so the move is a whole-chain rotation about COM and inert by symmetry.
+PARAMETER INTEGER :: MC_EVERY = 0
+PARAMETER REAL :: MC_ANGLE = 0.08
+PARAMETER REAL :: MC_TRANS = 0.3
+! ── Oriented-residue (Cosserat ribbon) dynamics ────────────────────
+! Each residue carries an orientation quaternion RES_Q* integrated via
+! q_dot = 0.5 * omega (x) q, plus angular velocity RES_W*. Neighbor
+! alignment torques (FRAME_K) compare q_i^-1 (x) q_i+1 against the native
+! relative frame; the orientation->position coupling (FRAME_POS_K) pulls
+! p_i+1 toward p_i + R(q_i) . v*_i (native bond in the local frame).
+! Both default 0 = off. These act DURING collapse, from frame 0.
+PARAMETER REAL :: FRAME_K = 0.1
+PARAMETER REAL :: FRAME_POS_K = 0.1
+
+! ── Contact-layer orientation coupling (second coordination shell) ──
+! For each native contact pair (i,j), bead j is pulled toward
+! p_i + R(q_i).v*_ij (native contact vector carried in i's local frame).
+! Generalizes FRAME_POS_K from backbone bonds to spatial contacts.
+! Native structure is a zero-force fixed point by construction.
+PARAMETER REAL :: FRAME_CL_K = 0.0
+PARAMETER INTEGER :: NCL = 0
+PARAMETER REAL :: FRAME_DAMP = 0.98
+
+! Metropolis temperature for MC acceptance: uphill moves accepted with
+! probability EXP(-dE/MCT). Anneals linearly to 0 over the first 60% of
+! the post-gate window (= quench frame when gate=0.5M, quench=0.8M).
+! 0 = greedy (downhill-only).
+PARAMETER REAL :: MC_TEMP = 0.0
+PARAMETER INTEGER :: NDOM = 1
+
+! ── Backbone (permanent) ─────────────────────────────────────
+PARAMETER REAL :: BACKBONE_R0 = 1.52
+PARAMETER REAL :: BACKBONE_D = 1.4
+PARAMETER REAL :: MORSE_A = 1.0
+
+! ── H-bonds (dynamic contacts) ────────────────────────────────
+PARAMETER REAL :: HB_R0 = 2.2
+PARAMETER REAL :: HB_D = 0.30
+PARAMETER REAL :: HB_FORM = 2.5
+PARAMETER REAL :: HB_BREAK = 2.8
+PARAMETER INTEGER :: HB_CAP = 0
+! Breakable cystine restraints (harmonic Cα–Cα to native distance; CYS_ON=0 deletes the bond)
+PARAMETER REAL :: CSS_K = 0.5000
+PARAMETER INTEGER :: NCYSPAIR = 19
+! Non-native disulfide mispairing (e.g. freed CysB7 attacking wrong partners in Akita)
+PARAMETER REAL :: MIS_K = 0.0
+PARAMETER INTEGER :: NMISPAIR = 0
+! Multi-chain support: backbone/angle/torsion/frame terms skipped across the break
+! (residue CHAIN_BREAK ends chain 1, CHAIN_BREAK+1 starts chain 2; 0 = single chain)
+! CHAIN_BREAK2/3 = optional further breaks for 3- and 4-chain systems (0 = unused)
+PARAMETER INTEGER :: CHAIN_BREAK = 0
+PARAMETER INTEGER :: CHAIN_BREAK2 = 0
+PARAMETER INTEGER :: CHAIN_BREAK3 = 0
+! Adaptive substepping (Ergo_Activity_Bounds §5): temporal resolution, not caps.
+! Closest-approach scan before the force block; if DMIN < SUBSTEP_D the frame's
+! dynamics run NSUB = min(SUBSTEP_MAX, floor(SUBSTEP_D/DMIN)+1) substeps of DT/NSUB.
+PARAMETER REAL :: SUBSTEP_D = 0.8
+PARAMETER INTEGER :: SUBSTEP_MAX = 64
+PARAMETER REAL :: HB_PHASE_FORM = 0.80
+PARAMETER REAL :: HB_PHASE_STABLE = 0.95
+
+! ── Steric exclusion ─────────────────────────────────────────
+PARAMETER REAL :: STERIC_SIG = 1.60
+PARAMETER REAL :: STERIC_EPS = 0.1
+PARAMETER REAL :: STERIC_CUT = 2.5
+
+! ── Screened phosphate repulsion (RNA backbone; PHOS_EPS=0 = off) ──
+! E = PHOS_EPS * EXP(-D/PHOS_LAM) / D   (screened Coulomb, per pair)
+! Only bead pairs with RES_PHOS > 0 on BOTH beads feel it.
+PARAMETER REAL :: PHOS_EPS = 0.0500
+PARAMETER REAL :: PHOS_LAM = 8.0000
+
+! ── Packed pair-slot geometry (GPU pair-force kernels) ─────────────
+! All pair forces (steric/PHOS/hydro/Go contacts) run over ONE unified
+! padded slot list: atom a owns slots [(a-1)*PSEG+1, a*PSEG]; PAD slots
+! carry zero weights. PSEG is a multiple of 256 covering the longest
+! per-atom pair run (the segmented-reduction extraction requires
+! 256-aligned segments). Both are patched per variant (literal ints).
+PARAMETER INTEGER :: PSEG = 256
+PARAMETER INTEGER :: NSLOT = 23552
+
+! ── Hydrophobic attraction ───────────────────────────────────
+PARAMETER REAL :: HYDRO_STRENGTH = 0.0020
+PARAMETER REAL :: HYDRO_R0 = 4.0
+PARAMETER REAL :: HYDRO_CUTOFF = 8.0
+PARAMETER REAL :: HYDRO_ALPHA = 1.0
+
+
+
+! ── Native contact potential (Go-like) ─────────────────────────
+PARAMETER REAL :: NATIVE_K = 1.00
+PARAMETER REAL :: NATIVE_CUTOFF = 2.600000
+
+! ── Fold-then-dock staging ─────────────────────────────────────
+! Inter-domain native contacts (CONTACT_INTER = 1) exert no force and
+! contribute no energy until FRAME > DOCK_FROM. Default: off (huge).
+PARAMETER INTEGER :: DOCK_FROM = 2000000000
+
+
+
+! ── Residue state ─────────────────────────────────────────────
+STATIC REAL :: RES_X(92)
+STATIC REAL :: RES_Y(92)
+STATIC REAL :: RES_Z(92)
+STATIC REAL :: RES_VX(92)
+STATIC REAL :: RES_VY(92)
+STATIC REAL :: RES_VZ(92)
+STATIC REAL :: RES_THETA(92)
+STATIC REAL :: RES_OMEGA(92)
+
+! ── Per-residue sequence parameters ──────────────────────────
+STATIC REAL :: RES_ANGK(92)
+STATIC REAL :: RES_ANGT0(92)
+STATIC REAL :: RES_TORSK(92)
+STATIC REAL :: RES_TORSP0(92)
+STATIC REAL :: RES_HYDRO(92)
+STATIC REAL :: RES_PHOS(92)
+
+
+
+! ── Native coordinates (PDB 1L2Y, model 1, chain A) ─
+! These are Cα positions from the NMR structure.
+STATIC REAL :: NATIVE_X(92)
+STATIC REAL :: NATIVE_Y(92)
+STATIC REAL :: NATIVE_Z(92)
+
+! ── Native contact state ─────────────────────────────────────
+STATIC INTEGER :: NATIVE_CONTACT(92, 92)
+STATIC INTEGER :: CONTACT_INTER(92, 92)
+STATIC INTEGER :: DOM_BEG(16)
+STATIC INTEGER :: DOM_END(16)
+STATIC REAL :: RES_Q0(92)
+STATIC REAL :: RES_Q1(92)
+STATIC REAL :: RES_Q2(92)
+STATIC REAL :: RES_Q3(92)
+STATIC REAL :: RES_WX(92)
+STATIC REAL :: RES_WY(92)
+STATIC REAL :: RES_WZ(92)
+STATIC REAL :: NATIVE_Q0(92)
+STATIC REAL :: NATIVE_Q1(92)
+STATIC REAL :: NATIVE_Q2(92)
+STATIC REAL :: NATIVE_Q3(92)
+STATIC REAL :: NATIVE_BVX(92)
+STATIC REAL :: NATIVE_BVY(92)
+STATIC REAL :: NATIVE_BVZ(92)
+
+! ── Contact-layer list (packed pairs + native contact vector, local frame) ──
+STATIC INTEGER :: CL_I(1024)
+STATIC INTEGER :: CL_J(1024)
+STATIC REAL :: CL_VX(1024)
+STATIC REAL :: CL_VY(1024)
+STATIC REAL :: CL_VZ(1024)
+STATIC REAL :: MC_OX(92)
+STATIC REAL :: MC_OY(92)
+STATIC REAL :: MC_OZ(92)
+STATIC REAL :: NATIVE_R0(92, 92)
+
+! ── Unified pair-slot tables (built once at init, two orders) ──────
+! i-major: slot (a-1)*PSEG+t holds pair (a, a+2+t) when <= NRES;
+! j-major: slot (b-1)*PSEG+t holds pair (t, b) when t <= b-3.
+! PAIR_BLK is the segment owner (accumulator table for the segmented
+! reduction). Weights bake every static gate: hbond exclusion (WST),
+! charge flags (WPH), hydro flag+strength product (WHY), contact
+! membership (WCO), inter-domain flag (WCI), native distance (CR0).
+STATIC INTEGER :: PAIR_BLK(23552)
+STATIC INTEGER :: PAIR_J_I(23552)
+STATIC INTEGER :: PAIR_I_J(23552)
+STATIC REAL :: WST_I(23552), WPH_I(23552), WHY_I(23552)
+STATIC REAL :: WCO_I(23552), WCI_I(23552), CR0_I(23552)
+STATIC REAL :: WST_J(23552), WPH_J(23552), WHY_J(23552)
+STATIC REAL :: WCO_J(23552), WCI_J(23552), CR0_J(23552)
+
+! ── H-bond state ──────────────────────────────────────────────
+STATIC INTEGER :: HBOND_MATRIX(92, 92)
+STATIC INTEGER :: CYS_I(192)
+STATIC INTEGER :: CYS_J(192)
+STATIC REAL :: CYS_R0(192)
+STATIC INTEGER :: CYS_ON(192)
+STATIC INTEGER :: MIS_I(40)
+STATIC INTEGER :: MIS_J(40)
+STATIC REAL :: MIS_R0(40)
+STATIC REAL :: MIS_KK(40)
+STATIC INTEGER :: NHBOND
+STATIC INTEGER :: HB_I(256)
+STATIC INTEGER :: HB_J(256)
+
+! ── Diagnostics ────────────────────────────────────────────────
+STATIC REAL :: RGYR
+STATIC REAL :: E2E
+STATIC REAL :: BANG_MEAN
+STATIC REAL :: BANG_RMS
+STATIC REAL :: TORS_MEAN
+STATIC REAL :: ALPHA_FRAC
+STATIC REAL :: E_MORSE
+STATIC REAL :: E_ANGLE
+STATIC REAL :: E_TORSION
+STATIC REAL :: E_HYDRO
+STATIC REAL :: E_NATIVE
+STATIC REAL :: THERMAL_CURRENT
+STATIC REAL :: RMSD_NATIVE
+STATIC REAL :: RMSD_CHAIN(4)
+STATIC INTEGER :: NCHAINR
+STATIC INTEGER :: SEG_LO(4)
+STATIC INTEGER :: SEG_HI(4)
+STATIC INTEGER :: I3CNT
+STATIC INTEGER :: I4CNT
+STATIC INTEGER :: ILCNT
+STATIC INTEGER :: HB_FORMS
+STATIC INTEGER :: HB_BREAKS
+
+! ── Working scalars ───────────────────────────────────────────
+STATIC INTEGER :: I, J, K, FRAME, N, NC, NI3, NI4, NIL, DEG, P
+STATIC REAL :: X, Y, Z, VX, VY, VZ, TH, OM, R, D, E, F
+STATIC REAL :: DX, DY, DZ, CS, ALIGN, FM, TEMP_X, TEMP_Y, TEMP_Z
+STATIC REAL :: SIN_AVG, COS_AVG, THETA_MEAN, PHASE_DEV
+STATIC REAL :: SUM_RGYR, SUM_BANG, SUM_BANGSQ, SUM_TORS, CNT_TORS
+STATIC REAL :: DIS, ANG, COSA, DEV, BX, CX, BY, CY, BZ, CZ
+STATIC REAL :: UX, UY, UZ, WX, WY, WZ, UN, VN, B1X, B1Y, B1Z
+STATIC REAL :: B2X, B2Y, B2Z, B3X, B3Y, B3Z, N1X, N1Y, N1Z
+STATIC REAL :: N2X, N2Y, N2Z, B2MAG, PHI, DPHI_DR1X, DPHI_DR1Y, DPHI_DR1Z
+STATIC REAL :: DPHI_DR4X, DPHI_DR4Y, DPHI_DR4Z, DPHI_DR2X, DPHI_DR2Y, DPHI_DR2Z
+STATIC REAL :: DPHI_DR3X, DPHI_DR3Y, DPHI_DR3Z, N1MAG2, N2MAG2, N1MAG, N2MAG
+STATIC REAL :: B1DOT, B3DOT, SCALE_B2, SCALE_B1, SCALE_B3, B2DOT
+STATIC REAL :: SHIFT_SUM, SCALE_SHIFT, RMSD_SUM
+STATIC INTEGER :: IDOM, DA, DB
+STATIC REAL :: MCCX, MCCY, MCCZ, MCAX, MCAY, MCAZ, MCAN, MCANG
+STATIC REAL :: MCQ0, MCQ1, MCQ2, MCQ3, MCS2
+STATIC REAL :: MCR11, MCR12, MCR13, MCR21, MCR22, MCR23, MCR31, MCR32, MCR33
+STATIC REAL :: MCEBF, MCEAF, MCRX, MCRY, MCRZ, MCDOM
+STATIC REAL :: MCTX, MCTY, MCTZ
+STATIC REAL :: MCT, MCFRAC, MCH, MCDE
+STATIC REAL :: QW0, QW1, QW2, QW3, QE0, QE1, QE2, QE3, QSGN
+STATIC REAL :: TQX, TQY, TQZ, QNORM, HBX, HBY, HBZ
+STATIC REAL :: FR11, FR12, FR13, FR21, FR22, FR23, FR31, FR32, FR33
+STATIC REAL :: PFX, PFY, PFZ
+STATIC REAL :: EQ0, EQ1, EQ2, EQ3
+STATIC REAL :: DMIN_S, DTW, DAMP_SUB, FDAMP_SUB
+STATIC INTEGER :: NSUB, SUB
+! pair-kernel working scalars
+STATIC INTEGER :: T, I2, J2, KI, KJ
+STATIC REAL :: DD, MD, MS, MH, BST, FMS, FMP, FMH, WCT, FMC, DOCKM
+
+
+
+! ── Initialize ─────────────────────────────────────────────
+CALL INIT_CHAIN()
+CALL INIT_NATIVE()
+
+  ! Single domain: MC move is inert (whole-chain rotation)
+  DOM_BEG(1) := 1
+  DOM_END(1) := NRES
+
+! Orientation field: identity quaternions, zero angular velocity.
+! Alignment torques pull the field toward native relative frames from
+! frame 0 (during collapse), so the initial coil needs no frames of its own.
+DO I = 1, NRES
+  RES_Q0(I) := 1.0
+  RES_Q1(I) := 0.0
+  RES_Q2(I) := 0.0
+  RES_Q3(I) := 0.0
+  RES_WX(I) := 0.0
+  RES_WY(I) := 0.0
+  RES_WZ(I) := 0.0
+ENDDO
+
+
+
+! CSV header
+WRITE(*, "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydro,e_native,thermal,rmsd_native,rmsd_c1,rmsd_c2,rmsd_c3,rmsd_c4")
+
+! ── Build the unified pair-slot tables (one O(N^2) pass at init) ───
+! Both orders are filled in the same nested sweep: i-major slot
+! (a-1)*PSEG+t <-> pair (a, a+2+t); j-major slot (b-1)*PSEG+t <->
+! pair (t, b). Steric/PHOS/hydro terms act only on |i-j| >= 4 pairs;
+! Go contacts on |i-j| >= 3 native pairs. PAD slots: self-pair, all
+! weights zero (they contribute exactly 0.0 to the accumulator).
+DO I = 1, NRES
+  DO T = 1, PSEG
+    K := (I - 1) * PSEG + T
+    PAIR_BLK(K) := I
+    ! i-major: owner I, partner J = I+2+T
+    J := I + 2 + T
+    IF J <= NRES THEN
+      PAIR_J_I(K) := J
+      WST_I(K) := 0.0
+      WPH_I(K) := 0.0
+      WHY_I(K) := 0.0
+      WCO_I(K) := REAL(NATIVE_CONTACT(I, J))
+      WCI_I(K) := REAL(CONTACT_INTER(I, J))
+      CR0_I(K) := NATIVE_R0(I, J)
+      IF J - I >= 4 THEN
+        IF HBOND_MATRIX(I, J) = 0 THEN
+          WST_I(K) := 1.0
+        ENDIF
+        WPH_I(K) := RES_PHOS(I) * RES_PHOS(J)
+        IF RES_HYDRO(I) > 0.0 .AND. RES_HYDRO(J) > 0.0 THEN
+          WHY_I(K) := RES_HYDRO(I) * RES_HYDRO(J)
+        ENDIF
+      ENDIF
+    ELSE
+      PAIR_J_I(K) := I
+      WST_I(K) := 0.0
+      WPH_I(K) := 0.0
+      WHY_I(K) := 0.0
+      WCO_I(K) := 0.0
+      WCI_I(K) := 0.0
+      CR0_I(K) := 0.0
+    ENDIF
+    ! j-major: owner I (as second atom), partner I2 = T
+    I2 := T
+    J2 := I
+    IF I2 <= J2 - 3 THEN
+      PAIR_I_J(K) := I2
+      WST_J(K) := 0.0
+      WPH_J(K) := 0.0
+      WHY_J(K) := 0.0
+      WCO_J(K) := REAL(NATIVE_CONTACT(I2, J2))
+      WCI_J(K) := REAL(CONTACT_INTER(I2, J2))
+      CR0_J(K) := NATIVE_R0(I2, J2)
+      IF J2 - I2 >= 4 THEN
+        IF HBOND_MATRIX(I2, J2) = 0 THEN
+          WST_J(K) := 1.0
+        ENDIF
+        WPH_J(K) := RES_PHOS(I2) * RES_PHOS(J2)
+        IF RES_HYDRO(I2) > 0.0 .AND. RES_HYDRO(J2) > 0.0 THEN
+          WHY_J(K) := RES_HYDRO(I2) * RES_HYDRO(J2)
+        ENDIF
+      ENDIF
+    ELSE
+      PAIR_I_J(K) := J2
+      WST_J(K) := 0.0
+      WPH_J(K) := 0.0
+      WHY_J(K) := 0.0
+      WCO_J(K) := 0.0
+      WCI_J(K) := 0.0
+      CR0_J(K) := 0.0
+    ENDIF
+  ENDDO
+ENDDO
+
+! ════════════════════════════════════════════════════════════
+! MAIN LOOP
+! ════════════════════════════════════════════════════════════
+DO FRAME = 1, MAXFRAME
+
+  ! Phase dynamics: intrinsic advance + Kuramoto coupling + noise
+  DO I = 1, NRES
+    RES_THETA(I) := RES_THETA(I) + RES_OMEGA(I) * DT
+  ENDDO
+
+  SIN_AVG := 0.0
+  COS_AVG := 0.0
+  DO I = 1, NRES
+    SIN_AVG := SIN_AVG + SIN(RES_THETA(I))
+    COS_AVG := COS_AVG + COS(RES_THETA(I))
+  ENDDO
+  THETA_MEAN := ATAN2(SIN_AVG, COS_AVG)
+  DO I = 1, NRES
+    RES_THETA(I) := RES_THETA(I) + COUPLING_K * SIN(THETA_MEAN - RES_THETA(I)) * DT
+  ENDDO
+
+  ! Phase noise
+  TEMP_X := THERMAL_CURRENT * PHASE_NOISE_SCALE
+  DO I = 1, NRES
+    RES_THETA(I) := RES_THETA(I) + TEMP_X * SIN((I+1)*11.3 + REAL(FRAME)*0.23) * DT
+  ENDDO
+
+  ! Thermal impulses (velocity kicks)
+  DO I = 1, NRES
+    RES_VX(I) := RES_VX(I) + THERMAL_CURRENT * SIN((I+1)*7.3 + REAL(FRAME)*0.17)
+    RES_VY(I) := RES_VY(I) + THERMAL_CURRENT * COS((I+1)*5.7 + REAL(FRAME)*0.31)
+    RES_VZ(I) := RES_VZ(I) + THERMAL_CURRENT * SIN((I+1)*3.1 + REAL(FRAME)*0.09)
+  ENDDO
+
+  ! Ultrasonic pulse: mode-1 standing wave along the backbone,
+  ! sinusoidal velocity kick, axes phase-shifted by 2pi/3
+  IF PULSE_AMP > 0.0 THEN
+    DO I = 1, NRES
+      RES_VX(I) := RES_VX(I) + PULSE_AMP * SIN(PULSE_OMEGA * REAL(FRAME)) * SIN(3.14159265 * REAL(I) / REAL(NRES + 1))
+      RES_VY(I) := RES_VY(I) + PULSE_AMP * SIN(PULSE_OMEGA * REAL(FRAME) + 2.0943951) * SIN(3.14159265 * REAL(I) / REAL(NRES + 1))
+      RES_VZ(I) := RES_VZ(I) + PULSE_AMP * SIN(PULSE_OMEGA * REAL(FRAME) + 4.1887902) * SIN(3.14159265 * REAL(I) / REAL(NRES + 1))
+    ENDDO
+  ENDIF
+
+
+  ! ── Adaptive substepping: closest-approach pre-scan (a priori bound) ──
+  DMIN_S := 9999.0
+  DO I = 1, NRES-4
+    DO J = I+4, NRES
+      DX := RES_X(I) - RES_X(J)
+      DY := RES_Y(I) - RES_Y(J)
+      DZ := RES_Z(I) - RES_Z(J)
+      D := SQRT(DX*DX + DY*DY + DZ*DZ)
+      IF D < DMIN_S THEN
+        DMIN_S := D
+      ENDIF
+    ENDDO
+  ENDDO
+  DO I = 1, NRES-1
+    IF I /= CHAIN_BREAK .AND. I /= CHAIN_BREAK2 .AND. I /= CHAIN_BREAK3 THEN
+      DX := RES_X(I) - RES_X(I+1)
+      DY := RES_Y(I) - RES_Y(I+1)
+      DZ := RES_Z(I) - RES_Z(I+1)
+      D := SQRT(DX*DX + DY*DY + DZ*DZ)
+      IF D < DMIN_S THEN
+        DMIN_S := D
+      ENDIF
+    ENDIF
+  ENDDO
+  NSUB := 1
+  IF DMIN_S < SUBSTEP_D THEN
+    IF DMIN_S > 0.0 THEN
+      NSUB := INT(SUBSTEP_D / DMIN_S) + 1
+    ELSE
+      NSUB := SUBSTEP_MAX
+    ENDIF
+    IF NSUB > SUBSTEP_MAX THEN
+      NSUB := SUBSTEP_MAX
+    ENDIF
+  ENDIF
+  DTW := DT / REAL(NSUB)
+  IF NSUB = 1 THEN
+    DAMP_SUB := VELOCITY_DAMP
+    FDAMP_SUB := FRAME_DAMP
+  ELSE
+    DAMP_SUB := EXP(LOG(VELOCITY_DAMP) / REAL(NSUB))
+    FDAMP_SUB := EXP(LOG(FRAME_DAMP) / REAL(NSUB))
+  ENDIF
+
+  ! Dock gate mask (exact 0/1 arithmetic, strict): 1 once
+  ! FRAME > DOCK_FROM; inter-domain Go contacts (WCI=1) scale with it.
+  DOCKM := (1.0 - SIGN(1.0, REAL(DOCK_FROM - FRAME))) * 0.5
+
+  DO SUB = 1, NSUB
+  ! ── Unified pair forces (GPU segmented-reduction form) ──────────
+  ! Steric + PHOS + hydro + Go contacts in ONE straight-line body over
+  ! the padded slot list. All gates are exact 0/1 arithmetic masks (no
+  ! IF — required for extraction):
+  !   MD = POS(D)             (strict D > 0)
+  !   MS = POS(STERIC_CUT-D)  (strict D < CUT)
+  !   MH = POS(HYDRO_CUTOFF-D)
+  ! with POS(x) = (1 - SIGN(1,-x))/2. The steric base folds the masks
+  ! INSIDE the power so padding/out-of-range slots evaluate to exactly
+  ! 0 without overflow (DD floors the denominator at 1e-30).
+  ! i-side pass: add +F to the owner atom.
+  DO K = 1, NSLOT
+    KI := PAIR_BLK(K)
+    KJ := PAIR_J_I(K)
+    DX := RES_X(KI) - RES_X(KJ)
+    DY := RES_Y(KI) - RES_Y(KJ)
+    DZ := RES_Z(KI) - RES_Z(KJ)
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    DD := MAX(D, 1.0E-16)
+    MD := (1.0 - SIGN(1.0, -D)) * 0.5
+    MS := (1.0 - SIGN(1.0, D - STERIC_CUT)) * 0.5
+    MH := (1.0 - SIGN(1.0, D - HYDRO_CUTOFF)) * 0.5
+    BST := MD * MS * WST_I(K) * STERIC_SIG / DD
+    FMS := STERIC_EPS * BST * BST * BST * BST * BST * BST
+    FMP := WPH_I(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
+    FMH := -HYDRO_STRENGTH * WHY_I(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
+    WCT := WCO_I(K) * (1.0 - WCI_I(K) + WCI_I(K) * DOCKM)
+    FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_I(K))
+    FM := MD * (FMS + FMP + FMH + FMC)
+    RES_VX(PAIR_BLK(K)) := RES_VX(PAIR_BLK(K)) + FM * DX / DD * DTW * FORCE_SCALE
+  ENDDO
+  DO K = 1, NSLOT
+    KI := PAIR_BLK(K)
+    KJ := PAIR_J_I(K)
+    DX := RES_X(KI) - RES_X(KJ)
+    DY := RES_Y(KI) - RES_Y(KJ)
+    DZ := RES_Z(KI) - RES_Z(KJ)
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    DD := MAX(D, 1.0E-16)
+    MD := (1.0 - SIGN(1.0, -D)) * 0.5
+    MS := (1.0 - SIGN(1.0, D - STERIC_CUT)) * 0.5
+    MH := (1.0 - SIGN(1.0, D - HYDRO_CUTOFF)) * 0.5
+    BST := MD * MS * WST_I(K) * STERIC_SIG / DD
+    FMS := STERIC_EPS * BST * BST * BST * BST * BST * BST
+    FMP := WPH_I(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
+    FMH := -HYDRO_STRENGTH * WHY_I(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
+    WCT := WCO_I(K) * (1.0 - WCI_I(K) + WCI_I(K) * DOCKM)
+    FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_I(K))
+    FM := MD * (FMS + FMP + FMH + FMC)
+    RES_VY(PAIR_BLK(K)) := RES_VY(PAIR_BLK(K)) + FM * DY / DD * DTW * FORCE_SCALE
+  ENDDO
+  DO K = 1, NSLOT
+    KI := PAIR_BLK(K)
+    KJ := PAIR_J_I(K)
+    DX := RES_X(KI) - RES_X(KJ)
+    DY := RES_Y(KI) - RES_Y(KJ)
+    DZ := RES_Z(KI) - RES_Z(KJ)
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    DD := MAX(D, 1.0E-16)
+    MD := (1.0 - SIGN(1.0, -D)) * 0.5
+    MS := (1.0 - SIGN(1.0, D - STERIC_CUT)) * 0.5
+    MH := (1.0 - SIGN(1.0, D - HYDRO_CUTOFF)) * 0.5
+    BST := MD * MS * WST_I(K) * STERIC_SIG / DD
+    FMS := STERIC_EPS * BST * BST * BST * BST * BST * BST
+    FMP := WPH_I(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
+    FMH := -HYDRO_STRENGTH * WHY_I(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
+    WCT := WCO_I(K) * (1.0 - WCI_I(K) + WCI_I(K) * DOCKM)
+    FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_I(K))
+    FM := MD * (FMS + FMP + FMH + FMC)
+    RES_VZ(PAIR_BLK(K)) := RES_VZ(PAIR_BLK(K)) + FM * DZ / DD * DTW * FORCE_SCALE
+  ENDDO
+  ! j-side pass (j-major slot order — segment geometry must group by
+  ! the accumulation atom): subtract the same per-pair force.
+  DO K = 1, NSLOT
+    KJ := PAIR_BLK(K)
+    KI := PAIR_I_J(K)
+    DX := RES_X(KI) - RES_X(KJ)
+    DY := RES_Y(KI) - RES_Y(KJ)
+    DZ := RES_Z(KI) - RES_Z(KJ)
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    DD := MAX(D, 1.0E-16)
+    MD := (1.0 - SIGN(1.0, -D)) * 0.5
+    MS := (1.0 - SIGN(1.0, D - STERIC_CUT)) * 0.5
+    MH := (1.0 - SIGN(1.0, D - HYDRO_CUTOFF)) * 0.5
+    BST := MD * MS * WST_J(K) * STERIC_SIG / DD
+    FMS := STERIC_EPS * BST * BST * BST * BST * BST * BST
+    FMP := WPH_J(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
+    FMH := -HYDRO_STRENGTH * WHY_J(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
+    WCT := WCO_J(K) * (1.0 - WCI_J(K) + WCI_J(K) * DOCKM)
+    FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_J(K))
+    FM := MD * (FMS + FMP + FMH + FMC)
+    RES_VX(PAIR_BLK(K)) := RES_VX(PAIR_BLK(K)) + (0.0 - FM) * DX / DD * DTW * FORCE_SCALE
+  ENDDO
+  DO K = 1, NSLOT
+    KJ := PAIR_BLK(K)
+    KI := PAIR_I_J(K)
+    DX := RES_X(KI) - RES_X(KJ)
+    DY := RES_Y(KI) - RES_Y(KJ)
+    DZ := RES_Z(KI) - RES_Z(KJ)
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    DD := MAX(D, 1.0E-16)
+    MD := (1.0 - SIGN(1.0, -D)) * 0.5
+    MS := (1.0 - SIGN(1.0, D - STERIC_CUT)) * 0.5
+    MH := (1.0 - SIGN(1.0, D - HYDRO_CUTOFF)) * 0.5
+    BST := MD * MS * WST_J(K) * STERIC_SIG / DD
+    FMS := STERIC_EPS * BST * BST * BST * BST * BST * BST
+    FMP := WPH_J(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
+    FMH := -HYDRO_STRENGTH * WHY_J(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
+    WCT := WCO_J(K) * (1.0 - WCI_J(K) + WCI_J(K) * DOCKM)
+    FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_J(K))
+    FM := MD * (FMS + FMP + FMH + FMC)
+    RES_VY(PAIR_BLK(K)) := RES_VY(PAIR_BLK(K)) + (0.0 - FM) * DY / DD * DTW * FORCE_SCALE
+  ENDDO
+  DO K = 1, NSLOT
+    KJ := PAIR_BLK(K)
+    KI := PAIR_I_J(K)
+    DX := RES_X(KI) - RES_X(KJ)
+    DY := RES_Y(KI) - RES_Y(KJ)
+    DZ := RES_Z(KI) - RES_Z(KJ)
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    DD := MAX(D, 1.0E-16)
+    MD := (1.0 - SIGN(1.0, -D)) * 0.5
+    MS := (1.0 - SIGN(1.0, D - STERIC_CUT)) * 0.5
+    MH := (1.0 - SIGN(1.0, D - HYDRO_CUTOFF)) * 0.5
+    BST := MD * MS * WST_J(K) * STERIC_SIG / DD
+    FMS := STERIC_EPS * BST * BST * BST * BST * BST * BST
+    FMP := WPH_J(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
+    FMH := -HYDRO_STRENGTH * WHY_J(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
+    WCT := WCO_J(K) * (1.0 - WCI_J(K) + WCI_J(K) * DOCKM)
+    FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_J(K))
+    FM := MD * (FMS + FMP + FMH + FMC)
+    RES_VZ(PAIR_BLK(K)) := RES_VZ(PAIR_BLK(K)) + (0.0 - FM) * DZ / DD * DTW * FORCE_SCALE
+  ENDDO
+
+  
+
+  ! Breakable cystine restraints: harmonic Cα–Cα toward native distance.
+  ! CYS_ON(P)=0 models a deleted disulfide (e.g. Akita CysA7Tyr).
+  ! E = CSS_K * (D - R0)^2 ; FM = -dE/dD = -2*CSS_K*(D-R0)
+  IF NCYSPAIR > 0 THEN
+    DO P = 1, NCYSPAIR
+      IF CYS_ON(P) = 1 THEN
+        I := CYS_I(P)
+        J := CYS_J(P)
+        DX := RES_X(I) - RES_X(J)
+        DY := RES_Y(I) - RES_Y(J)
+        DZ := RES_Z(I) - RES_Z(J)
+        D := SQRT(DX*DX + DY*DY + DZ*DZ)
+        IF D > 0.0 THEN
+          FM := -2.0 * CSS_K * (D - CYS_R0(P))
+          RES_VX(I) := RES_VX(I) + FM * DX / D * DTW * FORCE_SCALE
+          RES_VY(I) := RES_VY(I) + FM * DY / D * DTW * FORCE_SCALE
+          RES_VZ(I) := RES_VZ(I) + FM * DZ / D * DTW * FORCE_SCALE
+          RES_VX(J) := RES_VX(J) - FM * DX / D * DTW * FORCE_SCALE
+          RES_VY(J) := RES_VY(J) - FM * DY / D * DTW * FORCE_SCALE
+          RES_VZ(J) := RES_VZ(J) - FM * DZ / D * DTW * FORCE_SCALE
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDIF
+
+  ! Disulfide mispairing: competing non-native restraints (same harmonic form)
+  IF NMISPAIR > 0 THEN
+    DO P = 1, NMISPAIR
+      I := MIS_I(P)
+      J := MIS_J(P)
+      DX := RES_X(I) - RES_X(J)
+      DY := RES_Y(I) - RES_Y(J)
+      DZ := RES_Z(I) - RES_Z(J)
+      D := SQRT(DX*DX + DY*DY + DZ*DZ)
+      IF D > 0.0 THEN
+        FM := -2.0 * MIS_KK(P) * (D - MIS_R0(P))
+        RES_VX(I) := RES_VX(I) + FM * DX / D * DTW * FORCE_SCALE
+        RES_VY(I) := RES_VY(I) + FM * DY / D * DTW * FORCE_SCALE
+        RES_VZ(I) := RES_VZ(I) + FM * DZ / D * DTW * FORCE_SCALE
+        RES_VX(J) := RES_VX(J) - FM * DX / D * DTW * FORCE_SCALE
+        RES_VY(J) := RES_VY(J) - FM * DY / D * DTW * FORCE_SCALE
+        RES_VZ(J) := RES_VZ(J) - FM * DZ / D * DTW * FORCE_SCALE
+      ENDIF
+    ENDDO
+  ENDIF
+
+  ! Morse bonds (backbone)
+  DO I = 1, NRES-1
+    IF I /= CHAIN_BREAK .AND. I /= CHAIN_BREAK2 .AND. I /= CHAIN_BREAK3 THEN
+    DX := RES_X(I) - RES_X(I+1)
+    DY := RES_Y(I) - RES_Y(I+1)
+    DZ := RES_Z(I) - RES_Z(I+1)
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    IF D > 0.0 THEN
+      E := EXP(-MORSE_A * (D - BACKBONE_R0))
+      FM := -2.0 * BACKBONE_D * MORSE_A * (1.0 - E) * E * FORCE_SCALE
+      RES_VX(I) := RES_VX(I) + FM * DX / D * DTW
+      RES_VY(I) := RES_VY(I) + FM * DY / D * DTW
+      RES_VZ(I) := RES_VZ(I) + FM * DZ / D * DTW
+      RES_VX(I+1) := RES_VX(I+1) - FM * DX / D * DTW
+      RES_VY(I+1) := RES_VY(I+1) - FM * DY / D * DTW
+      RES_VZ(I+1) := RES_VZ(I+1) - FM * DZ / D * DTW
+    ENDIF
+    ENDIF
+  ENDDO
+
+  ! NOTE: dynamic H-bond force temporarily disabled for Trp-cage sweep
+
+  ! Angle bending (backbone angles)
+  DO I = 2, NRES-1
+    IF I /= CHAIN_BREAK .AND. I /= CHAIN_BREAK + 1 .AND. I /= CHAIN_BREAK2 .AND. I /= CHAIN_BREAK2 + 1 .AND. I /= CHAIN_BREAK3 .AND. I /= CHAIN_BREAK3 + 1 THEN
+    BX := RES_X(I-1) - RES_X(I)
+    BY := RES_Y(I-1) - RES_Y(I)
+    BZ := RES_Z(I-1) - RES_Z(I)
+    CX := RES_X(I+1) - RES_X(I)
+    CY := RES_Y(I+1) - RES_Y(I)
+    CZ := RES_Z(I+1) - RES_Z(I)
+    UN := SQRT(BX*BX + BY*BY + BZ*BZ)
+    VN := SQRT(CX*CX + CY*CY + CZ*CZ)
+    IF UN > 1.0E-12 .AND. VN > 1.0E-12 THEN
+      CS := MAX(-1.0, MIN(1.0, (BX*CX + BY*CY + BZ*CZ) / (UN * VN)))
+      E := 2.0 * RES_ANGK(I) * (CS - COS(RES_ANGT0(I)))
+      UX := (CX / (UN * VN) - CS * BX / UN / UN)
+      UY := (CY / (UN * VN) - CS * BY / UN / UN)
+      UZ := (CZ / (UN * VN) - CS * BZ / UN / UN)
+      WX := (BX / (UN * VN) - CS * CX / VN / VN)
+      WY := (BY / (UN * VN) - CS * CY / VN / VN)
+      WZ := (BZ / (UN * VN) - CS * CZ / VN / VN)
+      RES_VX(I-1) := RES_VX(I-1) - E * UX * DTW * FORCE_SCALE
+      RES_VY(I-1) := RES_VY(I-1) - E * UY * DTW * FORCE_SCALE
+      RES_VZ(I-1) := RES_VZ(I-1) - E * UZ * DTW * FORCE_SCALE
+      RES_VX(I+1) := RES_VX(I+1) - E * WX * DTW * FORCE_SCALE
+      RES_VY(I+1) := RES_VY(I+1) - E * WY * DTW * FORCE_SCALE
+      RES_VZ(I+1) := RES_VZ(I+1) - E * WZ * DTW * FORCE_SCALE
+      RES_VX(I) := RES_VX(I) + (E * UX + E * WX) * DTW * FORCE_SCALE
+      RES_VY(I) := RES_VY(I) + (E * UY + E * WY) * DTW * FORCE_SCALE
+      RES_VZ(I) := RES_VZ(I) + (E * UZ + E * WZ) * DTW * FORCE_SCALE
+    ENDIF
+    ENDIF
+  ENDDO
+
+  ! Torsion (dihedral) angles
+  DO I = 2, NRES-2
+    IF I /= CHAIN_BREAK - 1 .AND. I /= CHAIN_BREAK .AND. I /= CHAIN_BREAK + 1 .AND. I /= CHAIN_BREAK2 - 1 .AND. I /= CHAIN_BREAK2 .AND. I /= CHAIN_BREAK2 + 1 .AND. I /= CHAIN_BREAK3 - 1 .AND. I /= CHAIN_BREAK3 .AND. I /= CHAIN_BREAK3 + 1 THEN
+    B1X := RES_X(I) - RES_X(I-1)
+    B1Y := RES_Y(I) - RES_Y(I-1)
+    B1Z := RES_Z(I) - RES_Z(I-1)
+    B2X := RES_X(I+1) - RES_X(I)
+    B2Y := RES_Y(I+1) - RES_Y(I)
+    B2Z := RES_Z(I+1) - RES_Z(I)
+    B3X := RES_X(I+2) - RES_X(I+1)
+    B3Y := RES_Y(I+2) - RES_Y(I+1)
+    B3Z := RES_Z(I+2) - RES_Z(I+1)
+
+    N1X := B1Y*B2Z - B1Z*B2Y
+    N1Y := B1Z*B2X - B1X*B2Z
+    N1Z := B1X*B2Y - B1Y*B2X
+    N2X := B2Y*B3Z - B2Z*B3Y
+    N2Y := B2Z*B3X - B2X*B3Z
+    N2Z := B2X*B3Y - B2Y*B3X
+
+    N1MAG2 := N1X*N1X + N1Y*N1Y + N1Z*N1Z
+    N2MAG2 := N2X*N2X + N2Y*N2Y + N2Z*N2Z
+    B2MAG := SQRT(B2X*B2X + B2Y*B2Y + B2Z*B2Z)
+
+    IF N1MAG2 > 1.0E-12 .AND. N2MAG2 > 1.0E-12 .AND. B2MAG > 1.0E-12 THEN
+      N1MAG := SQRT(N1MAG2)
+      N2MAG := SQRT(N2MAG2)
+      PHI := ATAN2(B2MAG*(B1X*N2X + B1Y*N2Y + B1Z*N2Z), N1X*N2X + N1Y*N2Y + N1Z*N2Z)
+      E := 2.0 * RES_TORSK(I) * (1.0 - COS(PHI - RES_TORSP0(I)))
+
+      DPHI_DR1X := -B2MAG / N1MAG2 * N1X
+      DPHI_DR1Y := -B2MAG / N1MAG2 * N1Y
+      DPHI_DR1Z := -B2MAG / N1MAG2 * N1Z
+
+      DPHI_DR4X := B2MAG / N2MAG2 * N2X
+      DPHI_DR4Y := B2MAG / N2MAG2 * N2Y
+      DPHI_DR4Z := B2MAG / N2MAG2 * N2Z
+
+      B1DOT := B1X*B2X + B1Y*B2Y + B1Z*B2Z
+      B3DOT := B3X*B2X + B3Y*B2Y + B3Z*B2Z
+      SCALE_B2 := 1.0 / (B2MAG * B2MAG)
+      SCALE_B1 := B1DOT * SCALE_B2
+      SCALE_B3 := B3DOT * SCALE_B2
+
+      DPHI_DR2X := -(1.0 + SCALE_B1) * DPHI_DR1X + SCALE_B3 * DPHI_DR4X
+      DPHI_DR2Y := -(1.0 + SCALE_B1) * DPHI_DR1Y + SCALE_B3 * DPHI_DR4Y
+      DPHI_DR2Z := -(1.0 + SCALE_B1) * DPHI_DR1Z + SCALE_B3 * DPHI_DR4Z
+
+      DPHI_DR3X := -(DPHI_DR1X + DPHI_DR2X + DPHI_DR4X)
+      DPHI_DR3Y := -(DPHI_DR1Y + DPHI_DR2Y + DPHI_DR4Y)
+      DPHI_DR3Z := -(DPHI_DR1Z + DPHI_DR2Z + DPHI_DR4Z)
+
+      F := -2.0 * RES_TORSK(I) * SIN(PHI - RES_TORSP0(I))
+
+      RES_VX(I-1) := RES_VX(I-1) + F * DPHI_DR1X * DTW * FORCE_SCALE
+      RES_VY(I-1) := RES_VY(I-1) + F * DPHI_DR1Y * DTW * FORCE_SCALE
+      RES_VZ(I-1) := RES_VZ(I-1) + F * DPHI_DR1Z * DTW * FORCE_SCALE
+
+      RES_VX(I) := RES_VX(I) + F * DPHI_DR2X * DTW * FORCE_SCALE
+      RES_VY(I) := RES_VY(I) + F * DPHI_DR2Y * DTW * FORCE_SCALE
+      RES_VZ(I) := RES_VZ(I) + F * DPHI_DR2Z * DTW * FORCE_SCALE
+
+      RES_VX(I+1) := RES_VX(I+1) + F * DPHI_DR3X * DTW * FORCE_SCALE
+      RES_VY(I+1) := RES_VY(I+1) + F * DPHI_DR3Y * DTW * FORCE_SCALE
+      RES_VZ(I+1) := RES_VZ(I+1) + F * DPHI_DR3Z * DTW * FORCE_SCALE
+
+      RES_VX(I+2) := RES_VX(I+2) + F * DPHI_DR4X * DTW * FORCE_SCALE
+      RES_VY(I+2) := RES_VY(I+2) + F * DPHI_DR4Y * DTW * FORCE_SCALE
+      RES_VZ(I+2) := RES_VZ(I+2) + F * DPHI_DR4Z * DTW * FORCE_SCALE
+    ENDIF
+    ENDIF
+  ENDDO
+
+  
+
+  ! ── Oriented-residue dynamics (Cosserat ribbon) ──────────────────
+  IF FRAME_K > 0.0 .OR. FRAME_POS_K > 0.0 .OR. FRAME_CL_K > 0.0 THEN
+
+    ! Neighbor alignment torques: error = (q_i^-1 x q_i+1) (x) (target)^-1
+    IF FRAME_K > 0.0 THEN
+      DO I = 1, NRES-1
+        IF I /= CHAIN_BREAK .AND. I /= CHAIN_BREAK2 .AND. I /= CHAIN_BREAK3 THEN
+        ! dq = conj(q_i) (x) q_i+1
+        QW0 := RES_Q0(I)*RES_Q0(I+1) + RES_Q1(I)*RES_Q1(I+1) + RES_Q2(I)*RES_Q2(I+1) + RES_Q3(I)*RES_Q3(I+1)
+        QW1 := RES_Q0(I)*RES_Q1(I+1) - RES_Q1(I)*RES_Q0(I+1) - RES_Q2(I)*RES_Q3(I+1) + RES_Q3(I)*RES_Q2(I+1)
+        QW2 := RES_Q0(I)*RES_Q2(I+1) + RES_Q1(I)*RES_Q3(I+1) - RES_Q2(I)*RES_Q0(I+1) - RES_Q3(I)*RES_Q1(I+1)
+        QW3 := RES_Q0(I)*RES_Q3(I+1) - RES_Q1(I)*RES_Q2(I+1) + RES_Q2(I)*RES_Q1(I+1) - RES_Q3(I)*RES_Q0(I+1)
+        ! target relative frame dq* = conj(q*_i) (x) q*_i+1
+        QE0 := NATIVE_Q0(I)*NATIVE_Q0(I+1) + NATIVE_Q1(I)*NATIVE_Q1(I+1) + NATIVE_Q2(I)*NATIVE_Q2(I+1) + NATIVE_Q3(I)*NATIVE_Q3(I+1)
+        QE1 := NATIVE_Q0(I)*NATIVE_Q1(I+1) - NATIVE_Q1(I)*NATIVE_Q0(I+1) - NATIVE_Q2(I)*NATIVE_Q3(I+1) + NATIVE_Q3(I)*NATIVE_Q2(I+1)
+        QE2 := NATIVE_Q0(I)*NATIVE_Q2(I+1) + NATIVE_Q1(I)*NATIVE_Q3(I+1) - NATIVE_Q2(I)*NATIVE_Q0(I+1) - NATIVE_Q3(I)*NATIVE_Q1(I+1)
+        QE3 := NATIVE_Q0(I)*NATIVE_Q3(I+1) - NATIVE_Q1(I)*NATIVE_Q2(I+1) + NATIVE_Q2(I)*NATIVE_Q1(I+1) - NATIVE_Q3(I)*NATIVE_Q0(I+1)
+        ! error e = dq (x) conj(dq*)
+        EQ0 := QW0*QE0 + QW1*QE1 + QW2*QE2 + QW3*QE3
+        EQ1 := QW1*QE0 - QW0*QE1 + QW2*QE3 - QW3*QE2
+        EQ2 := QW2*QE0 - QW0*QE2 + QW3*QE1 - QW1*QE3
+        EQ3 := QW3*QE0 - QW0*QE3 + QW1*QE2 - QW2*QE1
+        ! shortest-rotation branch
+        QSGN := 1.0
+        IF EQ0 < 0.0 THEN
+          QSGN := -1.0
+        ENDIF
+        ! torque (world-frame, small-angle): 2*K*Im(e)*sgn
+        TQX := 2.0 * FRAME_K * EQ1 * QSGN
+        TQY := 2.0 * FRAME_K * EQ2 * QSGN
+        TQZ := 2.0 * FRAME_K * EQ3 * QSGN
+        RES_WX(I+1) := RES_WX(I+1) - TQX * DTW
+        RES_WY(I+1) := RES_WY(I+1) - TQY * DTW
+        RES_WZ(I+1) := RES_WZ(I+1) - TQZ * DTW
+        RES_WX(I) := RES_WX(I) + TQX * DTW
+        RES_WY(I) := RES_WY(I) + TQY * DTW
+        RES_WZ(I) := RES_WZ(I) + TQZ * DTW
+        ENDIF
+      ENDDO
+    ENDIF
+
+    ! Damp + integrate angular velocity into orientation: q += 0.5*DTW*(w x q)
+    DO I = 1, NRES
+      RES_WX(I) := RES_WX(I) * FDAMP_SUB
+      RES_WY(I) := RES_WY(I) * FDAMP_SUB
+      RES_WZ(I) := RES_WZ(I) * FDAMP_SUB
+      QW0 := -RES_WX(I)*RES_Q1(I) - RES_WY(I)*RES_Q2(I) - RES_WZ(I)*RES_Q3(I)
+      QW1 :=  RES_WX(I)*RES_Q0(I) + RES_WY(I)*RES_Q3(I) - RES_WZ(I)*RES_Q2(I)
+      QW2 :=  RES_WY(I)*RES_Q0(I) - RES_WX(I)*RES_Q3(I) + RES_WZ(I)*RES_Q1(I)
+      QW3 :=  RES_WZ(I)*RES_Q0(I) + RES_WX(I)*RES_Q2(I) - RES_WY(I)*RES_Q1(I)
+      RES_Q0(I) := RES_Q0(I) + 0.5 * DTW * QW0
+      RES_Q1(I) := RES_Q1(I) + 0.5 * DTW * QW1
+      RES_Q2(I) := RES_Q2(I) + 0.5 * DTW * QW2
+      RES_Q3(I) := RES_Q3(I) + 0.5 * DTW * QW3
+      QNORM := SQRT(RES_Q0(I)**2 + RES_Q1(I)**2 + RES_Q2(I)**2 + RES_Q3(I)**2)
+      IF QNORM > 0.0 THEN
+        RES_Q0(I) := RES_Q0(I) / QNORM
+        RES_Q1(I) := RES_Q1(I) / QNORM
+        RES_Q2(I) := RES_Q2(I) / QNORM
+        RES_Q3(I) := RES_Q3(I) / QNORM
+      ENDIF
+    ENDDO
+
+    ! Orientation->position coupling: pull p_i+1 toward p_i + R(q_i).v*_i
+    IF FRAME_POS_K > 0.0 THEN
+      DO I = 1, NRES-1
+        IF I /= CHAIN_BREAK .AND. I /= CHAIN_BREAK2 .AND. I /= CHAIN_BREAK3 THEN
+        FR11 := RES_Q0(I)**2 + RES_Q1(I)**2 - RES_Q2(I)**2 - RES_Q3(I)**2
+        FR12 := 2.0 * (RES_Q1(I)*RES_Q2(I) - RES_Q0(I)*RES_Q3(I))
+        FR13 := 2.0 * (RES_Q1(I)*RES_Q3(I) + RES_Q0(I)*RES_Q2(I))
+        FR21 := 2.0 * (RES_Q1(I)*RES_Q2(I) + RES_Q0(I)*RES_Q3(I))
+        FR22 := RES_Q0(I)**2 - RES_Q1(I)**2 + RES_Q2(I)**2 - RES_Q3(I)**2
+        FR23 := 2.0 * (RES_Q2(I)*RES_Q3(I) - RES_Q0(I)*RES_Q1(I))
+        FR31 := 2.0 * (RES_Q1(I)*RES_Q3(I) - RES_Q0(I)*RES_Q2(I))
+        FR32 := 2.0 * (RES_Q2(I)*RES_Q3(I) + RES_Q0(I)*RES_Q1(I))
+        FR33 := RES_Q0(I)**2 - RES_Q1(I)**2 - RES_Q2(I)**2 + RES_Q3(I)**2
+        HBX := FR11*NATIVE_BVX(I) + FR12*NATIVE_BVY(I) + FR13*NATIVE_BVZ(I)
+        HBY := FR21*NATIVE_BVX(I) + FR22*NATIVE_BVY(I) + FR23*NATIVE_BVZ(I)
+        HBZ := FR31*NATIVE_BVX(I) + FR32*NATIVE_BVY(I) + FR33*NATIVE_BVZ(I)
+        PFX := FRAME_POS_K * (RES_X(I) + HBX - RES_X(I+1))
+        PFY := FRAME_POS_K * (RES_Y(I) + HBY - RES_Y(I+1))
+        PFZ := FRAME_POS_K * (RES_Z(I) + HBZ - RES_Z(I+1))
+        RES_VX(I+1) := RES_VX(I+1) + PFX * DTW * FORCE_SCALE
+        RES_VY(I+1) := RES_VY(I+1) + PFY * DTW * FORCE_SCALE
+        RES_VZ(I+1) := RES_VZ(I+1) + PFZ * DTW * FORCE_SCALE
+        RES_VX(I) := RES_VX(I) - PFX * DTW * FORCE_SCALE
+        RES_VY(I) := RES_VY(I) - PFY * DTW * FORCE_SCALE
+        RES_VZ(I) := RES_VZ(I) - PFZ * DTW * FORCE_SCALE
+        ENDIF
+      ENDDO
+    ENDIF
+
+    ! Contact-layer coupling: p_j pulled toward p_i + R(q_i).v*_ij
+    ! (same rotation recipe as FRAME_POS_K, packed contact list)
+    IF FRAME_CL_K > 0.0 .AND. NCL > 0 THEN
+      DO P = 1, NCL
+        I := CL_I(P)
+        J := CL_J(P)
+        IF CONTACT_INTER(I, J) = 0 .OR. FRAME > DOCK_FROM THEN
+        FR11 := RES_Q0(I)**2 + RES_Q1(I)**2 - RES_Q2(I)**2 - RES_Q3(I)**2
+        FR12 := 2.0 * (RES_Q1(I)*RES_Q2(I) - RES_Q0(I)*RES_Q3(I))
+        FR13 := 2.0 * (RES_Q1(I)*RES_Q3(I) + RES_Q0(I)*RES_Q2(I))
+        FR21 := 2.0 * (RES_Q1(I)*RES_Q2(I) + RES_Q0(I)*RES_Q3(I))
+        FR22 := RES_Q0(I)**2 - RES_Q1(I)**2 + RES_Q2(I)**2 - RES_Q3(I)**2
+        FR23 := 2.0 * (RES_Q2(I)*RES_Q3(I) - RES_Q0(I)*RES_Q1(I))
+        FR31 := 2.0 * (RES_Q1(I)*RES_Q3(I) - RES_Q0(I)*RES_Q2(I))
+        FR32 := 2.0 * (RES_Q2(I)*RES_Q3(I) + RES_Q0(I)*RES_Q1(I))
+        FR33 := RES_Q0(I)**2 - RES_Q1(I)**2 - RES_Q2(I)**2 + RES_Q3(I)**2
+        HBX := FR11*CL_VX(P) + FR12*CL_VY(P) + FR13*CL_VZ(P)
+        HBY := FR21*CL_VX(P) + FR22*CL_VY(P) + FR23*CL_VZ(P)
+        HBZ := FR31*CL_VX(P) + FR32*CL_VY(P) + FR33*CL_VZ(P)
+        PFX := FRAME_CL_K * (RES_X(I) + HBX - RES_X(J))
+        PFY := FRAME_CL_K * (RES_Y(I) + HBY - RES_Y(J))
+        PFZ := FRAME_CL_K * (RES_Z(I) + HBZ - RES_Z(J))
+        RES_VX(J) := RES_VX(J) + PFX * DTW * FORCE_SCALE
+        RES_VY(J) := RES_VY(J) + PFY * DTW * FORCE_SCALE
+        RES_VZ(J) := RES_VZ(J) + PFZ * DTW * FORCE_SCALE
+        RES_VX(I) := RES_VX(I) - PFX * DTW * FORCE_SCALE
+        RES_VY(I) := RES_VY(I) - PFY * DTW * FORCE_SCALE
+        RES_VZ(I) := RES_VZ(I) - PFZ * DTW * FORCE_SCALE
+        ENDIF
+      ENDDO
+    ENDIF
+  ENDIF
+
+  ! Velocity damping (per-substep: DAMP_SUB = VELOCITY_DAMP^(1/NSUB))
+  DO I = 1, NRES
+    RES_VX(I) := RES_VX(I) * DAMP_SUB
+    RES_VY(I) := RES_VY(I) * DAMP_SUB
+    RES_VZ(I) := RES_VZ(I) * DAMP_SUB
+  ENDDO
+
+
+
+  ! Position update
+  DO I = 1, NRES
+    RES_X(I) := RES_X(I) + RES_VX(I) * DTW
+    RES_Y(I) := RES_Y(I) + RES_VY(I) * DTW
+    RES_Z(I) := RES_Z(I) + RES_VZ(I) * DTW
+  ENDDO
+  ENDDO
+
+  ! ── Domain rigid-body quaternion MC (post-gate) ─────────────────
+  ! Nested IFs: MOD(FRAME, MC_EVERY) must never evaluate with MC_EVERY = 0.
+  IF MC_EVERY > 0 THEN
+    IF NDOM > 1 .AND. FRAME > DOCK_FROM THEN
+      IF MOD(FRAME, MC_EVERY) = 0 THEN
+        ! Anneal MC_TEMP -> 0 over the first 60% of the post-gate window
+        MCFRAC := REAL(FRAME - DOCK_FROM) / REAL(MAXFRAME - DOCK_FROM)
+        MCT := MC_TEMP * MAX(0.0, 1.0 - MCFRAC / 0.6)
+        DO IDOM = 1, NDOM
+          DA := DOM_BEG(IDOM)
+          DB := DOM_END(IDOM)
+
+          ! Domain centre of mass
+          MCCX := 0.0
+          MCCY := 0.0
+          MCCZ := 0.0
+          DO I = DA, DB
+            MCCX := MCCX + RES_X(I)
+            MCCY := MCCY + RES_Y(I)
+            MCCZ := MCCZ + RES_Z(I)
+          ENDDO
+          MCDOM := REAL(DB - DA + 1)
+          MCCX := MCCX / MCDOM
+          MCCY := MCCY / MCDOM
+          MCCZ := MCCZ / MCDOM
+
+          ! Hash-deterministic rotation axis + angle in [-MC_ANGLE, MC_ANGLE]
+          MCAX := SIN(REAL(FRAME) * 0.371 + REAL(IDOM) * 1.713)
+          MCAY := SIN(REAL(FRAME) * 0.517 + REAL(IDOM) * 2.317)
+          MCAZ := SIN(REAL(FRAME) * 0.733 + REAL(IDOM) * 1.117)
+          MCAN := SQRT(MCAX*MCAX + MCAY*MCAY + MCAZ*MCAZ)
+          MCAX := MCAX / MCAN
+          MCAY := MCAY / MCAN
+          MCAZ := MCAZ / MCAN
+          MCANG := MC_ANGLE * SIN(REAL(FRAME) * 0.173 + REAL(IDOM) * 2.913)
+          MCQ0 := COS(MCANG * 0.5)
+          MCS2 := SIN(MCANG * 0.5)
+          MCQ1 := MCAX * MCS2
+          MCQ2 := MCAY * MCS2
+          MCQ3 := MCAZ * MCS2
+
+          ! Rotation matrix from unit quaternion
+          MCR11 := MCQ0*MCQ0 + MCQ1*MCQ1 - MCQ2*MCQ2 - MCQ3*MCQ3
+          MCR12 := 2.0 * (MCQ1*MCQ2 - MCQ0*MCQ3)
+          MCR13 := 2.0 * (MCQ1*MCQ3 + MCQ0*MCQ2)
+          MCR21 := 2.0 * (MCQ1*MCQ2 + MCQ0*MCQ3)
+          MCR22 := MCQ0*MCQ0 - MCQ1*MCQ1 + MCQ2*MCQ2 - MCQ3*MCQ3
+          MCR23 := 2.0 * (MCQ2*MCQ3 - MCQ0*MCQ1)
+          MCR31 := 2.0 * (MCQ1*MCQ3 - MCQ0*MCQ2)
+          MCR32 := 2.0 * (MCQ2*MCQ3 + MCQ0*MCQ1)
+          MCR33 := MCQ0*MCQ0 - MCQ1*MCQ1 - MCQ2*MCQ2 + MCQ3*MCQ3
+
+          ! E_before: inter-domain Go + steric pairs (i in domain, j outside)
+          MCEBF := 0.0
+          DO I = DA, DB
+            DO J = 1, NRES
+              IF J < DA .OR. J > DB THEN
+                DX := RES_X(I) - RES_X(J)
+                DY := RES_Y(I) - RES_Y(J)
+                DZ := RES_Z(I) - RES_Z(J)
+                D := SQRT(DX*DX + DY*DY + DZ*DZ)
+                IF D > 0.0 THEN
+                  IF NATIVE_CONTACT(I, J) = 1 THEN
+                    MCEBF := MCEBF + NATIVE_K * (D - NATIVE_R0(I, J))**2
+                  ENDIF
+                  IF ABS(I - J) >= 4 .AND. D < STERIC_CUT THEN
+                    MCEBF := MCEBF + STERIC_EPS * (STERIC_SIG / D) ** 6
+                  ENDIF
+                  IF ABS(I - J) >= 4 .AND. PHOS_EPS > 0.0 .AND. RES_PHOS(I) > 0.0 .AND. RES_PHOS(J) > 0.0 THEN
+                    MCEBF := MCEBF + PHOS_EPS * EXP(-D / PHOS_LAM) / D
+                  ENDIF
+                ENDIF
+              ENDIF
+            ENDDO
+          ENDDO
+
+          ! Save domain positions, apply rigid rotation about COM
+          DO I = DA, DB
+            MC_OX(I) := RES_X(I)
+            MC_OY(I) := RES_Y(I)
+            MC_OZ(I) := RES_Z(I)
+          ENDDO
+          DO I = DA, DB
+            MCRX := RES_X(I) - MCCX
+            MCRY := RES_Y(I) - MCCY
+            MCRZ := RES_Z(I) - MCCZ
+            RES_X(I) := MCCX + MCR11*MCRX + MCR12*MCRY + MCR13*MCRZ
+            RES_Y(I) := MCCY + MCR21*MCRX + MCR22*MCRY + MCR23*MCRZ
+            RES_Z(I) := MCCZ + MCR31*MCRX + MCR32*MCRY + MCR33*MCRZ
+          ENDDO
+
+          ! E_after
+          MCEAF := 0.0
+          DO I = DA, DB
+            DO J = 1, NRES
+              IF J < DA .OR. J > DB THEN
+                DX := RES_X(I) - RES_X(J)
+                DY := RES_Y(I) - RES_Y(J)
+                DZ := RES_Z(I) - RES_Z(J)
+                D := SQRT(DX*DX + DY*DY + DZ*DZ)
+                IF D > 0.0 THEN
+                  IF NATIVE_CONTACT(I, J) = 1 THEN
+                    MCEAF := MCEAF + NATIVE_K * (D - NATIVE_R0(I, J))**2
+                  ENDIF
+                  IF ABS(I - J) >= 4 .AND. D < STERIC_CUT THEN
+                    MCEAF := MCEAF + STERIC_EPS * (STERIC_SIG / D) ** 6
+                  ENDIF
+                  IF ABS(I - J) >= 4 .AND. PHOS_EPS > 0.0 .AND. RES_PHOS(I) > 0.0 .AND. RES_PHOS(J) > 0.0 THEN
+                    MCEAF := MCEAF + PHOS_EPS * EXP(-D / PHOS_LAM) / D
+                  ENDIF
+                ENDIF
+              ENDIF
+            ENDDO
+          ENDDO
+
+          ! Metropolis accept (MCT=0 reduces to greedy): rotate velocities
+          ! rigidly on accept; else restore positions
+          MCDE := MCEAF - MCEBF
+          IF MCDE > 0.0 .AND. MCT > 0.0 THEN
+            MCH := 0.5 * (1.0 + SIN(REAL(FRAME) * 0.917 + REAL(IDOM) * 3.791))
+            IF MCH < EXP(-MCDE / MCT) THEN
+              MCDE := 0.0
+            ENDIF
+          ENDIF
+          IF MCDE <= 0.0 THEN
+            DO I = DA, DB
+              MCRX := RES_VX(I)
+              MCRY := RES_VY(I)
+              MCRZ := RES_VZ(I)
+              RES_VX(I) := MCR11*MCRX + MCR12*MCRY + MCR13*MCRZ
+              RES_VY(I) := MCR21*MCRX + MCR22*MCRY + MCR23*MCRZ
+              RES_VZ(I) := MCR31*MCRX + MCR32*MCRY + MCR33*MCRZ
+            ENDDO
+          ELSE
+            DO I = DA, DB
+              RES_X(I) := MC_OX(I)
+              RES_Y(I) := MC_OY(I)
+              RES_Z(I) := MC_OZ(I)
+            ENDDO
+          ENDIF
+
+          ! Rigid translation attempt (same greedy rule; positions only)
+          MCTX := MC_TRANS * SIN(REAL(FRAME) * 0.271 + REAL(IDOM) * 1.313)
+          MCTY := MC_TRANS * SIN(REAL(FRAME) * 0.419 + REAL(IDOM) * 2.117)
+          MCTZ := MC_TRANS * SIN(REAL(FRAME) * 0.631 + REAL(IDOM) * 1.917)
+
+          MCEBF := 0.0
+          DO I = DA, DB
+            DO J = 1, NRES
+              IF J < DA .OR. J > DB THEN
+                DX := RES_X(I) - RES_X(J)
+                DY := RES_Y(I) - RES_Y(J)
+                DZ := RES_Z(I) - RES_Z(J)
+                D := SQRT(DX*DX + DY*DY + DZ*DZ)
+                IF D > 0.0 THEN
+                  IF NATIVE_CONTACT(I, J) = 1 THEN
+                    MCEBF := MCEBF + NATIVE_K * (D - NATIVE_R0(I, J))**2
+                  ENDIF
+                  IF ABS(I - J) >= 4 .AND. D < STERIC_CUT THEN
+                    MCEBF := MCEBF + STERIC_EPS * (STERIC_SIG / D) ** 6
+                  ENDIF
+                  IF ABS(I - J) >= 4 .AND. PHOS_EPS > 0.0 .AND. RES_PHOS(I) > 0.0 .AND. RES_PHOS(J) > 0.0 THEN
+                    MCEBF := MCEBF + PHOS_EPS * EXP(-D / PHOS_LAM) / D
+                  ENDIF
+                ENDIF
+              ENDIF
+            ENDDO
+          ENDDO
+
+          DO I = DA, DB
+            MC_OX(I) := RES_X(I)
+            MC_OY(I) := RES_Y(I)
+            MC_OZ(I) := RES_Z(I)
+            RES_X(I) := RES_X(I) + MCTX
+            RES_Y(I) := RES_Y(I) + MCTY
+            RES_Z(I) := RES_Z(I) + MCTZ
+          ENDDO
+
+          MCEAF := 0.0
+          DO I = DA, DB
+            DO J = 1, NRES
+              IF J < DA .OR. J > DB THEN
+                DX := RES_X(I) - RES_X(J)
+                DY := RES_Y(I) - RES_Y(J)
+                DZ := RES_Z(I) - RES_Z(J)
+                D := SQRT(DX*DX + DY*DY + DZ*DZ)
+                IF D > 0.0 THEN
+                  IF NATIVE_CONTACT(I, J) = 1 THEN
+                    MCEAF := MCEAF + NATIVE_K * (D - NATIVE_R0(I, J))**2
+                  ENDIF
+                  IF ABS(I - J) >= 4 .AND. D < STERIC_CUT THEN
+                    MCEAF := MCEAF + STERIC_EPS * (STERIC_SIG / D) ** 6
+                  ENDIF
+                  IF ABS(I - J) >= 4 .AND. PHOS_EPS > 0.0 .AND. RES_PHOS(I) > 0.0 .AND. RES_PHOS(J) > 0.0 THEN
+                    MCEAF := MCEAF + PHOS_EPS * EXP(-D / PHOS_LAM) / D
+                  ENDIF
+                ENDIF
+              ENDIF
+            ENDDO
+          ENDDO
+
+          MCDE := MCEAF - MCEBF
+          IF MCDE > 0.0 .AND. MCT > 0.0 THEN
+            MCH := 0.5 * (1.0 + SIN(REAL(FRAME) * 0.791 + REAL(IDOM) * 2.573))
+            IF MCH < EXP(-MCDE / MCT) THEN
+              MCDE := 0.0
+            ENDIF
+          ENDIF
+          IF MCDE > 0.0 THEN
+            DO I = DA, DB
+              RES_X(I) := MC_OX(I)
+              RES_Y(I) := MC_OY(I)
+              RES_Z(I) := MC_OZ(I)
+            ENDDO
+          ENDIF
+        ENDDO
+      ENDIF
+    ENDIF
+  ENDIF
+
+  ! H-bond update
+  CALL UPDATE_HBONDS()
+
+  ! Thermal schedule
+  CALL UPDATE_THERMAL(FRAME)
+
+  ! Output every 10 frames
+  IF MOD(FRAME, 10) = 0 .OR. FRAME = MAXFRAME THEN
+    CALL COMPUTE_DIAGNOSTICS()
+    CALL COMPUTE_RMSD()
+    CALL COMPUTE_RMSD_CHAINS()
+    WRITE(*, "%d,%.4f,%.4f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f") &
+      FRAME, RGYR, E2E, NHBOND, I3CNT, I4CNT, ILCNT, BANG_MEAN, BANG_RMS, TORS_MEAN, &
+      ALPHA_FRAC, E_MORSE, E_ANGLE, E_TORSION, E_HYDRO, E_NATIVE, THERMAL_CURRENT, RMSD_NATIVE, &
+      RMSD_CHAIN(1), RMSD_CHAIN(2), RMSD_CHAIN(3), RMSD_CHAIN(4)
+  ENDIF
+
+ENDDO
+
+! Final structure dump for gap analysis
+WRITE(*, "FINAL_STRUCTURE")
+DO I = 1, NRES
+  WRITE(*, "%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f") &
+    I, RES_X(I), RES_Y(I), RES_Z(I), NATIVE_X(I), NATIVE_Y(I), NATIVE_Z(I)
+ENDDO
+WRITE(*, "END_FINAL_STRUCTURE")
+
+STOP
+
+! ════════════════════════════════════════════════════════════
+! SUBROUTINES
+! ════════════════════════════════════════════════════════════
+
+SUBROUTINE INIT_CHAIN()
+  INTEGER :: I, ATT, J2, OK
+  REAL :: TH0, OM0, R
+  REAL :: U1, U2, COSTH, SINTH, PHI2, UX, UY, UZ, CANDX, CANDY, CANDZ, DD
+
+  ! Self-avoiding random walk coil (denatured start)
+  RES_X(1) := 10.0
+  RES_Y(1) := 10.0
+  RES_Z(1) := 10.0
+  DO I = 2, NRES
+    OK := 0
+    ATT := 0
+    DO WHILE ATT < 20
+      ATT := ATT + 1
+      U1 := MOD(ABS(SIN(REAL(I) * 12.9898 + REAL(ATT) * 3.7 + SEED) * 43758.5453), 1.0)
+      U2 := MOD(ABS(SIN(REAL(I) * 78.2330 + REAL(ATT) * 1.3 + SEED) * 12543.1230), 1.0)
+      COSTH := 2.0 * U1 - 1.0
+      SINTH := SQRT(1.0 - COSTH * COSTH)
+      PHI2 := 2.0 * 3.14159265 * U2
+      UX := SINTH * COS(PHI2)
+      UY := SINTH * SIN(PHI2)
+      UZ := COSTH
+      CANDX := RES_X(I - 1) + UX * BACKBONE_R0
+      CANDY := RES_Y(I - 1) + UY * BACKBONE_R0
+      CANDZ := RES_Z(I - 1) + UZ * BACKBONE_R0
+      OK := 1
+      IF I ≥ 5 THEN
+        DO J2 = 1, I - 4
+          DD := SQRT((CANDX - RES_X(J2))**2 + (CANDY - RES_Y(J2))**2 + (CANDZ - RES_Z(J2))**2)
+          IF DD < 1.55 THEN
+            OK := 0
+          ENDIF
+        ENDDO
+      ENDIF
+      IF OK = 1 THEN
+        ATT := 20
+      ENDIF
+    ENDDO
+    RES_X(I) := CANDX
+    RES_Y(I) := CANDY
+    RES_Z(I) := CANDZ
+  ENDDO
+
+  ! Phases from position hash; zero velocities
+  DO I = 1, NRES
+    RES_THETA(I) := 0.3 * RES_X(I) + 0.5 * RES_Y(I) + 0.7 * RES_Z(I) + SEED
+    RES_OMEGA(I) := BASE_OMEGA + 0.5 * SIN(RES_THETA(I))
+    RES_VX(I) := 0.0
+    RES_VY(I) := 0.0
+    RES_VZ(I) := 0.0
+  ENDDO
+
+  ! Sequence design: native angle targets and native torsion targets
+  DO I = 1, NRES
+    RES_ANGK(I) := 0.3000
+    RES_TORSK(I) := 0.6000
+  ENDDO
+
+  ! Native Cα-Cα-Cα angle targets
+  RES_ANGT0(1) := 0.000000
+  RES_ANGT0(2) := 2.202361
+  RES_ANGT0(3) := 2.157623
+  RES_ANGT0(4) := 2.740463
+  RES_ANGT0(5) := 2.617831
+  RES_ANGT0(6) := 2.413444
+  RES_ANGT0(7) := 2.699566
+  RES_ANGT0(8) := 2.633239
+  RES_ANGT0(9) := 2.709059
+  RES_ANGT0(10) := 2.502621
+  RES_ANGT0(11) := 2.651841
+  RES_ANGT0(12) := 2.401360
+  RES_ANGT0(13) := 2.548456
+  RES_ANGT0(14) := 1.038782
+  RES_ANGT0(15) := 1.220997
+  RES_ANGT0(16) := 2.792295
+  RES_ANGT0(17) := 2.737551
+  RES_ANGT0(18) := 2.464244
+  RES_ANGT0(19) := 2.851095
+  RES_ANGT0(20) := 2.515073
+  RES_ANGT0(21) := 1.726267
+  RES_ANGT0(22) := 2.475179
+  RES_ANGT0(23) := 2.726583
+  RES_ANGT0(24) := 2.193229
+  RES_ANGT0(25) := 2.500837
+  RES_ANGT0(26) := 0.820430
+  RES_ANGT0(27) := 1.950066
+  RES_ANGT0(28) := 2.525939
+  RES_ANGT0(29) := 2.211341
+  RES_ANGT0(30) := 2.606491
+  RES_ANGT0(31) := 2.520287
+  RES_ANGT0(32) := 1.715995
+  RES_ANGT0(33) := 0.832930
+  RES_ANGT0(34) := 1.829083
+  RES_ANGT0(35) := 2.165521
+  RES_ANGT0(36) := 2.927448
+  RES_ANGT0(37) := 2.693906
+  RES_ANGT0(38) := 2.692547
+  RES_ANGT0(39) := 2.310123
+  RES_ANGT0(40) := 2.706493
+  RES_ANGT0(41) := 1.855475
+  RES_ANGT0(42) := 2.021900
+  RES_ANGT0(43) := 1.524597
+  RES_ANGT0(44) := 1.620853
+  RES_ANGT0(45) := 2.070859
+  RES_ANGT0(46) := 2.377428
+  RES_ANGT0(47) := 2.497626
+  RES_ANGT0(48) := 2.717774
+  RES_ANGT0(49) := 2.632447
+  RES_ANGT0(50) := 0.781829
+  RES_ANGT0(51) := 1.987763
+  RES_ANGT0(52) := 2.628443
+  RES_ANGT0(53) := 2.281702
+  RES_ANGT0(54) := 2.881385
+  RES_ANGT0(55) := 2.742588
+  RES_ANGT0(56) := 2.831466
+  RES_ANGT0(57) := 1.318561
+  RES_ANGT0(58) := 2.965528
+  RES_ANGT0(59) := 2.582539
+  RES_ANGT0(60) := 2.668553
+  RES_ANGT0(61) := 0.801924
+  RES_ANGT0(62) := 2.587077
+  RES_ANGT0(63) := 0.883466
+  RES_ANGT0(64) := 2.253091
+  RES_ANGT0(65) := 2.518816
+  RES_ANGT0(66) := 2.681627
+  RES_ANGT0(67) := 2.648642
+  RES_ANGT0(68) := 2.713584
+  RES_ANGT0(69) := 2.367994
+  RES_ANGT0(70) := 2.930006
+  RES_ANGT0(71) := 2.613776
+  RES_ANGT0(72) := 2.753080
+  RES_ANGT0(73) := 2.194755
+  RES_ANGT0(74) := 2.756402
+  RES_ANGT0(75) := 2.755142
+  RES_ANGT0(76) := 2.711195
+  RES_ANGT0(77) := 2.275249
+  RES_ANGT0(78) := 3.017346
+  RES_ANGT0(79) := 2.559778
+  RES_ANGT0(80) := 2.125367
+  RES_ANGT0(81) := 1.699211
+  RES_ANGT0(82) := 2.131378
+  RES_ANGT0(83) := 2.182920
+  RES_ANGT0(84) := 1.355873
+  RES_ANGT0(85) := 2.474635
+  RES_ANGT0(86) := 2.146937
+  RES_ANGT0(87) := 2.744737
+  RES_ANGT0(88) := 2.507086
+  RES_ANGT0(89) := 2.864012
+  RES_ANGT0(90) := 2.538670
+  RES_ANGT0(91) := 2.664857
+  RES_ANGT0(92) := 0.000000
+
+  ! Native Cα-Cα-Cα-Cα dihedral targets
+  RES_TORSP0(1) := 0.000000
+  RES_TORSP0(2) := 0.618325
+  RES_TORSP0(3) := 0.633520
+  RES_TORSP0(4) := 0.233430
+  RES_TORSP0(5) := 0.642115
+  RES_TORSP0(6) := -0.016268
+  RES_TORSP0(7) := 0.064105
+  RES_TORSP0(8) := 0.743103
+  RES_TORSP0(9) := 0.052552
+  RES_TORSP0(10) := 0.338503
+  RES_TORSP0(11) := 0.599724
+  RES_TORSP0(12) := 2.029066
+  RES_TORSP0(13) := 2.386272
+  RES_TORSP0(14) := 1.775994
+  RES_TORSP0(15) := -0.508833
+  RES_TORSP0(16) := 0.676455
+  RES_TORSP0(17) := 0.050057
+  RES_TORSP0(18) := -0.433445
+  RES_TORSP0(19) := 1.007292
+  RES_TORSP0(20) := 2.782084
+  RES_TORSP0(21) := -2.351893
+  RES_TORSP0(22) := -1.155016
+  RES_TORSP0(23) := 1.125241
+  RES_TORSP0(24) := 2.571666
+  RES_TORSP0(25) := -2.621350
+  RES_TORSP0(26) := -1.303275
+  RES_TORSP0(27) := 0.275996
+  RES_TORSP0(28) := 0.388789
+  RES_TORSP0(29) := 0.761019
+  RES_TORSP0(30) := 0.163746
+  RES_TORSP0(31) := -2.180120
+  RES_TORSP0(32) := 2.728487
+  RES_TORSP0(33) := 1.887860
+  RES_TORSP0(34) := -0.110557
+  RES_TORSP0(35) := -0.044679
+  RES_TORSP0(36) := 0.267550
+  RES_TORSP0(37) := 0.361636
+  RES_TORSP0(38) := 0.026945
+  RES_TORSP0(39) := 0.277112
+  RES_TORSP0(40) := 1.212358
+  RES_TORSP0(41) := 2.023409
+  RES_TORSP0(42) := -2.043893
+  RES_TORSP0(43) := -1.172965
+  RES_TORSP0(44) := 0.835743
+  RES_TORSP0(45) := -0.939692
+  RES_TORSP0(46) := 0.818557
+  RES_TORSP0(47) := 2.411393
+  RES_TORSP0(48) := -1.071654
+  RES_TORSP0(49) := -1.174150
+  RES_TORSP0(50) := 2.561707
+  RES_TORSP0(51) := -1.204377
+  RES_TORSP0(52) := 0.359402
+  RES_TORSP0(53) := -0.776520
+  RES_TORSP0(54) := 1.001022
+  RES_TORSP0(55) := 1.428146
+  RES_TORSP0(56) := 1.490004
+  RES_TORSP0(57) := 1.910854
+  RES_TORSP0(58) := 0.162424
+  RES_TORSP0(59) := 1.162983
+  RES_TORSP0(60) := 2.818801
+  RES_TORSP0(61) := 0.070508
+  RES_TORSP0(62) := 1.455995
+  RES_TORSP0(63) := 1.550730
+  RES_TORSP0(64) := -0.079570
+  RES_TORSP0(65) := -0.661300
+  RES_TORSP0(66) := 0.936004
+  RES_TORSP0(67) := 0.113656
+  RES_TORSP0(68) := 0.212016
+  RES_TORSP0(69) := 0.779482
+  RES_TORSP0(70) := -1.862108
+  RES_TORSP0(71) := -2.338542
+  RES_TORSP0(72) := 0.035646
+  RES_TORSP0(73) := -0.101006
+  RES_TORSP0(74) := 0.683104
+  RES_TORSP0(75) := 0.411391
+  RES_TORSP0(76) := 0.331179
+  RES_TORSP0(77) := -0.288324
+  RES_TORSP0(78) := 1.958148
+  RES_TORSP0(79) := -1.171095
+  RES_TORSP0(80) := -0.011177
+  RES_TORSP0(81) := 2.214241
+  RES_TORSP0(82) := -3.138132
+  RES_TORSP0(83) := -0.485628
+  RES_TORSP0(84) := 0.202017
+  RES_TORSP0(85) := 1.552254
+  RES_TORSP0(86) := -0.524250
+  RES_TORSP0(87) := 0.551627
+  RES_TORSP0(88) := 0.336817
+  RES_TORSP0(89) := 0.075568
+  RES_TORSP0(90) := 0.292262
+  RES_TORSP0(91) := 0.000000
+  RES_TORSP0(92) := 0.000000
+
+  ! Hydrophobic weights from residue type
+  RES_HYDRO(1) := 0.0   ! UNK
+  RES_HYDRO(2) := 0.0   ! UNK
+  RES_HYDRO(3) := 0.0   ! UNK
+  RES_HYDRO(4) := 0.0   ! UNK
+  RES_HYDRO(5) := 0.0   ! UNK
+  RES_HYDRO(6) := 0.0   ! UNK
+  RES_HYDRO(7) := 0.0   ! UNK
+  RES_HYDRO(8) := 0.0   ! UNK
+  RES_HYDRO(9) := 0.0   ! UNK
+  RES_HYDRO(10) := 0.0   ! UNK
+  RES_HYDRO(11) := 0.0   ! UNK
+  RES_HYDRO(12) := 0.0   ! UNK
+  RES_HYDRO(13) := 0.0   ! UNK
+  RES_HYDRO(14) := 0.0   ! UNK
+  RES_HYDRO(15) := 0.0   ! UNK
+  RES_HYDRO(16) := 0.0   ! UNK
+  RES_HYDRO(17) := 0.0   ! UNK
+  RES_HYDRO(18) := 0.0   ! UNK
+  RES_HYDRO(19) := 0.0   ! UNK
+  RES_HYDRO(20) := 0.0   ! UNK
+  RES_HYDRO(21) := 0.0   ! UNK
+  RES_HYDRO(22) := 0.0   ! UNK
+  RES_HYDRO(23) := 0.0   ! UNK
+  RES_HYDRO(24) := 0.0   ! UNK
+  RES_HYDRO(25) := 0.0   ! UNK
+  RES_HYDRO(26) := 0.0   ! UNK
+  RES_HYDRO(27) := 0.0   ! UNK
+  RES_HYDRO(28) := 0.0   ! UNK
+  RES_HYDRO(29) := 0.0   ! UNK
+  RES_HYDRO(30) := 0.0   ! UNK
+  RES_HYDRO(31) := 0.0   ! UNK
+  RES_HYDRO(32) := 0.0   ! UNK
+  RES_HYDRO(33) := 0.0   ! UNK
+  RES_HYDRO(34) := 0.0   ! UNK
+  RES_HYDRO(35) := 0.0   ! UNK
+  RES_HYDRO(36) := 0.0   ! UNK
+  RES_HYDRO(37) := 0.0   ! UNK
+  RES_HYDRO(38) := 0.0   ! UNK
+  RES_HYDRO(39) := 0.0   ! UNK
+  RES_HYDRO(40) := 0.0   ! UNK
+  RES_HYDRO(41) := 0.0   ! UNK
+  RES_HYDRO(42) := 0.0   ! UNK
+  RES_HYDRO(43) := 0.0   ! UNK
+  RES_HYDRO(44) := 0.0   ! UNK
+  RES_HYDRO(45) := 0.0   ! UNK
+  RES_HYDRO(46) := 0.0   ! UNK
+  RES_HYDRO(47) := 0.0   ! UNK
+  RES_HYDRO(48) := 0.0   ! UNK
+  RES_HYDRO(49) := 0.0   ! UNK
+  RES_HYDRO(50) := 0.0   ! UNK
+  RES_HYDRO(51) := 0.0   ! UNK
+  RES_HYDRO(52) := 0.0   ! UNK
+  RES_HYDRO(53) := 0.0   ! UNK
+  RES_HYDRO(54) := 0.0   ! UNK
+  RES_HYDRO(55) := 0.0   ! UNK
+  RES_HYDRO(56) := 0.0   ! UNK
+  RES_HYDRO(57) := 0.0   ! UNK
+  RES_HYDRO(58) := 0.0   ! UNK
+  RES_HYDRO(59) := 0.0   ! UNK
+  RES_HYDRO(60) := 0.0   ! UNK
+  RES_HYDRO(61) := 0.0   ! UNK
+  RES_HYDRO(62) := 0.0   ! UNK
+  RES_HYDRO(63) := 0.0   ! UNK
+  RES_HYDRO(64) := 0.0   ! UNK
+  RES_HYDRO(65) := 0.0   ! UNK
+  RES_HYDRO(66) := 0.0   ! UNK
+  RES_HYDRO(67) := 0.0   ! UNK
+  RES_HYDRO(68) := 0.0   ! UNK
+  RES_HYDRO(69) := 0.0   ! UNK
+  RES_HYDRO(70) := 0.0   ! UNK
+  RES_HYDRO(71) := 0.0   ! UNK
+  RES_HYDRO(72) := 0.0   ! UNK
+  RES_HYDRO(73) := 0.0   ! UNK
+  RES_HYDRO(74) := 0.0   ! UNK
+  RES_HYDRO(75) := 0.0   ! UNK
+  RES_HYDRO(76) := 0.0   ! UNK
+  RES_HYDRO(77) := 0.0   ! UNK
+  RES_HYDRO(78) := 0.0   ! UNK
+  RES_HYDRO(79) := 0.0   ! UNK
+  RES_HYDRO(80) := 0.0   ! UNK
+  RES_HYDRO(81) := 0.0   ! UNK
+  RES_HYDRO(82) := 0.0   ! UNK
+  RES_HYDRO(83) := 0.0   ! UNK
+  RES_HYDRO(84) := 0.0   ! UNK
+  RES_HYDRO(85) := 0.0   ! UNK
+  RES_HYDRO(86) := 0.0   ! UNK
+  RES_HYDRO(87) := 0.0   ! UNK
+  RES_HYDRO(88) := 0.0   ! UNK
+  RES_HYDRO(89) := 0.0   ! UNK
+  RES_HYDRO(90) := 0.0   ! UNK
+  RES_HYDRO(91) := 0.0   ! UNK
+  RES_HYDRO(92) := 0.0   ! UNK
+
+  ! Phosphate charge flags (screened repulsion term)
+  RES_PHOS(1) := 1.0   ! UNK
+  RES_PHOS(2) := 1.0   ! UNK
+  RES_PHOS(3) := 1.0   ! UNK
+  RES_PHOS(4) := 1.0   ! UNK
+  RES_PHOS(5) := 1.0   ! UNK
+  RES_PHOS(6) := 1.0   ! UNK
+  RES_PHOS(7) := 1.0   ! UNK
+  RES_PHOS(8) := 1.0   ! UNK
+  RES_PHOS(9) := 1.0   ! UNK
+  RES_PHOS(10) := 1.0   ! UNK
+  RES_PHOS(11) := 1.0   ! UNK
+  RES_PHOS(12) := 1.0   ! UNK
+  RES_PHOS(13) := 1.0   ! UNK
+  RES_PHOS(14) := 1.0   ! UNK
+  RES_PHOS(15) := 1.0   ! UNK
+  RES_PHOS(16) := 1.0   ! UNK
+  RES_PHOS(17) := 1.0   ! UNK
+  RES_PHOS(18) := 1.0   ! UNK
+  RES_PHOS(19) := 1.0   ! UNK
+  RES_PHOS(20) := 1.0   ! UNK
+  RES_PHOS(21) := 1.0   ! UNK
+  RES_PHOS(22) := 1.0   ! UNK
+  RES_PHOS(23) := 1.0   ! UNK
+  RES_PHOS(24) := 1.0   ! UNK
+  RES_PHOS(25) := 1.0   ! UNK
+  RES_PHOS(26) := 1.0   ! UNK
+  RES_PHOS(27) := 1.0   ! UNK
+  RES_PHOS(28) := 1.0   ! UNK
+  RES_PHOS(29) := 1.0   ! UNK
+  RES_PHOS(30) := 1.0   ! UNK
+  RES_PHOS(31) := 1.0   ! UNK
+  RES_PHOS(32) := 1.0   ! UNK
+  RES_PHOS(33) := 1.0   ! UNK
+  RES_PHOS(34) := 1.0   ! UNK
+  RES_PHOS(35) := 1.0   ! UNK
+  RES_PHOS(36) := 1.0   ! UNK
+  RES_PHOS(37) := 1.0   ! UNK
+  RES_PHOS(38) := 1.0   ! UNK
+  RES_PHOS(39) := 1.0   ! UNK
+  RES_PHOS(40) := 1.0   ! UNK
+  RES_PHOS(41) := 1.0   ! UNK
+  RES_PHOS(42) := 1.0   ! UNK
+  RES_PHOS(43) := 1.0   ! UNK
+  RES_PHOS(44) := 1.0   ! UNK
+  RES_PHOS(45) := 1.0   ! UNK
+  RES_PHOS(46) := 1.0   ! UNK
+  RES_PHOS(47) := 1.0   ! UNK
+  RES_PHOS(48) := 1.0   ! UNK
+  RES_PHOS(49) := 1.0   ! UNK
+  RES_PHOS(50) := 1.0   ! UNK
+  RES_PHOS(51) := 1.0   ! UNK
+  RES_PHOS(52) := 1.0   ! UNK
+  RES_PHOS(53) := 1.0   ! UNK
+  RES_PHOS(54) := 1.0   ! UNK
+  RES_PHOS(55) := 1.0   ! UNK
+  RES_PHOS(56) := 1.0   ! UNK
+  RES_PHOS(57) := 1.0   ! UNK
+  RES_PHOS(58) := 1.0   ! UNK
+  RES_PHOS(59) := 1.0   ! UNK
+  RES_PHOS(60) := 1.0   ! UNK
+  RES_PHOS(61) := 1.0   ! UNK
+  RES_PHOS(62) := 1.0   ! UNK
+  RES_PHOS(63) := 1.0   ! UNK
+  RES_PHOS(64) := 1.0   ! UNK
+  RES_PHOS(65) := 1.0   ! UNK
+  RES_PHOS(66) := 1.0   ! UNK
+  RES_PHOS(67) := 1.0   ! UNK
+  RES_PHOS(68) := 1.0   ! UNK
+  RES_PHOS(69) := 1.0   ! UNK
+  RES_PHOS(70) := 1.0   ! UNK
+  RES_PHOS(71) := 1.0   ! UNK
+  RES_PHOS(72) := 1.0   ! UNK
+  RES_PHOS(73) := 1.0   ! UNK
+  RES_PHOS(74) := 1.0   ! UNK
+  RES_PHOS(75) := 1.0   ! UNK
+  RES_PHOS(76) := 1.0   ! UNK
+  RES_PHOS(77) := 1.0   ! UNK
+  RES_PHOS(78) := 1.0   ! UNK
+  RES_PHOS(79) := 1.0   ! UNK
+  RES_PHOS(80) := 1.0   ! UNK
+  RES_PHOS(81) := 1.0   ! UNK
+  RES_PHOS(82) := 1.0   ! UNK
+  RES_PHOS(83) := 1.0   ! UNK
+  RES_PHOS(84) := 1.0   ! UNK
+  RES_PHOS(85) := 1.0   ! UNK
+  RES_PHOS(86) := 1.0   ! UNK
+  RES_PHOS(87) := 1.0   ! UNK
+  RES_PHOS(88) := 1.0   ! UNK
+  RES_PHOS(89) := 1.0   ! UNK
+  RES_PHOS(90) := 1.0   ! UNK
+  RES_PHOS(91) := 1.0   ! UNK
+  RES_PHOS(92) := 1.0   ! UNK
+
+  RETURN
+END
+SUBROUTINE INIT_NATIVE()
+  INTEGER :: I, J
+
+  ! Native Cα coordinates, scaled by factor 0.400000
+
+  NATIVE_X(1) := 98.856000
+  NATIVE_Y(1) := 128.672000
+  NATIVE_Z(1) := 127.621200
+  NATIVE_X(2) := 99.994400
+  NATIVE_Y(2) := 126.890800
+  NATIVE_Z(2) := 126.776800
+  NATIVE_X(3) := 99.160400
+  NATIVE_Y(3) := 125.224400
+  NATIVE_Z(3) := 125.867200
+  NATIVE_X(4) := 97.471600
+  NATIVE_Y(4) := 125.295600
+  NATIVE_Z(4) := 124.672000
+  NATIVE_X(5) := 96.070000
+  NATIVE_Y(5) := 126.126400
+  NATIVE_Z(5) := 123.192000
+  NATIVE_X(6) := 95.601600
+  NATIVE_Y(6) := 127.623200
+  NATIVE_Z(6) := 121.570000
+  NATIVE_X(7) := 96.627600
+  NATIVE_Y(7) := 128.606400
+  NATIVE_Z(7) := 119.920400
+  NATIVE_X(8) := 98.319600
+  NATIVE_Y(8) := 129.044000
+  NATIVE_Z(8) := 118.669600
+  NATIVE_X(9) := 100.388400
+  NATIVE_Y(9) := 128.719600
+  NATIVE_Z(9) := 118.095600
+  NATIVE_X(10) := 102.261600
+  NATIVE_Y(10) := 127.451600
+  NATIVE_Z(10) := 117.636400
+  NATIVE_X(11) := 102.979200
+  NATIVE_Y(11) := 125.445600
+  NATIVE_Z(11) := 117.485200
+  NATIVE_X(12) := 102.671200
+  NATIVE_Y(12) := 123.362800
+  NATIVE_Z(12) := 117.256400
+  NATIVE_X(13) := 101.335600
+  NATIVE_Y(13) := 122.084800
+  NATIVE_Z(13) := 116.226400
+  NATIVE_X(14) := 100.988000
+  NATIVE_Y(14) := 119.616000
+  NATIVE_Z(14) := 113.730400
+  NATIVE_X(15) := 99.598000
+  NATIVE_Y(15) := 119.344400
+  NATIVE_Z(15) := 116.290000
+  NATIVE_X(16) := 98.208000
+  NATIVE_Y(16) := 120.036400
+  NATIVE_Z(16) := 114.752800
+  NATIVE_X(17) := 97.443600
+  NATIVE_Y(17) := 121.050800
+  NATIVE_Z(17) := 112.894800
+  NATIVE_X(18) := 97.468800
+  NATIVE_Y(18) := 121.704400
+  NATIVE_Z(18) := 110.848400
+  NATIVE_X(19) := 98.640000
+  NATIVE_Y(19) := 121.573600
+  NATIVE_Z(19) := 109.088000
+  NATIVE_X(20) := 100.243200
+  NATIVE_Y(20) := 121.350800
+  NATIVE_Z(20) := 107.749600
+  NATIVE_X(21) := 101.778800
+  NATIVE_Y(21) := 120.050000
+  NATIVE_Z(21) := 107.128000
+  NATIVE_X(22) := 102.416400
+  NATIVE_Y(22) := 121.486000
+  NATIVE_Z(22) := 103.737200
+  NATIVE_X(23) := 102.719600
+  NATIVE_Y(23) := 120.923200
+  NATIVE_Z(23) := 101.735200
+  NATIVE_X(24) := 103.771600
+  NATIVE_Y(24) := 120.002000
+  NATIVE_Z(24) := 100.049600
+  NATIVE_X(25) := 104.165200
+  NATIVE_Y(25) := 117.896800
+  NATIVE_Z(25) := 99.813600
+  NATIVE_X(26) := 104.503200
+  NATIVE_Y(26) := 115.387600
+  NATIVE_Z(26) := 97.460000
+  NATIVE_X(27) := 102.957200
+  NATIVE_Y(27) := 115.418800
+  NATIVE_Z(27) := 102.164400
+  NATIVE_X(28) := 104.569200
+  NATIVE_Y(28) := 115.626000
+  NATIVE_Z(28) := 103.516800
+  NATIVE_X(29) := 106.714000
+  NATIVE_Y(29) := 116.192800
+  NATIVE_Z(29) := 103.716400
+  NATIVE_X(30) := 107.812800
+  NATIVE_Y(30) := 117.409600
+  NATIVE_Z(30) := 102.414800
+  NATIVE_X(31) := 107.934400
+  NATIVE_Y(31) := 119.076000
+  NATIVE_Z(31) := 101.284400
+  NATIVE_X(32) := 106.824000
+  NATIVE_Y(32) := 121.216400
+  NATIVE_Z(32) := 100.730000
+  NATIVE_X(33) := 106.648800
+  NATIVE_Y(33) := 120.899200
+  NATIVE_Z(33) := 98.216400
+  NATIVE_X(34) := 104.796000
+  NATIVE_Y(34) := 122.896800
+  NATIVE_Z(34) := 100.517200
+  NATIVE_X(35) := 105.639200
+  NATIVE_Y(35) := 125.675200
+  NATIVE_Z(35) := 99.954800
+  NATIVE_X(36) := 107.254400
+  NATIVE_Y(36) := 126.217600
+  NATIVE_Z(36) := 98.550400
+  NATIVE_X(37) := 109.086000
+  NATIVE_Y(37) := 126.300400
+  NATIVE_Z(37) := 96.952400
+  NATIVE_X(38) := 110.563600
+  NATIVE_Y(38) := 125.369600
+  NATIVE_Z(38) := 95.286400
+  NATIVE_X(39) := 111.170400
+  NATIVE_Y(39) := 123.847200
+  NATIVE_Z(39) := 93.681600
+  NATIVE_X(40) := 110.180000
+  NATIVE_Y(40) := 122.155200
+  NATIVE_Z(40) := 92.868000
+  NATIVE_X(41) := 108.501200
+  NATIVE_Y(41) := 120.905600
+  NATIVE_Z(41) := 92.470400
+  NATIVE_X(42) := 107.154800
+  NATIVE_Y(42) := 122.075600
+  NATIVE_Z(42) := 90.995200
+  NATIVE_X(43) := 106.853200
+  NATIVE_Y(43) := 120.998800
+  NATIVE_Z(43) := 88.621600
+  NATIVE_X(44) := 108.547600
+  NATIVE_Y(44) := 124.081200
+  NATIVE_Z(44) := 87.201600
+  NATIVE_X(45) := 105.750400
+  NATIVE_Y(45) := 126.278400
+  NATIVE_Z(45) := 88.141600
+  NATIVE_X(46) := 104.986000
+  NATIVE_Y(46) := 126.146400
+  NATIVE_Z(46) := 90.061600
+  NATIVE_X(47) := 104.177600
+  NATIVE_Y(47) := 124.505200
+  NATIVE_Z(47) := 91.385200
+  NATIVE_X(48) := 104.575200
+  NATIVE_Y(48) := 122.484800
+  NATIVE_Z(48) := 92.094000
+  NATIVE_X(49) := 104.714000
+  NATIVE_Y(49) := 120.425200
+  NATIVE_Z(49) := 93.984400
+  NATIVE_X(50) := 106.660000
+  NATIVE_Y(50) := 118.389600
+  NATIVE_Z(50) := 98.457200
+  NATIVE_X(51) := 108.102800
+  NATIVE_Y(51) := 119.241600
+  NATIVE_Z(51) := 94.982000
+  NATIVE_X(52) := 110.163200
+  NATIVE_Y(52) := 119.895200
+  NATIVE_Z(52) := 95.025600
+  NATIVE_X(53) := 111.852000
+  NATIVE_Y(53) := 121.546800
+  NATIVE_Z(53) := 95.612800
+  NATIVE_X(54) := 111.812400
+  NATIVE_Y(54) := 123.118400
+  NATIVE_Z(54) := 97.028400
+  NATIVE_X(55) := 111.256400
+  NATIVE_Y(55) := 124.828000
+  NATIVE_Z(55) := 98.270000
+  NATIVE_X(56) := 109.908400
+  NATIVE_Y(56) := 126.127600
+  NATIVE_Z(56) := 99.861600
+  NATIVE_X(57) := 108.961200
+  NATIVE_Y(57) := 126.993200
+  NATIVE_Z(57) := 101.923600
+  NATIVE_X(58) := 111.280800
+  NATIVE_Y(58) := 128.488000
+  NATIVE_Z(58) := 101.542800
+  NATIVE_X(59) := 112.816400
+  NATIVE_Y(59) := 129.910000
+  NATIVE_Z(59) := 101.178000
+  NATIVE_X(60) := 113.408400
+  NATIVE_Y(60) := 132.164000
+  NATIVE_Z(60) := 100.802000
+  NATIVE_X(61) := 113.716400
+  NATIVE_Y(61) := 135.270400
+  NATIVE_Z(61) := 101.721600
+  NATIVE_X(62) := 114.530400
+  NATIVE_Y(62) := 134.136400
+  NATIVE_Z(62) := 100.201600
+  NATIVE_X(63) := 114.611600
+  NATIVE_Y(63) := 132.237200
+  NATIVE_Z(63) := 99.160000
+  NATIVE_X(64) := 112.514800
+  NATIVE_Y(64) := 134.721600
+  NATIVE_Z(64) := 98.787200
+  NATIVE_X(65) := 112.685600
+  NATIVE_Y(65) := 136.678000
+  NATIVE_Z(65) := 97.330400
+  NATIVE_X(66) := 113.935600
+  NATIVE_Y(66) := 137.697600
+  NATIVE_Z(66) := 95.964400
+  NATIVE_X(67) := 115.904400
+  NATIVE_Y(67) := 138.434000
+  NATIVE_Z(67) := 95.226800
+  NATIVE_X(68) := 117.953200
+  NATIVE_Y(68) := 138.114000
+  NATIVE_Z(68) := 94.648000
+  NATIVE_X(69) := 119.670800
+  NATIVE_Y(69) := 136.961600
+  NATIVE_Z(69) := 94.210800
+  NATIVE_X(70) := 120.054000
+  NATIVE_Y(70) := 135.012400
+  NATIVE_Z(70) := 93.896800
+  NATIVE_X(71) := 120.095600
+  NATIVE_Y(71) := 132.711200
+  NATIVE_Z(71) := 93.234000
+  NATIVE_X(72) := 119.792000
+  NATIVE_Y(72) := 130.571200
+  NATIVE_Z(72) := 93.725200
+  NATIVE_X(73) := 120.285600
+  NATIVE_Y(73) := 128.203600
+  NATIVE_Z(73) := 93.824000
+  NATIVE_X(74) := 121.978000
+  NATIVE_Y(74) := 127.309200
+  NATIVE_Z(74) := 93.121600
+  NATIVE_X(75) := 123.874800
+  NATIVE_Y(75) := 127.139600
+  NATIVE_Z(75) := 92.122800
+  NATIVE_X(76) := 125.936000
+  NATIVE_Y(76) := 127.729600
+  NATIVE_Z(76) := 91.464400
+  NATIVE_X(77) := 127.815200
+  NATIVE_Y(77) := 128.794400
+  NATIVE_Z(77) := 91.601600
+  NATIVE_X(78) := 128.726400
+  NATIVE_Y(78) := 129.741200
+  NATIVE_Z(78) := 93.241600
+  NATIVE_X(79) := 129.496400
+  NATIVE_Y(79) := 130.806800
+  NATIVE_Z(79) := 95.237200
+  NATIVE_X(80) := 131.435600
+  NATIVE_Y(80) := 130.577200
+  NATIVE_Z(80) := 97.980400
+  NATIVE_X(81) := 131.015600
+  NATIVE_Y(81) := 129.211600
+  NATIVE_Z(81) := 99.521200
+  NATIVE_X(82) := 128.980800
+  NATIVE_Y(82) := 128.238400
+  NATIVE_Z(82) := 98.534000
+  NATIVE_X(83) := 128.698000
+  NATIVE_Y(83) := 125.738400
+  NATIVE_Z(83) := 98.219200
+  NATIVE_X(84) := 126.286800
+  NATIVE_Y(84) := 124.414000
+  NATIVE_Z(84) := 97.027200
+  NATIVE_X(85) := 125.334400
+  NATIVE_Y(85) := 126.474800
+  NATIVE_Z(85) := 97.986000
+  NATIVE_X(86) := 126.192400
+  NATIVE_Y(86) := 129.304400
+  NATIVE_Z(86) := 99.252400
+  NATIVE_X(87) := 126.523600
+  NATIVE_Y(87) := 131.214000
+  NATIVE_Z(87) := 97.974000
+  NATIVE_X(88) := 127.049200
+  NATIVE_Y(88) := 132.382800
+  NATIVE_Z(88) := 96.227200
+  NATIVE_X(89) := 127.065600
+  NATIVE_Y(89) := 132.371600
+  NATIVE_Z(89) := 93.906800
+  NATIVE_X(90) := 126.678000
+  NATIVE_Y(90) := 131.928000
+  NATIVE_Z(90) := 91.830400
+  NATIVE_X(91) := 125.503600
+  NATIVE_Y(91) := 130.779600
+  NATIVE_Z(91) := 90.467600
+  NATIVE_X(92) := 123.786000
+  NATIVE_Y(92) := 129.551600
+  NATIVE_Z(92) := 89.961200
+
+
+  ! Native per-residue frames (Frenet) as quaternions, and
+  ! native bond vectors in the local frame (oriented-ribbon dynamics)
+  NATIVE_Q0(1) := 1.000000
+  NATIVE_Q1(1) := 0.000000
+  NATIVE_Q2(1) := 0.000000
+  NATIVE_Q3(1) := 0.000000
+  NATIVE_BVX(1) := 1.138400
+  NATIVE_BVY(1) := -1.781200
+  NATIVE_BVZ(1) := -0.844400
+  NATIVE_Q0(2) := 0.629754
+  NATIVE_Q1(2) := -0.361742
+  NATIVE_Q2(2) := 0.575967
+  NATIVE_Q3(2) := -0.375252
+  NATIVE_BVX(2) := 1.849117
+  NATIVE_BVY(2) := -0.000000
+  NATIVE_BVZ(2) := -0.938395
+  NATIVE_Q0(3) := 0.389468
+  NATIVE_Q1(3) := 0.053355
+  NATIVE_Q2(3) := 0.650965
+  NATIVE_Q3(3) := -0.649394
+  NATIVE_BVX(3) := 1.824645
+  NATIVE_BVY(3) := -0.000000
+  NATIVE_BVZ(3) := -0.977901
+  NATIVE_Q0(4) := 0.092368
+  NATIVE_Q1(4) := 0.347717
+  NATIVE_Q2(4) := 0.509748
+  NATIVE_Q3(4) := -0.781485
+  NATIVE_BVX(4) := 2.157037
+  NATIVE_BVY(4) := -0.000000
+  NATIVE_BVZ(4) := -0.438521
+  NATIVE_Q0(5) := -0.064408
+  NATIVE_Q1(5) := 0.526604
+  NATIVE_Q2(5) := 0.421627
+  NATIVE_Q3(5) := -0.735371
+  NATIVE_BVX(5) := 2.179329
+  NATIVE_BVY(5) := 0.000000
+  NATIVE_BVZ(5) := -0.584139
+  NATIVE_Q0(6) := -0.335442
+  NATIVE_Q1(6) := 0.676764
+  NATIVE_Q2(6) := 0.121584
+  NATIVE_Q3(6) := -0.643962
+  NATIVE_BVX(6) := 2.034566
+  NATIVE_BVY(6) := -0.000000
+  NATIVE_BVZ(6) := -0.775294
+  NATIVE_Q0(7) := -0.350377
+  NATIVE_Q1(7) := 0.836486
+  NATIVE_Q2(7) := 0.024511
+  NATIVE_Q3(7) := -0.420626
+  NATIVE_BVX(7) := 2.096877
+  NATIVE_BVY(7) := 0.000000
+  NATIVE_BVZ(7) := -0.471133
+  NATIVE_Q0(8) := -0.372704
+  NATIVE_Q1(8) := 0.900305
+  NATIVE_Q2(8) := -0.072537
+  NATIVE_Q3(8) := -0.212791
+  NATIVE_BVX(8) := 2.101560
+  NATIVE_BVY(8) := 0.000000
+  NATIVE_BVZ(8) := -0.545977
+  NATIVE_Q0(9) := -0.650230
+  NATIVE_Q1(9) := 0.727191
+  NATIVE_Q2(9) := -0.217708
+  NATIVE_Q3(9) := 0.031590
+  NATIVE_BVX(9) := 2.254385
+  NATIVE_BVY(9) := -0.000000
+  NATIVE_BVZ(9) := -0.495295
+  NATIVE_Q0(10) := -0.588342
+  NATIVE_Q1(10) := 0.675299
+  NATIVE_Q2(10) := -0.382074
+  NATIVE_Q3(10) := 0.227694
+  NATIVE_BVX(10) := 2.027768
+  NATIVE_BVY(10) := -0.000000
+  NATIVE_BVZ(10) := -0.670824
+  NATIVE_Q0(11) := -0.564371
+  NATIVE_Q1(11) := 0.480194
+  NATIVE_Q2(11) := -0.480633
+  NATIVE_Q3(11) := 0.468924
+  NATIVE_BVX(11) := 2.054665
+  NATIVE_BVY(11) := -0.000000
+  NATIVE_BVZ(11) := -0.513441
+  NATIVE_Q0(12) := -0.525148
+  NATIVE_Q1(12) := 0.126384
+  NATIVE_Q2(12) := -0.471479
+  NATIVE_Q3(12) := 0.697105
+  NATIVE_BVX(12) := 1.972838
+  NATIVE_BVY(12) := 0.000000
+  NATIVE_BVZ(12) := -0.765455
+  NATIVE_Q0(13) := -0.266058
+  NATIVE_Q1(13) := -0.488329
+  NATIVE_Q2(13) := 0.269577
+  NATIVE_Q3(13) := 0.786178
+  NATIVE_BVX(13) := 3.373854
+  NATIVE_BVY(13) := -0.000000
+  NATIVE_BVZ(13) := -1.030984
+  NATIVE_Q0(14) := 0.013967
+  NATIVE_Q1(14) := -0.459184
+  NATIVE_Q2(14) := 0.863061
+  NATIVE_Q3(14) := -0.209954
+  NATIVE_BVX(14) := 1.451980
+  NATIVE_BVY(14) := -0.000000
+  NATIVE_BVZ(14) := -2.539522
+  NATIVE_Q0(15) := -0.106778
+  NATIVE_Q1(15) := -0.062888
+  NATIVE_Q2(15) := 0.120048
+  NATIVE_Q3(15) := -0.985004
+  NATIVE_BVX(15) := 1.252572
+  NATIVE_BVY(15) := -0.000000
+  NATIVE_BVZ(15) := -1.790255
+  NATIVE_Q0(16) := -0.069316
+  NATIVE_Q1(16) := 0.497469
+  NATIVE_Q2(16) := 0.277510
+  NATIVE_Q3(16) := -0.818968
+  NATIVE_BVX(16) := 2.216424
+  NATIVE_BVY(16) := -0.000000
+  NATIVE_BVZ(16) := -0.391080
+  NATIVE_Q0(17) := -0.274579
+  NATIVE_Q1(17) := 0.583891
+  NATIVE_Q2(17) := -0.029064
+  NATIVE_Q3(17) := -0.763435
+  NATIVE_BVX(17) := 2.104699
+  NATIVE_BVY(17) := 0.000000
+  NATIVE_BVZ(17) := -0.431073
+  NATIVE_Q0(18) := -0.270037
+  NATIVE_Q1(18) := 0.759426
+  NATIVE_Q2(18) := -0.121366
+  NATIVE_Q3(18) := -0.579330
+  NATIVE_BVX(18) := 1.998112
+  NATIVE_BVY(18) := 0.000000
+  NATIVE_BVZ(18) := -0.703828
+  NATIVE_Q0(19) := -0.053073
+  NATIVE_Q1(19) := 0.910895
+  NATIVE_Q2(19) := -0.070041
+  NATIVE_Q3(19) := -0.403171
+  NATIVE_BVX(19) := 2.078171
+  NATIVE_BVY(19) := 0.000000
+  NATIVE_BVZ(19) := -0.303992
+  NATIVE_Q0(20) := -0.453067
+  NATIVE_Q1(20) := 0.828800
+  NATIVE_Q2(20) := -0.301082
+  NATIVE_Q3(20) := -0.131037
+  NATIVE_BVX(20) := 2.003803
+  NATIVE_BVY(20) := -0.000000
+  NATIVE_BVZ(20) := -0.649083
+  NATIVE_Q0(21) := -0.818758
+  NATIVE_Q1(21) := -0.354431
+  NATIVE_Q2(21) := -0.372738
+  NATIVE_Q3(21) := 0.255109
+  NATIVE_BVX(21) := 2.839784
+  NATIVE_BVY(21) := -0.000000
+  NATIVE_BVZ(21) := -2.429358
+  NATIVE_Q0(22) := -0.567229
+  NATIVE_Q1(22) := 0.511424
+  NATIVE_Q2(22) := -0.451477
+  NATIVE_Q3(22) := -0.461374
+  NATIVE_BVX(22) := 1.985998
+  NATIVE_BVY(22) := -0.000000
+  NATIVE_BVZ(22) := -0.687378
+  NATIVE_Q0(23) := -0.062478
+  NATIVE_Q1(23) := 0.809737
+  NATIVE_Q2(23) := -0.257596
+  NATIVE_Q3(23) := -0.523514
+  NATIVE_BVX(23) := 2.143123
+  NATIVE_BVY(23) := 0.000000
+  NATIVE_BVZ(23) := -0.451204
+  NATIVE_Q0(24) := -0.367930
+  NATIVE_Q1(24) := 0.742252
+  NATIVE_Q2(24) := -0.557209
+  NATIVE_Q3(24) := -0.056635
+  NATIVE_BVX(24) := 1.916914
+  NATIVE_BVY(24) := -0.000000
+  NATIVE_BVZ(24) := -0.983833
+  NATIVE_Q0(25) := -0.749159
+  NATIVE_Q1(25) := -0.112395
+  NATIVE_Q2(25) := -0.183929
+  NATIVE_Q3(25) := 0.626337
+  NATIVE_BVX(25) := 3.280946
+  NATIVE_BVY(25) := -0.000000
+  NATIVE_BVZ(25) := -1.088647
+  NATIVE_Q0(26) := 0.037378
+  NATIVE_Q1(26) := 0.603482
+  NATIVE_Q2(26) := -0.761845
+  NATIVE_Q3(26) := 0.232389
+  NATIVE_BVX(26) := 1.974897
+  NATIVE_BVY(26) := -0.000000
+  NATIVE_BVZ(26) := -4.541173
+  NATIVE_Q0(27) := 0.797367
+  NATIVE_Q1(27) := 0.013670
+  NATIVE_Q2(27) := -0.601281
+  NATIVE_Q3(27) := 0.049815
+  NATIVE_BVX(27) := 1.750088
+  NATIVE_BVY(27) := 0.000000
+  NATIVE_BVZ(27) := -1.186446
+  NATIVE_Q0(28) := 0.969677
+  NATIVE_Q1(28) := 0.111058
+  NATIVE_Q2(28) := -0.183951
+  NATIVE_Q3(28) := 0.116422
+  NATIVE_BVX(28) := 2.122691
+  NATIVE_BVY(28) := 0.000000
+  NATIVE_BVZ(28) := -0.674874
+  NATIVE_Q0(29) := 0.926116
+  NATIVE_Q1(29) := 0.241817
+  NATIVE_Q2(29) := 0.212174
+  NATIVE_Q3(29) := 0.197018
+  NATIVE_BVX(29) := 1.870966
+  NATIVE_BVY(29) := -0.000000
+  NATIVE_BVZ(29) := -0.938942
+  NATIVE_Q0(30) := 0.650100
+  NATIVE_Q1(30) := 0.478604
+  NATIVE_Q2(30) := 0.573605
+  NATIVE_Q3(30) := 0.138873
+  NATIVE_BVX(30) := 1.945522
+  NATIVE_BVY(30) := 0.000000
+  NATIVE_BVZ(30) := -0.533313
+  NATIVE_Q0(31) := 0.418675
+  NATIVE_Q1(31) := 0.471911
+  NATIVE_Q2(31) := 0.743187
+  NATIVE_Q3(31) := 0.222899
+  NATIVE_BVX(31) := 2.355769
+  NATIVE_BVY(31) := -0.000000
+  NATIVE_BVZ(31) := -0.756314
+  NATIVE_Q0(32) := 0.449981
+  NATIVE_Q1(32) := -0.355549
+  NATIVE_Q2(32) := 0.284371
+  NATIVE_Q3(32) := 0.768268
+  NATIVE_BVX(32) := 1.921285
+  NATIVE_BVY(32) := 0.000000
+  NATIVE_BVZ(32) := -1.660771
+  NATIVE_Q0(33) := 0.182920
+  NATIVE_Q1(33) := 0.320650
+  NATIVE_Q2(33) := 0.918763
+  NATIVE_Q3(33) := -0.139994
+  NATIVE_BVX(33) := 1.442589
+  NATIVE_BVY(33) := 0.000000
+  NATIVE_BVZ(33) := -3.261271
+  NATIVE_Q0(34) := -0.637308
+  NATIVE_Q1(34) := 0.140916
+  NATIVE_Q2(34) := 0.371312
+  NATIVE_Q3(34) := -0.660385
+  NATIVE_BVX(34) := 2.343174
+  NATIVE_BVY(34) := 0.000000
+  NATIVE_BVZ(34) := -1.804528
+  NATIVE_Q0(35) := -0.724904
+  NATIVE_Q1(35) := 0.512114
+  NATIVE_Q2(35) := 0.002869
+  NATIVE_Q3(35) := -0.460700
+  NATIVE_BVX(35) := 1.950257
+  NATIVE_BVY(35) := 0.000000
+  NATIVE_BVZ(35) := -1.035328
+  NATIVE_Q0(36) := -0.680537
+  NATIVE_Q1(36) := 0.640435
+  NATIVE_Q2(36) := -0.201795
+  NATIVE_Q3(36) := -0.293243
+  NATIVE_BVX(36) := 2.418194
+  NATIVE_BVY(36) := 0.000000
+  NATIVE_BVZ(36) := -0.259915
+  NATIVE_Q0(37) := -0.715297
+  NATIVE_Q1(37) := 0.581728
+  NATIVE_Q2(37) := -0.352376
+  NATIVE_Q3(37) := -0.160542
+  NATIVE_BVX(37) := 2.353340
+  NATIVE_BVY(37) := -0.000000
+  NATIVE_BVZ(37) := -0.535758
+  NATIVE_Q0(38) := -0.713573
+  NATIVE_Q1(38) := 0.464376
+  NATIVE_Q2(38) := -0.523289
+  NATIVE_Q3(38) := 0.036569
+  NATIVE_BVX(38) := 2.236178
+  NATIVE_BVY(38) := 0.000000
+  NATIVE_BVZ(38) := -0.510683
+  NATIVE_Q0(39) := -0.518875
+  NATIVE_Q1(39) := 0.418994
+  NATIVE_Q2(39) := -0.721298
+  NATIVE_Q3(39) := 0.186928
+  NATIVE_BVX(39) := 1.941855
+  NATIVE_BVY(39) := -0.000000
+  NATIVE_BVZ(39) := -0.857264
+  NATIVE_Q0(40) := -0.320941
+  NATIVE_Q1(40) := 0.275245
+  NATIVE_Q2(40) := -0.807473
+  NATIVE_Q3(40) := 0.411370
+  NATIVE_BVX(40) := 2.080036
+  NATIVE_BVY(40) := -0.000000
+  NATIVE_BVZ(40) := -0.459788
+  NATIVE_Q0(41) := -0.165661
+  NATIVE_Q1(41) := -0.211311
+  NATIVE_Q2(41) := -0.517164
+  NATIVE_Q3(41) := 0.812678
+  NATIVE_BVX(41) := 1.852387
+  NATIVE_BVY(41) := -0.000000
+  NATIVE_BVZ(41) := -1.388010
+  NATIVE_Q0(42) := 0.290404
+  NATIVE_Q1(42) := -0.458404
+  NATIVE_Q2(42) := 0.404996
+  NATIVE_Q3(42) := 0.735873
+  NATIVE_BVX(42) := 2.223260
+  NATIVE_BVY(42) := 0.000000
+  NATIVE_BVZ(42) := -1.393396
+  NATIVE_Q0(43) := -0.326341
+  NATIVE_Q1(43) := -0.716657
+  NATIVE_Q2(43) := -0.411949
+  NATIVE_Q3(43) := 0.458479
+  NATIVE_BVX(43) := 2.619549
+  NATIVE_BVY(43) := -0.000000
+  NATIVE_BVZ(43) := -2.743455
+  NATIVE_Q0(44) := -0.352614
+  NATIVE_Q1(44) := -0.517165
+  NATIVE_Q2(44) := -0.678981
+  NATIVE_Q3(44) := -0.383651
+  NATIVE_BVX(44) := 2.665790
+  NATIVE_BVY(44) := 0.000000
+  NATIVE_BVZ(44) := -2.535582
+  NATIVE_Q0(45) := 0.308596
+  NATIVE_Q1(45) := -0.276542
+  NATIVE_Q2(45) := -0.867573
+  NATIVE_Q3(45) := -0.274974
+  NATIVE_BVX(45) := 1.781040
+  NATIVE_BVY(45) := 0.000000
+  NATIVE_BVZ(45) := -1.056423
+  NATIVE_Q0(46) := 0.473942
+  NATIVE_Q1(46) := -0.281899
+  NATIVE_Q2(46) := -0.438032
+  NATIVE_Q3(46) := -0.709957
+  NATIVE_BVX(46) := 2.095258
+  NATIVE_BVY(46) := 0.000000
+  NATIVE_BVZ(46) := -0.841936
+  NATIVE_Q0(47) := 0.650338
+  NATIVE_Q1(47) := 0.175579
+  NATIVE_Q2(47) := -0.513058
+  NATIVE_Q3(47) := -0.531982
+  NATIVE_BVX(47) := 2.065814
+  NATIVE_BVY(47) := -0.000000
+  NATIVE_BVZ(47) := -0.689139
+  NATIVE_Q0(48) := 0.081202
+  NATIVE_Q1(48) := 0.743488
+  NATIVE_Q2(48) := -0.602588
+  NATIVE_Q3(48) := 0.278423
+  NATIVE_BVX(48) := 2.736464
+  NATIVE_BVY(48) := -0.000000
+  NATIVE_BVZ(48) := -0.588721
+  NATIVE_Q0(49) := 0.570223
+  NATIVE_Q1(49) := 0.531756
+  NATIVE_Q2(49) := -0.621986
+  NATIVE_Q3(49) := 0.072211
+  NATIVE_BVX(49) := 5.115155
+  NATIVE_BVY(49) := 0.000000
+  NATIVE_BVZ(49) := -1.331057
+  NATIVE_Q0(50) := 0.979603
+  NATIVE_Q1(50) := 0.165250
+  NATIVE_Q2(50) := 0.017460
+  NATIVE_Q3(50) := -0.112984
+  NATIVE_BVX(50) := 1.470051
+  NATIVE_BVY(50) := 0.000000
+  NATIVE_BVZ(50) := -3.567007
+  NATIVE_Q0(51) := -0.008411
+  NATIVE_Q1(51) := 0.946431
+  NATIVE_Q2(51) := 0.162395
+  NATIVE_Q3(51) := -0.278972
+  NATIVE_BVX(51) := 1.812098
+  NATIVE_BVY(51) := 0.000000
+  NATIVE_BVZ(51) := -1.179255
+  NATIVE_Q0(52) := 0.493933
+  NATIVE_Q1(52) := 0.825632
+  NATIVE_Q2(52) := 0.190068
+  NATIVE_Q3(52) := 0.195541
+  NATIVE_BVX(52) := 2.354377
+  NATIVE_BVY(52) := -0.000000
+  NATIVE_BVZ(52) := -0.617688
+  NATIVE_Q0(53) := 0.244648
+  NATIVE_Q1(53) := 0.791089
+  NATIVE_Q2(53) := 0.361701
+  NATIVE_Q3(53) := 0.428367
+  NATIVE_BVX(53) := 1.922982
+  NATIVE_BVY(53) := -0.000000
+  NATIVE_BVZ(53) := -0.881792
+  NATIVE_Q0(54) := 0.397001
+  NATIVE_Q1(54) := 0.522980
+  NATIVE_Q2(54) := 0.179239
+  NATIVE_Q3(54) := 0.732636
+  NATIVE_BVX(54) := 2.166355
+  NATIVE_BVY(54) := 0.000000
+  NATIVE_BVZ(54) := -0.283452
+  NATIVE_Q0(55) := 0.054776
+  NATIVE_Q1(55) := 0.540541
+  NATIVE_Q2(55) := 0.554920
+  NATIVE_Q3(55) := 0.629983
+  NATIVE_BVX(55) := 2.408746
+  NATIVE_BVY(55) := -0.000000
+  NATIVE_BVZ(55) := -0.487029
+  NATIVE_Q0(56) := -0.377966
+  NATIVE_Q1(56) := 0.345916
+  NATIVE_Q2(56) := 0.840431
+  NATIVE_Q3(56) := 0.176522
+  NATIVE_BVX(56) := 2.399501
+  NATIVE_BVY(56) := -0.000000
+  NATIVE_BVZ(56) := -0.375085
+  NATIVE_Q0(57) := -0.815461
+  NATIVE_Q1(57) := 0.125272
+  NATIVE_Q2(57) := 0.415375
+  NATIVE_Q3(57) := -0.383136
+  NATIVE_BVX(57) := 1.706360
+  NATIVE_BVY(57) := 0.000000
+  NATIVE_BVZ(57) := -2.201889
+  NATIVE_Q0(58) := -0.747016
+  NATIVE_Q1(58) := -0.576504
+  NATIVE_Q2(58) := -0.260905
+  NATIVE_Q3(58) := -0.203809
+  NATIVE_BVX(58) := 2.116210
+  NATIVE_BVY(58) := 0.000000
+  NATIVE_BVZ(58) := -0.186778
+  NATIVE_Q0(59) := -0.636360
+  NATIVE_Q1(59) := -0.590151
+  NATIVE_Q2(59) := -0.403717
+  NATIVE_Q3(59) := -0.289448
+  NATIVE_BVX(59) := 2.268960
+  NATIVE_BVY(59) := -0.000000
+  NATIVE_BVZ(59) := -0.651287
+  NATIVE_Q0(60) := -0.107422
+  NATIVE_Q1(60) := -0.759797
+  NATIVE_Q2(60) := -0.627806
+  NATIVE_Q3(60) := -0.130493
+  NATIVE_BVX(60) := 3.163665
+  NATIVE_BVY(60) := -0.000000
+  NATIVE_BVZ(60) := -0.762542
+  NATIVE_Q0(61) := 0.779755
+  NATIVE_Q1(61) := -0.453045
+  NATIVE_Q2(61) := 0.134250
+  NATIVE_Q3(61) := 0.410743
+  NATIVE_BVX(61) := 0.805480
+  NATIVE_BVY(61) := 0.000000
+  NATIVE_BVZ(61) := -1.900041
+  NATIVE_Q0(62) := 0.515863
+  NATIVE_Q1(62) := -0.588342
+  NATIVE_Q2(62) := 0.622633
+  NATIVE_Q3(62) := -0.008236
+  NATIVE_BVX(62) := 2.084818
+  NATIVE_BVY(62) := -0.000000
+  NATIVE_BVZ(62) := -0.593313
+  NATIVE_Q0(63) := 0.351959
+  NATIVE_Q1(63) := 0.152690
+  NATIVE_Q2(63) := 0.760308
+  NATIVE_Q3(63) := -0.524159
+  NATIVE_BVX(63) := 1.398921
+  NATIVE_BVY(63) := 0.000000
+  NATIVE_BVZ(63) := -2.958177
+  NATIVE_Q0(64) := -0.430783
+  NATIVE_Q1(64) := 0.395412
+  NATIVE_Q2(64) := 0.251710
+  NATIVE_Q3(64) := -0.771179
+  NATIVE_BVX(64) := 2.207840
+  NATIVE_BVY(64) := 0.000000
+  NATIVE_BVZ(64) := -1.050896
+  NATIVE_Q0(65) := -0.475136
+  NATIVE_Q1(65) := 0.669253
+  NATIVE_Q2(65) := 0.104546
+  NATIVE_Q3(65) := -0.561619
+  NATIVE_BVX(65) := 2.012121
+  NATIVE_BVY(65) := 0.000000
+  NATIVE_BVZ(65) := -0.647619
+  NATIVE_Q0(66) := -0.234957
+  NATIVE_Q1(66) := 0.907500
+  NATIVE_Q2(66) := 0.148459
+  NATIVE_Q3(66) := -0.314959
+  NATIVE_BVX(66) := 2.169016
+  NATIVE_BVY(66) := 0.000000
+  NATIVE_BVZ(66) := -0.507821
+  NATIVE_Q0(67) := -0.643228
+  NATIVE_Q1(67) := 0.747942
+  NATIVE_Q2(67) := -0.066181
+  NATIVE_Q3(67) := -0.149869
+  NATIVE_BVX(67) := 2.087839
+  NATIVE_BVY(67) := -0.000000
+  NATIVE_BVZ(67) := -0.525281
+  NATIVE_Q0(68) := -0.652779
+  NATIVE_Q1(68) := 0.724708
+  NATIVE_Q2(68) := -0.218707
+  NATIVE_Q3(68) := 0.029086
+  NATIVE_BVX(68) := 2.065851
+  NATIVE_BVY(68) := 0.000000
+  NATIVE_BVZ(68) := -0.448976
+  NATIVE_Q0(69) := -0.632353
+  NATIVE_Q1(69) := 0.609000
+  NATIVE_Q2(69) := -0.403366
+  NATIVE_Q3(69) := 0.257962
+  NATIVE_BVX(69) := 1.862590
+  NATIVE_BVY(69) := -0.000000
+  NATIVE_BVZ(69) := -0.758667
+  NATIVE_Q0(70) := -0.691691
+  NATIVE_Q1(70) := 0.271720
+  NATIVE_Q2(70) := -0.375021
+  NATIVE_Q3(70) := 0.554158
+  NATIVE_BVX(70) := 2.381720
+  NATIVE_BVY(70) := -0.000000
+  NATIVE_BVZ(70) := -0.252915
+  NATIVE_Q0(71) := -0.112331
+  NATIVE_Q1(71) := 0.675581
+  NATIVE_Q2(71) := -0.721935
+  NATIVE_Q3(71) := 0.098908
+  NATIVE_BVX(71) := 2.139799
+  NATIVE_BVY(71) := 0.000000
+  NATIVE_BVZ(71) := -0.578197
+  NATIVE_Q0(72) := 0.639619
+  NATIVE_Q1(72) := 0.328553
+  NATIVE_Q2(72) := -0.397385
+  NATIVE_Q3(72) := -0.570110
+  NATIVE_BVX(72) := 2.374997
+  NATIVE_BVY(72) := -0.000000
+  NATIVE_BVZ(72) := -0.467251
+  NATIVE_Q0(73) := 0.730017
+  NATIVE_Q1(73) := 0.507447
+  NATIVE_Q2(73) := -0.176712
+  NATIVE_Q3(73) := -0.422311
+  NATIVE_BVX(73) := 1.814743
+  NATIVE_BVY(73) := 0.000000
+  NATIVE_BVZ(73) := -0.929646
+  NATIVE_Q0(74) := 0.775072
+  NATIVE_Q1(74) := 0.579092
+  NATIVE_Q2(74) := 0.089061
+  NATIVE_Q3(74) := -0.236611
+  NATIVE_BVX(74) := 2.110640
+  NATIVE_BVY(74) := -0.000000
+  NATIVE_BVZ(74) := -0.411601
+  NATIVE_Q0(75) := 0.506724
+  NATIVE_Q1(75) := 0.837881
+  NATIVE_Q2(75) := 0.143057
+  NATIVE_Q3(75) := -0.143949
+  NATIVE_BVX(75) := 2.201058
+  NATIVE_BVY(75) := 0.000000
+  NATIVE_BVZ(75) := -0.430674
+  NATIVE_Q0(76) := 0.286533
+  NATIVE_Q1(76) := 0.935563
+  NATIVE_Q2(76) := 0.206446
+  NATIVE_Q3(76) := 0.000270
+  NATIVE_BVX(76) := 2.114338
+  NATIVE_BVY(76) := 0.000000
+  NATIVE_BVZ(76) := -0.462160
+  NATIVE_Q0(77) := 0.049729
+  NATIVE_Q1(77) := 0.925266
+  NATIVE_Q2(77) := 0.266309
+  NATIVE_Q3(77) := 0.265498
+  NATIVE_BVX(77) := 1.907406
+  NATIVE_BVY(77) := 0.000000
+  NATIVE_BVZ(77) := -0.882110
+  NATIVE_Q0(78) := 0.106720
+  NATIVE_Q1(78) := 0.823364
+  NATIVE_Q2(78) := 0.205562
+  NATIVE_Q3(78) := 0.518100
+  NATIVE_BVX(78) := 2.385123
+  NATIVE_BVY(78) := 0.000000
+  NATIVE_BVZ(78) := -0.148362
+  NATIVE_Q0(79) := -0.689525
+  NATIVE_Q1(79) := 0.508853
+  NATIVE_Q2(79) := 0.472532
+  NATIVE_Q3(79) := 0.205761
+  NATIVE_BVX(79) := 3.225770
+  NATIVE_BVY(79) := -0.000000
+  NATIVE_BVZ(79) := -0.965800
+  NATIVE_Q0(80) := -0.390694
+  NATIVE_Q1(80) := 0.674505
+  NATIVE_Q2(80) := 0.056714
+  NATIVE_Q3(80) := 0.623847
+  NATIVE_BVX(80) := 1.835803
+  NATIVE_BVY(80) := -0.000000
+  NATIVE_BVZ(80) := -1.022329
+  NATIVE_Q0(81) := -0.347769
+  NATIVE_Q1(81) := 0.193431
+  NATIVE_Q2(81) := -0.182032
+  NATIVE_Q3(81) := 0.899169
+  NATIVE_BVX(81) := 1.849110
+  NATIVE_BVY(81) := -0.000000
+  NATIVE_BVZ(81) := -1.625695
+  NATIVE_Q0(82) := -0.165633
+  NATIVE_Q1(82) := -0.452340
+  NATIVE_Q2(82) := 0.662112
+  NATIVE_Q3(82) := 0.574075
+  NATIVE_BVX(82) := 2.218928
+  NATIVE_BVY(82) := -0.000000
+  NATIVE_BVZ(82) := -1.226962
+  NATIVE_Q0(83) := -0.460493
+  NATIVE_Q1(83) := 0.172991
+  NATIVE_Q2(83) := -0.567324
+  NATIVE_Q3(83) := 0.660428
+  NATIVE_BVX(83) := 2.660244
+  NATIVE_BVY(83) := 0.000000
+  NATIVE_BVZ(83) := -1.382709
+  NATIVE_Q0(84) := 0.076332
+  NATIVE_Q1(84) := -0.139839
+  NATIVE_Q2(84) := -0.856119
+  NATIVE_Q3(84) := 0.491608
+  NATIVE_BVX(84) := 1.545639
+  NATIVE_BVY(84) := -0.000000
+  NATIVE_BVZ(84) := -1.919443
+  NATIVE_Q0(85) := 0.579500
+  NATIVE_Q1(85) := -0.364012
+  NATIVE_Q2(85) := -0.609134
+  NATIVE_Q3(85) := 0.400789
+  NATIVE_BVX(85) := 3.039403
+  NATIVE_BVY(85) := 0.000000
+  NATIVE_BVZ(85) := -1.052900
+  NATIVE_Q0(86) := 0.784972
+  NATIVE_Q1(86) := 0.016569
+  NATIVE_Q2(86) := 0.069850
+  NATIVE_Q3(86) := 0.615358
+  NATIVE_BVX(86) := 2.040504
+  NATIVE_BVY(86) := -0.000000
+  NATIVE_BVZ(86) := -1.107663
+  NATIVE_Q0(87) := 0.670247
+  NATIVE_Q1(87) := -0.386018
+  NATIVE_Q2(87) := 0.163560
+  NATIVE_Q3(87) := 0.612378
+  NATIVE_BVX(87) := 2.123974
+  NATIVE_BVY(87) := 0.000000
+  NATIVE_BVZ(87) := -0.427076
+  NATIVE_Q0(88) := 0.678502
+  NATIVE_Q1(88) := -0.324549
+  NATIVE_Q2(88) := 0.489341
+  NATIVE_Q3(88) := 0.441417
+  NATIVE_BVX(88) := 2.204683
+  NATIVE_BVY(88) := 0.000000
+  NATIVE_BVZ(88) := -0.723895
+  NATIVE_Q0(89) := 0.603313
+  NATIVE_Q1(89) := -0.304082
+  NATIVE_Q2(89) := 0.689983
+  NATIVE_Q3(89) := 0.259753
+  NATIVE_BVX(89) := 2.137590
+  NATIVE_BVY(89) := 0.000000
+  NATIVE_BVZ(89) := -0.298597
+  NATIVE_Q0(90) := 0.448434
+  NATIVE_Q1(90) := -0.328378
+  NATIVE_Q2(90) := 0.815206
+  NATIVE_Q3(90) := 0.162828
+  NATIVE_BVX(90) := 2.038056
+  NATIVE_BVY(90) := -0.000000
+  NATIVE_BVZ(90) := -0.633710
+  NATIVE_Q0(91) := 0.261074
+  NATIVE_Q1(91) := -0.294550
+  NATIVE_Q2(91) := 0.917807
+  NATIVE_Q3(91) := -0.052072
+  NATIVE_BVX(91) := 2.109913
+  NATIVE_BVY(91) := -0.000000
+  NATIVE_BVZ(91) := -0.512682
+  NATIVE_Q0(92) := 0.261074
+  NATIVE_Q1(92) := -0.294550
+  NATIVE_Q2(92) := 0.917807
+  NATIVE_Q3(92) := -0.052072
+  NATIVE_BVX(92) := 0.000000
+  NATIVE_BVY(92) := 0.000000
+  NATIVE_BVZ(92) := 0.000000
+
+  ! Initialize native contact matrix
+  DO I = 1, NRES
+    DO J = 1, NRES
+      NATIVE_CONTACT(I, J) := 0
+      CONTACT_INTER(I, J) := 0
+      NATIVE_R0(I, J) := 0.0
+    ENDDO
+  ENDDO
+
+  ! Go-like contacts (|i-j| >= MIN_SEP, native Cα-Cα < 2.600000 model units)
+  NATIVE_CONTACT(33, 50) := 1
+  NATIVE_R0(33, 50) := 2.521151
+  NATIVE_CONTACT(50, 33) := 1
+  NATIVE_R0(50, 33) := 2.521151
+
+  ! Breakable cystine restraints (CYS_ON=0 = deleted disulfide)
+  CYS_I(1) := 22
+  CYS_J(1) := 34
+  CYS_R0(1) := 4.245145
+  CYS_ON(1) := 1
+  CYS_I(2) := 23
+  CYS_J(2) := 32
+  CYS_R0(2) := 4.235858
+  CYS_ON(2) := 1
+  CYS_I(3) := 24
+  CYS_J(3) := 31
+  CYS_R0(3) := 4.439720
+  CYS_ON(3) := 1
+  CYS_I(4) := 25
+  CYS_J(4) := 33
+  CYS_R0(4) := 4.211143
+  CYS_ON(4) := 1
+  CYS_I(5) := 30
+  CYS_J(5) := 50
+  CYS_R0(5) := 4.236974
+  CYS_ON(5) := 1
+  CYS_I(6) := 35
+  CYS_J(6) := 57
+  CYS_R0(6) := 4.080316
+  CYS_ON(6) := 1
+  CYS_I(7) := 36
+  CYS_J(7) := 55
+  CYS_R0(7) := 4.245659
+  CYS_ON(7) := 1
+  CYS_I(8) := 37
+  CYS_J(8) := 54
+  CYS_R0(8) := 4.190961
+  CYS_ON(8) := 1
+  CYS_I(9) := 38
+  CYS_J(9) := 53
+  CYS_R0(9) := 4.047260
+  CYS_ON(9) := 1
+  CYS_I(10) := 39
+  CYS_J(10) := 52
+  CYS_R0(10) := 4.294076
+  CYS_ON(10) := 1
+  CYS_I(11) := 40
+  CYS_J(11) := 51
+  CYS_R0(11) := 4.156058
+  CYS_ON(11) := 1
+  CYS_I(12) := 41
+  CYS_J(12) := 49
+  CYS_R0(12) := 4.106807
+  CYS_ON(12) := 1
+  CYS_I(13) := 43
+  CYS_J(13) := 48
+  CYS_R0(13) := 4.410787
+  CYS_ON(13) := 1
+  CYS_I(14) := 74
+  CYS_J(14) := 92
+  CYS_R0(14) := 4.276137
+  CYS_ON(14) := 1
+  CYS_I(15) := 75
+  CYS_J(15) := 91
+  CYS_R0(15) := 4.317670
+  CYS_ON(15) := 1
+  CYS_I(16) := 76
+  CYS_J(16) := 90
+  CYS_R0(16) := 4.279145
+  CYS_ON(16) := 1
+  CYS_I(17) := 77
+  CYS_J(17) := 89
+  CYS_R0(17) := 4.321135
+  CYS_ON(17) := 1
+  CYS_I(18) := 78
+  CYS_J(18) := 88
+  CYS_R0(18) := 4.324911
+  CYS_ON(18) := 1
+  CYS_I(19) := 79
+  CYS_J(19) := 87
+  CYS_R0(19) := 4.061210
+  CYS_ON(19) := 1
+
+  RETURN
+END
+SUBROUTINE UPDATE_THERMAL(FRAME)
+  INTEGER :: FRAME
+  INTEGER :: HS, HE, CE
+  INTEGER :: HALF, QTR, CYC
+  REAL :: FRAC
+
+  THERMAL_CURRENT := HEAT_START
+
+  IF SCHEDULE_SCALED = 1 THEN
+    ! Two heat/cool cycles spanning the first half of MAXFRAME
+    ! (legacy shape preserved: cycle length = HALF/2, like 600 = 1200/2)
+    HALF := MAXFRAME / 2
+    QTR := HALF / 4
+    IF FRAME < HALF THEN
+      CYC := MOD(FRAME, 2 * QTR)
+      IF CYC < QTR THEN
+        FRAC := REAL(CYC) / REAL(QTR)
+        THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * FRAC
+      ELSE
+        FRAC := REAL(CYC - QTR) / REAL(QTR)
+        THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * FRAC
+      ENDIF
+    ELSE
+      THERMAL_CURRENT := HEAT_START
+    ENDIF
+  ELSE
+    ! Legacy: two heat/cool cycles hard-coded into frames 0-1200
+    IF FRAME < 300 THEN
+      FRAC := REAL(FRAME) / 300.0
+      THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * FRAC
+    ELSEIF FRAME < 600 THEN
+      FRAC := REAL(FRAME - 300) / 300.0
+      THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * FRAC
+    ELSEIF FRAME < 900 THEN
+      FRAC := REAL(FRAME - 600) / 300.0
+      THERMAL_CURRENT := HEAT_START + (HEAT_PEAK - HEAT_START) * FRAC
+    ELSEIF FRAME < 1200 THEN
+      FRAC := REAL(FRAME - 900) / 300.0
+      THERMAL_CURRENT := HEAT_PEAK - (HEAT_PEAK - HEAT_START) * FRAC
+    ELSE
+      THERMAL_CURRENT := HEAT_START
+    ENDIF
+  ENDIF
+
+  
+  ! Quench tail: zero thermal noise after frame 76800
+  IF FRAME > 76800 THEN
+    THERMAL_CURRENT := 0.0
+  ENDIF
+
+
+  RETURN
+END
+
+SUBROUTINE UPDATE_HBONDS()
+  INTEGER :: I, J, DEG_I, DEG_J, NF, NB
+  REAL :: DX, DY, DZ, D, ALIGN
+
+  NF := 0
+  NB := 0
+
+  ! Count current degrees
+  DO I = 1, NRES
+    DEG_I := 0
+    DO J = 1, NRES
+      IF HBOND_MATRIX(I, J) = 1 THEN
+        DEG_I := DEG_I + 1
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Break weak H-bonds
+  DO I = 1, NRES-3
+    DO J = I+3, NRES
+      IF HBOND_MATRIX(I, J) = 1 THEN
+        DX := RES_X(I) - RES_X(J)
+        DY := RES_Y(I) - RES_Y(J)
+        DZ := RES_Z(I) - RES_Z(J)
+        D := SQRT(DX*DX + DY*DY + DZ*DZ)
+        ALIGN := COS(RES_THETA(I) - RES_THETA(J))
+        IF ALIGN < HB_PHASE_STABLE .OR. D > HB_BREAK THEN
+          HBOND_MATRIX(I, J) := 0
+          HBOND_MATRIX(J, I) := 0
+          NB := NB + 1
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Form new H-bonds
+  DO I = 1, NRES-3
+    DEG_I := 0
+    DO J = 1, NRES
+      IF HBOND_MATRIX(I, J) = 1 THEN
+        DEG_I := DEG_I + 1
+      ENDIF
+    ENDDO
+    IF DEG_I < HB_CAP THEN
+      DO J = I+3, NRES
+        IF HBOND_MATRIX(I, J) = 0 THEN
+          DEG_J := 0
+          DO K = 1, NRES
+            IF HBOND_MATRIX(J, K) = 1 THEN
+              DEG_J := DEG_J + 1
+            ENDIF
+          ENDDO
+          IF DEG_J < HB_CAP THEN
+            DX := RES_X(I) - RES_X(J)
+            DY := RES_Y(I) - RES_Y(J)
+            DZ := RES_Z(I) - RES_Z(J)
+            D := SQRT(DX*DX + DY*DY + DZ*DZ)
+            ALIGN := COS(RES_THETA(I) - RES_THETA(J))
+            IF D < HB_FORM .AND. ALIGN > HB_PHASE_FORM THEN
+              HBOND_MATRIX(I, J) := 1
+              HBOND_MATRIX(J, I) := 1
+              NF := NF + 1
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDIF
+  ENDDO
+
+  HB_FORMS := NF
+  HB_BREAKS := NB
+
+  RETURN
+END
+
+SUBROUTINE COMPUTE_DIAGNOSTICS()
+  INTEGER :: I, J, N_ACTIVE
+  REAL :: CX, CY, CZ, SUM_ANG, SUM_ANGSQ
+  REAL :: U_X, U_Y, U_Z, V_X, V_Y, V_Z, U_MAG, V_MAG, COS_ANG
+  REAL :: B1X, B1Y, B1Z, B2X, B2Y, B2Z, B3X, B3Y, B3Z
+  REAL :: N1X, N1Y, N1Z, N2X, N2Y, N2Z, N1MAG2, N2MAG2, B2MAG
+  REAL :: N1MAG, N2MAG, PHI_ACTUAL
+  REAL :: DX, DY, DZ, D, E, G
+  REAL :: SUM_PHI2, COS_DIFF
+
+  ! Radius of gyration
+  CX := 0.0
+  CY := 0.0
+  CZ := 0.0
+  DO I = 1, NRES
+    CX := CX + RES_X(I)
+    CY := CY + RES_Y(I)
+    CZ := CZ + RES_Z(I)
+  ENDDO
+  CX := CX / REAL(NRES)
+  CY := CY / REAL(NRES)
+  CZ := CZ / REAL(NRES)
+  RGYR := 0.0
+  DO I = 1, NRES
+    RGYR := RGYR + (RES_X(I) - CX)**2 + (RES_Y(I) - CY)**2 + (RES_Z(I) - CZ)**2
+  ENDDO
+  RGYR := SQRT(RGYR / REAL(NRES))
+
+  ! End-to-end distance
+  E2E := SQRT((RES_X(NRES) - RES_X(92))**2 + (RES_Y(NRES) - RES_Y(92))**2 + (RES_Z(NRES) - RES_Z(92))**2)
+
+  ! Backbone angles
+  SUM_ANG := 0.0
+  SUM_ANGSQ := 0.0
+  N_ACTIVE := 0
+  DO I = 2, NRES-1
+    U_X := RES_X(I-1) - RES_X(I)
+    U_Y := RES_Y(I-1) - RES_Y(I)
+    U_Z := RES_Z(I-1) - RES_Z(I)
+    V_X := RES_X(I+1) - RES_X(I)
+    V_Y := RES_Y(I+1) - RES_Y(I)
+    V_Z := RES_Z(I+1) - RES_Z(I)
+    U_MAG := SQRT(U_X*U_X + U_Y*U_Y + U_Z*U_Z)
+    V_MAG := SQRT(V_X*V_X + V_Y*V_Y + V_Z*V_Z)
+    IF U_MAG > 1.0E-12 .AND. V_MAG > 1.0E-12 THEN
+      COS_ANG := MAX(-1.0, MIN(1.0, (U_X*V_X + U_Y*V_Y + U_Z*V_Z) / (U_MAG * V_MAG)))
+      SUM_ANG := SUM_ANG + ACOS(COS_ANG) * 180.0 / 3.14159265
+      SUM_ANGSQ := SUM_ANGSQ + (ACOS(COS_ANG) * 180.0 / 3.14159265) ** 2
+      N_ACTIVE := N_ACTIVE + 1
+    ENDIF
+  ENDDO
+  IF N_ACTIVE > 0 THEN
+    BANG_MEAN := SUM_ANG / REAL(N_ACTIVE)
+    BANG_RMS := SQRT(MAX(0.0, SUM_ANGSQ / REAL(N_ACTIVE) - BANG_MEAN**2))
+  ELSE
+    BANG_MEAN := 0.0
+    BANG_RMS := 0.0
+  ENDIF
+
+  ! Actual torsion angles from current geometry
+  SUM_TORS := 0.0
+  CNT_TORS := 0.0
+  ALPHA_FRAC := 0.0
+  DO I = 2, NRES-2
+    B1X := RES_X(I) - RES_X(I-1)
+    B1Y := RES_Y(I) - RES_Y(I-1)
+    B1Z := RES_Z(I) - RES_Z(I-1)
+    B2X := RES_X(I+1) - RES_X(I)
+    B2Y := RES_Y(I+1) - RES_Y(I)
+    B2Z := RES_Z(I+1) - RES_Z(I)
+    B3X := RES_X(I+2) - RES_X(I+1)
+    B3Y := RES_Y(I+2) - RES_Y(I+1)
+    B3Z := RES_Z(I+2) - RES_Z(I+1)
+
+    N1X := B1Y*B2Z - B1Z*B2Y
+    N1Y := B1Z*B2X - B1X*B2Z
+    N1Z := B1X*B2Y - B1Y*B2X
+    N2X := B2Y*B3Z - B2Z*B3Y
+    N2Y := B2Z*B3X - B2X*B3Z
+    N2Z := B2X*B3Y - B2Y*B3X
+
+    N1MAG2 := N1X*N1X + N1Y*N1Y + N1Z*N1Z
+    N2MAG2 := N2X*N2X + N2Y*N2Y + N2Z*N2Z
+    B2MAG := SQRT(B2X*B2X + B2Y*B2Y + B2Z*B2Z)
+
+    IF N1MAG2 > 1.0E-12 .AND. N2MAG2 > 1.0E-12 .AND. B2MAG > 1.0E-12 THEN
+      N1MAG := SQRT(N1MAG2)
+      N2MAG := SQRT(N2MAG2)
+      PHI_ACTUAL := ATAN2(B2MAG*(B1X*N2X + B1Y*N2Y + B1Z*N2Z), N1X*N2X + N1Y*N2Y + N1Z*N2Z)
+      ! Wrap to (-pi, pi] and report in degrees
+      IF PHI_ACTUAL > 3.14159265 THEN
+        PHI_ACTUAL := PHI_ACTUAL - 2.0 * 3.14159265
+      ENDIF
+      IF PHI_ACTUAL ≤ -3.14159265 THEN
+        PHI_ACTUAL := PHI_ACTUAL + 2.0 * 3.14159265
+      ENDIF
+      SUM_TORS := SUM_TORS + PHI_ACTUAL * 180.0 / 3.14159265
+      CNT_TORS := CNT_TORS + 1.0
+      ! Alpha helix: within ±25 degrees of 50 degrees
+      IF ABS(PHI_ACTUAL * 180.0 / 3.14159265 - 50.0) < 25.0 THEN
+        ALPHA_FRAC := ALPHA_FRAC + 1.0
+      ENDIF
+    ENDIF
+  ENDDO
+  IF CNT_TORS > 0.0 THEN
+    TORS_MEAN := SUM_TORS / CNT_TORS
+    ALPHA_FRAC := ALPHA_FRAC / CNT_TORS
+  ELSE
+    TORS_MEAN := 0.0
+    ALPHA_FRAC := 0.0
+  ENDIF
+
+  ! Count H-bonds by type
+  I3CNT := 0
+  I4CNT := 0
+  ILCNT := 0
+  NHBOND := 0
+  DO I = 1, NRES
+    DO J = I+3, NRES
+      IF HBOND_MATRIX(I, J) = 1 THEN
+        NHBOND := NHBOND + 1
+        IF J - I = 3 THEN
+          I3CNT := I3CNT + 1
+        ELSEIF J - I = 4 THEN
+          I4CNT := I4CNT + 1
+        ELSE
+          ILCNT := ILCNT + 1
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Energy accounting from current geometry
+  E_MORSE := 0.0
+  E_ANGLE := 0.0
+  E_TORSION := 0.0
+  E_HYDRO := 0.0
+
+  ! Morse bond energy (backbone)
+  DO I = 1, NRES-1
+    DX := RES_X(I) - RES_X(I+1)
+    DY := RES_Y(I) - RES_Y(I+1)
+    DZ := RES_Z(I) - RES_Z(I+1)
+    D := SQRT(DX*DX + DY*DY + DZ*DZ)
+    G := EXP(-MORSE_A * (D - BACKBONE_R0))
+    E_MORSE := E_MORSE + BACKBONE_D * (1.0 - G) * (1.0 - G)
+  ENDDO
+
+  ! Angle bending energy
+  DO I = 2, NRES-1
+    BX := RES_X(I-1) - RES_X(I)
+    BY := RES_Y(I-1) - RES_Y(I)
+    BZ := RES_Z(I-1) - RES_Z(I)
+    CX := RES_X(I+1) - RES_X(I)
+    CY := RES_Y(I+1) - RES_Y(I)
+    CZ := RES_Z(I+1) - RES_Z(I)
+    U_MAG := SQRT(BX*BX + BY*BY + BZ*BZ)
+    V_MAG := SQRT(CX*CX + CY*CY + CZ*CZ)
+    IF U_MAG > 1.0E-12 .AND. V_MAG > 1.0E-12 THEN
+      COS_ANG := MAX(-1.0, MIN(1.0, (BX*CX + BY*CY + BZ*CZ) / (U_MAG * V_MAG)))
+      E_ANGLE := E_ANGLE + RES_ANGK(I) * (COS_ANG - COS(RES_ANGT0(I)))**2
+    ENDIF
+  ENDDO
+
+  ! Torsion energy from current geometry (matches 2*k*(1-cos(dphi)) force)
+  DO I = 2, NRES-2
+    B1X := RES_X(I) - RES_X(I-1)
+    B1Y := RES_Y(I) - RES_Y(I-1)
+    B1Z := RES_Z(I) - RES_Z(I-1)
+    B2X := RES_X(I+1) - RES_X(I)
+    B2Y := RES_Y(I+1) - RES_Y(I)
+    B2Z := RES_Z(I+1) - RES_Z(I)
+    B3X := RES_X(I+2) - RES_X(I+1)
+    B3Y := RES_Y(I+2) - RES_Y(I+1)
+    B3Z := RES_Z(I+2) - RES_Z(I+1)
+
+    N1X := B1Y*B2Z - B1Z*B2Y
+    N1Y := B1Z*B2X - B1X*B2Z
+    N1Z := B1X*B2Y - B1Y*B2X
+    N2X := B2Y*B3Z - B2Z*B3Y
+    N2Y := B2Z*B3X - B2X*B3Z
+    N2Z := B2X*B3Y - B2Y*B3X
+
+    N1MAG2 := N1X*N1X + N1Y*N1Y + N1Z*N1Z
+    N2MAG2 := N2X*N2X + N2Y*N2Y + N2Z*N2Z
+    B2MAG := SQRT(B2X*B2X + B2Y*B2Y + B2Z*B2Z)
+
+    IF N1MAG2 > 1.0E-12 .AND. N2MAG2 > 1.0E-12 .AND. B2MAG > 1.0E-12 THEN
+      N1MAG := SQRT(N1MAG2)
+      N2MAG := SQRT(N2MAG2)
+      PHI_ACTUAL := ATAN2(B2MAG*(N1X*N2X + N1Y*N2Y + N1Z*N2Z), N1MAG*N2MAG)
+      COS_DIFF := COS(PHI_ACTUAL - RES_TORSP0(I))
+      E_TORSION := E_TORSION + 2.0 * RES_TORSK(I) * (1.0 - COS_DIFF)
+    ENDIF
+  ENDDO
+
+  ! Hydrophobic energy corresponding to the attractive force (Cα-Cα)
+  DO I = 1, NRES-4
+    DO J = I+4, NRES
+      IF RES_HYDRO(I) > 0.0 .AND. RES_HYDRO(J) > 0.0 THEN
+        DX := RES_X(I) - RES_X(J)
+        DY := RES_Y(I) - RES_Y(J)
+        DZ := RES_Z(I) - RES_Z(J)
+        D := SQRT(DX*DX + DY*DY + DZ*DZ)
+        IF D < HYDRO_CUTOFF .AND. D > 0.0 THEN
+          E_HYDRO := E_HYDRO - (HYDRO_STRENGTH / HYDRO_ALPHA) * RES_HYDRO(I) * RES_HYDRO(J) * &
+                     EXP(-HYDRO_ALPHA * (D - HYDRO_R0))
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  ! Go-like native contact energy (harmonic; same DOCK_FROM gate as force)
+  E_NATIVE := 0.0
+  DO I = 1, NRES-3
+    DO J = I+3, NRES
+      IF NATIVE_CONTACT(I, J) = 1 THEN
+        IF CONTACT_INTER(I, J) = 0 .OR. FRAME > DOCK_FROM THEN
+          DX := RES_X(I) - RES_X(J)
+          DY := RES_Y(I) - RES_Y(J)
+          DZ := RES_Z(I) - RES_Z(J)
+          D := SQRT(DX*DX + DY*DY + DZ*DZ)
+          IF D > 0.0 THEN
+            E_NATIVE := E_NATIVE + NATIVE_K * (D - NATIVE_R0(I, J))**2
+          ENDIF
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+
+  RETURN
+END
+
+SUBROUTINE COMPUTE_RMSD()
+  INTEGER :: I, J, ITER, K
+  INTEGER :: P, Q, NSW, I0
+  REAL :: XC, YC, ZC, XN, YN, ZN
+  REAL :: SXX, SXY, SXZ, SYX, SYY, SYZ, SZX, SZY, SZZ
+  REAL :: N44(4,4), V44(4,4), VEC(4), NEWVEC(4), LAMBDA, NORM
+  REAL :: OFF, TAU, TT, C, SN, AKP, AKQ, APK, AQR, VKP, VKQ
+  REAL :: G_CUR, G_NAT, SUM_DIST_SQ
+  REAL :: RX, RY, RZ, NX, NY, NZ
+  REAL :: Q0, Q1, Q2, Q3, QQ
+  REAL :: R11, R12, R13, R21, R22, R23, R31, R32, R33
+  REAL :: TX, TY, TZ
+
+  ! Center current structure
+  XC := 0.0
+  YC := 0.0
+  ZC := 0.0
+  DO I = 1, NRES
+    XC := XC + RES_X(I)
+    YC := YC + RES_Y(I)
+    ZC := ZC + RES_Z(I)
+  ENDDO
+  XC := XC / REAL(NRES)
+  YC := YC / REAL(NRES)
+  ZC := ZC / REAL(NRES)
+
+  ! Center native structure
+  XN := 0.0
+  YN := 0.0
+  ZN := 0.0
+  DO I = 1, NRES
+    XN := XN + NATIVE_X(I)
+    YN := YN + NATIVE_Y(I)
+    ZN := ZN + NATIVE_Z(I)
+  ENDDO
+  XN := XN / REAL(NRES)
+  YN := YN / REAL(NRES)
+  ZN := ZN / REAL(NRES)
+
+  ! Compute covariance matrix S = sum(cur_i * nat_i^T)
+  SXX := 0.0
+  SXY := 0.0
+  SXZ := 0.0
+  SYX := 0.0
+  SYY := 0.0
+  SYZ := 0.0
+  SZX := 0.0
+  SZY := 0.0
+  SZZ := 0.0
+  G_CUR := 0.0
+  G_NAT := 0.0
+  DO I = 1, NRES
+    RX := RES_X(I) - XC
+    RY := RES_Y(I) - YC
+    RZ := RES_Z(I) - ZC
+    NX := NATIVE_X(I) - XN
+    NY := NATIVE_Y(I) - YN
+    NZ := NATIVE_Z(I) - ZN
+    SXX := SXX + RX * NX
+    SXY := SXY + RX * NY
+    SXZ := SXZ + RX * NZ
+    SYX := SYX + RY * NX
+    SYY := SYY + RY * NY
+    SYZ := SYZ + RY * NZ
+    SZX := SZX + RZ * NX
+    SZY := SZY + RZ * NY
+    SZZ := SZZ + RZ * NZ
+    G_CUR := G_CUR + RX*RX + RY*RY + RZ*RZ
+    G_NAT := G_NAT + NX*NX + NY*NY + NZ*NZ
+  ENDDO
+
+  ! Build quaternion matrix N for Kabsch optimal rotation
+  N44(1,1) := SXX + SYY + SZZ
+  N44(1,2) := SYZ - SZY
+  N44(1,3) := SZX - SXZ
+  N44(1,4) := SXY - SYX
+  N44(2,1) := SYZ - SZY
+  N44(2,2) := SXX - SYY - SZZ
+  N44(2,3) := SXY + SYX
+  N44(2,4) := SXZ + SZX
+  N44(3,1) := SZX - SXZ
+  N44(3,2) := SXY + SYX
+  N44(3,3) := -SXX + SYY - SZZ
+  N44(3,4) := SYZ + SZY
+  N44(4,1) := SXY - SYX
+  N44(4,2) := SXZ + SZX
+  N44(4,3) := SYZ + SZY
+  N44(4,4) := -SXX - SYY + SZZ
+
+  ! Cyclic Jacobi eigensolve for the largest eigenpair of N44.
+  ! (viviani_4d_ed-certified block, as used in h2_wig/h4_wig CI.
+  !  Replaces power iteration, which failed whenever the top
+  !  eigenvector was near-orthogonal to the fixed start vector —
+  !  i.e. exactly on far-from-native structures.)
+  DO P = 1, 4
+    DO Q = 1, 4
+      V44(P, Q) := 0.0
+    ENDDO
+    V44(P, P) := 1.0
+  ENDDO
+  DO NSW = 1, 50
+    OFF := 0.0
+    DO P = 1, 4
+      DO Q = 1, 4
+        OFF := OFF + N44(P, Q) * N44(P, Q)
+      ENDDO
+      OFF := OFF - N44(P, P) * N44(P, P)
+    ENDDO
+    OFF := SQRT(MAX(OFF, 0.0))
+    IF (OFF >= 1.0E-14) THEN
+      DO P = 1, 3
+        DO Q = P + 1, 4
+          IF (ABS(N44(P, Q)) > 1.0E-16) THEN
+            TAU := (N44(Q, Q) - N44(P, P)) / (2.0 * N44(P, Q))
+            IF (TAU /= 0.0) THEN
+              TT := SIGN(1.0, TAU) / (ABS(TAU) + SQRT(1.0 + TAU * TAU))
+            ELSE
+              TT := 1.0
+            ENDIF
+            C := 1.0 / SQRT(1.0 + TT * TT)
+            SN := TT * C
+            DO K = 1, 4
+              AKP := N44(K, P)
+              AKQ := N44(K, Q)
+              N44(K, P) := C * AKP - SN * AKQ
+              N44(K, Q) := SN * AKP + C * AKQ
+            ENDDO
+            DO K = 1, 4
+              APK := N44(P, K)
+              AQR := N44(Q, K)
+              N44(P, K) := C * APK - SN * AQR
+              N44(Q, K) := SN * APK + C * AQR
+            ENDDO
+            DO K = 1, 4
+              VKP := V44(K, P)
+              VKQ := V44(K, Q)
+              V44(K, P) := C * VKP - SN * VKQ
+              V44(K, Q) := SN * VKP + C * VKQ
+            ENDDO
+          ENDIF
+        ENDDO
+      ENDDO
+    ENDIF
+  ENDDO
+  I0 := 1
+  LAMBDA := N44(1, 1)
+  DO P = 2, 4
+    IF (N44(P, P) > LAMBDA) THEN
+      LAMBDA := N44(P, P)
+      I0 := P
+    ENDIF
+  ENDDO
+  VEC(1) := V44(1, I0)
+  VEC(2) := V44(2, I0)
+  VEC(3) := V44(3, I0)
+  VEC(4) := V44(4, I0)
+
+  ! Rayleigh quotient for largest eigenvalue
+  LAMBDA := VEC(1)*(N44(1,1)*VEC(1) + N44(1,2)*VEC(2) + N44(1,3)*VEC(3) + N44(1,4)*VEC(4)) + &
+            VEC(2)*(N44(2,1)*VEC(1) + N44(2,2)*VEC(2) + N44(2,3)*VEC(3) + N44(2,4)*VEC(4)) + &
+            VEC(3)*(N44(3,1)*VEC(1) + N44(3,2)*VEC(2) + N44(3,3)*VEC(3) + N44(3,4)*VEC(4)) + &
+            VEC(4)*(N44(4,1)*VEC(1) + N44(4,2)*VEC(2) + N44(4,3)*VEC(3) + N44(4,4)*VEC(4))
+
+  ! Build rotation matrix from unit quaternion eigenvector
+  Q0 := VEC(1)
+  Q1 := VEC(2)
+  Q2 := VEC(3)
+  Q3 := VEC(4)
+  QQ := Q0*Q0 + Q1*Q1 + Q2*Q2 + Q3*Q3
+  IF QQ > 1.0E-12 THEN
+    QQ := SQRT(QQ)
+    Q0 := Q0 / QQ
+    Q1 := Q1 / QQ
+    Q2 := Q2 / QQ
+    Q3 := Q3 / QQ
+  ENDIF
+  R11 := Q0*Q0 + Q1*Q1 - Q2*Q2 - Q3*Q3
+  R12 := 2.0*(Q1*Q2 - Q0*Q3)
+  R13 := 2.0*(Q1*Q3 + Q0*Q2)
+  R21 := 2.0*(Q1*Q2 + Q0*Q3)
+  R22 := Q0*Q0 - Q1*Q1 + Q2*Q2 - Q3*Q3
+  R23 := 2.0*(Q2*Q3 - Q0*Q1)
+  R31 := 2.0*(Q1*Q3 - Q0*Q2)
+  R32 := 2.0*(Q2*Q3 + Q0*Q1)
+  R33 := Q0*Q0 - Q1*Q1 - Q2*Q2 + Q3*Q3
+
+  ! RMSD after optimal rotation
+  SUM_DIST_SQ := 0.0
+  DO I = 1, NRES
+    RX := RES_X(I) - XC
+    RY := RES_Y(I) - YC
+    RZ := RES_Z(I) - ZC
+    TX := R11*RX + R12*RY + R13*RZ
+    TY := R21*RX + R22*RY + R23*RZ
+    TZ := R31*RX + R32*RY + R33*RZ
+    NX := NATIVE_X(I) - XN
+    NY := NATIVE_Y(I) - YN
+    NZ := NATIVE_Z(I) - ZN
+    SUM_DIST_SQ := SUM_DIST_SQ + (TX - NX)**2 + (TY - NY)**2 + (TZ - NZ)**2
+  ENDDO
+  RMSD_NATIVE := SQRT(SUM_DIST_SQ / REAL(NRES))
+
+  RETURN
+END
+
+SUBROUTINE COMPUTE_RMSD_CHAINS()
+  ! Per-chain Kabsch RMSD telemetry (folding-kinetics read, 2026-08-23).
+  ! Segments derived from CHAIN_BREAK / CHAIN_BREAK2; single-chain systems
+  ! get RMSD_CHAIN(1) == RMSD_NATIVE. Pure instrumentation: reads only.
+  INTEGER :: I, K, C
+  INTEGER :: P, Q, NSW, I0
+  INTEGER :: LO, HI, SEGN
+  REAL :: XC, YC, ZC, XN, YN, ZN
+  REAL :: SXX, SXY, SXZ, SYX, SYY, SYZ, SZX, SZY, SZZ
+  REAL :: N44(4,4), V44(4,4), VEC(4), LAMBDA
+  REAL :: OFF, TAU, TT, CS, SN, AKP, AKQ, APK, AQR, VKP, VKQ
+  REAL :: SUM_DIST_SQ
+  REAL :: RX, RY, RZ, NX, NY, NZ
+  REAL :: Q0, Q1, Q2, Q3, QQ
+  REAL :: R11, R12, R13, R21, R22, R23, R31, R32, R33
+  REAL :: TX, TY, TZ
+
+  NCHAINR := 1
+  SEG_LO(1) := 1
+  SEG_HI(1) := NRES
+  SEG_LO(2) := 0
+  SEG_HI(2) := 0
+  SEG_LO(3) := 0
+  SEG_HI(3) := 0
+  SEG_LO(4) := 0
+  SEG_HI(4) := 0
+  IF CHAIN_BREAK > 0 THEN
+    NCHAINR := 2
+    SEG_HI(1) := CHAIN_BREAK
+    SEG_LO(2) := CHAIN_BREAK + 1
+    SEG_HI(2) := NRES
+    IF CHAIN_BREAK2 > 0 THEN
+      NCHAINR := 3
+      SEG_HI(2) := CHAIN_BREAK2
+      SEG_LO(3) := CHAIN_BREAK2 + 1
+      SEG_HI(3) := NRES
+      IF CHAIN_BREAK3 > 0 THEN
+        NCHAINR := 4
+        SEG_HI(3) := CHAIN_BREAK3
+        SEG_LO(4) := CHAIN_BREAK3 + 1
+        SEG_HI(4) := NRES
+      ENDIF
+    ENDIF
+  ENDIF
+  DO C = 1, 4
+    RMSD_CHAIN(C) := 0.0
+  ENDDO
+
+  DO C = 1, NCHAINR
+    LO := SEG_LO(C)
+    HI := SEG_HI(C)
+    SEGN := HI - LO + 1
+
+    XC := 0.0
+    YC := 0.0
+    ZC := 0.0
+    DO I = LO, HI
+      XC := XC + RES_X(I)
+      YC := YC + RES_Y(I)
+      ZC := ZC + RES_Z(I)
+    ENDDO
+    XC := XC / REAL(SEGN)
+    YC := YC / REAL(SEGN)
+    ZC := ZC / REAL(SEGN)
+
+    XN := 0.0
+    YN := 0.0
+    ZN := 0.0
+    DO I = LO, HI
+      XN := XN + NATIVE_X(I)
+      YN := YN + NATIVE_Y(I)
+      ZN := ZN + NATIVE_Z(I)
+    ENDDO
+    XN := XN / REAL(SEGN)
+    YN := YN / REAL(SEGN)
+    ZN := ZN / REAL(SEGN)
+
+    SXX := 0.0
+    SXY := 0.0
+    SXZ := 0.0
+    SYX := 0.0
+    SYY := 0.0
+    SYZ := 0.0
+    SZX := 0.0
+    SZY := 0.0
+    SZZ := 0.0
+    DO I = LO, HI
+      RX := RES_X(I) - XC
+      RY := RES_Y(I) - YC
+      RZ := RES_Z(I) - ZC
+      NX := NATIVE_X(I) - XN
+      NY := NATIVE_Y(I) - YN
+      NZ := NATIVE_Z(I) - ZN
+      SXX := SXX + RX * NX
+      SXY := SXY + RX * NY
+      SXZ := SXZ + RX * NZ
+      SYX := SYX + RY * NX
+      SYY := SYY + RY * NY
+      SYZ := SYZ + RY * NZ
+      SZX := SZX + RZ * NX
+      SZY := SZY + RZ * NY
+      SZZ := SZZ + RZ * NZ
+    ENDDO
+
+    N44(1,1) := SXX + SYY + SZZ
+    N44(1,2) := SYZ - SZY
+    N44(1,3) := SZX - SXZ
+    N44(1,4) := SXY - SYX
+    N44(2,1) := SYZ - SZY
+    N44(2,2) := SXX - SYY - SZZ
+    N44(2,3) := SXY + SYX
+    N44(2,4) := SXZ + SZX
+    N44(3,1) := SZX - SXZ
+    N44(3,2) := SXY + SYX
+    N44(3,3) := -SXX + SYY - SZZ
+    N44(3,4) := SYZ + SZY
+    N44(4,1) := SXY - SYX
+    N44(4,2) := SXZ + SZX
+    N44(4,3) := SYZ + SZY
+    N44(4,4) := -SXX - SYY + SZZ
+
+    DO P = 1, 4
+      DO Q = 1, 4
+        V44(P, Q) := 0.0
+      ENDDO
+      V44(P, P) := 1.0
+    ENDDO
+    DO NSW = 1, 50
+      OFF := 0.0
+      DO P = 1, 4
+        DO Q = 1, 4
+          OFF := OFF + N44(P, Q) * N44(P, Q)
+        ENDDO
+        OFF := OFF - N44(P, P) * N44(P, P)
+      ENDDO
+      OFF := SQRT(MAX(OFF, 0.0))
+      IF (OFF >= 1.0E-14) THEN
+        DO P = 1, 3
+          DO Q = P + 1, 4
+            IF (ABS(N44(P, Q)) > 1.0E-16) THEN
+              TAU := (N44(Q, Q) - N44(P, P)) / (2.0 * N44(P, Q))
+              IF (TAU /= 0.0) THEN
+                TT := SIGN(1.0, TAU) / (ABS(TAU) + SQRT(1.0 + TAU * TAU))
+              ELSE
+                TT := 1.0
+              ENDIF
+              CS := 1.0 / SQRT(1.0 + TT * TT)
+              SN := TT * CS
+              DO K = 1, 4
+                AKP := N44(K, P)
+                AKQ := N44(K, Q)
+                N44(K, P) := CS * AKP - SN * AKQ
+                N44(K, Q) := SN * AKP + CS * AKQ
+              ENDDO
+              DO K = 1, 4
+                APK := N44(P, K)
+                AQR := N44(Q, K)
+                N44(P, K) := CS * APK - SN * AQR
+                N44(Q, K) := SN * APK + CS * AQR
+              ENDDO
+              DO K = 1, 4
+                VKP := V44(K, P)
+                VKQ := V44(K, Q)
+                V44(K, P) := CS * VKP - SN * VKQ
+                V44(K, Q) := SN * VKP + CS * VKQ
+              ENDDO
+            ENDIF
+          ENDDO
+        ENDDO
+      ENDIF
+    ENDDO
+    I0 := 1
+    LAMBDA := N44(1, 1)
+    DO P = 2, 4
+      IF (N44(P, P) > LAMBDA) THEN
+        LAMBDA := N44(P, P)
+        I0 := P
+      ENDIF
+    ENDDO
+    VEC(1) := V44(1, I0)
+    VEC(2) := V44(2, I0)
+    VEC(3) := V44(3, I0)
+    VEC(4) := V44(4, I0)
+
+    Q0 := VEC(1)
+    Q1 := VEC(2)
+    Q2 := VEC(3)
+    Q3 := VEC(4)
+    QQ := Q0*Q0 + Q1*Q1 + Q2*Q2 + Q3*Q3
+    IF QQ > 1.0E-12 THEN
+      QQ := SQRT(QQ)
+      Q0 := Q0 / QQ
+      Q1 := Q1 / QQ
+      Q2 := Q2 / QQ
+      Q3 := Q3 / QQ
+    ENDIF
+    R11 := Q0*Q0 + Q1*Q1 - Q2*Q2 - Q3*Q3
+    R12 := 2.0*(Q1*Q2 - Q0*Q3)
+    R13 := 2.0*(Q1*Q3 + Q0*Q2)
+    R21 := 2.0*(Q1*Q2 + Q0*Q3)
+    R22 := Q0*Q0 - Q1*Q1 + Q2*Q2 - Q3*Q3
+    R23 := 2.0*(Q2*Q3 - Q0*Q1)
+    R31 := 2.0*(Q1*Q3 - Q0*Q2)
+    R32 := 2.0*(Q2*Q3 + Q0*Q1)
+    R33 := Q0*Q0 - Q1*Q1 - Q2*Q2 + Q3*Q3
+
+    SUM_DIST_SQ := 0.0
+    DO I = LO, HI
+      RX := RES_X(I) - XC
+      RY := RES_Y(I) - YC
+      RZ := RES_Z(I) - ZC
+      TX := R11*RX + R12*RY + R13*RZ
+      TY := R21*RX + R22*RY + R23*RZ
+      TZ := R31*RX + R32*RY + R33*RZ
+      NX := NATIVE_X(I) - XN
+      NY := NATIVE_Y(I) - YN
+      NZ := NATIVE_Z(I) - ZN
+      SUM_DIST_SQ := SUM_DIST_SQ + (TX - NX)**2 + (TY - NY)**2 + (TZ - NZ)**2
+    ENDDO
+    RMSD_CHAIN(C) := SQRT(SUM_DIST_SQ / REAL(SEGN))
+  ENDDO
+
+  RETURN
+END
