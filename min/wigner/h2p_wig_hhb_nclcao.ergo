@@ -1,0 +1,227 @@
+! ════════════════════════════════════════════════════════════════════
+! H2P_WIG_HHB_NCLCAO (NEGATIVE CONTROL: wrong-sign midpoint oracle value, must SCANFAIL) — Stage W + HHB oracles (NCHK norm, W00 parity midpoint).
+! Rename: h2p_wig.ergo.txt -> h2p_wig.ergo
+! Run: python -m core min/handshake/h2p_wig.ergo -o /tmp/hw && /tmp/hw
+!      (7 R x 2 parities x 2500 imag-time steps on 128^3; expect
+!       tens of minutes total — same per-point cost class as h2p)
+!
+! Per (R, parity): converge the two-center orbital by imaginary time
+! (h2p.ergo production grid: NX=128, BOX=16, exact Coulomb, cell
+! centers, masked stencil, DTAU=0.008, NSTEPS=2500 — identical solver
+! physics, no RNG), then emit the bond-axis Wigner map:
+!   RZ(z,z') = sum_{x,y} psi(x,y,z) psi(x,y,z') DX^2   (trace = 1)
+!   W(z,p)   = (DZ/pi) sum_m RZ(z-m, z+m) COS(2 p m DZ)
+! p spans the full Nyquist range [-pi/(2 DZ), +pi/(2 DZ)] so the
+! WNORM = ∫∫W dz dp = 1 oracle stays exact.
+!
+! ORACLES (analytic 1s-combo mirror, wigner_mirror.py; tolerances per
+! wigner_handshake_spec.md — W0 to 2e-3, fringe p to 5%, depth to 15%):
+!   W0   = +1/pi (par=1) / -1/pi (par=2) at EVERY R  (1/pi = 0.3183098862)
+!   fringe trough (par=1): R=2: p=±1.296 d=-0.0228; R=3: ±0.905 -0.0622;
+!     R=4: ±0.685 -0.1104; R=6: ±0.489 -0.1921
+!   par=2: node pocket at (0,0), fringe = W0 itself
+!   R<=1.401 fringes are at the grid p-resolution edge -> qualitative.
+! ════════════════════════════════════════════════════════════════════
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 128
+REAL, PARAMETER :: BOX = 16.0
+INTEGER, PARAMETER :: NPTS = 2097152
+INTEGER, PARAMETER :: NXY = 16384
+INTEGER, PARAMETER :: NSTEPS = 2500
+REAL, PARAMETER :: DTAU = 0.008
+INTEGER, PARAMETER :: NP = 256
+
+STATIC REAL :: RLIST(7)
+DATA RLIST / 0.5, 1.0, 1.401, 2.0, 3.0, 4.0, 6.0 /
+
+STATIC REAL :: PSI(NPTS), PSIN(NPTS), V(NPTS)
+STATIC INTEGER :: BND(NPTS)
+STATIC REAL :: RZ(128,128), WG(128,256)
+
+REAL :: DX, DX2, IDX2, DV, X, Y, Z, R, RZD, RL, RR
+REAL :: LAP, NRM, NCHK, T_KE, V_PE, E_TOT, PI, PMAX, PV, WV
+REAL :: W00, WMIN, WMAX, PMIN, ACC, WN
+INTEGER :: I, J, K, IR, IP, T, IC, JC, KC, KC2, M2, MM, IPL
+INTEGER :: KA, KB
+
+PI := 3.14159265358979323846
+DX := 2.0 * BOX / REAL(NX)
+DX2 := DX * DX
+IDX2 := 1.0 / DX2
+DV := DX * DX * DX
+PMAX := PI / (2.0 * DX)
+
+! boundary mask (face cells zeroed and never used by interior stencils)
+DO K = 1, NPTS
+  BND(K) := 0
+  V(K) := 0.0
+ENDDO
+DO KC = 2, NX - 1
+  DO JC = 2, NX - 1
+    DO IC = 2, NX - 1
+      K := IC + (JC - 1) * NX + (KC - 1) * NXY
+      BND(K) := 1
+    ENDDO
+  ENDDO
+ENDDO
+
+DO IR = 1, 7
+  R := RLIST(IR)
+  RZD := 0.5 * R
+  DO IP = 1, 2
+    ! two-center potential + parity-selected start packet
+    DO K = 1, NPTS
+      KC := 1 + (K - 1) / NXY
+      JC := 1 + MOD((K - 1) / NX, NX)
+      IC := 1 + MOD(K - 1, NX)
+      X := -BOX + (REAL(IC) - 0.5) * DX
+      Y := -BOX + (REAL(JC) - 0.5) * DX
+      Z := -BOX + (REAL(KC) - 0.5) * DX
+      RL := SQRT(X * X + Y * Y + (Z + RZD) * (Z + RZD))
+      RR := SQRT(X * X + Y * Y + (Z - RZD) * (Z - RZD))
+      V(K) := -1.0 / RL - 1.0 / RR
+      IF (IP = 1) THEN
+        PSI(K) := EXP(-RL * RL) + EXP(-RR * RR)
+      ELSE
+        PSI(K) := EXP(-RL * RL) - EXP(-RR * RR)
+      ENDIF
+    ENDDO
+    NRM := 0.0
+    DO K = 1, NPTS
+      NRM := NRM + PSI(K) * PSI(K) * DV
+    ENDDO
+    NRM := SQRT(NRM)
+    DO K = 1, NPTS
+      PSI(K) := PSI(K) / NRM
+    ENDDO
+    NCHK := 1.0
+
+    ! imaginary time (identical solver physics to h2p.ergo)
+    VERIFY HANDSHAKE h2p_scf DEPTH=1 FRAME_BYTES=256 MAXIT=100 CONSERVE NORM VALUE=0.0 TOL=1.0E-10 PAYLOAD=(NRM) ORACLE NCHK VALUE=1.0 LIMIT=1.0E-9
+    DO T = 1, NSTEPS
+      DO K = NXY + 2, NPTS - NXY - 1
+        LAP := (PSI(K - 1) + PSI(K + 1) + PSI(K - NX) + PSI(K + NX) &
+          + PSI(K - NXY) + PSI(K + NXY) - 6.0 * PSI(K)) * IDX2
+        PSIN(K) := (PSI(K) + DTAU * (0.5 * LAP - V(K) * PSI(K))) &
+          * REAL(BND(K))
+      ENDDO
+      NRM := 0.0
+      DO K = 1, NPTS
+        NRM := NRM + PSIN(K) * PSIN(K) * DV
+      ENDDO
+      NRM := SQRT(NRM)
+      DO K = 1, NPTS
+        PSI(K) := PSIN(K) / NRM
+      ENDDO
+      NCHK := 0.0
+      DO K = 1, NPTS
+        NCHK := NCHK + PSI(K) * PSI(K) * DV
+      ENDDO
+      NCHK := SQRT(NCHK)
+    ENDDO
+
+    ! convergence energy line (diagnostic; grid budget per H2 findings)
+    T_KE := 0.0
+    V_PE := 0.0
+    DO K = NXY + 2, NPTS - NXY - 1
+      LAP := (PSI(K - 1) + PSI(K + 1) + PSI(K - NX) + PSI(K + NX) &
+        + PSI(K - NXY) + PSI(K + NXY) - 6.0 * PSI(K)) * IDX2
+      T_KE := T_KE - 0.5 * PSI(K) * LAP * DV
+      V_PE := V_PE + V(K) * PSI(K) * PSI(K) * DV
+    ENDDO
+    E_TOT := T_KE + V_PE
+    WRITE(*, "('ECONV %.3f %d %.10e')") R, IP, E_TOT
+
+    ! ── Wigner block ──────────────────────────────────────────────
+    ! RZ(z,z') accumulation over interior transverse columns
+    DO KC = 1, NX
+      DO KC2 = 1, NX
+        RZ(KC, KC2) := 0.0
+      ENDDO
+    ENDDO
+    DO JC = 2, NX - 1
+      DO IC = 2, NX - 1
+        DO KC = 1, NX
+          KA := IC + (JC - 1) * NX + (KC - 1) * NXY
+          DO KC2 = KC, NX
+            KB := IC + (JC - 1) * NX + (KC2 - 1) * NXY
+            RZ(KC, KC2) := RZ(KC, KC2) + PSI(KA) * PSI(KB) * DX2
+          ENDDO
+        ENDDO
+      ENDDO
+    ENDDO
+    DO KC = 1, NX
+      IF (KC > 1) THEN
+        DO KC2 = 1, KC - 1
+          RZ(KC, KC2) := RZ(KC2, KC)
+        ENDDO
+      ENDIF
+    ENDDO
+
+    ! DFT: W(KC, IPL) over full Nyquist p range
+    DO KC = 1, NX
+      MM := KC - 1
+      IF (NX - KC < MM) THEN
+        MM := NX - KC
+      ENDIF
+      DO IPL = 1, NP
+        PV := -PMAX + (REAL(IPL) - 0.5) * 2.0 * PMAX / REAL(NP)
+        ACC := 0.0
+        DO M2 = -MM, MM
+          ACC := ACC + RZ(KC - M2, KC + M2) * COS(2.0 * PV * REAL(M2) * DX)
+        ENDDO
+        WG(KC, IPL) := ACC * DX / PI
+      ENDDO
+    ENDDO
+
+    ! scalar oracles
+    ! WNORM = sum W dz dp (exact: 1.0)
+    WN := 0.0
+    DO KC = 1, NX
+      DO IPL = 1, NP
+        WN := WN + WG(KC, IPL)
+      ENDDO
+    ENDDO
+    WN := WN * DX * 2.0 * PMAX / REAL(NP)
+    WRITE(*, "('WNORM %.3f %d %.17e')") R, IP, WN
+
+    ! midpoint row: z=0 lies between KC=64 and 65; average
+    KC := NX / 2
+    ! z=0 lies between KC and KC+1, p=0 between NP/2 and NP/2+1 (both
+    ! exactly halfway): bilinear value at (0,0) = plain 4-point average
+    W00 := 0.25 * (WG(KC, NP / 2) + WG(KC, NP / 2 + 1) &
+      + WG(KC + 1, NP / 2) + WG(KC + 1, NP / 2 + 1))
+    WMIN := WG(KC, 1)
+    WMAX := WG(KC, 1)
+    PMIN := -PMAX + 0.5 * 2.0 * PMAX / REAL(NP)
+    VERIFY HANDSHAKE h2p_w0 DEPTH=1 FRAME_BYTES=256 MAXIT=NP PAYLOAD=(W00) ORACLE W00 VALUE=-1.0/PI*(1-2*(IP-1)) LIMIT=1.5E-2
+    DO IPL = 1, NP
+      PV := -PMAX + (REAL(IPL) - 0.5) * 2.0 * PMAX / REAL(NP)
+      WV := 0.5 * (WG(KC, IPL) + WG(KC + 1, IPL))
+      IF (WV < WMIN) THEN
+        WMIN := WV
+        PMIN := PV
+      ENDIF
+      IF (WV > WMAX) THEN
+        WMAX := WV
+      ENDIF
+    ENDDO
+    WRITE(*, "('W0 %.3f %d %.17e')") R, IP, W00
+    WRITE(*, "('WFR %.3f %d %.17e %.17e')") R, IP, WMIN, PMIN
+    WRITE(*, "('WVIS %.3f %d %.17e')") R, IP, ABS(WMIN) / WMAX
+
+    ! coarse map: every 2nd z, every 2nd p
+    DO KC = 1, NX, 2
+      Z := -BOX + (REAL(KC) - 0.5) * DX
+      DO IPL = 1, NP, 2
+        PV := -PMAX + (REAL(IPL) - 0.5) * 2.0 * PMAX / REAL(NP)
+        WRITE(*, "('WMAP %.3f %d %.4f %.4f %.17e')") R, IP, Z, PV, &
+          WG(KC, IPL)
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+WRITE(*, "('DONE')")
+STOP

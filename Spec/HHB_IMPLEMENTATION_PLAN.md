@@ -17,7 +17,7 @@ The handshake is **not** general recursion. It is a compile-time-provable static
 | 3b | Auto-emission of CONSERVE + ORACLE checks + parser acceptance → IR lowering | Parser + AST + IR builder + codegen | **Done** |
 | 3c | `HANDSHAKE ... ENDHANDSHAKE` first-class AST/IR node (sugar over 3b lowering) | Parser + AST + checker + IR builder + codegen | **Done** |
 | 3d | `VERIFY HANDSHAKE` directive lowers to the same emission as `HANDSHAKE` | IR builder promotion pass | **Done** |
-| 4 | Certification suite with positive/negative oracles | Tests | In progress |
+| 4 | Certification suite with positive/negative oracles | Tests | **Done** |
 
 ## Completed Phase 1 + 2
 
@@ -202,13 +202,47 @@ The IR builder lowers this to:
   and `work/timing_comparison/run_comparison.py`.  CPU f64 and SPIR-V f32
   variants produce identical values; runtimes are within noise.
 
+## Phase 4 complete (2026-08-28) — certification ladder scoreboard
+
+Positive rungs (all PASS, all oracle values verified by hand):
+
+| Rung | Program | Evidence |
+|---|---|---|
+| H₂⁺ parity | `min/wigner/h2p_wig_hhb.ergo` | WNORM = 1.0 to 1e-13; σg/σu split ±0.310 vs ±1/π target |
+| H₂ singlet/triplet | `min/wigner/h2_wig_hhb.ergo` | Singlet binds all 7 R (≤2e-3 vs Stage-3 table); triplet above singlet everywhere; dissociation −0.9999; bitwise-identical to un-annotated reference |
+| HeH⁺ heteronuclear | `min/wigner/h4_wig_hhb.ergo` | Correct variational direction; triplet midpoint non-erasure (W00_T 0.035–0.080); charge localizes toward He monotone in R; bitwise-identical to reference |
+| df_radial2 SCF | `min/wigner/df_radial2_hhb.ergo` | Converges to He collapse value, rc=0 |
+| Field test | `min/ribosome/ul18_stag5_hhb.ergo` | Full 144k-frame GPU f32 run byte-identical to certified `ul18_stag5.csv` |
+
+Negative controls (all three TRIP, exit 1, with actual/expected/tol):
+
+| Control | Corruption | Caught by |
+|---|---|---|
+| NC1 `h2p_wig_hhb_ncnorm.ergo` | norm-inflated orbitals | NCHK oracle (1.001 vs 1.0, tol 1e-9) |
+| NC2 `h2p_wig_hhb_nclcao.ergo` | wrong-sign mirror value | W00 oracle (+0.310 vs −0.31831) |
+| NC3 `h2_wig_hhb_xfail.ergo` (+ `_r6` fast variant) | exchange integral at wrong pair index | `h2_dissoc` dissociation-limit oracle (0.196 vs 0.0, tol 0.01) |
+
+NC3 initially escaped: the per-R EGAP window (0, 20) only catches sign
+flips; an index slip leaves EGAP wrong-but-plausible at small R while
+diverging 345× at R=6 (0.196 vs 0.00057 — the slipped integral doesn't
+vanish at dissociation). Fix: post-R-loop `VERIFY HANDSHAKE h2_dissoc`
+with `ORACLE EGAP VALUE=0.0 LIMIT=0.01` recomputing EGAP from the final
+CI ground states. Pass arm remains bitwise-identical to reference.
+`_r6` variant (R=6 only) runs the control in ~13 min instead of ~1.5 h.
+
+Process rule adopted: every negative control gets a corruption-presence
+gate (diff vs the pass arm showing *only* the intended change) before
+compiling — a control whose corruption silently failed to apply once
+produced a byte-identical false pass.
+
+The stag5 "hang" is resolved: root cause was the NaN trio (see
+`core/test_stag5_hang_regression.py` docstring), not HHB; the residual
+was a miscalibrated 30 s timeout vs a measured 38 s workload (fixed in
+f97fba8).
+
 ## Next action
 
-- Finish narrowing the `ul18_stag5.ergo` f32 SPIR-V hang to the specific
-  compiler change, fix it, and verify `core/test_stag5_hang_regression.py`
-  passes.
-- Run the full 144 k-frame validation of `min/ribosome/ul18_stag5_hhb.ergo`
-  against the certified `min/ribosome/ul18_stag5.csv` once the hang is fixed.
-- Otherwise the HHB feature is field-proven on `ul18_full_slot`: unit tests,
-  multi-stage golden tests, annotation and block-form non-interference all
-  pass with byte-identical output.
+- None for Phase 4. Possible follow-ups: promote the no-oracle lint
+  warning to a rejection in certified mode; apply the dissociation-limit
+  oracle pattern to other multi-R programs; ribosome perf lever
+  (coalesce segred combines into one drain per substep).

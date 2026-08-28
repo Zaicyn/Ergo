@@ -1,0 +1,623 @@
+! ════════════════════════════════════════════════════════════════════
+! H2_WIG_HHB — Stage W2 engine + HHB annotation: six-orbital H2 full-CI + two-electron
+! 1-RDM Wigner handshake maps (singlet + triplet), per R.
+! Rename: h2_wig.ergo.txt -> h2_wig.ergo
+! Run: python -m core min/handshake/h2_wig.ergo -o /tmp/h2w && /tmp/h2w > /tmp/h2w.out
+!      (h2_orb production cost per R — SOR integrals dominate — plus
+!       seconds of CI/Wigner; expect ~1-1.5 h total for 7 R)
+!
+! Solver/orbital/integral physics = h2_orb.ergo verbatim (production
+! grid NX=128 BOX=16 exact Coulomb, NSTEPS=2000, NSOR=400 SOR).
+! New: in-engine spin-adapted CI (21 singlet CSFs: 6 |ii> + 15 |ij_S>;
+! 15 triplet |ij_T>) — one-electron matrix diagonal by construction
+! (orbitals are h-eigenstates), Slater-Condon per H2_FINDINGS:
+!   <ii|H|ii> = 2 E_i + (ii|ii)        <ii|H|jj> = (ij|ij)
+!   <ii|H|jk_S> = sqrt2 (ij|ik)        <ij_S|H|kl_S> = (ik|jl)+(il|jk)
+!   triplet same with MINUS on the exchange term.
+! Cyclic Jacobi (viviani_4d_ed-certified block) for the ground states.
+! 1-RDM from CI coefficients (brute-force determinant-derived rules):
+!   singlet:  g_pp = 2 c_Dp^2 + sum_q c_Spq^2
+!             g_pq = sqrt2 (c_Dp + c_Dq) c_Spq + sum_k c_Spk c_Sqk
+!   triplet:  same without D terms.
+! Then RZ(z,z') = sum_pq g_pq P_pq(z,z'), DFT, WMAP — same block as
+! h2p_wig.ergo. WNORM oracle = 2.0 (trace g = 2).
+!
+! ENERGY ORACLES (Stage 3 table, H2_FINDINGS): E_singlet/E_triplet (Ha)
+!   0.5: -0.422767/+0.160213   1.0: -1.046424/-0.604854
+!   1.401: -1.117669/-0.774287 2.0: -1.104895/-0.886749
+!   3.0: -1.032158/-0.960916   4.0: -1.002596/-0.987272
+!   6.0: -0.999965/-0.999324
+! MAP ORACLES (structural; 2-orbital mirror wigner_mirror_w2.py, engine
+! values are 2x the per-electron mirror numbers):
+!   W00_T ~ 0 at every R (antisymmetry erases the midpoint)
+!   W00_S: 0.63/0.62/0.60/0.49/0.30/0.08 at R=0.5/1/1.401/2/3/4/6
+!   (6-orbital correlation will deepen S and shift depths; signs and
+!    node structure are the oracle, depths are indicative)
+! ════════════════════════════════════════════════════════════════════
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NX = 128
+REAL, PARAMETER :: BOX = 16.0
+INTEGER, PARAMETER :: NPTS = 2097152
+INTEGER, PARAMETER :: NXY = 16384
+INTEGER, PARAMETER :: NORB = 6
+INTEGER, PARAMETER :: NSTEPS = 2000
+REAL, PARAMETER :: DTAU = 0.008
+INTEGER, PARAMETER :: NSOR = 400
+REAL, PARAMETER :: SORW = 1.8
+INTEGER, PARAMETER :: NP = 256
+INTEGER, PARAMETER :: NCS = 21, NCT = 15
+
+STATIC REAL :: RLIST(7)
+DATA RLIST / 0.5, 1.0, 1.401, 2.0, 3.0, 4.0, 6.0 /
+
+STATIC REAL :: PSI(NPTS, 6), PSIN(NPTS), V(NPTS), RHO(NPTS), PHI(NPTS)
+STATIC INTEGER :: BND(NPTS)
+STATIC REAL :: QP(3)
+STATIC REAL :: EORB(6), INTG(1296)
+STATIC REAL :: HS(21,21), VS(21,21), HT(15,15), VT(15,15)
+STATIC REAL :: CS(21), CT(15), GMS(6,6), GMT(6,6)
+STATIC INTEGER :: PA(15), PB(15), PIDX(6,6)
+STATIC REAL :: RZ(128,128), WG(128,256)
+
+REAL :: DX, DX2, IDX2, DV, X, Y, Z, R, RZD, RL, RR
+REAL :: LAP, NRM, EGAP, T_KE, V_PE, E_TOT, OV, PI, PMAX, PV, WV
+REAL :: W00, WMIN, WMAX, PMIN, ACC, WN, ES, ET, GTR
+REAL :: OFF, TAU, TT, C, SN, AKP, AKQ, APK, AQR, VKP, VKQ, EMN, SQ2
+REAL :: ACT, GMV
+INTEGER :: I, J, K, IR, IO, JO, T, IC, JC, KC, KC2, IJ, KL, M2, MM, IPL
+INTEGER :: KA, KB, P, Q, IP2, I0, NSW, IA, IB, KO, SP
+INTEGER :: IA4, IB4
+
+PI := 3.14159265358979323846
+SQ2 := SQRT(2.0)
+DX := 2.0 * BOX / REAL(NX)
+DX2 := DX * DX
+IDX2 := 1.0 / DX2
+DV := DX * DX * DX
+PMAX := PI / (2.0 * DX)
+
+! pair tables
+IP2 := 1
+DO P = 1, 5
+  DO Q = P + 1, 6
+    PA(IP2) := P
+    PB(IP2) := Q
+    PIDX(P, Q) := IP2
+    PIDX(Q, P) := IP2
+    IP2 := IP2 + 1
+  ENDDO
+ENDDO
+
+! boundary mask
+DO K = 1, NPTS
+  BND(K) := 0
+ENDDO
+DO KC = 2, NX - 1
+  DO JC = 2, NX - 1
+    DO IC = 2, NX - 1
+      BND(IC + (JC - 1) * NX + (KC - 1) * NXY) := 1
+    ENDDO
+  ENDDO
+ENDDO
+
+DO IR = 1, 7
+  R := RLIST(IR)
+  RZD := 0.5 * R
+  ! two-center potential
+  DO K = 1, NPTS
+    KC := 1 + (K - 1) / NXY
+    JC := 1 + MOD((K - 1) / NX, NX)
+    IC := 1 + MOD(K - 1, NX)
+    X := -BOX + (REAL(IC) - 0.5) * DX
+    Y := -BOX + (REAL(JC) - 0.5) * DX
+    Z := -BOX + (REAL(KC) - 0.5) * DX
+    RL := SQRT(X * X + Y * Y + (Z - RZD) * (Z - RZD))
+    RR := SQRT(X * X + Y * Y + (Z + RZD) * (Z + RZD))
+    V(K) := -1.0 / RL - 1.0 / RR
+  ENDDO
+
+  ! ── orbital production with deflation (h2_orb verbatim) ──
+  DO IO = 1, NORB
+    DO K = 1, NPTS
+      KC := 1 + (K - 1) / NXY
+      JC := 1 + MOD((K - 1) / NX, NX)
+      IC := 1 + MOD(K - 1, NX)
+      X := -BOX + (REAL(IC) - 0.5) * DX
+      Y := -BOX + (REAL(JC) - 0.5) * DX
+      Z := -BOX + (REAL(KC) - 0.5) * DX
+      RL := SQRT(X * X + Y * Y + (Z - RZD) * (Z - RZD))
+      RR := SQRT(X * X + Y * Y + (Z + RZD) * (Z + RZD))
+      IF IO == 1 THEN
+        PSIN(K) := EXP(-(RL * RL)) + EXP(-(RR * RR))
+      ENDIF
+      IF IO == 2 THEN
+        PSIN(K) := EXP(-(RL * RL)) - EXP(-(RR * RR))
+      ENDIF
+      IF IO == 3 THEN
+        PSIN(K) := X * (EXP(-(RL * RL)) + EXP(-(RR * RR)))
+      ENDIF
+      IF IO == 4 THEN
+        PSIN(K) := X * (EXP(-(RL * RL)) - EXP(-(RR * RR)))
+      ENDIF
+      IF IO == 5 THEN
+        PSIN(K) := Z * (EXP(-(RL * RL)) - EXP(-(RR * RR)))
+      ENDIF
+      IF IO == 6 THEN
+        PSIN(K) := Z * (EXP(-(RL * RL)) + EXP(-(RR * RR)))
+      ENDIF
+      PSIN(K) := PSIN(K) * REAL(BND(K))
+    ENDDO
+    VERIFY HANDSHAKE h2_scf DEPTH=1 FRAME_BYTES=256 MAXIT=NSTEPS CONSERVE NORM VALUE=0.0 TOL=1.0E-10 PAYLOAD=(NRM)
+    DO T = 1, NSTEPS
+      DO JO = 1, IO - 1
+        OV := 0.0
+        DO K = 1, NPTS
+          OV := OV + PSIN(K) * PSI(K, JO) * DV
+        ENDDO
+        DO K = 1, NPTS
+          PSIN(K) := PSIN(K) - OV * PSI(K, JO)
+        ENDDO
+      ENDDO
+      NRM := 0.0
+      DO K = 1, NPTS
+        NRM := NRM + PSIN(K) * PSIN(K) * DV
+      ENDDO
+      NRM := SQRT(NRM)
+      DO K = 1, NPTS
+        PSIN(K) := PSIN(K) / NRM
+      ENDDO
+      DO K = NXY + 2, NPTS - NXY - 1
+        LAP := (PSIN(K - 1) + PSIN(K + 1) + PSIN(K - NX) + PSIN(K + NX) &
+          + PSIN(K - NXY) + PSIN(K + NXY) - 6.0 * PSIN(K)) * IDX2
+        PSIN(K) := (PSIN(K) + DTAU * (0.5 * LAP - V(K) * PSIN(K))) &
+          * REAL(BND(K))
+      ENDDO
+    ENDDO
+    DO JO = 1, IO - 1
+      OV := 0.0
+      DO K = 1, NPTS
+        OV := OV + PSIN(K) * PSI(K, JO) * DV
+      ENDDO
+      DO K = 1, NPTS
+        PSIN(K) := PSIN(K) - OV * PSI(K, JO)
+      ENDDO
+    ENDDO
+    NRM := 0.0
+    DO K = 1, NPTS
+      NRM := NRM + PSIN(K) * PSIN(K) * DV
+    ENDDO
+    NRM := SQRT(NRM)
+    DO K = 1, NPTS
+      PSIN(K) := PSIN(K) / NRM
+    ENDDO
+    T_KE := 0.0
+    V_PE := 0.0
+    DO K = NXY + 2, NPTS - NXY - 1
+      PSI(K, IO) := PSIN(K)
+      LAP := (PSIN(K - 1) + PSIN(K + 1) + PSIN(K - NX) + PSIN(K + NX) &
+        + PSIN(K - NXY) + PSIN(K + NXY) - 6.0 * PSIN(K)) * IDX2
+      T_KE := T_KE - 0.5 * PSIN(K) * LAP * DV
+      V_PE := V_PE + V(K) * PSIN(K) * PSIN(K) * DV
+    ENDDO
+    EORB(IO) := T_KE + V_PE
+  ENDDO
+
+  ! ── two-electron integrals via SOR Poisson (h2_orb verbatim) ──
+  DO IO = 1, NORB
+    DO JO = IO, NORB
+      DO K = 1, NPTS
+        RHO(K) := PSI(K, IO) * PSI(K, JO)
+      ENDDO
+      DO KL = 1, 3
+        QP(KL) := 0.0
+      ENDDO
+      OV := 0.0
+      DO K = 1, NPTS
+        KC := 1 + (K - 1) / NXY
+        JC := 1 + MOD((K - 1) / NX, NX)
+        IC := 1 + MOD(K - 1, NX)
+        X := -BOX + (REAL(IC) - 0.5) * DX
+        Y := -BOX + (REAL(JC) - 0.5) * DX
+        Z := -BOX + (REAL(KC) - 0.5) * DX
+        OV := OV + RHO(K) * DV
+        QP(1) := QP(1) + X * RHO(K) * DV
+        QP(2) := QP(2) + Y * RHO(K) * DV
+        QP(3) := QP(3) + Z * RHO(K) * DV
+      ENDDO
+      DO K = 1, NPTS
+        KC := 1 + (K - 1) / NXY
+        JC := 1 + MOD((K - 1) / NX, NX)
+        IC := 1 + MOD(K - 1, NX)
+        X := -BOX + (REAL(IC) - 0.5) * DX
+        Y := -BOX + (REAL(JC) - 0.5) * DX
+        Z := -BOX + (REAL(KC) - 0.5) * DX
+        IF (IC == 1) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSEIF (IC == NX) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSEIF (JC == 1) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSEIF (JC == NX) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSEIF (KC == 1) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSEIF (KC == NX) THEN
+          PHI(K) := OV / BOX + (QP(1) * X + QP(2) * Y + QP(3) * Z) &
+            / (BOX * BOX * BOX)
+        ELSE
+          PHI(K) := 0.0
+        ENDIF
+      ENDDO
+      DO T = 1, NSOR
+        DO K = NXY + 2, NPTS - NXY - 1
+          IF (BND(K) == 1) THEN
+            PHI(K) := (1.0 - SORW) * PHI(K) + SORW * &
+              (PHI(K - 1) + PHI(K + 1) + PHI(K - NX) + PHI(K + NX) &
+              + PHI(K - NXY) + PHI(K + NXY) &
+              + 12.566370614359 * RHO(K) * DX2) / 6.0
+          ENDIF
+        ENDDO
+      ENDDO
+      DO KL = 1, NORB
+        DO IJ = KL, NORB
+          OV := 0.0
+          DO K = 1, NPTS
+            OV := OV + PHI(K) * PSI(K, KL) * PSI(K, IJ) * DV
+          ENDDO
+          ! INTG flat index a + 6(b-1) + 36(c-1) + 216(d-1), 8-fold sym
+          INTG(IO + 6*(JO-1) + 36*(KL-1) + 216*(IJ-1)) := OV
+          INTG(JO + 6*(IO-1) + 36*(KL-1) + 216*(IJ-1)) := OV
+          INTG(IO + 6*(JO-1) + 36*(IJ-1) + 216*(KL-1)) := OV
+          INTG(JO + 6*(IO-1) + 36*(IJ-1) + 216*(KL-1)) := OV
+          INTG(KL + 6*(IJ-1) + 36*(IO-1) + 216*(JO-1)) := OV
+          INTG(IJ + 6*(KL-1) + 36*(IO-1) + 216*(JO-1)) := OV
+          INTG(KL + 6*(IJ-1) + 36*(JO-1) + 216*(IO-1)) := OV
+          INTG(IJ + 6*(KL-1) + 36*(JO-1) + 216*(IO-1)) := OV
+        ENDDO
+      ENDDO
+    ENDDO
+  ENDDO
+
+  ! ── spin-adapted CI matrices ─────────────────────────────────
+  DO IA = 1, NCS
+    DO IB = 1, NCS
+      HS(IA, IB) := 0.0
+    ENDDO
+  ENDDO
+  DO IA = 1, NCT
+    DO IB = 1, NCT
+      HT(IA, IB) := 0.0
+    ENDDO
+  ENDDO
+  ! D-D block
+  DO IA = 1, 6
+    DO IB = 1, 6
+      HS(IA, IB) := INTG(IA + 6*(IB-1) + 36*(IA-1) + 216*(IB-1))
+    ENDDO
+    HS(IA, IA) := 2.0 * EORB(IA) + INTG(IA + 6*(IA-1) + 36*(IA-1) &
+      + 216*(IA-1))
+  ENDDO
+  ! D-S and S-S blocks
+  DO IA = 1, 6
+    DO IP2 = 1, 15
+      HS(IA, 6+IP2) := SQ2 * INTG(IA + 6*(PA(IP2)-1) + 36*(IA-1) &
+        + 216*(PB(IP2)-1))
+      HS(6+IP2, IA) := HS(IA, 6+IP2)
+    ENDDO
+  ENDDO
+  DO IA = 1, 15
+    DO IB = 1, 15
+      P := PA(IA)
+      Q := PB(IA)
+      KA := PA(IB)
+      KB := PB(IB)
+      HS(6+IA, 6+IB) := INTG(P + 6*(KA-1) + 36*(Q-1) + 216*(KB-1)) &
+        + INTG(P + 6*(KB-1) + 36*(Q-1) + 216*(KA-1))
+      HT(IA, IB) := INTG(P + 6*(KA-1) + 36*(Q-1) + 216*(KB-1)) &
+        - INTG(P + 6*(KB-1) + 36*(Q-1) + 216*(KA-1))
+    ENDDO
+    HS(6+IA, 6+IA) := HS(6+IA, 6+IA) + EORB(PA(IA)) + EORB(PB(IA))
+    HT(IA, IA) := HT(IA, IA) + EORB(PA(IA)) + EORB(PB(IA))
+  ENDDO
+
+  ! ── Jacobi: singlet (N=21) ─────────────────────────────────
+  DO P = 1, NCS
+    DO Q = 1, NCS
+      VS(P, Q) := 0.0
+    ENDDO
+    VS(P, P) := 1.0
+  ENDDO
+  DO NSW = 1, 200
+    OFF := 0.0
+    DO P = 1, NCS
+      DO Q = 1, NCS
+        OFF := OFF + HS(P, Q) * HS(P, Q)
+      ENDDO
+      OFF := OFF - HS(P, P) * HS(P, P)
+    ENDDO
+    OFF := SQRT(OFF)
+    IF (OFF >= 1.0e-14) THEN
+      DO P = 1, NCS - 1
+        DO Q = P + 1, NCS
+          IF (ABS(HS(P, Q)) > 1.0e-16) THEN
+            TAU := (HS(Q, Q) - HS(P, P)) / (2.0 * HS(P, Q))
+            IF (TAU /= 0.0) THEN
+              TT := SIGN(1.0, TAU) / (ABS(TAU) + SQRT(1.0 + TAU * TAU))
+            ELSE
+              TT := 1.0
+            ENDIF
+            C := 1.0 / SQRT(1.0 + TT * TT)
+            SN := TT * C
+            DO K = 1, NCS
+              AKP := HS(K, P)
+              AKQ := HS(K, Q)
+              HS(K, P) := C * AKP - SN * AKQ
+              HS(K, Q) := SN * AKP + C * AKQ
+            ENDDO
+            DO K = 1, NCS
+              APK := HS(P, K)
+              AQR := HS(Q, K)
+              HS(P, K) := C * APK - SN * AQR
+              HS(Q, K) := SN * APK + C * AQR
+            ENDDO
+            DO K = 1, NCS
+              VKP := VS(K, P)
+              VKQ := VS(K, Q)
+              VS(K, P) := C * VKP - SN * VKQ
+              VS(K, Q) := SN * VKP + C * VKQ
+            ENDDO
+          ENDIF
+        ENDDO
+      ENDDO
+    ENDIF
+  ENDDO
+  EMN := HS(1, 1)
+  I0 := 1
+  DO P = 2, NCS
+    IF (HS(P, P) < EMN) THEN
+      EMN := HS(P, P)
+      I0 := P
+    ENDIF
+  ENDDO
+  DO K = 1, NCS
+    CS(K) := VS(K, I0)
+  ENDDO
+  ES := EMN
+
+  ! ── Jacobi: triplet (N=15) ─────────────────────────────────
+  DO P = 1, NCT
+    DO Q = 1, NCT
+      VT(P, Q) := 0.0
+    ENDDO
+    VT(P, P) := 1.0
+  ENDDO
+  DO NSW = 1, 200
+    OFF := 0.0
+    DO P = 1, NCT
+      DO Q = 1, NCT
+        OFF := OFF + HT(P, Q) * HT(P, Q)
+      ENDDO
+      OFF := OFF - HT(P, P) * HT(P, P)
+    ENDDO
+    OFF := SQRT(OFF)
+    IF (OFF >= 1.0e-14) THEN
+      DO P = 1, NCT - 1
+        DO Q = P + 1, NCT
+          IF (ABS(HT(P, Q)) > 1.0e-16) THEN
+            TAU := (HT(Q, Q) - HT(P, P)) / (2.0 * HT(P, Q))
+            IF (TAU /= 0.0) THEN
+              TT := SIGN(1.0, TAU) / (ABS(TAU) + SQRT(1.0 + TAU * TAU))
+            ELSE
+              TT := 1.0
+            ENDIF
+            C := 1.0 / SQRT(1.0 + TT * TT)
+            SN := TT * C
+            DO K = 1, NCT
+              AKP := HT(K, P)
+              AKQ := HT(K, Q)
+              HT(K, P) := C * AKP - SN * AKQ
+              HT(K, Q) := SN * AKP + C * AKQ
+            ENDDO
+            DO K = 1, NCT
+              APK := HT(P, K)
+              AQR := HT(Q, K)
+              HT(P, K) := C * APK - SN * AQR
+              HT(Q, K) := SN * APK + C * AQR
+            ENDDO
+            DO K = 1, NCT
+              VKP := VT(K, P)
+              VKQ := VT(K, Q)
+              VT(K, P) := C * VKP - SN * VKQ
+              VT(K, Q) := SN * VKP + C * VKQ
+            ENDDO
+          ENDIF
+        ENDDO
+      ENDDO
+    ENDIF
+  ENDDO
+  EMN := HT(1, 1)
+  I0 := 1
+  DO P = 2, NCT
+    IF (HT(P, P) < EMN) THEN
+      EMN := HT(P, P)
+      I0 := P
+    ENDIF
+  ENDDO
+  DO K = 1, NCT
+    CT(K) := VT(K, I0)
+  ENDDO
+  ET := EMN
+  WRITE(*, "('E2 %.3f %.17e %.17e')") R, ES, ET
+  EGAP := ET - ES
+  ! triplet-null oracle (HHB): no bound triplet — EGAP in (0, 20) Ha.
+  VERIFY HANDSHAKE h2_tripnull DEPTH=1 FRAME_BYTES=256 MAXIT=6 PAYLOAD=(EGAP) ORACLE EGAP VALUE=10.0 LIMIT=10.0
+  ! ── 1-RDM coefficients ──────────────────────────────────────
+  DO P = 1, 6
+    DO Q = 1, 6
+      GMS(P, Q) := 0.0
+      GMT(P, Q) := 0.0
+    ENDDO
+  ENDDO
+  DO P = 1, 6
+    ACC := 2.0 * CS(P) * CS(P)
+    ACT := 0.0
+    DO Q = 1, 6
+      IF (Q /= P) THEN
+        ACC := ACC + CS(6 + PIDX(P, Q)) * CS(6 + PIDX(P, Q))
+        ACT := ACT + CT(PIDX(P, Q)) * CT(PIDX(P, Q))
+      ENDIF
+    ENDDO
+    GMS(P, P) := ACC
+    GMT(P, P) := ACT
+  ENDDO
+  DO P = 1, 5
+    DO Q = P + 1, 6
+      ACC := SQ2 * (CS(P) + CS(Q)) * CS(6 + PIDX(P, Q))
+      ACT := 0.0
+      DO KO = Q + 1, 6
+        ACC := ACC + CS(6 + PIDX(P, KO)) * CS(6 + PIDX(Q, KO))
+        ACT := ACT + CT(PIDX(P, KO)) * CT(PIDX(Q, KO))
+      ENDDO
+      DO KO = 1, P - 1
+        ACC := ACC + CS(6 + PIDX(KO, P)) * CS(6 + PIDX(KO, Q))
+        ACT := ACT + CT(PIDX(KO, P)) * CT(PIDX(KO, Q))
+      ENDDO
+      DO KO = P + 1, Q - 1
+        ACC := ACC + CS(6 + PIDX(P, KO)) * CS(6 + PIDX(KO, Q))
+        ACT := ACT + CT(PIDX(P, KO)) * CT(PIDX(KO, Q))
+      ENDDO
+      GMS(P, Q) := ACC
+      GMS(Q, P) := ACC
+      GMT(P, Q) := ACT
+      GMT(Q, P) := ACT
+    ENDDO
+  ENDDO
+  GTR := 0.0
+  DO P = 1, 6
+    GTR := GTR + GMS(P, P)
+  ENDDO
+  WRITE(*, "('GTRS %.3f %.17e')") R, GTR
+  GTR := 0.0
+  DO P = 1, 6
+    GTR := GTR + GMT(P, P)
+  ENDDO
+  WRITE(*, "('GTRT %.3f %.17e')") R, GTR
+
+  ! ── Wigner maps from the 1-RDM, per spin ──────────────────────
+  DO SP = 1, 2
+    DO KC = 1, NX
+      DO KC2 = 1, NX
+        RZ(KC, KC2) := 0.0
+      ENDDO
+    ENDDO
+    ! RZ(z,z') = sum_pq g_pq P_pq(z,z'), upper triangle then mirror
+    DO P = 1, 6
+      DO Q = P, 6
+        IF (SP = 1) THEN
+          GMV := GMS(P, Q)
+        ELSE
+          GMV := GMT(P, Q)
+        ENDIF
+        IF (ABS(GMV) > 1.0e-14) THEN
+          DO JC = 2, NX - 1
+            DO IC = 2, NX - 1
+              DO KC = 1, NX
+                KA := IC + (JC - 1) * NX + (KC - 1) * NXY
+                IF (P = Q) THEN
+                  DO KC2 = KC, NX
+                    KB := IC + (JC - 1) * NX + (KC2 - 1) * NXY
+                    RZ(KC, KC2) := RZ(KC, KC2) &
+                      + GMV * PSI(KA, P) * PSI(KB, P) * DX2
+                  ENDDO
+                ELSE
+                  DO KC2 = KC, NX
+                    KB := IC + (JC - 1) * NX + (KC2 - 1) * NXY
+                    RZ(KC, KC2) := RZ(KC, KC2) + GMV * DX2 * &
+                      (PSI(KA, P) * PSI(KB, Q) + PSI(KA, Q) * PSI(KB, P))
+                  ENDDO
+                ENDIF
+              ENDDO
+            ENDDO
+          ENDDO
+        ENDIF
+      ENDDO
+    ENDDO
+    DO KC = 1, NX
+      DO KC2 = 1, KC - 1
+        RZ(KC, KC2) := RZ(KC2, KC)
+      ENDDO
+    ENDDO
+    ! DFT
+    DO KC = 1, NX
+      MM := KC - 1
+      IF (NX - KC < MM) THEN
+        MM := NX - KC
+      ENDIF
+      DO IPL = 1, NP
+        PV := -PMAX + (REAL(IPL) - 0.5) * 2.0 * PMAX / REAL(NP)
+        ACC := 0.0
+        DO M2 = -MM, MM
+          ACC := ACC + RZ(KC - M2, KC + M2) * COS(2.0 * PV * REAL(M2) * DX)
+        ENDDO
+        WG(KC, IPL) := ACC * DX / PI
+      ENDDO
+    ENDDO
+    ! scalar oracles
+    WN := 0.0
+    DO KC = 1, NX
+      DO IPL = 1, NP
+        WN := WN + WG(KC, IPL)
+      ENDDO
+    ENDDO
+    WN := WN * DX * 2.0 * PMAX / REAL(NP)
+    KC := NX / 2
+    W00 := 0.25 * (WG(KC, NP / 2) + WG(KC, NP / 2 + 1) &
+      + WG(KC + 1, NP / 2) + WG(KC + 1, NP / 2 + 1))
+    WMIN := WG(KC, 1)
+    WMAX := WG(KC, 1)
+    PMIN := -PMAX + 0.5 * 2.0 * PMAX / REAL(NP)
+    DO IPL = 1, NP
+      PV := -PMAX + (REAL(IPL) - 0.5) * 2.0 * PMAX / REAL(NP)
+      WV := 0.5 * (WG(KC, IPL) + WG(KC + 1, IPL))
+      IF (WV < WMIN) THEN
+        WMIN := WV
+        PMIN := PV
+      ENDIF
+      IF (WV > WMAX) THEN
+        WMAX := WV
+      ENDIF
+    ENDDO
+    WRITE(*, "('W2NORM %.3f %d %.17e')") R, SP, WN
+    WRITE(*, "('W2W0 %.3f %d %.17e')") R, SP, W00
+    WRITE(*, "('W2FR %.3f %d %.17e %.17e')") R, SP, WMIN, PMIN
+    WRITE(*, "('W2VIS %.3f %d %.17e')") R, SP, ABS(WMIN) / WMAX
+    DO KC = 1, NX, 2
+      Z := -BOX + (REAL(KC) - 0.5) * DX
+      DO IPL = 1, NP, 2
+        PV := -PMAX + (REAL(IPL) - 0.5) * 2.0 * PMAX / REAL(NP)
+        WRITE(*, "('W2MAP %.3f %d %.4f %.4f %.17e')") R, SP, Z, PV, &
+          WG(KC, IPL)
+      ENDDO
+    ENDDO
+  ENDDO
+ENDDO
+
+! Dissociation-limit oracle (HHB): after the R loop, EGAP := ET - ES
+! recomputed from the final (R=6, separated-atom) CI ground states must
+! be ~0 — singlet and triplet are degenerate at dissociation. This is
+! the net that catches structure-preserving wrong exchange integrals
+! (the per-R window oracle only sees sign flips).
+VERIFY HANDSHAKE h2_dissoc DEPTH=1 FRAME_BYTES=256 MAXIT=1 PAYLOAD=(EGAP) ORACLE EGAP VALUE=0.0 LIMIT=0.01
+DO K = 1, 1
+  EGAP := ET - ES
+ENDDO
+
+WRITE(*, "('DONE')")
+STOP

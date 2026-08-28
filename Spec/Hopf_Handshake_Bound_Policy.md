@@ -110,6 +110,15 @@ Every handshake stage must expose at least one null/limit oracle. Reusable oracl
 - screened-vs-hydrogenic distinction: hydrogenic values are baselines, not targets, once screening exists
 - byte-determinism: same input → same output hash
 
+Measured caveat (2026-08-28, HHB Phase-4 NC3): a fixed-window oracle
+(e.g. a singlet-triplet gap asserted inside (0, 20) Ha at every R)
+catches sign flips and norm drift but NOT structure-preserving wrong
+integrals — an exchange read at a slipped index produced plausible gaps
+inside the window at every R. The discriminator is the dissociation
+limit (the corrupted split persisted at 0.196 Ha vs the correct 0.0006
+at R=6): the dissociation-limit oracle must be wired per-program (e.g.
+as a post-loop boundary check), not assumed to fall out of a window.
+
 A handshake block without an oracle clause should compile with a warning in prototype mode and reject in certified mode.
 
 ### 7. GPU lowering rule

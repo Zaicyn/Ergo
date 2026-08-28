@@ -1,0 +1,81 @@
+! GPU_FALLBACK_COIL — regression for the 2026-08-24 interface bug class
+! =====================================================================
+! Covers, in one program:
+!   1. A DO loop containing a DO WHILE whose per-iteration temporaries
+!      feed trailing array stores (the INIT_CHAIN coil pattern). The
+!      loop MUST NOT extract: the WHILE computes the temporaries, so a
+!      flow-prefix kernel would read them as stale host inputs.
+!      (was: extracted, wrote BSS zeros over the position arrays)
+!   2. A padded-segment segmented reduction (ACC(BLK(K)) += ...) with
+!      SIGN/MAX masks — the unified pair-kernel form. MUST extract as
+!      a segmented reduction; host readback must see the sums.
+!   3. Host diagnostics reading the accumulated arrays after the
+!      kernels (readback ordering).
+!
+! Oracles (exact): the WHILE loop sets COIL(I) = 3*I - 2 (CAND starts
+! at COIL(I-1), three +1 steps); the segred computes
+!   ACC(a) = sum over atom a's real slots k=1..M of 2.0*(COIL(a) -
+!   COIL(j)),  j = a+2+k,  M = NRES-a-2 (a <= 73)
+!          = -6 * sum_{k=1..M} (k+2) = -6*(M(M+1)/2 + 2M)
+!   ACC(1) = -6*2847 = -17082;  ACC(73) = -6*3 = -18;
+!   ACC(74..76) = 0 (no real slots).
+!
+! CPU:  python -m core tests/gpu_fallback_coil.ergo -o /tmp/x && /tmp/x
+! GPU:  python -m core tests/gpu_fallback_coil.ergo --target spirv -o /tmp/xg
+!       — outputs must match the CPU run byte-exactly (f64 both).
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: NRES = 76
+INTEGER, PARAMETER :: PSEG = 256
+INTEGER, PARAMETER :: NSLOT = 19456
+
+STATIC REAL :: COIL(NRES), ACC(NRES)
+STATIC INTEGER :: BLK(NSLOT), PJ(NSLOT)
+STATIC REAL :: W(NSLOT)
+INTEGER :: I, K, ATT
+REAL :: CAND, D, DD, MD, FM
+
+! ── 1. coil pattern: DO WHILE computes CAND, store after ──
+COIL(1) := 1.0
+DO I = 2, NRES
+  CAND := COIL(I - 1)
+  ATT := 0
+  DO WHILE ATT < 3
+    ATT := ATT + 1
+    CAND := CAND + 1.0
+  ENDDO
+  COIL(I) := CAND
+ENDDO
+
+! ── 2. padded segmented reduction with masks (pair-kernel form) ──
+DO I = 1, NRES
+  ACC(I) := 0.0
+ENDDO
+DO I = 1, NRES
+  DO K = 1, PSEG
+    BLK((I-1)*PSEG + K) := I
+    PJ((I-1)*PSEG + K) := 1 + MOD(K + I, NRES)
+    W((I-1)*PSEG + K) := 0.0
+  ENDDO
+ENDDO
+DO I = 1, NRES
+  DO K = 1, PSEG
+    IF I + 2 + K <= NRES THEN
+      PJ((I-1)*PSEG + K) := I + 2 + K
+      W((I-1)*PSEG + K) := 2.0
+    ENDIF
+  ENDDO
+ENDDO
+DO K = 1, NSLOT
+  D := COIL(BLK(K)) - COIL(PJ(K))
+  DD := MAX(ABS(D), 1.0E-16)
+  MD := (1.0 - SIGN(1.0, -DD)) * 0.5
+  FM := W(K) * MD * D
+  ACC(BLK(K)) := ACC(BLK(K)) + FM
+ENDDO
+
+! ── 3. host readback after the kernels ──
+WRITE(*, "('%.6f %.6f %.6f')") COIL(1), COIL(2), COIL(NRES)
+WRITE(*, "('%.6f %.6f %.6f')") ACC(1), ACC(73), ACC(76)
+STOP
