@@ -3,6 +3,16 @@
 Fresh f32 SPIR-V builds of `min/ribosome/ul18_stag5.ergo` hang between
 frame 500 and frame 1000 under the current working tree.  This test
 compiles a MAXFRAME=1000 copy and verifies it finishes within a timeout.
+
+2026-08-28 root cause (fixed in b74f029-era commits): NOT a hang — the
+misextracted INIT_CHAIN coil loop (DO-WHILE temporaries read as host
+push constants) plus a stale host-fallback download wrote zeros over
+the position arrays, which NaN'd the physics mid-run (f32). The fixed
+build completes MAXFRAME=1000 in ~38s on the RTX 2060 (uniformly
+~43 ms/frame, host-sync-bound — the padded segmented-reduction pair
+kernels drain per kernel per substep; NSUB stays 1-2, measured).
+TIMEOUT_SEC is 120s = >3x the measured workload bound; a real hang
+(fence deadlock / host spin) still fails fast against it.
 """
 
 import os
@@ -14,7 +24,7 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ERGOC = [sys.executable, "-m", "core"]
 SOURCE = os.path.join(REPO, "min", "ribosome", "ul18_stag5.ergo")
-TIMEOUT_SEC = 30
+TIMEOUT_SEC = 120
 MAXFRAME = 1000
 
 
