@@ -458,6 +458,11 @@ build-ID, timestamp, and similar non-semantic metadata.
 The guarantee does **not** extend to:
 - Cross-target builds (x86 vs ARM vs RISC-V). Each target has its own
   determinism contract per its own audit.
+- CPU↔GPU at fusible `a*b±c` sites inside extracted kernels (the GPU
+  never contracts; the CPU recipe may). The compiler reports these
+  sites per kernel at compile time (Part 9.10); a kernel with no
+  reported sites, no transcendentals, and no reductions is
+  CPU==GPU-bitwise by construction.
 - Builds with `--cpu-fast-math`. This flag explicitly permits
   reassociation and non-NaN-preserving min/max; bit-identity is
   sacrificed for speed.
@@ -899,6 +904,24 @@ compile-time warning naming the functions; expected deviation is ~1e-7
 relative to the CPU path for those calls. Programs that need full f64
 transcendentals on the GPU must use the CPU path (or restructure); the
 CPU backend always computes in the declared precision.
+
+**Contraction (2026-08-29):** every floating-point arithmetic result the
+SPIRV backend emits is decorated `NoContraction` — the Vulkan driver may
+never fuse an `a*b ± c` site on its own discretion. The CPU recipe still
+contracts per `-ffp-contract=fast` (Part 7); fusible sites inside
+extracted kernels are reported at compile time (a NOTE per kernel
+listing source lines). A kernel with no reported sites and no
+transcendentals is CPU==GPU-bitwise by construction. The full policy,
+the measurement evidence, and the deferred plan for by-construction
+equality at fusible sites: `Spec/Ergo_Hardware_Op_Map.md` §4.
+
+**Measured driver precision notes (2026-08-29, RTX 2060):** the Vulkan
+driver contracts undecorated fp arithmetic (consequence: before the
+NoContraction policy, GPU output was driver-discretion). And the
+GLSL.std.450 `Sqrt` at f32 is NOT correctly rounded on this driver
+(1 ulp low measured); f64 `Sqrt` is exact (the stress test covers it).
+A kernel needing bitwise-exact f32 square roots has no GPU path today —
+same boundary class as the f32 transcendentals above.
 
 ---
 

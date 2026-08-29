@@ -119,6 +119,15 @@ class SPIRVBackend(KernelBackend):
             self._var_types[v.name] = v.type
             self._var_storage[v.name] = v.storage
 
+        # Compiler-owned contraction policy (Spec/Ergo_Hardware_Op_Map.md
+        # section 4): the IR-level fusible-site analysis.  The emitters
+        # NoContraction-decorate every fp arithmetic result and report the
+        # marked sites (the documented CPU≠GPU last-ulp boundary).
+        from ..ir_contract import compute_fma_sites
+        self._fma_sites = compute_fma_sites(module)
+        self._boundary_warned = False
+        self._boundary_lines: list[tuple[int, int]] = []
+
     # ── top-level ───────────────────────────────────────────
 
     def generate(self) -> str:
@@ -126,6 +135,24 @@ class SPIRVBackend(KernelBackend):
         parts = []
         for kernel in self.plan.kernels:
             parts.append(self._emit_kernel_module(kernel))
+        # Contraction boundary lint: report fusible sites found in
+        # emitted kernels once per build (generate() is called twice by
+        # the driver — device code and host launches use it).
+        if self._boundary_lines and not self._boundary_warned:
+            self._boundary_warned = True
+            per_kernel: dict[int, list[int]] = {}
+            for kid, ln in self._boundary_lines:
+                per_kernel.setdefault(kid, []).append(ln)
+            for kid in sorted(per_kernel):
+                ks = sorted(set(per_kernel[kid]))
+                src = self.plan.kernels[kid].source_line
+                lines = ", ".join(str(x if x else src) for x in ks)
+                print(f"[spirv] NOTE kernel_{kid}: fusible a*b±c sites "
+                      f"(source lines {lines}) — the CPU recipe may "
+                      f"contract these while the GPU never will "
+                      f"(NoContraction): last-ulp CPU≠GPU boundary, "
+                      f"Spec/Ergo_Hardware_Op_Map.md section 4",
+                      file=sys.stderr)
         # Generate compiler-created sort-by-GEN kernels
         next_kid = len(self.plan.kernels)
         for sp in self.plan.sort_plans:
@@ -181,8 +208,11 @@ class SPIRVBackend(KernelBackend):
         ctx = _EmitContext(kernel, self._var_types, self.gpu_fast_math,
                           array_shapes,
                           pingpong_arrays=self._pp_arrays,
-                          gpu_tile_size=self.gpu_tile_size)
+                          gpu_tile_size=self.gpu_tile_size,
+                          fma_sites=self._fma_sites)
         ctx.emit_module()
+        self._boundary_lines.extend(
+            (kernel.kernel_id, ln) for ln in ctx._fusible_lines)
         return "\n".join(ctx.lines) + "\n"
 
     @staticmethod
@@ -896,7 +926,8 @@ class _EmitContext:
                  gpu_fast_math: bool,
                  array_shapes: dict[str, tuple] | None = None,
                  pingpong_arrays: set[str] | None = None,
-                 gpu_tile_size: int = 0):
+                 gpu_tile_size: int = 0,
+                 fma_sites: dict | None = None):
         self.kernel = kernel
         self.var_types = var_types
         # Spec 9.9: atomic ops for SCATTER kernels are only legal under
@@ -954,6 +985,16 @@ class _EmitContext:
         self._types: list[str] = []
         self._globals: list[str] = []
         self._function: list[str] = []
+
+        # Compiler-owned contraction policy (Spec/Ergo_Hardware_Op_Map.md
+        # section 4): every floating-point arithmetic result we emit gets
+        # a NoContraction decoration — the Vulkan driver may never fuse
+        # what we did not choose.  ids collected during emit, decorated
+        # at assembly.  Marked fusible sites encountered during emission
+        # are collected for the boundary lint (reported once per build).
+        self._nocontract: list[int] = []
+        self._fusible_lines: list[int] = []
+        self._fma_sites = fma_sites
 
         # Pre-allocated type IDs (filled during type declaration)
         self.id_void: int = 0
@@ -1145,6 +1186,11 @@ class _EmitContext:
         self.lines.extend(self._header)
         self.lines.append("")
         self.lines.extend(self._decorations)
+        # NoContraction on every fp arithmetic result id emitted for this
+        # kernel (compiler-owned contraction policy, op map §4)
+        for rid in self._nocontract:
+            self.lines.append(
+                f"               OpDecorate {self._id(rid)} NoContraction")
         self.lines.append("")
         self.lines.extend(self._types)
         self.lines.append("")
@@ -1944,6 +1990,7 @@ class _EmitContext:
                 self._function.append(
                     f"         {self._id(s)} = OpFAdd {self._id(self.id_real)} "
                     f"{self._id(v0)} {self._id(v1)}")
+                self._nocontract.append(s)
                 self._function.append(
                     f"               OpStore {self._id(p0)} {self._id(s)}")
                 self._function.append(f"               OpBranch {self._id(merge_lbl)}")
@@ -2379,6 +2426,12 @@ class _EmitContext:
                 self._function.append(
                     f"         {self._id(result)} = {spv_op} {self._id(self.id_real)} {self._id(a)} {self._id(b)}")
                 self._set_ssa_type(result, self.id_real)
+                self._nocontract.append(result)
+                # Contraction boundary lint: this site is fusible
+                # (a*b±c); the CPU recipe may contract it while the GPU
+                # never will (NoContraction).  Reported once per build.
+                if op in (Op.ADD, Op.SUB) and id(inst) in self._fma_sites:
+                    self._fusible_lines.append(inst.line)
             else:
                 spv_op = {Op.ADD: "OpIAdd", Op.SUB: "OpISub",
                           Op.MUL: "OpIMul", Op.DIV: "OpSDiv"}[op]
@@ -2399,6 +2452,7 @@ class _EmitContext:
                 self._function.append(
                     f"         {self._id(result)} = OpFNegate {self._id(self.id_real)} {self._id(a)}")
                 self._set_ssa_type(result, self.id_real)
+                self._nocontract.append(result)
             else:
                 self._function.append(
                     f"         {self._id(result)} = OpSNegate {self._id(self.id_i32)} {self._id(a)}")
@@ -2649,6 +2703,7 @@ class _EmitContext:
             self._function.append(
                 f"         {self._id(result)} = OpFDiv {self._id(self.id_real)} {self._id(log_a)} {self._id(log_10)}")
             self._set_ssa_type(result, self.id_real)
+            self._nocontract.append(result)
             if inst.result:
                 ssa_map[inst.result] = result
             return False
@@ -2727,6 +2782,7 @@ class _EmitContext:
                     f"         {self._id(result)} = OpFMul {self._id(self.id_real)} "
                     f"{self._id(abs_a)} {self._id(sel)}")
                 self._set_ssa_type(result, self.id_real)
+                self._nocontract.append(result)
             if inst.result:
                 ssa_map[inst.result] = result
             return False
@@ -3168,6 +3224,7 @@ class _EmitContext:
                     f"         {self._id(result)} = OpFMul "
                     f"{self._id(self.id_real)} {self._id(f)} {self._id(scale)}")
                 self._set_ssa_type(result, self.id_real)
+                self._nocontract.append(result)
             if inst.result:
                 ssa_map[inst.result] = result
             return False

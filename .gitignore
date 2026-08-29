@@ -96,6 +96,11 @@
 !tests/math_kernels/*.py
 !tests/math_kernels/*.c
 !tests/math_kernels/*.md
+# contraction-policy survey probes + runner (the evidence base for the
+# NoContraction policy and the rejected plan-A rationale)
+!tests/contraction/
+!tests/contraction/*.py
+!tests/contraction/*.c
 
 # Always ignore build artifacts
 __pycache__/

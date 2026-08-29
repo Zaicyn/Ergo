@@ -1,0 +1,62 @@
+! fusible_stress.ergo — contraction-policy stress test
+! =====================================================================
+! Dense fusible a*b±c sites in INJECTIVE loops (GPU-extractable), plus
+! call-result products (the phi-sensitive class).  Prints selected
+! elements at full precision; the oracle is bitwise CPU==GPU comparison
+! (f64 AND f32 via --precision), plus CPU cross-compiler identity.
+!
+! Deliberately excluded: accumulation/reduction loops — GPU staged
+! reductions combine in tree order vs CPU sequential, which is a
+! different (documented, Part 9.9) bitwise boundary, not contraction.
+!
+! CPU:   python -m core tests/fusible_stress.ergo -o /tmp/fs && /tmp/fs
+! GPU:   python -m core tests/fusible_stress.ergo --target spirv \
+!          -o /tmp/fsg && /tmp/fsg   — stdout must match byte-exactly.
+! f32:   add --precision f32 to both.
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 4096
+STATIC REAL :: A(N), B(N), C(N), D(N)
+STATIC REAL :: R1(N), R2(N), R3(N), R4(N), R5(N), R6(N)
+INTEGER :: I
+
+DO I = 1, N
+  A(I) := REAL(I) * 0.001 - 0.7          ! mul-sub (fused site)
+  B(I) := REAL(I) * -0.0007 + 0.13       ! mul-add (fused site)
+  C(I) := REAL(2 * I + 1) * 0.0003       ! mul only
+  D(I) := REAL(I) * 0.00011 - 0.2        ! mul-sub
+ENDDO
+
+DO I = 1, N
+  R1(I) := A(I) * B(I) + C(I)            ! a*b + c
+ENDDO
+DO I = 1, N
+  R2(I) := A(I) * B(I) - C(I)            ! a*b - c
+ENDDO
+DO I = 1, N
+  R3(I) := C(I) - A(I) * B(I)            ! c - a*b (right-mul sub)
+ENDDO
+DO I = 1, N
+  R4(I) := A(I) * B(I) + C(I) * D(I)     ! two-mul add (left fuses)
+ENDDO
+DO I = 1, N
+  R5(I) := R4(I) * A(I) - R1(I) * C(I)   ! two-mul sub (left fuses)
+ENDDO
+DO I = 1, N
+  R6(I) := ABS(A(I)) * 0.73 + C(I)   ! call-result product + add
+                                     ! (FAbs: exact both sides; SQRT was
+                                     !  replaced — the driver deviates
+                                     !  1 ulp at f32, a documented class)
+ENDDO
+
+WRITE(*, "('R1 %.17g %.17g %.17g %.17g')") R1(1), R1(97), R1(1024), R1(4096)
+WRITE(*, "('R2 %.17g %.17g %.17g %.17g')") R2(1), R2(97), R2(1024), R2(4096)
+WRITE(*, "('R3 %.17g %.17g %.17g %.17g')") R3(1), R3(97), R3(1024), R3(4096)
+WRITE(*, "('R4 %.17g %.17g %.17g %.17g')") R4(1), R4(97), R4(1024), R4(4096)
+WRITE(*, "('R5 %.17g %.17g %.17g %.17g')") R5(1), R5(97), R5(1024), R5(4096)
+WRITE(*, "('R6 %.17g %.17g %.17g %.17g')") R6(1), R6(97), R6(1024), R6(4096)
+! full-array digest lines: every 16th element (256 values/array)
+DO I = 1, N, 16
+  WRITE(*, "('D %.17g %.17g %.17g %.17g %.17g %.17g')") &
+    R1(I), R2(I), R3(I), R4(I), R5(I), R6(I)
+ENDDO
+STOP
