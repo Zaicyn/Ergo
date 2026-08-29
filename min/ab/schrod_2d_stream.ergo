@@ -1,0 +1,118 @@
+! ════════════════════════════════════════════════════════════════════
+! SCHROD_2D_STREAM — schrod_2d.ergo + raw f32 stream emission
+! ════════════════════════════════════════════════════════════════════
+! Physics is IDENTICAL to schrod_2d.ergo (same parameters, same
+! leapfrog, same sponge).  The only change: after each full step, the
+! row y = Y0 of R is written as one raw f32 record (Part 10.4),
+! 512 floats per step, NSTEPS records total.
+!
+! Purpose: real-engine waveform stream for the SQF-H lazy-handoff
+! benchmark (benchmark/bench_sqfh_ab.c).  Tiles of 64 consecutive
+! samples along the row are locally sinusoidal at the carrier K0 —
+! the frame SQFH_DESIGN.md's lock-in prior expects.
+!
+! Build/run (f32 so the record element size is 4 bytes):
+!   python -m core min/ab/schrod_2d_stream.ergo --precision f32 \
+!       -o /tmp/schrod_stream && /tmp/schrod_stream
+! ════════════════════════════════════════════════════════════════════
+IMPLICIT NONE
+INTEGER, PARAMETER :: NX = 512, NY = 512
+INTEGER, PARAMETER :: NPTS = NX*NY
+INTEGER, PARAMETER :: NEND = NPTS - NX - 1
+INTEGER, PARAMETER :: NSTEPS = 1600
+INTEGER, PARAMETER :: NSP = 48
+REAL, PARAMETER :: AA = 0.20         ! a = hbar*dt/(2m*dx^2)
+REAL, PARAMETER :: SIG0 = 16.0
+REAL, PARAMETER :: K0 = 0.4
+INTEGER, PARAMETER :: X0 = 140, Y0 = 256
+INTEGER, PARAMETER :: T1 = 400, T2 = 1600
+INTEGER, PARAMETER :: ROWLO = (Y0 - 1) * NX + 1, ROWHI = Y0 * NX
+
+STATIC REAL :: R(NPTS), I(NPTS)
+STATIC REAL :: ABSORB(NPTS)
+REAL :: SV, FR, FI, M1X, M2X, M0, SX1, SX2, MX1, MX2
+REAL :: M1Y, M2Y, MY1, MY2, SY1, SY2
+INTEGER :: K, J, T
+
+DO DMY = 1, 1
+  DO K = 1, NPTS
+    R(K) := 0.0
+    I(K) := 0.0
+    ABSORB(K) := 1.0
+  ENDDO
+ENDDO
+DO J = 1, NSP
+  SV := 1.0 - 0.35 * (1.0 - REAL(J) / REAL(NSP + 1)) ** 2
+  DO K = 1, NX
+    ABSORB(K + (J - 1) * NX) := ABSORB(K + (J - 1) * NX) * SV
+    ABSORB(K + (NY - J) * NX) := ABSORB(K + (NY - J) * NX) * SV
+  ENDDO
+  DO K = 1, NY
+    ABSORB(J + (K - 1) * NX) := ABSORB(J + (K - 1) * NX) * SV
+    ABSORB(NX - J + 1 + (K - 1) * NX) := ABSORB(NX - J + 1 + (K - 1) * NX) * SV
+  ENDDO
+ENDDO
+
+! Gaussian packet, plane wave exp(i k0 x)
+DO J = 1, NY
+  DO K = 1, NX
+    SV := EXP(0.0 - ((REAL(K - X0)) ** 2 + (REAL(J - Y0)) ** 2) / (SIG0 * SIG0))
+    R(K + (J - 1) * NX) := SV * COS(K0 * REAL(K - X0))
+    I(K + (J - 1) * NX) := SV * SIN(K0 * REAL(K - X0))
+  ENDDO
+ENDDO
+
+OPEN(7, "/tmp/schrod_stream.bin", "WRITE")
+
+SX1 := 0.0
+MX1 := 0.0
+DO T = 1, NSTEPS
+  DO K = NX + 2, NEND
+    I(K) := (I(K) + AA * (R(K + 1) + R(K - 1) + R(K + NX) + R(K - NX) &
+      - 4.0 * R(K))) * ABSORB(K)
+  ENDDO
+  DO K = NX + 2, NEND
+    R(K) := (R(K) - AA * (I(K + 1) + I(K - 1) + I(K + NX) + I(K - NX) &
+      - 4.0 * I(K))) * ABSORB(K)
+  ENDDO
+  WRITE(7) R(ROWLO:ROWHI)
+  IF (T == T1) THEN
+    M0 := 0.0
+    M1X := 0.0
+    M2X := 0.0
+    M2Y := 0.0
+    DO K = NX + 2, NEND
+      SV := R(K) * R(K) + I(K) * I(K)
+      M0 := M0 + SV
+      M1X := M1X + SV * REAL(MOD(K - 1, NX) + 1)
+      M2X := M2X + SV * REAL((MOD(K - 1, NX) + 1) * (MOD(K - 1, NX) + 1))
+      M2Y := M2Y + SV * REAL(((K - 1) / NX + 1) * ((K - 1) / NX + 1))
+    ENDDO
+    MX1 := M1X / M0
+    SX1 := SQRT(M2X / M0 - MX1 * MX1)
+    SY1 := SQRT(M2Y / M0 - 256.0 * 256.0)
+  ENDIF
+ENDDO
+CLOSE(7)
+
+M0 := 0.0
+M1X := 0.0
+M2X := 0.0
+M2Y := 0.0
+DO K = NX + 2, NEND
+  SV := R(K) * R(K) + I(K) * I(K)
+  M0 := M0 + SV
+  M1X := M1X + SV * REAL(MOD(K - 1, NX) + 1)
+  M2X := M2X + SV * REAL((MOD(K - 1, NX) + 1) * (MOD(K - 1, NX) + 1))
+  M2Y := M2Y + SV * REAL(((K - 1) / NX + 1) * ((K - 1) / NX + 1))
+ENDDO
+MX2 := M1X / M0
+SX2 := SQRT(M2X / M0 - MX2 * MX2)
+SY2 := SQRT(M2Y / M0 - 256.0 * 256.0)
+
+! same oracles as schrod_2d.ergo — the emission must not change them
+WRITE(*, "mean_x  T1 %.3f  T2 %.3f") MX1, MX2
+WRITE(*, "sigma_y T1 %.3f  T2 %.3f") SY1, SY2
+WRITE(*, "vgroup  meas %.4f  expect %.4f") &
+  (MX2 - MX1) / REAL(T2 - T1), 2.0 * AA * K0
+WRITE(*, "streamed %d rows x %d f32 to /tmp/schrod_stream.bin") NSTEPS, NX
