@@ -213,6 +213,7 @@ STATIC INTEGER :: PAIR_J_I(150016)
 STATIC INTEGER :: PAIR_I_J(150016)
 STATIC REAL :: WST_I(150016), WPH_I(150016), WHY_I(150016)
 STATIC REAL :: WCO_I(150016), WCI_I(150016), CR0_I(150016)
+STATIC REAL :: CG_I(150016), CG_J(150016)
 STATIC REAL :: WST_J(150016), WPH_J(150016), WHY_J(150016)
 STATIC REAL :: WCO_J(150016), WCI_J(150016), CR0_J(150016)
 
@@ -285,7 +286,7 @@ STATIC INTEGER :: NSUB, SUB
 ! pair-kernel working scalars
 STATIC INTEGER :: T, I2, J2, KI, KJ
 STATIC REAL :: DD, MD, MS, MH, BST, FMS, FMP, FMH, WCT, FMC, DOCKM
-STATIC REAL :: P_G, P2_G, C_G, S_G
+STATIC REAL :: P_G, P2_G, C_G, S_G, FRM
 
 
 
@@ -342,6 +343,8 @@ DO I = 1, NRES
       WHY_I(K) := 0.0
       WCO_I(K) := REAL(NATIVE_CONTACT(I, J))
       WCI_I(K) := REAL(CONTACT_INTER(I, J))
+      P2_G := (1.0 - SIGN(1.0, 1.5 - WCI_I(K))) * 0.5
+      CG_I(K) := REAL(DOCK_FROM) + P2_G * (WCI_I(K) - REAL(DOCK_FROM))
       CR0_I(K) := NATIVE_R0(I, J)
       IF J - I >= 4 THEN
         IF HBOND_MATRIX(I, J) = 0 THEN
@@ -359,6 +362,7 @@ DO I = 1, NRES
       WHY_I(K) := 0.0
       WCO_I(K) := 0.0
       WCI_I(K) := 0.0
+      CG_I(K) := REAL(DOCK_FROM)
       CR0_I(K) := 0.0
     ENDIF
     ! j-major: owner I (as second atom), partner I2 = T
@@ -371,6 +375,8 @@ DO I = 1, NRES
       WHY_J(K) := 0.0
       WCO_J(K) := REAL(NATIVE_CONTACT(I2, J2))
       WCI_J(K) := REAL(CONTACT_INTER(I2, J2))
+      P2_G := (1.0 - SIGN(1.0, 1.5 - WCI_J(K))) * 0.5
+      CG_J(K) := REAL(DOCK_FROM) + P2_G * (WCI_J(K) - REAL(DOCK_FROM))
       CR0_J(K) := NATIVE_R0(I2, J2)
       IF J2 - I2 >= 4 THEN
         IF HBOND_MATRIX(I2, J2) = 0 THEN
@@ -388,6 +394,7 @@ DO I = 1, NRES
       WHY_J(K) := 0.0
       WCO_J(K) := 0.0
       WCI_J(K) := 0.0
+      CG_J(K) := REAL(DOCK_FROM)
       CR0_J(K) := 0.0
     ENDIF
   ENDDO
@@ -484,7 +491,7 @@ DO FRAME = 1, MAXFRAME
 
   ! Dock gate mask (exact 0/1 arithmetic, strict): 1 once
   ! FRAME > DOCK_FROM; inter-domain Go contacts (WCI=1) scale with it.
-  DOCKM := (1.0 - SIGN(1.0, REAL(DOCK_FROM - FRAME))) * 0.5
+  FRM := REAL(FRAME)
 
   DO SUB = 1, NSUB
   ! ── Unified pair forces (GPU segmented-reduction form) ──────────
@@ -514,9 +521,7 @@ DO FRAME = 1, MAXFRAME
     FMP := WPH_I(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
     FMH := -HYDRO_STRENGTH * WHY_I(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
     P_G := (1.0 - SIGN(1.0, 0.5 - WCI_I(K))) * 0.5
-    P2_G := (1.0 - SIGN(1.0, 1.5 - WCI_I(K))) * 0.5
-    C_G := REAL(DOCK_FROM) + P2_G * (WCI_I(K) - REAL(DOCK_FROM))
-    S_G := (1.0 - SIGN(1.0, C_G - REAL(FRAME))) * 0.5
+    S_G := (1.0 - SIGN(1.0, CG_I(K) - FRM)) * 0.5
     WCT := WCO_I(K) * ((1.0 - P_G) + P_G * S_G)
     FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_I(K))
     FM := MD * (FMS + FMP + FMH + FMC)
@@ -538,9 +543,7 @@ DO FRAME = 1, MAXFRAME
     FMP := WPH_I(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
     FMH := -HYDRO_STRENGTH * WHY_I(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
     P_G := (1.0 - SIGN(1.0, 0.5 - WCI_I(K))) * 0.5
-    P2_G := (1.0 - SIGN(1.0, 1.5 - WCI_I(K))) * 0.5
-    C_G := REAL(DOCK_FROM) + P2_G * (WCI_I(K) - REAL(DOCK_FROM))
-    S_G := (1.0 - SIGN(1.0, C_G - REAL(FRAME))) * 0.5
+    S_G := (1.0 - SIGN(1.0, CG_I(K) - FRM)) * 0.5
     WCT := WCO_I(K) * ((1.0 - P_G) + P_G * S_G)
     FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_I(K))
     FM := MD * (FMS + FMP + FMH + FMC)
@@ -562,9 +565,7 @@ DO FRAME = 1, MAXFRAME
     FMP := WPH_I(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
     FMH := -HYDRO_STRENGTH * WHY_I(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
     P_G := (1.0 - SIGN(1.0, 0.5 - WCI_I(K))) * 0.5
-    P2_G := (1.0 - SIGN(1.0, 1.5 - WCI_I(K))) * 0.5
-    C_G := REAL(DOCK_FROM) + P2_G * (WCI_I(K) - REAL(DOCK_FROM))
-    S_G := (1.0 - SIGN(1.0, C_G - REAL(FRAME))) * 0.5
+    S_G := (1.0 - SIGN(1.0, CG_I(K) - FRM)) * 0.5
     WCT := WCO_I(K) * ((1.0 - P_G) + P_G * S_G)
     FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_I(K))
     FM := MD * (FMS + FMP + FMH + FMC)
@@ -588,9 +589,7 @@ DO FRAME = 1, MAXFRAME
     FMP := WPH_J(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
     FMH := -HYDRO_STRENGTH * WHY_J(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
     P_G := (1.0 - SIGN(1.0, 0.5 - WCI_J(K))) * 0.5
-    P2_G := (1.0 - SIGN(1.0, 1.5 - WCI_J(K))) * 0.5
-    C_G := REAL(DOCK_FROM) + P2_G * (WCI_J(K) - REAL(DOCK_FROM))
-    S_G := (1.0 - SIGN(1.0, C_G - REAL(FRAME))) * 0.5
+    S_G := (1.0 - SIGN(1.0, CG_J(K) - FRM)) * 0.5
     WCT := WCO_J(K) * ((1.0 - P_G) + P_G * S_G)
     FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_J(K))
     FM := MD * (FMS + FMP + FMH + FMC)
@@ -612,9 +611,7 @@ DO FRAME = 1, MAXFRAME
     FMP := WPH_J(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
     FMH := -HYDRO_STRENGTH * WHY_J(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
     P_G := (1.0 - SIGN(1.0, 0.5 - WCI_J(K))) * 0.5
-    P2_G := (1.0 - SIGN(1.0, 1.5 - WCI_J(K))) * 0.5
-    C_G := REAL(DOCK_FROM) + P2_G * (WCI_J(K) - REAL(DOCK_FROM))
-    S_G := (1.0 - SIGN(1.0, C_G - REAL(FRAME))) * 0.5
+    S_G := (1.0 - SIGN(1.0, CG_J(K) - FRM)) * 0.5
     WCT := WCO_J(K) * ((1.0 - P_G) + P_G * S_G)
     FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_J(K))
     FM := MD * (FMS + FMP + FMH + FMC)
@@ -636,9 +633,7 @@ DO FRAME = 1, MAXFRAME
     FMP := WPH_J(K) * PHOS_EPS * EXP(-DD / PHOS_LAM) * (DD + PHOS_LAM) / (PHOS_LAM * DD * DD)
     FMH := -HYDRO_STRENGTH * WHY_J(K) * MH * EXP(-HYDRO_ALPHA * (DD - HYDRO_R0))
     P_G := (1.0 - SIGN(1.0, 0.5 - WCI_J(K))) * 0.5
-    P2_G := (1.0 - SIGN(1.0, 1.5 - WCI_J(K))) * 0.5
-    C_G := REAL(DOCK_FROM) + P2_G * (WCI_J(K) - REAL(DOCK_FROM))
-    S_G := (1.0 - SIGN(1.0, C_G - REAL(FRAME))) * 0.5
+    S_G := (1.0 - SIGN(1.0, CG_J(K) - FRM)) * 0.5
     WCT := WCO_J(K) * ((1.0 - P_G) + P_G * S_G)
     FMC := -2.0 * NATIVE_K * WCT * (DD - CR0_J(K))
     FM := MD * (FMS + FMP + FMH + FMC)

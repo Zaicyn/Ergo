@@ -4107,7 +4107,8 @@ class IRCodeGen:
 
     def _emit_reduction_readback(self, kernel: KernelPlan,
                                  chunk_var: str = "_rchunk",
-                                 downloaded: bool = False):
+                                 downloaded: bool = False,
+                                 skip_acc_sync: bool = False):
         """Emit the host read-back + ordered combine for one reduction
         kernel's partials buffer.
 
@@ -4138,6 +4139,9 @@ class IRCodeGen:
         # the host copy from the device before combining (otherwise the
         # host adds onto stale values and a later download would clobber
         # the combined sums), and write the combined values back after.
+        # In a coalesced group (_flush_pending_reductions) the group
+        # caller emits one sync per distinct accumulator instead of one
+        # per kernel (skip_acc_sync) — same arithmetic, fewer transfers.
         seg_acc = kernel.reduction_array
         seg_acc_gpu = False
         seg_size = seg_sz = None
@@ -4147,9 +4151,10 @@ class IRCodeGen:
                 seg_acc_gpu = True
                 seg_size = " * ".join(self._dim_expr(d) for d in seg_shape)
                 seg_sz = self._gpu_sizeof(seg_acc)
-                self._put(f"/* Sync segmented accumulator with device copy */")
-                self._put(f"ergo_vk_download(d_{seg_acc}, {seg_acc}, "
-                          f"{seg_size} * {seg_sz});")
+                if not skip_acc_sync:
+                    self._put(f"/* Sync segmented accumulator with device copy */")
+                    self._put(f"ergo_vk_download(d_{seg_acc}, {seg_acc}, "
+                              f"{seg_size} * {seg_sz});")
 
         self._put(f"/* Reduction read-back: ordered sum of group "
                   f"partials into '{red}' */")
@@ -4230,7 +4235,7 @@ class IRCodeGen:
         self.indent -= 1
         self._put("}")
 
-        if seg_acc_gpu:
+        if seg_acc_gpu and not skip_acc_sync:
             self._put(f"ergo_vk_upload(d_{seg_acc}, {seg_acc}, "
                       f"{seg_size} * {seg_sz});")
             self._gpu_current.add(seg_acc)
@@ -4354,9 +4359,42 @@ class IRCodeGen:
             self._put(f"  size_t _mo[{n}] = {{ {offs} }};")
             self._put(f"  size_t _ms[{n}] = {{ {sizes} }};")
             self._put(f"  ergo_vk_download_multi(_mb, _md, _mo, _ms, {n}); }}")
+            # Segmented accumulators: sync each DISTINCT accumulator
+            # once for the whole group (download before its first
+            # combine, upload after its last) instead of per kernel —
+            # the six pair-force segred kernels share RES_VX/Y/Z.
+            # Combine order per accumulator is unchanged (kernel order),
+            # so output is bitwise-identical to per-kernel syncs.
+            seen_accs: list = []
+            for k in pending:
+                acc = k.reduction_array
+                if acc and acc not in seen_accs:
+                    seen_accs.append(acc)
+            for acc in seen_accs:
+                if acc in set(self._gpu_arrays()):
+                    shape = self._array_shapes.get(acc)
+                    if shape:
+                        sz_expr = " * ".join(self._dim_expr(d)
+                                             for d in shape)
+                        sz = self._gpu_sizeof(acc)
+                        self._put(f"/* Sync segmented accumulator "
+                                  f"(once per group) */")
+                        self._put(f"ergo_vk_download(d_{acc}, {acc}, "
+                                  f"{sz_expr} * {sz});")
             for k in pending:
                 self._emit_reduction_readback(
-                    k, chunk_var=f"_rc{k.kernel_id}", downloaded=True)
+                    k, chunk_var=f"_rc{k.kernel_id}", downloaded=True,
+                    skip_acc_sync=True)
+            for acc in seen_accs:
+                if acc in set(self._gpu_arrays()):
+                    shape = self._array_shapes.get(acc)
+                    if shape:
+                        sz_expr = " * ".join(self._dim_expr(d)
+                                             for d in shape)
+                        sz = self._gpu_sizeof(acc)
+                        self._put(f"ergo_vk_upload(d_{acc}, {acc}, "
+                                  f"{sz_expr} * {sz});")
+                        self._gpu_current.add(acc)
             self.indent -= 1
             self._put("}")
         else:
