@@ -185,9 +185,9 @@ recorded in the kernel header, f64 and f32 variants. The six marked
 ones the cross-libc evidence convicts; the rest follow the same
 standard as they land. Landed cost profile (this machine): owned
 sin/cos/exp/atan2 beat glibc scalar libm; log is ~2× slower; pow is
-~23× slower (double-double series — the price of a compiler-independent
-1-ulp pow; a SLEEF-style poly-with-dd-head rework is the documented
-follow-up if pow profiles hot).
+~4.7× slower (107 ns vs 22.8 — double-double heads over the leading
+series terms with plain-f64 tails; the full-dd first cut was ~534 ns.
+Residual gap is the documented follow-up if pow profiles hot).
 
 Why own even the agreeing ones (LOG, ATAN2): two libcs agreeing today
 says nothing about musl-next-year or a third libc. Bit-identity that

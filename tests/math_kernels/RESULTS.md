@@ -35,6 +35,13 @@ LOG, POW, ATAN2; f64 + f32). Standard: Spec/Ergo_Hardware_Op_Map.md §2.
 | atan2f | 20049 | 2 | yes |
 | powf   | 20385 | 1 | yes |
 
+pow extended stress (post-restructure, 2026-08-29 evening): 200,000
+additional cases (positive base × ±1000 exponent, near-1 bases,
+negative base × integer exponent, overflow/underflow boundary fuzz) —
+max 1 ulp, gcc==clang bit-identical. Speed: 534 → 107 ns/call f64
+(log2_dd 195 → 68 ns, exp2_dd 207 → 23 ns), 83 ns f32 (libm: 22.8 /
+9.3).
+
 Edge coverage: denormal inputs/outputs, ±0, ±Inf, NaN; trig near
 multiples of π/2 at several magnitudes and huge arguments through the
 Payne-Hanek path (1e6..1e300, plus 6381956970095103-class stress

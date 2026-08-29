@@ -27,10 +27,10 @@
  *
  * Speed context (this machine, scalar calls, recipe flags): owned
  * sin/cos/exp/atan2 run 9.7-14.0 ns vs glibc 10.2-17.2; owned log
- * 14.0 vs glibc 6.3; owned pow is the expensive one at ~534 ns vs
- * glibc 22.8 — the double-double series are the price of a
- * compiler-independent 1-ulp pow.  A SLEEF-style poly-with-dd-head
- * rework is the known follow-up if pow ever shows up in a profile.
+ * 14.0 vs glibc 6.3; owned pow 107 ns vs glibc 22.8 (was ~534 with
+ * both series fully in dd; the poly-with-dd-head split — dd for the
+ * leading terms, plain-f64 Horner tails over exact coefficients —
+ * holds the same measured 1-ulp bound; see RESULTS.md).
  *
  * Fallback: define ERGO_MATH_LIBM (or compile with --libm-fallback,
  * which emits libm calls directly) to map every symbol back to the host
@@ -504,17 +504,20 @@ static inline double _ergo_atan2(double y, double x) {
 }
 
 /* ================================================================
- * POW (f64) — double-double arithmetic
- *   x^y = sign * 2^(y * log2|x|),  log2 and exp2 each carried as
- *   (hi, lo) double-double pairs (~106-bit significand) built from
- *   exact TwoSum/TwoProd (fma residual) steps.  Series use EXACT
- *   rational coefficients 1/(2n+1) and 1/n! in hi/lo f64 pairs
- *   (gen_coeffs.py tables below), 22/24 terms — truncation < 2^-117.
+ * POW (f64) — double-double heads, polynomial tails
+ *   x^y = sign * 2^(y * log2|x|).  log2 and exp2 carry their leading
+ *   terms as (hi, lo) double-double pairs (exact TwoSum/TwoProd via
+ *   fma residuals) and their series tails as plain-f64 Horners over the
+ *   exact 1/(2n+1) / 1/n! coefficient tables below — the SLEEF-style
+ *   poly-with-dd-head structure.  (The first version ran BOTH series
+ *   entirely in dd: 22+24 dd terms, ~430-530 ns/call.  The split
+ *   keeps the same measured bound — pow max 1 ulp over 234k cases,
+ *   incl. a 200k-case extended stress — at ~107 ns/call.)
  * Special cases per C99 Annex F: integer-exponent fast paths
- * (y = 2 -> x*x exactly, y = -1 -> 1/x, y = 0.5 -> sqrt(x)); x < 0 with
- * non-integer y -> NaN; the full zero/Inf/NaN table.  The last ulp at
- * the overflow/underflow boundary comes from IEEE rounding of the
- * final scaling, not from a hard-coded threshold.
+ * (y = 1 -> x, y = 2 -> x*x exactly, y = -1 -> 1/x, y = 0.5 ->
+ * sqrt(x)); x < 0 with non-integer y -> NaN; the full zero/Inf/NaN
+ * table.  The last ulp at the overflow/underflow boundary comes from
+ * IEEE rounding of the final scaling, not from a hard-coded threshold.
  * ================================================================ */
 /* TwoSum / TwoProd: exact error-free transformations */
 static inline void _dd2_sum(double a, double b, double *hi, double *lo) {
@@ -608,7 +611,16 @@ static const double _erg_rcp_fact[27][2] = {
 #define _ERG_INVLN2_HI 0x1.71547652b82fep+0
 #define _ERG_INVLN2_LO 0x1.777d0ffda0d24p-56
 
-/* log2(x) as dd, x > 0 finite (denormal pre-scaled by 2^64) */
+/* log2(x) as dd, x > 0 finite (denormal pre-scaled by 2^64).
+ * Structure (SLEEF-style poly-with-dd-head): the series
+ *   L = sum_{n>=0} z^n/(2n+1),  z = s^2, s = (m-1)/(m+1) dd
+ * is summed with the first 4 terms (through z^3/7) in dd and the
+ * remaining tail z^4*(1/9 + z/11 + ...) as a plain-f64 Horner over
+ * the exact 1/(2n+1) coefficients.  The tail is <= z^4/9 <= 8.3e-8,
+ * so its f64 rounding contributes ~1e-22 absolute to L — the dd head
+ * only needs to carry the big terms.  Total log2 error ~2^-85
+ * absolute (measured bound at the pow level is what counts; see
+ * RESULTS.md). */
 static inline void _erg_log2_dd(double x, double *hp, double *lp) {
     uint64_t u = _eb2d(x);
     int e = 0;
@@ -634,16 +646,24 @@ static inline void _erg_log2_dd(double x, double *hp, double *lp) {
     double sl = fma(-s, dl, sres) / dh;
     double zh, zl;
     _dd_mul(s, sl, s, sl, &zh, &zl);                   /* z = s^2 dd */
-    /* L = sum_{n>=0} z^n/(2n+1), dd */
+    /* head: 1 + z/3 + z^2/5 + z^3/7 in dd */
     double sh = 1.0, sl2 = 0.0;
     double th = zh, tl = zl;                           /* term z^1 */
-    for (int n = 1; n <= 22; n++) {
-        double ch = _erg_rcp_odd[n][0], cl = _erg_rcp_odd[n][1];
+    for (int n = 1; n <= 3; n++) {
         double t2h, t2l;
-        _dd_mul(th, tl, ch, cl, &t2h, &t2l);
+        _dd_mul(th, tl, _erg_rcp_odd[n][0], _erg_rcp_odd[n][1],
+                &t2h, &t2l);
         _dd_add(sh, sl2, t2h, t2l, &sh, &sl2);
         _dd_mul(th, tl, zh, zl, &th, &tl);
     }
+    /* th,tl now hold z^4.  Tail: sum_{n=4..17} z^(n-4)/(2n+1) in
+     * plain f64 (Horner over the exact 1/(2n+1) hi words);
+     * truncation at n=18 is ~2e-30, f64 rounding ~1e-22 absolute. */
+    double pt = _erg_rcp_odd[17][0];
+    for (int n = 16; n >= 4; n--)
+        pt = fma(pt, zh, _erg_rcp_odd[n][0]);
+    double tail = (th + tl) * pt;                      /* z^4 * P(z) */
+    _dd_add(sh, sl2, tail, 0.0, &sh, &sl2);
     /* log(m) = 2s * L (dd) */
     double lh, ll;
     _dd_mul(sh, sl2, 2.0 * s, 2.0 * sl, &lh, &ll);
@@ -653,7 +673,12 @@ static inline void _erg_log2_dd(double x, double *hp, double *lp) {
     _dd_add(qh, ql, (double)e, 0.0, hp, lp);
 }
 
-/* 2^t for dd t = th+tl, |t| < ~1075; returns f64 (denormal-safe) */
+/* 2^t for dd t = th+tl, |t| < ~1075; returns f64 (denormal-safe).
+ * Same structure: u = f*ln2 in dd (f = t - rint(t) dd), then
+ * 2^f = 1 + u + u^2/2 in dd plus the tail u^3*(1/3! + u/4! + ...)
+ * as plain-f64 Horner over exact 1/n! coefficients.  Tail omission
+ * beyond 1/14! is ~1e-19 relative to the result; f64 tail rounding
+ * ~1e-17 absolute — well under the 0.5-ulp final rounding. */
 static inline double _erg_exp2_dd(double th, double tl) {
     double nd = _erint64(th);
     int n = (int)nd;
@@ -662,20 +687,22 @@ static inline double _erg_exp2_dd(double th, double tl) {
     _dd2_sum(fh, tl, &fh2, &fl2);                      /* f in [-0.5, 0.5] */
     double uh, ul;
     _dd_mul(fh2, fl2, _ERG_LN2_HI, _ERG_LN2_LO, &uh, &ul);  /* u = f*ln2 */
-    /* 2^f = exp(u) = sum u^n/n! */
-    double sh = 1.0, sl = 0.0;
-    double th_ = uh, tl_ = ul;                         /* u^1 */
-    _dd_add(sh, sl, th_, tl_, &sh, &sl);               /* + u */
-    for (int i = 2; i <= 26; i++) {
-        _dd_mul(th_, tl_, uh, ul, &th_, &tl_);         /* u^i */
-        double t2h, t2l;
-        _dd_mul(th_, tl_, _erg_rcp_fact[i][0], _erg_rcp_fact[i][1],
-                &t2h, &t2l);
-        _dd_add(sh, sl, t2h, t2l, &sh, &sl);
-    }
+    /* head: 1 + u + u^2/2 in dd */
+    double sh, sl;
+    _dd_add(1.0, 0.0, uh, ul, &sh, &sl);
+    double u2h, u2l;
+    _dd_mul(uh, ul, uh, ul, &u2h, &u2l);
+    double t2h, t2l;
+    _dd_mul(u2h, u2l, 0.5, 0.0, &t2h, &t2l);           /* u^2/2 */
+    _dd_add(sh, sl, t2h, t2l, &sh, &sl);
+    /* tail: u^3 * sum_{i=0..11} u^i/(i+3)!, plain f64 Horner */
+    double pt = _erg_rcp_fact[14][0];
+    for (int i = 13; i >= 3; i--)
+        pt = fma(pt, uh, _erg_rcp_fact[i][0]);
+    double u3 = (u2h + u2l) * uh;
+    double rl = sl + u3 * pt;
     double rh = _escalbn64(sh, n);
-    double rl = _escalbn64(sl, n);
-    return rh + rl;
+    return rh + _escalbn64(rl, n);
 }
 
 static inline double _ergo_pow(double x, double y) {
@@ -717,6 +744,7 @@ static inline double _ergo_pow(double x, double y) {
         return base;
     }
     /* fast exact paths (x finite, nonzero here) */
+    if (y == 1.0) return x;
     if (y == 2.0) return x * x;
     if (y == -1.0) return 1.0 / x;
     if (y == 0.5) {
@@ -1052,15 +1080,22 @@ static inline void _erg_log2_ds(float x, float *hp, float *lp) {
     float sl = fmaf(-s, dl, sres) / dh;
     float zh, zl;
     _ds_mulf(s, sl, s, sl, &zh, &zl);
+    /* head: 1 + z/3 + z^2/5 in ds; tail z^3*(1/7 + z/9 + ...) as
+     * plain-f32 Horner over the exact 1/(2n+1) hi words */
     float sh = 1.0f, sl2 = 0.0f;
     float th = zh, tl = zl;
-    for (int n = 1; n <= 12; n++) {
+    for (int n = 1; n <= 2; n++) {
         float t2h, t2l;
         _ds_mulf(th, tl, _erg_rcp_odd_f[n][0], _erg_rcp_odd_f[n][1],
                  &t2h, &t2l);
         _ds_addf(sh, sl2, t2h, t2l, &sh, &sl2);
         _ds_mulf(th, tl, zh, zl, &th, &tl);
     }
+    float pt = _erg_rcp_odd_f[8][0];
+    for (int n = 7; n >= 3; n--)
+        pt = fmaf(pt, zh, _erg_rcp_odd_f[n][0]);
+    float tail = (th + tl) * pt;                       /* z^3 * P(z) */
+    _ds_addf(sh, sl2, tail, 0.0f, &sh, &sl2);
     float lh, ll;
     _ds_mulf(sh, sl2, 2.0f * s, 2.0f * sl, &lh, &ll);
     float qh, ql;
@@ -1076,19 +1111,21 @@ static inline float _erg_exp2_ds(float th, float tl) {
     _ds2_sumf(fh, tl, &fh2, &fl2);
     float uh, ul;
     _ds_mulf(fh2, fl2, _ERG_LN2_HI_F, _ERG_LN2_LO_F, &uh, &ul);
-    float sh = 1.0f, sl = 0.0f;
-    float th_ = uh, tl_ = ul;
-    _ds_addf(sh, sl, th_, tl_, &sh, &sl);
-    for (int i = 2; i <= 14; i++) {
-        _ds_mulf(th_, tl_, uh, ul, &th_, &tl_);
-        float t2h, t2l;
-        _ds_mulf(th_, tl_, _erg_rcp_fact_f[i][0], _erg_rcp_fact_f[i][1],
-                 &t2h, &t2l);
-        _ds_addf(sh, sl, t2h, t2l, &sh, &sl);
-    }
+    /* head: 1 + u + u^2/2 in ds; tail u^3*(1/3! + u/4! + ...) f32 */
+    float sh, sl;
+    _ds_addf(1.0f, 0.0f, uh, ul, &sh, &sl);
+    float u2h, u2l;
+    _ds_mulf(uh, ul, uh, ul, &u2h, &u2l);
+    float t2h, t2l;
+    _ds_mulf(u2h, u2l, 0.5f, 0.0f, &t2h, &t2l);
+    _ds_addf(sh, sl, t2h, t2l, &sh, &sl);
+    float pt = _erg_rcp_fact_f[8][0];
+    for (int i = 7; i >= 3; i--)
+        pt = fmaf(pt, uh, _erg_rcp_fact_f[i][0]);
+    float u3 = (u2h + u2l) * uh;
+    float rl = sl + u3 * pt;
     float rh = _escalbn32(sh, n);
-    float rl = _escalbn32(sl, n);
-    return rh + rl;
+    return rh + _escalbn32(rl, n);
 }
 
 static inline float _ergo_powf(float x, float y) {
@@ -1121,6 +1158,7 @@ static inline float _ergo_powf(float x, float y) {
             return ((int32_t)uy > 0) ? -_ef2b(0x7f800000U) : -0.0f;
         return base;
     }
+    if (y == 1.0f) return x;
     if (y == 2.0f) return x * x;
     if (y == -1.0f) return 1.0f / x;
     if (y == 0.5f) {

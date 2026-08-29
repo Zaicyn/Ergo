@@ -188,6 +188,7 @@ def main():
     mp_pow = lambda x, y: power(x, y)
 
     import math as _mm
+    import math as _m
 
     def annex_pow(x, y):           # C99 Annex F table (both precisions)
         N = _mm.nan
@@ -277,7 +278,6 @@ def main():
 
     # ---- atan2 f64 ----
     if not only or "atan2" in only:
-        import math as _m
         ain = []
         for i in range(30000):    # random magnitudes, all quadrants
             import random
@@ -383,7 +383,6 @@ def main():
 
     # ---- f32 sweeps ----
     if not only or "f32" in only:
-        import math as _m
         trig32 = []
         trig32 += linspace_bits(-10 * _m.pi, 10 * _m.pi, 40000, True)
         trig32 += logspace_bits(1e-6, 6400, 15000, True)      # medium
