@@ -186,6 +186,13 @@ def main():
             tokens = Lexer(source).tokenize()
             tree = Parser(tokens).parse()
             Checker().check(tree)
+            # HHB lint marks proven-bounded DO WHILE nodes for the IR
+            # builder's unroll — the report must see the same IR the
+            # real compile produces.
+            from .hhb_lint import HHBLinter
+            for v in HHBLinter(certified=False).lint(tree):
+                prefix = "HHB ERROR" if v.certified else "HHB WARNING"
+                print(f"{prefix} (line {v.line}): {v.message}", file=sys.stderr)
             mod = IRBuilder().build(tree, source_file=args.source)
             from .ir_inline import inline_subroutines
             inline_diags = inline_subroutines(mod)

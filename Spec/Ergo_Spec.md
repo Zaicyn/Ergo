@@ -173,6 +173,9 @@ array would share it, so the checker rejects recursion cycles
 involving functions with hoisted locals (named error; recursion with
 only small/ALLOCATABLE locals is unaffected). Unresolvable sizes keep
 the batch-1 stack warning. The legacy backend keeps the warning only.
+For bounded, compile-time-provable recursion-shaped control flow
+(endpoint → mediator → endpoint chains), see Part 11 (Handshake
+Verification) — that is where bounded "recursion" lives in Ergo.
 
 ✅ **WRITE format audit (A4, ratified 2026-08-13):** the WRITE format
 string lowers verbatim to C `fprintf`, so the supported set is
@@ -235,6 +238,8 @@ conversions, conversion/argument count mismatch, and type mismatch
 3. Memory model — now Part 2 of this document; lowering detail in [Spec/Arena_Lowering_Brief.md](Arena_Lowering_Brief.md)
 4. **Ergo_Intrinsic_Signatures_Complete.md** — Complete, authoritative intrinsic signatures (supersedes the first-draft intrinsics specification)
 5. **MCL_Bootstrap_Strategy.md** — Phase-by-phase implementation plan (MCL-era document; Ergo rewrite pending)
+6. **Hopf_Handshake_Bound_Policy.md** — HHB policy: bounded handshake topology, oracle rules, GPU lowering (language rules summarized in Part 11 of this document)
+7. **HHB_IMPLEMENTATION_PLAN.md** — HHB implementation phases, certification ladder scoreboard, process rules
 
 ---
 
@@ -395,6 +400,10 @@ Ergo supports two loop forms: counted (`DO I = A, B`) and conditional
 (`DO WHILE condition`). Both support `CYCLE` (continue) and `EXIT` (break).
 DO WHILE conditions must be boolean — no truthy integers.
 Use `ELSEIF` (one word), not `ELSE IF`.
+
+A `DO WHILE` matching the bounded-attempt pattern (constant-bound counter,
+unconditional increment) is provably counted and accepted inside handshake
+regions — see Part 11.4.
 
 This rule exists because array expressions create an impossible choice:
 1. **Fuse** the operations (no temporary) — changes semantics if arrays alias
@@ -964,6 +973,115 @@ WRITE(unit) A(lo:hi)            ! one or more sections, comma-separated
 - I/O statements never extract to GPU kernels; a `WRITE`/`OPEN`/
   `CLOSE` inside a loop forces that loop onto the CPU path (named
   reason in `--kernel-report`, like any host call).
+
+---
+
+## Part 11: Handshake Verification (HHB)
+
+### 11.1 Purpose
+
+A handshake declares a **bounded, compile-time-provable interaction
+schedule** with mandatory oracles. The compiler proves the schedule
+finite before generating code: no runtime call stack, no allocation,
+no data-dependent depth. The recursion expresses topology
+(endpoint → mediator → endpoint); it never expresses search.
+
+Full rationale: [Hopf_Handshake_Bound_Policy.md](Hopf_Handshake_Bound_Policy.md).
+Implementation status and certification ladder: [HHB_IMPLEMENTATION_PLAN.md](HHB_IMPLEMENTATION_PLAN.md).
+
+### 11.2 Forms
+
+```ergo
+VERIFY HANDSHAKE <name> DEPTH=2 FRAME_BYTES=256 MAXIT=240 &
+       CONSERVE PARITY NORM PAYLOAD=(AMP, PHASE) ORACLE NORM TOL=1.0E-12
+  <statement>
+
+HANDSHAKE <name> ...same options...
+  <statements>
+ENDHANDSHAKE
+```
+
+Both forms lower to the same emission: entry capture + boundary oracle
+checks. The compiler emits a checked schedule, not recursive calls.
+
+### 11.3 The Limits (language rules)
+
+- **DEPTH ≤ 2.** Chain length per unit is endpoint → mediator →
+  endpoint. `DEPTH > 2` is a hard compile error (`hhb_depth`). A paired
+  composite is two explicitly declared units; deeper interaction
+  patterns must be expressed as counted iteration over stages, not
+  recursion. Depth is topology; iteration is work.
+- **Payload ≤ 512 bytes per unit** (256-byte frame × depth 2). Fixed
+  record only: no pointers, no allocatables, no INTEGER*8 or COMPLEX
+  in the frame. Physical state (fields, orbitals, maps) stays in
+  normal STATIC arrays outside the handshake control block.
+- **All loops counted.** MAXIT must be a compile-time constant
+  (integer literal or PARAMETER). No magnitude ceiling — the rule is
+  provability, not size.
+- **Activation is monotonic.** Once a stage fires it stays fired for
+  the step; the token moves forward only. Rewind/recoil is not part of
+  the base construct.
+- **No ALLOCATE, no REWIND, no I/O inside the region** — enforced
+  recursively through called subroutines.
+
+### 11.4 Bounded Attempt Loops
+
+A `DO WHILE` inside a handshake is **provably counted** — accepted with
+an implicit MAXIT equal to its bound — when ALL of the following hold:
+
+- the condition is a strict `<` comparison of a single INTEGER counter
+  against a compile-time constant (literal or PARAMETER),
+- the counter's last write before the loop in the same scope is a
+  constant,
+- the counter is incremented exactly once per iteration, unconditionally,
+  at the top level of the body (`ATT := ATT + 1`),
+- every other write to the counter inside the body is a forced exit to
+  a constant ≥ the bound (the `ATT := 20` early-exit idiom, inside IFs),
+- no writes to the counter inside nested loops.
+
+Anything else keeps the hard `hhb_uncounted` error. The analysis is
+conservative by design: any doubt means rejection.
+
+### 11.5 Oracles
+
+- At least one ORACLE per handshake: prototype mode warns, certified
+  mode rejects.
+- CONSERVE invariants require an explicit TOL.
+- **f32 TOL floor:** TOL < 1e-6 is rejected at f32 — below the f32
+  noise floor you would be checking rounding error, not physics.
+- A failed oracle aborts loudly: `HHB_SCANFAIL` with
+  actual/expected/tol, exit 1. Never silently keep the old value.
+- Oracle checks are boundary-only and numerics-nonperturbing: golden
+  output is bitwise-identical with and without annotation at f64 and
+  f32.
+- **Window-oracle caveat** (Phase-4 NC3 finding): a per-iteration
+  window oracle (`|actual − VALUE| > LIMIT`) catches sign flips and
+  norm drift but NOT structure-preserving wrong values (e.g. an
+  integral read at a wrong index that stays plausible). Wire a
+  limit-value oracle where its value is meaningful — e.g. a
+  dissociation-limit check after the final iteration.
+
+### 11.6 GPU Lowering
+
+On GPU, a handshake lowers to an **unrolled schedule only**. A bounded
+loop (counted or proven-bounded per 11.4) unrolls into predicated
+straight-line kernel code when its proven bound ≤ 64; larger bounds
+keep the runtime loop, which blocks extraction of any enclosing loop.
+This is a structural capability cliff, not a numeric one — output is
+identical either way, but the enclosing kernel runs on CPU.
+
+Rejected for GPU extraction: activation depending on runtime data
+beyond a fixed sector index, pointers/allocatables in the payload,
+INTEGER*8 or COMPLEX in the frame.
+
+### 11.7 What HHB Is Not
+
+HHB is not general recursion support. It is a certification scaffold:
+it converts unbounded-looking behavior (hangs, silent numerical
+failure, drift) into compile-time rejection or a loud runtime abort,
+and it does so at zero numeric cost. If a problem's true topology is a
+tree or graph, it does not fit — write the pattern with counted loops
+outside the construct and accept that it gets no handshake checks.
 
 ---
 

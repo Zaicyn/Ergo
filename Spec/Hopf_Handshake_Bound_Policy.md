@@ -1,4 +1,9 @@
-# Hopf Handshake Bound — Prototype Compiler Policy
+# Hopf Handshake Bound — Compiler Policy (ratified 2026-08-28)
+
+Drafted as a prototype policy from the H₂⁺ / H₂ / df_radial2 campaigns;
+ratified after Phase 0–4 implementation and the certification ladder
+(scoreboard: HHB_IMPLEMENTATION_PLAN.md). Language-rule summary:
+Ergo_Spec.md Part 11.
 
 Source inspiration: H₂⁺ handshake findings, H₂ two-electron handshake findings, and the df_radial2 / Wigner-stage certification findings.
 
@@ -82,6 +87,20 @@ Two failure classes:
 - **Recoverable numerical miss:** print `HS_SCANFAIL`-style diagnostics — cycle, stage, kept epsilon, pole count — then widen at most three bounded attempts.
 - **Structural violation:** depth overflow, re-entry, payload overflow, allocation inside handshake, broken invariant → hard error.
 
+**Bounded attempt loops (added 2026-08-28, implemented):** a `DO WHILE`
+inside a handshake region counts as a counted loop when the compiler proves
+ALL of: condition is `counter < bound` (strict, counter a single INTEGER,
+bound a compile-time constant or PARAMETER); the counter's last write before
+the loop in the same scope is a constant; exactly one unconditional top-level
+increment `counter := counter + 1` per iteration; every other counter write
+is a forced exit inside an IF assigning a constant >= bound. The proof is
+emitted as the loop's implicit MAXIT in the lint diagnostics; anything not
+matching keeps the hard `hhb_uncounted` error. On the GPU path the proven
+loop is unrolled at its bound into predicated straight-line copies inside
+the kernel body (a forced exit makes later copies no-ops — exact while
+semantics), so an enclosing counted loop stays extractable (policy §7's
+"unrolled schedule only" now covers the attempt ladder).
+
 ### 5. Sector invariants are part of the type
 
 The handshake declares what it preserves:
@@ -125,6 +144,13 @@ A handshake block without an oracle clause should compile with a warning in prot
 
 On GPU, handshake = unrolled schedule only.
 
+A bounded loop inside a verified handshake unrolls into predicated
+straight-line kernel copies when its proven bound ≤ 64; larger bounds
+keep the runtime loop, which blocks extraction of any enclosing loop
+(structural cliff: identical output, but the kernel runs on CPU).
+This applies to counted loops and to proven bounded-attempt loops
+(§4) alike.
+
 Reject for GPU if:
 
 - depth cannot be proven at compile time
@@ -135,76 +161,69 @@ Reject for GPU if:
 
 The mediator should lower to registers/shared state. The endpoints lower to normal STATIC field arrays.
 
-## Future syntax sketch
+## Syntax (implemented 2026-08-28, Phase 0–4 complete)
 
-Not current ergo — a planning sketch:
+Current ergo — two forms, same lowering:
 
 ```ergo
-HANDSHAKE PAIR DEPTH=2 FRAME_BYTES=256 MAXIT=240 &
-          CONSERVE PARITY SPIN NORM
-  ENDPOINT A = ATOM_LEFT
-  ENDPOINT B = ATOM_RIGHT
-  MEDIATOR M = PINNED_OSC MIDPOINT
+VERIFY HANDSHAKE h2_scf DEPTH=2 FRAME_BYTES=256 MAXIT=240 &
+       CONSERVE NORM PAYLOAD=(NRM) ORACLE NCHK VALUE=1.0 LIMIT=1.0E-9
+  <statement>
 
-  PAYLOAD M = (AMP, PHASE, SIGN, SECTOR)
-
-  STAGE 1: PROPAGATE A COUNT=NTAU ORACLE NORM TOL=1.0E-12
-  SIGNAL A -> M -> B WHEN OVERLAP(BOND) > 0.0
-  STAGE 2: PROPAGATE B COUNT=NTAU ORACLE NORM TOL=1.0E-12
-
-  ORACLE UNITED_LIMIT    R=0.2  TOL=6.0E-2
-  ORACLE SEPARATED_LIMIT R=12.0 TOL=1.0E-3
-  ORACLE TRIPLET_NULL
-  ORACLE VARIATIONAL
+HANDSHAKE h2_scf DEPTH=2 FRAME_BYTES=256 MAXIT=240 &
+          CONSERVE NORM PAYLOAD=(NRM) ORACLE NCHK VALUE=1.0 LIMIT=1.0E-9
+  <statements>
 ENDHANDSHAKE
 ```
 
-The compiler does not emit recursive calls for this. It emits a checked schedule:
+The compiler does not emit recursive calls. It emits a checked schedule:
 
 ```text
 check depth <= 2
 check frame bytes <= 512
 check no ALLOCATE in region
-emit stage 1 counted loop
+emit counted stages (bounded-attempt loops unrolled at their proven bound)
 emit mediator fixed-record update
-emit activation-token move
-emit stage 2 counted loop
-emit oracle checks
+emit oracle checks (entry capture + boundary checks)
 ```
 
-If any check fails: compile-time rejection.
+If any check fails: compile-time rejection. A failed oracle at runtime
+aborts with `HHB_SCANFAIL` (actual/expected/tol), exit 1.
 
-## Compiler prerequisites already surfaced by the campaign
+Still future work: the richer ENDPOINT/MEDIATOR/STAGE/SIGNAL declarative
+form (explicit topology naming, `SIGNAL A -> M -> B WHEN ...`). The
+implemented forms annotate existing counted-loop structure rather than
+declaring the topology; the policy limits above are enforced identically
+under either form.
 
-Before HHB becomes real syntax, these are the right prerequisites:
+## Compiler prerequisites surfaced by the campaign (all landed)
 
-1. **A6 scalar dummy-arg copy-out** must be fixed or permanently worked around with 1-element arrays.
-2. **Undefined identifier in array bound** must be a hard error — the df_radial colon-bounds failure should never become a silent “whatever ran.”
-3. **Case policy** needs a spec decision; until then generated handshake code should be UPPERCASE-only.
-4. **No silent fallback semantics** anywhere in the runtime: SCANFAIL must print.
-5. Dual-codegen drift needs a golden-output handshake test so legacy and IR paths cannot diverge quietly.
+These were prerequisites for real syntax; all are in now:
 
-## Suggested integration phases
+1. ~~A6 scalar dummy-arg copy-out~~ — fixed (language batch 1).
+2. ~~Undefined identifier in array bound~~ — hard error (batch 2).
+3. Case policy — settled; spec is the authority.
+4. ~~Silent fallback semantics~~ — SCANFAIL prints and aborts (exit 1).
+5. ~~Dual-codegen drift~~ — golden handshake test pins legacy and IR paths.
 
-**Phase 0 — pattern only:** write handshakes with existing counted DO loops, STATIC payload arrays, visited flags, and explicit oracle prints. No compiler change.
+## Integration phases (all complete)
 
-**Phase 1 — linter/static analysis:** mcl recognizes the pattern and warns on depth > 2, `ALLOCATE` in region, missing MAXIT, missing oracle, mediator writing activation flags.
+- **Phase 0–2** — pattern, linter (`core/hhb_lint.py`), `VERIFY HANDSHAKE` directive: done.
+- **Phase 3** — `HANDSHAKE ... ENDHANDSHAKE` AST/IR node, schedule-finiteness proof, GPU unrolled lowering: done.
+- **Phase 4** — certification suite with positive and negative oracles: done (scoreboard in HHB_IMPLEMENTATION_PLAN.md).
 
-**Phase 2 — directive form:** something like `VERIFY HANDSHAKE ...` or an attribute block before structured syntax exists.
+## Certification ladder (complete)
 
-**Phase 3 — real AST/IR node:** parser gains `HANDSHAKE ... ENDHANDSHAKE`; ir_builder proves the schedule finite; codegen lowers to straight-line/countable code; GPU path accepts only fully unrolled instances.
+All five rungs pass; all three negative controls trip. Full scoreboard
+with oracle values: HHB_IMPLEMENTATION_PLAN.md, Phase-4 section.
 
-**Phase 4 — certification suite:** tests must include both positive and negative oracles.
-
-## First certification ladder
-
-Reuse the existing physics as the compiler test ladder:
-
-1. **H₂⁺ parity handshake:** σg/σu stay separated; split exponent ≈ −1; midpoint coherence behaves.
-2. **H₂ two-electron handshake:** singlet binds, triplet repulsive, ionic content dissolves with R, dissociation limit −1.0.
-3. **HeH⁺ heteronuclear handshake:** no-parity case; triplet midpoint non-erasure; charge localization toward He.
-4. **df_radial2 SCF handshake:** SCANFAIL loud-and-recover; norm-root solver rejects source-amplitude-dependent fake roots.
-5. **Negative controls:** LCAO mirror v1 must fail where the engine catches it; norm-inflated stored orbitals must trip OVLMAT; wrong exchange-like integrals must trip the triplet-null/variational oracle.
+1. **H₂⁺ parity** — σg/σu separated, WNORM = 1 to 1e-13.
+2. **H₂ two-electron** — singlet binds, triplet repulsive, dissociation −1.0.
+3. **HeH⁺ heteronuclear** — no-parity case, charge localizes toward He.
+4. **df_radial2 SCF** — SCANFAIL loud-and-recover.
+5. **Negative controls** — norm inflation, wrong mirror value, and (after
+   the NC3 hole was found and closed) wrong exchange integrals all abort
+   with HHB_SCANFAIL.
 
 ## One-sentence policy
 

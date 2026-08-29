@@ -785,7 +785,28 @@ class IRBuilder:
         return [loop]
 
     def _lower_while(self, node: ast.DoWhileStmt) -> list:
-        from .ir import IRWhileLoop
+        from .ir import IRWhileLoop, IRIf
+        # HHB-proven bounded attempt loop (marked by hhb_lint inside a
+        # handshake region): unroll at the proven bound into predicated
+        # straight-line copies. Exact while semantics: copy i runs the
+        # body iff the condition holds there; a forced exit (counter :=
+        # constant >= bound) makes the condition false, so every later
+        # copy is a no-op. Capped at 64 copies — larger bounds keep the
+        # runtime DO WHILE (conservative).
+        bound = getattr(node, "hhb_bound", None)
+        if bound is not None and bound <= 64:
+            items = []
+            for _ in range(bound):
+                cond_block = IRBlock(self._fresh_block("hhb_while_cond"),
+                                     line=node.line)
+                cond_op = self._lower_expr(node.condition, cond_block)
+                body_items = []
+                for s in node.body:
+                    body_items.extend(self._lower_stmt(s))
+                items.append(cond_block)
+                items.append(IRIf(condition=cond_op,
+                                  then_body=body_items, line=node.line))
+            return items
         cond_block = IRBlock(self._fresh_block("while_cond"), line=node.line)
         cond_op = self._lower_expr(node.condition, cond_block)
 

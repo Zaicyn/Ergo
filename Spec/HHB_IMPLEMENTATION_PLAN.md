@@ -246,3 +246,40 @@ f97fba8).
   warning to a rejection in certified mode; apply the dissociation-limit
   oracle pattern to other multi-R programs; ribosome perf lever
   (coalesce segred combines into one drain per substep).
+
+## Bounded attempt loops inside handshakes (2026-08-28) — implemented
+
+Closes the gap between the policy's bounded-attempt-ladder intent and the
+two independent hard rejections (linter `hhb_uncounted` on any DO WHILE;
+GPU extractor "nested DO WHILE").
+
+- **Linter** (`core/hhb_lint.py`): a `DO WHILE counter < bound` counts as
+  a counted loop when ALL hold, proven from the AST (any doubt = keep the
+  hard error): strict `<` condition on a single INTEGER counter; bound a
+  compile-time constant/PARAMETER; counter's last pre-loop write in scope
+  is a constant; exactly one unconditional top-level `counter := counter + 1`;
+  every other counter write is a forced exit inside an IF to a constant
+  >= bound; no nested loop writes the counter. Accepted loops are reported
+  with their implicit MAXIT (lint note) and marked for the IR builder.
+- **GPU** (`core/ir_builder.py`): a proven loop unrolls at its bound into
+  predicated straight-line copies (condition recomputed per copy; a forced
+  exit makes the condition false, so later copies are no-ops — exact while
+  semantics; cap 64 copies, larger bounds keep the runtime loop). Unroll,
+  not exit-flag: the exit-flag form leaves a nested counted DO, which the
+  extractor still rejects — unrolling removes the nested loop entirely.
+- **Tests:** `core/test_hhb_lint.py` gains the positive case (INIT_CHAIN
+  idiom accepted with implicit-MAXIT note) and five negatives (conditional
+  increment, non-constant bound, double increment, wrong condition
+  variable, forced exit below the bound) — all stay rejected.
+  End-to-end: `min/wigner/hhb_bounded_attempt.ergo` runs a bounded attempt
+  loop inside a counted kernel loop inside a HANDSHAKE block; the attempt
+  loop's enclosing loop extracts to the GPU (kernel-report verified), and
+  CPU and SPIR-V builds are bitwise-identical at f64 (f32 matches at f32
+  noise). `core/test_hhb_golden.py` unchanged-green (f64+f32 bitwise);
+  `tests/gpu_fallback_coil.ergo` and `core/test_stag5_hang_regression.py`
+  stay green.
+- Test-program authoring note: the init uses `RAND(I)` (splitmix64
+  intrinsic — bitwise-identical across backends); a hand-rolled
+  `i*1103515245` hash wraps 32-bit INTEGER at i>=2, and SIN reroutes
+  f64->f32->f64 on GPU (Spec Part 9.10) — both silently break bitwise
+  comparability. This bit one draft of the test.

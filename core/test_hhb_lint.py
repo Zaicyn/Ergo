@@ -72,6 +72,92 @@ STOP
     assert "hhb_uncounted" in kinds
 
 
+# ── bounded-attempt pattern (the INIT_CHAIN idiom) ─────────────
+
+_BOUNDED_OK = """
+IMPLICIT NONE
+INTEGER, PARAMETER :: N = 8
+INTEGER, PARAMETER :: MAXATT = 20
+INTEGER :: I, ATT, OK
+REAL :: X
+VERIFY HANDSHAKE attempt DEPTH=1 FRAME_BYTES=256 MAXIT=10 CONSERVE NORM VALUE=0.0 TOL=1.0E-10 PAYLOAD=(X)
+DO I = 1, N
+  ATT := 0
+  OK := 0
+  DO WHILE ATT < MAXATT
+    ATT := ATT + 1
+    X := X + 1.0
+    IF OK = 1 THEN
+      ATT := 20
+    ENDIF
+  ENDDO
+ENDDO
+STOP
+"""
+
+
+def test_bounded_attempt_accepted():
+    """INIT_CHAIN-style bounded attempt loop: accepted, reported with
+    its implicit MAXIT, NOT counted as an uncounted DO WHILE."""
+    v = _lint(_BOUNDED_OK)
+    kinds = {x.kind for x in v}
+    assert "hhb_uncounted" not in kinds, f"bounded loop rejected: {v}"
+    bounded = [x for x in v if x.kind == "hhb_bounded"]
+    assert len(bounded) == 1 and "MAXIT=20" in bounded[0].message, \
+        f"missing bounded-attempt diagnostic: {v}"
+
+
+def test_bounded_attempt_conditional_increment_rejected():
+    """Increment inside an IF: some paths never increment — reject."""
+    src = _BOUNDED_OK.replace("""  DO WHILE ATT < MAXATT
+    ATT := ATT + 1
+    X := X + 1.0
+    IF OK = 1 THEN""", """  DO WHILE ATT < MAXATT
+    IF OK = 0 THEN
+      ATT := ATT + 1
+    ENDIF
+    X := X + 1.0
+    IF OK = 1 THEN""")
+    assert src != _BOUNDED_OK
+    v = _lint(src)
+    assert any(x.kind == "hhb_uncounted" for x in v)
+
+
+def test_bounded_attempt_nonconstant_bound_rejected():
+    """Bound must be a compile-time constant/PARAMETER."""
+    src = _BOUNDED_OK.replace("DO WHILE ATT < MAXATT", "DO WHILE ATT < NRUN")
+    src = src.replace("INTEGER :: I, ATT, OK", "INTEGER :: I, ATT, OK, NRUN")
+    src = src.replace("VERIFY HANDSHAKE", "NRUN := 4\nVERIFY HANDSHAKE")
+    assert "NRUN" in src
+    v = _lint(src)
+    assert any(x.kind == "hhb_uncounted" for x in v)
+
+
+def test_bounded_attempt_double_increment_rejected():
+    """Two increments per iteration would outrun the bound — reject."""
+    src = _BOUNDED_OK.replace("    ATT := ATT + 1\n    X := X + 1.0",
+                              "    ATT := ATT + 1\n    X := X + 1.0\n    ATT := ATT + 1")
+    assert src != _BOUNDED_OK
+    v = _lint(src)
+    assert any(x.kind == "hhb_uncounted" for x in v)
+
+
+def test_bounded_attempt_wrong_condition_var_rejected():
+    """Condition on a different variable than the incremented counter."""
+    src = _BOUNDED_OK.replace("DO WHILE ATT < MAXATT", "DO WHILE OK < MAXATT")
+    assert src != _BOUNDED_OK
+    v = _lint(src)
+    assert any(x.kind == "hhb_uncounted" for x in v)
+
+
+def test_bounded_attempt_low_forced_exit_rejected():
+    """Forced exit to a value BELOW the bound is not an exit — reject."""
+    src = _BOUNDED_OK.replace("      ATT := 20", "      ATT := 5")
+    assert src != _BOUNDED_OK
+    v = _lint(src)
+    assert any(x.kind == "hhb_uncounted" for x in v)
+
+
 def test_allocate_rejected():
     src = """
 IMPLICIT NONE

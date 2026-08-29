@@ -249,6 +249,15 @@ class HHBLinter:
                 f"all loops must be counted DO loops",
                 ctx.dw_line, certified=True)
 
+        # Bounded attempt loops accepted this block (proven counted):
+        # report each with its implicit MAXIT.
+        for ln, bound in ctx.bounded_whiles:
+            self._add(
+                "hhb_bounded",
+                f"Handshake '{name}': bounded attempt loop (DO WHILE, "
+                f"line {ln}) is provably counted — implicit MAXIT={bound}",
+                ln, certified=False)
+
         if ctx.uncounted_loops:
             self._add(
                 "hhb_uncounted",
@@ -343,22 +352,29 @@ class HHBLinter:
                 ctx.payload_int8_line, certified=True)
 
     def _analyze_block(self, node: Any, ctx: "_HandshakeContext",
-                        call_stack: tuple[str, ...] = ()):
+                        call_stack: tuple[str, ...] = (),
+                        siblings: list | None = None, idx: int | None = None):
         """Recursively analyze a handshake block, collecting statistics."""
         if isinstance(node, ast.DoLoop):
             ctx.note_do_loop(node)
-            for stmt in node.body:
-                self._analyze_block(stmt, ctx, call_stack)
+            for i, stmt in enumerate(node.body):
+                self._analyze_block(stmt, ctx, call_stack, node.body, i)
         elif isinstance(node, ast.DoWhileStmt):
-            ctx.note_do_while(node)
-            for stmt in node.body:
-                self._analyze_block(stmt, ctx, call_stack)
+            bound = self._bounded_attempt_bound(node, siblings, idx)
+            if bound is not None:
+                ctx.bounded_whiles.append((node.line, bound))
+                node.hhb_bound = bound   # for the IR builder (GPU unroll)
+            else:
+                ctx.note_do_while(node)
+            for i, stmt in enumerate(node.body):
+                self._analyze_block(stmt, ctx, call_stack, node.body, i)
         elif isinstance(node, ast.IfStmt):
-            for stmt in node.then_body:
-                self._analyze_block(stmt, ctx, call_stack)
+            for i, stmt in enumerate(node.then_body):
+                self._analyze_block(stmt, ctx, call_stack, node.then_body, i)
             if node.else_body:
-                for stmt in node.else_body:
-                    self._analyze_block(stmt, ctx, call_stack)
+                for i, stmt in enumerate(node.else_body):
+                    self._analyze_block(stmt, ctx, call_stack,
+                                        node.else_body, i)
         elif isinstance(node, ast.AllocateStmt):
             ctx.note_allocate(node)
         elif isinstance(node, ast.DeallocateStmt):
@@ -419,8 +435,12 @@ class HHBLinter:
             return
         sub_ctx = _HandshakeContext(ctx.name, ctx.depth, ctx.maxit)
         new_stack = call_stack + (name,)
-        for stmt in definition.body:
-            self._analyze_block(stmt, sub_ctx, new_stack)
+        for i, stmt in enumerate(definition.body):
+            self._analyze_block(stmt, sub_ctx, new_stack,
+                                definition.body, i)
+        # proven-bounded attempt loops in the callee count (and report)
+        # at the handshake level
+        ctx.bounded_whiles.extend(sub_ctx.bounded_whiles)
         if (sub_ctx.do_whiles or sub_ctx.allocates or
                 sub_ctx.uncounted_loops or sub_ctx.rewinds or
                 sub_ctx.payload_int8):
@@ -438,6 +458,109 @@ class HHBLinter:
             return True
         if isinstance(maxit, str):
             return self._static_int_value(maxit) is not None
+        return False
+
+    @staticmethod
+    def _target_name(expr: Any) -> str | None:
+        """Name of an assignment target (plain scalar only)."""
+        if isinstance(expr, ast.Variable):
+            return expr.name
+        return None
+
+    def _bounded_attempt_bound(self, node: ast.DoWhileStmt,
+                               siblings: list | None, idx: int | None
+                               ) -> int | None:
+        """Prove the bounded-attempt pattern on a DO WHILE; return the
+        implicit MAXIT (the bound) or None.
+
+        A `DO WHILE counter < bound` counts as a counted loop when ALL
+        hold (any doubt -> None, keep the hard error):
+          - condition is `counter < bound` (strict <), counter a single
+            INTEGER variable, bound a compile-time constant/PARAMETER;
+          - the counter's last top-level write before the loop in the
+            same scope assigns a compile-time constant;
+          - the body contains exactly one unconditional top-level
+            increment `counter := counter + 1`;
+          - every other write to the counter is inside an IF branch and
+            assigns a constant >= bound (the forced-exit idiom);
+          - no nested loop writes the counter.
+        """
+        cond = node.condition
+        if not isinstance(cond, ast.BinaryOp):
+            return None
+        if cond.op not in ("<", ".LT."):
+            return None
+        if not isinstance(cond.left, ast.Variable):
+            return None
+        var = cond.left.name
+        info = self.var_info.get(var)
+        if info is None or info["type"] != "INTEGER":
+            return None
+        bound = self._eval_static_dim(cond.right)
+        if bound is None or bound <= 0:
+            return None
+
+        # Pre-loop: the counter's last top-level write in this scope
+        # must assign a compile-time constant.
+        if siblings is None or idx is None:
+            return None
+        last_write = None
+        for s in siblings[:idx]:
+            if isinstance(s, ast.AssignStmt) and \
+                    self._target_name(s.target) == var:
+                last_write = s
+        if last_write is None:
+            return None
+        if self._eval_static_dim(last_write.value) is None:
+            return None
+
+        # Body: exactly one unconditional top-level increment;
+        # any other counter write must be a forced exit inside an IF.
+        top_increments = 0
+        for s in node.body:
+            if isinstance(s, ast.AssignStmt):
+                if self._target_name(s.target) != var:
+                    continue
+                if not self._is_unit_increment(s.value, var):
+                    return None
+                top_increments += 1
+            elif isinstance(s, ast.IfStmt):
+                for branch in (s.then_body, s.else_body or []):
+                    for ss in branch:
+                        if isinstance(ss, ast.AssignStmt) and \
+                                self._target_name(ss.target) == var:
+                            val = self._eval_static_dim(ss.value)
+                            if val is None or val < bound:
+                                return None
+                        elif self._writes_var_deep(ss, var):
+                            return None
+            else:
+                if self._writes_var_deep(s, var):
+                    return None
+        if top_increments != 1:
+            return None
+        return bound
+
+    def _is_unit_increment(self, expr: Any, var: str) -> bool:
+        """True for `var := var + 1` / `var := 1 + var`."""
+        if not isinstance(expr, ast.BinaryOp) or expr.op != "+":
+            return False
+        for a, b in ((expr.left, expr.right), (expr.right, expr.left)):
+            if isinstance(a, ast.Variable) and a.name == var and \
+                    isinstance(b, ast.Literal) and b.value == 1:
+                return True
+        return False
+
+    def _writes_var_deep(self, stmt: Any, var: str) -> bool:
+        """True if `stmt` writes `var` anywhere (including nested)."""
+        if isinstance(stmt, ast.AssignStmt):
+            return self._target_name(stmt.target) == var
+        for body_attr in ("body", "then_body", "else_body"):
+            body = getattr(stmt, body_attr, None)
+            if body:
+                for ss in body:
+                    if self._writes_var_deep(ss, var):
+                        return True
         return False
 
     def _static_int_value(self, name: str) -> int | None:
@@ -581,6 +704,8 @@ class _HandshakeContext:
     visited_vars: set[str] = field(default_factory=set)
     # Potential payload variables (scalars written in the block)
     payload_vars: set[str] = field(default_factory=set)
+    # Provably-bounded attempt loops accepted as counted: (line, bound)
+    bounded_whiles: list = field(default_factory=list)
 
     def note_do_loop(self, node: ast.DoLoop):
         self.do_loops += 1

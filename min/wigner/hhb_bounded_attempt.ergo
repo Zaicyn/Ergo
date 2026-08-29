@@ -1,0 +1,49 @@
+! HHB_BOUNDED_ATTEMPT — bounded attempt loop (INIT_CHAIN idiom) inside
+! a handshake, unrolled by the IR builder at its proven bound so the
+! enclosing counted loop can extract to the GPU.
+!
+! Per element i: A(i) = B(i) if B(i) > 0 (early exit), else 10*B(i)
+! (all 4 attempts). S = sum(A). Exact oracle value computed from
+! B(i) = RAND(i)*2 - 1 (splitmix64 intrinsic — bitwise-identical on CPU and GPU; a hand-rolled i*big hash wraps 32-bit INTEGER at i>=2, and a SIN init reroutes f64->f32->f64 on GPU per Spec 9.10 — both break bitwise comparability by design).
+!
+! CPU:  python -m core min/wigner/hhb_bounded_attempt.ergo -o /tmp/hba
+! GPU:  python -m core min/wigner/hhb_bounded_attempt.ergo --target spirv
+!       — outputs must match bitwise (f64) and at f32 noise level.
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: N = 2048
+INTEGER, PARAMETER :: MAXATT = 4
+STATIC REAL :: A(N), B(N)
+REAL :: S
+INTEGER :: I, ATT
+
+DO I = 1, N
+  B(I) := RAND(I) * 2.0 - 1.0
+  A(I) := 0.0
+ENDDO
+
+HANDSHAKE attempt
+    DEPTH=1
+    FRAME_BYTES=256
+    MAXIT=4
+    PAYLOAD=(S)
+  DO I = 1, N
+    ATT := 0
+    DO WHILE ATT < MAXATT
+      ATT := ATT + 1
+      A(I) := A(I) + B(I) * REAL(ATT)
+      IF B(I) > 0.0 THEN
+        ATT := 4
+      ENDIF
+    ENDDO
+  ENDDO
+  S := 0.0
+  DO I = 1, N
+    S := S + A(I)
+  ENDDO
+  WRITE(*, "('S %.10e')") S
+ENDHANDSHAKE
+
+WRITE(*, "('FINAL %.10e')") S
+STOP
