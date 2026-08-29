@@ -139,6 +139,22 @@ robustness. Both gcc and clang fumble this identically.
 
 ## 2. The transcendental table
 
+**Status 2026-08-29: the six core kernels are LANDED and are the
+default lowering** — `core/runtime/ergo_math_kernels.h` (inlined into
+generated C by `core/ir_codegen.py` when any of SIN/COS/EXP/LOG/ATAN2/
+POW is used), measured ≤ 2 ulp f64 / ≤ 2 ulp f32 against an 800-bit
+mpmath reference, bit-identical between gcc and clang
+(tests/math_kernels/RESULTS.md). The remaining rows (TAN, ASIN, …)
+still lower to libm.
+
+**Fallback (loud):** `--libm-fallback` (driver flag), or
+`ERGO_LIBM_FALLBACK=1` (environment), or `-DERGO_MATH_LIBM` (macro on a
+standalone rebuild of emitted C). Each route maps the six back to host
+libm; the driver prints a build-log note naming the broken guarantee
+(cross-libc bit-identity). The fallback exists for build environments
+where the kernels cannot compile and for generating gate baselines —
+it is not a silent default anywhere.
+
 Measured 2026-08-29, this machine, glibc vs musl: bitwise agreement
 checked by hashing 200k results per function; speed in ns/call.
 
@@ -149,6 +165,7 @@ checked by hashing 200k results per function; speed in ns/call.
 | EXP | libm `exp`/`expf` | **disagree** | 5.6 / 3.4 | owned kernel (2^k · polynomial) | **yes** |
 | LOG | libm `log`/`logf` | agree (measured) | 4.7 / 6.0 | owned kernel anyway — agreement between two libcs is luck, not a contract | **yes** |
 | POW | libm `pow`/`powf` | **disagree** | 16.1 / 14.7 | owned kernel (exp/log composite with exact special cases) | **yes** |
+
 | ATAN2 | libm `atan2`/`atan2f` | agree (measured) | 15.8 / 12.3 | owned kernel (same reasoning as LOG) | **yes** |
 | TAN | libm | unmeasured today | — | owned kernel (sincos ratio or own reduction) | no — assume divergent until measured |
 | ASIN / ACOS | libm | unmeasured today | — | owned kernel (atan2-based identities) | no |
@@ -162,10 +179,15 @@ checked by hashing 200k results per function; speed in ns/call.
 Cephes/SLEEF-style minimax polynomials, coefficients fixed in the
 source as hex-float literals, FMA3 evaluation (the x86-64-v3 baseline
 guarantees it), argument reduction documented per function, ulp bound
-measured against an mpfr reference and recorded in the kernel header,
-f64 and f32 variants. The six marked **core** are the ones physics
-programs actually hot-loop on and the ones the cross-libc evidence
-convicts; the rest follow the same standard as they land.
+measured against an mpfr-class reference (mpmath at 800 bits here) and
+recorded in the kernel header, f64 and f32 variants. The six marked
+**core** are the ones physics programs actually hot-loop on and the
+ones the cross-libc evidence convicts; the rest follow the same
+standard as they land. Landed cost profile (this machine): owned
+sin/cos/exp/atan2 beat glibc scalar libm; log is ~2× slower; pow is
+~23× slower (double-double series — the price of a compiler-independent
+1-ulp pow; a SLEEF-style poly-with-dd-head rework is the documented
+follow-up if pow profiles hot).
 
 Why own even the agreeing ones (LOG, ATAN2): two libcs agreeing today
 says nothing about musl-next-year or a third libc. Bit-identity that

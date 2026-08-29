@@ -136,7 +136,8 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
                    param_overrides: dict = None,
                    arena_size: int = None,
                    no_verify: bool = False,
-                   gpu_tile_size: int = 0) -> str:
+                   gpu_tile_size: int = 0,
+                   libm_fallback: bool = False) -> str:
     """Compile MCL source to an executable (or just emit C if requested).
 
     target: if set, extract GPU kernels and emit device code via the
@@ -147,6 +148,15 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
     # Lex
     tokens = Lexer(source).tokenize()
 
+    # ERGO_LIBM_FALLBACK=1 is the environment-level form of
+    # --libm-fallback (build environments / gate baselines).
+    if not libm_fallback and os.environ.get("ERGO_LIBM_FALLBACK") == "1":
+        libm_fallback = True
+    if libm_fallback:
+        print("ERGO NOTE: libm fallback active — SIN/COS/EXP/LOG/POW/"
+              "ATAN2 lower to host libm, not the owned kernels. Cross-libc "
+              "bit-identity is NOT guaranteed "
+              "(Spec/Ergo_Hardware_Op_Map.md §2).", file=sys.stderr)
     # Parse
     tree = Parser(tokens).parse()
 
@@ -198,7 +208,8 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
             target_result = _compile_target(ir_module, target, output, emit_c,
                                             cpu_fast_math, gpu_fast_math,
                                             no_split, render, arena_size,
-                                            no_verify, gpu_tile_size)
+                                            no_verify, gpu_tile_size,
+                                            libm_fallback)
             if target_result is not None:
                 return target_result
             # None = no extractable kernels; continue down the normal CPU
@@ -209,7 +220,8 @@ def compile_source(source: str, output: str = "a.out", emit_c: bool = False,
             for d in inline_subroutines(ir_module):
                 print(d, file=sys.stderr)
         c_code = IRCodeGen(ir_module, render=render,
-                           no_verify=no_verify).generate()
+                           no_verify=no_verify,
+                           libm_fallback=libm_fallback).generate()
     else:
         # Legacy AST codegen — DEPRECATED (2026-08-12): the IR path is
         # the supported backend. Legacy remains only for the dual-path
@@ -268,7 +280,8 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
                     render: bool = False,
                     arena_size: int = None,
                     no_verify: bool = False,
-                    gpu_tile_size: int = 0) -> str:
+                    gpu_tile_size: int = 0,
+                    libm_fallback: bool = False) -> str:
     """Kernel extraction + vendor backend compilation path."""
     # Load the requested backend (vendor-specific, loaded on demand)
     from .backends import get_backend
@@ -315,7 +328,8 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
     if not plan.kernels:
         print(f"[{target}] No extractable kernels found. "
               f"Falling back to CPU path.", file=sys.stderr)
-        c_code = IRCodeGen(ir_module, render=render, no_verify=no_verify).generate()
+        c_code = IRCodeGen(ir_module, render=render, no_verify=no_verify,
+                           libm_fallback=libm_fallback).generate()
         if emit_c:
             return c_code
         # Still need to compile with vk_host if rendering
@@ -370,7 +384,8 @@ def _compile_target(ir_module, target: str, output: str, emit_c: bool,
     # Generate GPU-aware host code (extracted loops -> dispatches)
     c_code = IRCodeGen(ir_module, gpu_plan=plan, backend=backend,
                        render=render, no_verify=no_verify,
-                       gpu_tile_size=gpu_tile_size).generate()
+                       gpu_tile_size=gpu_tile_size,
+                       libm_fallback=libm_fallback).generate()
 
     if emit_c:
         result = []
@@ -455,7 +470,8 @@ def compile_file(path: str, output: str = None, emit_c: bool = False,
                  param_overrides: dict = None,
                  arena_size: int = None,
                  no_verify: bool = False,
-                 gpu_tile_size: int = 0) -> str:
+                 gpu_tile_size: int = 0,
+                 libm_fallback: bool = False) -> str:
     """Compile an MCL source file."""
     with open(path, "r", encoding="utf-8") as f:
         source = f.read()
@@ -474,4 +490,5 @@ def compile_file(path: str, output: str = None, emit_c: bool = False,
                           param_overrides=param_overrides,
                           arena_size=arena_size,
                           no_verify=no_verify,
-                          gpu_tile_size=gpu_tile_size)
+                          gpu_tile_size=gpu_tile_size,
+                          libm_fallback=libm_fallback)

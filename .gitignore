@@ -89,6 +89,13 @@
 !tests/nodegraph/*.py
 !tests/nodegraph/*.json
 !tests/nodegraph/*.md
+# math-kernel verification harness (coefficient generator, bit-plumbing
+# dump, ulp checker, recorded results) — the audit trail for the owned
+# transcendentals, so it must live in git, not /tmp
+!tests/math_kernels/
+!tests/math_kernels/*.py
+!tests/math_kernels/*.c
+!tests/math_kernels/*.md
 
 # Always ignore build artifacts
 __pycache__/

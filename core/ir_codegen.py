@@ -75,6 +75,13 @@ C_MATH = {
     Op.SQRT: "sqrt", Op.SINH: "sinh", Op.COSH: "cosh", Op.TANH: "tanh",
 }
 
+# Ops with owned, fixed-coefficient kernels (core/runtime/
+# ergo_math_kernels.h, Spec/Ergo_Hardware_Op_Map.md §2) — used by default
+# and mapped back to host libm under --libm-fallback.
+OWNED_MATH = {Op.SIN: "_ergo_sin", Op.COS: "_ergo_cos",
+              Op.EXP: "_ergo_exp", Op.LOG: "_ergo_log",
+              Op.ATAN2: "_ergo_atan2", Op.POW: "_ergo_pow"}
+
 
 def _real_math(base: str) -> str:
     """libm function name for the current REAL precision (sin vs sinf)."""
@@ -122,13 +129,18 @@ def _real_lit(value) -> str:
 class IRCodeGen:
     def __init__(self, module: IRModule, gpu_plan: GPUPlan | None = None,
                  backend=None, render: bool = False, jit_mode: bool = False,
-                 no_verify: bool = False, gpu_tile_size: int = 0):
+                 no_verify: bool = False, gpu_tile_size: int = 0,
+                 libm_fallback: bool = False):
         self.module = module
         self.gpu_plan = gpu_plan
         self.backend = backend
         self.render = render
         self.jit_mode = jit_mode
         self.no_verify = no_verify
+        # --libm-fallback: lower the six owned transcendental intrinsics
+        # (SIN/COS/EXP/LOG/POW/ATAN2) to host libm instead of the owned
+        # fixed-coefficient kernels (Spec/Ergo_Hardware_Op_Map.md §2).
+        self.libm_fallback = libm_fallback
         # --gpu-tile-size: dispatch extracted kernels in contiguous tiles
         # over the same buffer (0 = whole-range dispatch, unchanged).
         # Quantized to a workgroup multiple so tiled reduction partials
@@ -350,6 +362,16 @@ class IRCodeGen:
         # Emit the splitmix64 hash helpers once if HASH/RAND is used.
         if self._uses_hash(mod):
             self._emit_hash_helper()
+
+        # Emit the owned transcendental kernels once if any of
+        # SIN/COS/EXP/LOG/ATAN2/POW is used and --libm-fallback is off.
+        if not self.libm_fallback and self._uses_owned_math(mod):
+            self._emit_math_kernels()
+        elif self.libm_fallback and self._uses_owned_math(mod):
+            self._put_raw("/* --libm-fallback: SIN/COS/EXP/LOG/ATAN2/POW "
+                          "lower to host libm; cross-libc bit-identity is "
+                          "NOT guaranteed (Spec/Ergo_Hardware_Op_Map.md "
+                          "§2). */")
 
         # Embed SPIR-V binaries as byte arrays (if GPU)
         if has_gpu:
@@ -2095,8 +2117,14 @@ class IRCodeGen:
             return
 
         if op == Op.POW:
-            self._put(f"{result} = {_real_math('pow')}("
-                      f"{self._operand(args[0])}, {self._operand(args[1])});")
+            if not self.libm_fallback:
+                fn = OWNED_MATH[Op.POW] + (
+                    "f" if get_real_precision() == 32 else "")
+                self._put(f"{result} = {fn}("
+                          f"{self._operand(args[0])}, {self._operand(args[1])});")
+            else:
+                self._put(f"{result} = {_real_math('pow')}("
+                          f"{self._operand(args[0])}, {self._operand(args[1])});")
             return
 
         if op == Op.MOD:
@@ -2174,6 +2202,12 @@ class IRCodeGen:
 
         # Math intrinsics
         if op in C_MATH:
+            if not self.libm_fallback and op in OWNED_MATH:
+                fn = OWNED_MATH[op] + (
+                    "f" if get_real_precision() == 32 else "")
+                a = ", ".join(self._operand(a) for a in args)
+                self._put(f"{result} = {fn}({a});")
+                return
             c_func = _real_math(C_MATH[op])
             a = ", ".join(self._operand(a) for a in args)
             self._put(f"{result} = {c_func}({a});")
@@ -3455,6 +3489,51 @@ class IRCodeGen:
             if walk_items(fn.body):
                 return True
         return False
+    def _uses_owned_math(self, mod: IRModule) -> bool:
+        """Return True if any owned-math intrinsic is reachable."""
+        def walk_items(items) -> bool:
+            for item in items:
+                if isinstance(item, IRBlock):
+                    for inst in item.insts:
+                        if inst.op in OWNED_MATH:
+                            return True
+                elif isinstance(item, IRLoop):
+                    if walk_items(item.body):
+                        return True
+                elif isinstance(item, IRWhileLoop):
+                    if walk_items(item.body):
+                        return True
+                elif isinstance(item, IRIf):
+                    if walk_items(item.then_body):
+                        return True
+                    if item.else_body and walk_items(item.else_body):
+                        return True
+            return False
+        if walk_items(mod.main_body):
+            return True
+        for fn in mod.functions:
+            if walk_items(fn.body):
+                return True
+        return False
+
+    def _emit_math_kernels(self) -> None:
+        """Inline the owned transcendental kernels into the preamble.
+
+        The source of truth is core/runtime/ergo_math_kernels.h; it is
+        read and inlined (same self-contained-TU model as the splitmix64
+        helpers) so the generated C compiles standalone.
+        """
+        import os
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "runtime", "ergo_math_kernels.h")
+        with open(path, "r") as f:
+            text = f.read()
+        self._put_raw("/* Owned transcendental kernels — inlined from "
+                      "core/runtime/ergo_math_kernels.h (do not edit the "
+                      "copy; see Spec/Ergo_Hardware_Op_Map.md §2). */")
+        self._put_raw(text)
+        self._put_raw("")
+
     # splitmix64 finalizer (Stafford 2013). Constants: the Weyl increment
     # is the golden-ratio 2^64/phi; both multipliers are Stafford's
     # odd 64-bit constants chosen for maximal avalanche. The full 64-bit

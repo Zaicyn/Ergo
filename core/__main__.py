@@ -88,6 +88,14 @@ def main():
              "flag; CPU codegen is unaffected",
     )
     parser.add_argument(
+        "--libm-fallback", action="store_true",
+        help="Lower SIN/COS/EXP/LOG/POW/ATAN2 to host libm instead of the "
+             "owned fixed-coefficient kernels "
+             "(core/runtime/ergo_math_kernels.h). Breaks cross-libc "
+             "bit-identity; announced at build time "
+             "(Spec/Ergo_Hardware_Op_Map.md section 2)",
+    )
+    parser.add_argument(
         "--precision", choices=["f32", "f64"], default="f64",
         help="Floating-point precision for REAL type (default: f64)",
     )
@@ -145,7 +153,8 @@ def main():
                 render=args.render,
                 promote_locals_flag=args.promote_locals,
                 no_verify=args.no_verify,
-                gpu_tile_size=args.gpu_tile_size)
+                gpu_tile_size=args.gpu_tile_size,
+                libm_fallback=args.libm_fallback)
             if args.emit_c:
                 print(c_code)
             else:
@@ -284,7 +293,8 @@ def main():
                               param_overrides=param_overrides,
                               arena_size=arena_size,
                               no_verify=args.no_verify,
-                              gpu_tile_size=args.gpu_tile_size)
+                              gpu_tile_size=args.gpu_tile_size,
+                              libm_fallback=args.libm_fallback)
         if args.emit_c:
             print(c_code)
         else:

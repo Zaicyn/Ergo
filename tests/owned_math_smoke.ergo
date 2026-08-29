@@ -1,0 +1,29 @@
+! owned_math_smoke.ergo — exercise the six owned transcendental kernels
+! (SIN COS EXP LOG POW ATAN2) in counted loops and print with full f64
+! digits so any last-ulp move is visible.  Determinism oracle: run the
+! built binary twice, outputs must be byte-identical.
+IMPLICIT NONE
+REAL :: X, S1, S2, S3, S4, S5, S6
+INTEGER :: I
+
+S1 := 0.0
+S2 := 0.0
+S3 := 0.0
+S4 := 0.0
+S5 := 0.0
+S6 := 0.0
+DO I = 1, 10000
+  X := REAL(I) * 0.001 - 5.0
+  S1 := S1 + SIN(X) * 0.37
+  S2 := S2 + COS(X) * 0.73
+  S3 := S3 + EXP(X * 0.13) * 0.19
+  S4 := S4 + LOG(ABS(X) + 1.0)
+  S5 := S5 + (REAL(I) ** 0.5) * 0.0001
+  S6 := S6 + ATAN2(X, REAL(I) * 0.01)
+ENDDO
+WRITE(*, "sin  %.17g") S1
+WRITE(*, "cos  %.17g") S2
+WRITE(*, "exp  %.17g") S3
+WRITE(*, "log  %.17g") S4
+WRITE(*, "pow  %.17g") S5
+WRITE(*, "atan2 %.17g") S6
