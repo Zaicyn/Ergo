@@ -101,6 +101,7 @@
 !tests/contraction/
 !tests/contraction/*.py
 !tests/contraction/*.c
+!tests/contraction/*.md
 
 # Always ignore build artifacts
 __pycache__/

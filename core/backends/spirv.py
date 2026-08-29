@@ -126,7 +126,7 @@ class SPIRVBackend(KernelBackend):
         from ..ir_contract import compute_fma_sites
         self._fma_sites = compute_fma_sites(module)
         self._boundary_warned = False
-        self._boundary_lines: list[tuple[int, int]] = []
+        self._boundary_lines: list[tuple[int, int, bool]] = []
 
     # ── top-level ───────────────────────────────────────────
 
@@ -140,19 +140,27 @@ class SPIRVBackend(KernelBackend):
         # the driver — device code and host launches use it).
         if self._boundary_lines and not self._boundary_warned:
             self._boundary_warned = True
-            per_kernel: dict[int, list[int]] = {}
-            for kid, ln in self._boundary_lines:
-                per_kernel.setdefault(kid, []).append(ln)
+            per_kernel: dict[int, list[tuple[int, bool]]] = {}
+            for kid, ln, fr in self._boundary_lines:
+                per_kernel.setdefault(kid, []).append((ln, fr))
             for kid in sorted(per_kernel):
-                ks = sorted(set(per_kernel[kid]))
+                ks = per_kernel[kid]
                 src = self.plan.kernels[kid].source_line
-                lines = ", ".join(str(x if x else src) for x in ks)
-                print(f"[spirv] NOTE kernel_{kid}: fusible a*b±c sites "
-                      f"(source lines {lines}) — the CPU recipe may "
-                      f"contract these while the GPU never will "
-                      f"(NoContraction): last-ulp CPU≠GPU boundary, "
-                      f"Spec/Ergo_Hardware_Op_Map.md section 4",
-                      file=sys.stderr)
+                plain = sorted({ln for ln, fr in ks if not fr})
+                fragile = sorted({ln for ln, fr in ks if fr})
+                pl = ", ".join(str(x if x else src) for x in plain)
+                msg = (f"[spirv] NOTE kernel_{kid}: {len(plain)} fusible "
+                       f"a*b±c site(s) (source lines {pl}) — the CPU "
+                       f"recipe may contract these while the GPU never "
+                       f"will (NoContraction): last-ulp CPU≠GPU boundary, "
+                       f"Spec/Ergo_Hardware_Op_Map.md section 4")
+                if fragile:
+                    fl = ", ".join(str(x if x else src) for x in fragile)
+                    msg += (f"; {len(fragile)} of them call-factor sites "
+                            f"(lines {fl}) where CPU fusion is "
+                            f"callee-shape luck (fusible-fragile class — "
+                            f"least stable across compiler versions)")
+                print(msg, file=sys.stderr)
         # Generate compiler-created sort-by-GEN kernels
         next_kid = len(self.plan.kernels)
         for sp in self.plan.sort_plans:
@@ -212,7 +220,7 @@ class SPIRVBackend(KernelBackend):
                           fma_sites=self._fma_sites)
         ctx.emit_module()
         self._boundary_lines.extend(
-            (kernel.kernel_id, ln) for ln in ctx._fusible_lines)
+            (kernel.kernel_id, ln, fr) for ln, fr in ctx._fusible_lines)
         return "\n".join(ctx.lines) + "\n"
 
     @staticmethod
@@ -993,7 +1001,7 @@ class _EmitContext:
         # at assembly.  Marked fusible sites encountered during emission
         # are collected for the boundary lint (reported once per build).
         self._nocontract: list[int] = []
-        self._fusible_lines: list[int] = []
+        self._fusible_lines: list[tuple[int, bool]] = []
         self._fma_sites = fma_sites
 
         # Pre-allocated type IDs (filled during type declaration)
@@ -2430,8 +2438,12 @@ class _EmitContext:
                 # Contraction boundary lint: this site is fusible
                 # (a*b±c); the CPU recipe may contract it while the GPU
                 # never will (NoContraction).  Reported once per build.
+                # Call-factor sites are separately fragile (callee-shape
+                # luck — core/ir_contract.py).
                 if op in (Op.ADD, Op.SUB) and id(inst) in self._fma_sites:
-                    self._fusible_lines.append(inst.line)
+                    st = self._fma_sites[id(inst)]
+                    self._fusible_lines.append(
+                        (inst.line, bool(st.get("fragile"))))
             else:
                 spv_op = {Op.ADD: "OpIAdd", Op.SUB: "OpISub",
                           Op.MUL: "OpIMul", Op.DIV: "OpSDiv"}[op]

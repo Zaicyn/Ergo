@@ -700,7 +700,7 @@ static inline double _erg_exp2_dd(double th, double tl) {
     for (int i = 13; i >= 3; i--)
         pt = fma(pt, uh, _erg_rcp_fact[i][0]);
     double u3 = (u2h + u2l) * uh;
-    double rl = sl + u3 * pt;
+    double rl = fma(u3, pt, sl);
     double rh = _escalbn64(sh, n);
     return rh + _escalbn64(rl, n);
 }
@@ -1123,7 +1123,7 @@ static inline float _erg_exp2_ds(float th, float tl) {
     for (int i = 7; i >= 3; i--)
         pt = fmaf(pt, uh, _erg_rcp_fact_f[i][0]);
     float u3 = (u2h + u2l) * uh;
-    float rl = sl + u3 * pt;
+    float rl = fmaf(u3, pt, sl);
     float rh = _escalbn32(sh, n);
     return rh + _escalbn32(rl, n);
 }

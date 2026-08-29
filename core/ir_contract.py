@@ -32,10 +32,31 @@ behavior on straight-line code (tests/contraction/probe*.c):
   never fusible         -> add feeding a mul, any division form,
                            all-constant subtrees (folded unfused)
 Multi-use and cross-block products are fusible; f32 mirrors f64.
+
+**Fusible-fragile (the call-factor class, sharpened 2026-08-29 per
+tests/contraction/FORMULA_INVENTORY.md):** a site whose mul factor is
+the result of a call — an intrinsic (SIN/COS/EXP/LOG/SQRT/ATAN2/POW/…)
+or a user function — is marked with `fragile: True`.  Whether gcc
+fuses such a site depends on the callee's return-path structure after
+inlining (probe9 flip-flop; the smoke-test sin-vs-cos asymmetry), not
+on anything visible at IR level.  The lint reports these separately:
+fusion there is callee-shape luck, the least compiler-version-stable
+fusion class.  Measured on the full corpus: 494 of 1,552 call-factor
+sites were path-dependent (mixed fused/unfused in one binary), 646
+fused deterministically — see FORMULA_INVENTORY.md.
 """
 
 from .ir import (IRModule, IRBlock, IRIf, IRLoop, IRWhileLoop, IRSelect,
                  IRInst, Op, IRType, IRConst, IRRef)
+
+# call-class ops: a mul factor produced by one of these makes the site
+# fusible-fragile (see module docstring)
+CALL_CLASS = {
+    Op.CALL, Op.SIN, Op.COS, Op.TAN, Op.ASIN, Op.ACOS, Op.ATAN,
+    Op.ATAN2, Op.EXP, Op.LOG, Op.LOG10, Op.SQRT, Op.SINH, Op.COSH,
+    Op.TANH, Op.POW, Op.ABS, Op.SIGN, Op.MOD, Op.MAX, Op.MIN,
+    Op.CLAMP, Op.HASH, Op.RAND,
+}
 
 # site record: id(add/sub inst) -> dict with:
 #   mul:   the IRInst of the MUL whose operands become fma's a,b
@@ -88,16 +109,28 @@ def compute_fma_sites(mod: IRModule) -> dict[int, dict]:
         sub = inst.op == Op.SUB
         lm = mul_def(xname, defs) if xname else None
         rm = mul_def(yname, defs) if yname else None
+        site_mul = lm or rm
+        fragile = False
+        if site_mul is not None:
+            mul = site_mul[0]
+            for a in mul.args:
+                if isinstance(a, IRRef):
+                    fd = defs.get(a.name)
+                    if fd is not None and isinstance(fd, IRInst) and \
+                            fd.op in CALL_CLASS:
+                        fragile = True
         if lm is not None:
             mul, neg = lm
             sites[id(inst)] = {"mul": mul, "side": "L",
-                               "neg_mul": neg, "neg_addend": sub}
+                               "neg_mul": neg, "neg_addend": sub,
+                               "fragile": fragile}
         elif rm is not None:
             mul, neg = rm
             # SUB with right mul: negate a factor (exact)
             sites[id(inst)] = {"mul": mul, "side": "R",
                                "neg_mul": (not neg) if sub else neg,
-                               "neg_addend": False}
+                               "neg_addend": False,
+                               "fragile": fragile}
 
     def walk(items, defs):
         for item in items:
