@@ -533,6 +533,18 @@ No barrier is required when operations are recorded in the same command buffer w
 
 **Correctness guarantee:** No read of a buffer observes partially completed writes from a prior operation. This preserves the deterministic semantics defined in Part 7.
 
+**Host-copy coherence (2026-08-30):** every GPU-mapped array also has a
+host copy that non-extracted (CPU) code reads. The compiler downloads a
+device-written array before any CPU read that follows the write within
+one linear pass over a loop body. Across the loop **back-edge** — a
+kernel writes the array in the body and a CPU read is reachable at the
+top of the next iteration — the compiler emits an end-of-iteration
+refresh download for arrays written by the body's kernels AND read by
+the body's CPU code, minus arrays already downloaded that iteration and
+minus arrays the CPU wrote (whose fresh copy is the host one;
+downloading would clobber it). A host copy must never go silently stale
+across an iteration boundary. Regression: `tests/gpu_backedge_sync.ergo`.
+
 ### 8.2 Atomic Insertion Rules (Scatter Semantics)
 
 A parallel loop may contain writes where multiple iterations target the same index:

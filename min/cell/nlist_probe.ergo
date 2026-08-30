@@ -104,12 +104,12 @@ WRITE(*, "# NLIST_PROBE M0  N=%d RC=%f NC=%d NCELL=%d MAXNBR=%d CORRUPT=%d") N, 
 
 DO STEP = 1, NSTEPS
   ! Drift FIRST (Euler, forces from the previous step; zero on step 1).
-  ! Order matters for the GPU build, not the math: the compiler's
-  ! host-download tracker is linear per loop body — a CPU read is
-  ! synced only when a kernel write precedes it IN THE SAME BODY
-  ! (min/cell/mre_loop_carried_sync.ergo shows the back-edge miss).
-  ! Integrate-at-top keeps every CPU read of PX/PY/PZ behind a kernel
-  ! write in body order, so the GPU build sees fresh positions.
+  ! This leapfrog ordering predates the loop-carried sync fix: before
+  ! 2026-08-30 a kernel at the bottom of a loop body followed by a CPU
+  ! read at the top of the next iteration read silently stale host data
+  ! (min/cell/mre_loop_carried_sync.ergo; fixed in core/ir_codegen.py —
+  ! frame-level back-edge refresh, Spec Part 8.1). The ordering stays
+  ! because it is the natural form, not because the bug remains.
   DO I = 1, N
     VX(I) := VX(I) + FX(I) * DT
     VY(I) := VY(I) + FY(I) * DT

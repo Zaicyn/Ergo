@@ -24,8 +24,10 @@ cell with a protein in the membrane.
 ### M0 — dynamic neighbor list (engine feature)
 Spatial-hash/cell-list short-range force path, GPU-extractable.
 **Status: DONE 2026-08-30 — all oracles pass, see
-`min/cell/M0_FINDINGS.md` (incl. the loop-carried GPU→CPU sync
-compiler bug it surfaced, filed as a check-in item).**
+`min/cell/M0_FINDINGS.md`. The loop-carried GPU→CPU sync compiler bug
+it surfaced is FIXED (frame-level back-edge refresh,
+core/ir_codegen.py; regression test tests/gpu_backedge_sync.ergo;
+Spec Part 8.1).**
 Oracles:
 - O1 force equivalence vs brute-force N² mirror on a random cloud
   (max |ΔF| ~0 at f64, order 1e-12 class)

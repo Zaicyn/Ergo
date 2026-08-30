@@ -85,6 +85,16 @@
   },
   {
    "cls": "GPU-PASS",
+   "compile_s": 0.15,
+   "file": "tests/gpu_backedge_sync.ergo",
+   "gpu_compile_s": 0.53,
+   "reason": "M0 back-edge sync regression (2026-08-30)",
+   "run2_s": 0.22,
+   "run_s": 0.22,
+   "stdout_bytes": 99
+  },
+  {
+   "cls": "GPU-PASS",
    "compile_s": 0.21,
    "file": "tests/gpu_clipmap.ergo",
    "gpu_compile_s": 0.53,

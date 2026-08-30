@@ -1611,8 +1611,17 @@ class IRCodeGen:
                           f"ergo_stop_requested) break; }}")
             # Emit body; suppress final download if GPU dispatches handle it
             self._frame_ended_early = False
+            # Scope the download tracker to this frame body so the
+            # back-edge refresh below skips exactly the arrays the
+            # mid-body logic already refreshed this iteration (and only
+            # those — stale entries from before the loop must not
+            # suppress a needed refresh).
+            saved_frame_downloaded = self._body_downloaded
+            self._body_downloaded = set()
             frame_dirty = self._emit_body(node.body,
                             suppress_final_download=has_gpu_dispatches)
+            frame_downloads = self._body_downloaded
+            self._body_downloaded = saved_frame_downloaded | frame_downloads
 
             # ── Combined upload: render + next-frame sync ──
             # Merge the render array upload and the next-frame GPU sync
@@ -1843,6 +1852,53 @@ class IRCodeGen:
                     if upload_guard:
                         self.indent -= 1
                         self._put("}")
+            # Back-edge refresh (2026-08-30, M0 sync bug): a kernel at
+            # the BOTTOM of the frame body device-dirties arrays that
+            # CPU code at the TOP of the body reads on the NEXT
+            # iteration. The mid-body download logic is linear per body
+            # pass and never sees next-iteration reads, so refresh those
+            # arrays at the end of each iteration (the frame-level twin
+            # of the nested-loop refresh in the non-frame path below;
+            # repro: min/cell/mre_loop_carried_sync.ergo). Skip arrays
+            # the mid-body logic already downloaded this iteration, and
+            # arrays the CPU wrote this iteration (their FRESH copy is
+            # the host one — downloading would clobber it, same rule as
+            # the host-fallback-kernel download path).
+            if use_batched:
+                be_written: set[str] = set()
+                _be_ids: set[int] = set()
+                self._collect_kernel_ids(node.body, _be_ids)
+                for _kid in _be_ids:
+                    if _kid in self._kernel_by_id:
+                        be_written |= self._kernel_by_id[_kid].arrays_written
+                be_read: set[str] = set()
+                self._collect_cpu_array_reads(node.body, be_read)
+                be_needed = ((be_written & be_read)
+                             - frame_downloads - (frame_dirty or set()))
+                if be_needed:
+                    # Frame already ended above (or drained mid-body);
+                    # the wait is idempotent. No frame_begin here: the
+                    # iteration closes and the next one opens its own.
+                    self._put("ergo_vk_frame_wait();")
+                    self._put("/* Back-edge refresh: host copies for next "
+                              "iteration (kernel write after the last CPU "
+                              "read in the body) */")
+                    pp = getattr(self, '_pp_arrays', set())
+                    for arr in sorted(be_needed):
+                        shape = self._array_shapes.get(arr)
+                        if not shape:
+                            continue
+                        size_expr = " * ".join(
+                            self._dim_expr(d) for d in shape)
+                        sz = self._gpu_sizeof(arr)
+                        if arr in pp:
+                            self._put(f"ergo_vk_download_at(d_{arr}, {arr}, "
+                                      f"(size_t)_pp_wr_offset * {sz}, "
+                                      f"{size_expr} * {sz});")
+                        else:
+                            self._put(f"ergo_vk_download(d_{arr}, {arr}, "
+                                      f"{size_expr} * {sz});")
+                    self._frame_gpu_dirty.clear()
             if self.render:
                 self._put(f"if (ergo_vk_should_close()) break;")
             self._emit_do_footer()

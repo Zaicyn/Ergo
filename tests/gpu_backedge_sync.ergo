@@ -1,0 +1,39 @@
+! GPU_BACKEDGE_SYNC — loop-carried GPU->CPU sync regression
+! =====================================================================
+! Regression for the silent-stale-read bug found in CELL M0 (2026-08-30,
+! fix: frame-level back-edge refresh in core/ir_codegen.py): a GPU
+! kernel at the BOTTOM of a loop body whose array is read by CPU code
+! at the TOP of the next iteration must see the fresh host copy. The
+! pre-fix tracker only downloaded when a kernel write preceded the CPU
+! read in linear body order, so the back-edge read was silently stale.
+!
+! Correct output (both targets): step sums 0, 1000, 2000 — the sum
+! loop runs on the CPU (IF body is not staged-reduction eligible) and
+! reads last iteration's kernel-bumped A. Pre-fix GPU printed 0,0,0.
+!
+! CPU:  python -m core tests/gpu_backedge_sync.ergo -o /tmp/be_cpu
+! GPU:  python -m core tests/gpu_backedge_sync.ergo --target spirv -o /tmp/be_gpu
+
+IMPLICIT NONE
+PARAMETER INTEGER :: N = 1000
+STATIC REAL :: A(N)
+STATIC REAL :: S
+STATIC INTEGER :: I, STEP
+
+DO I = 1, N
+  A(I) := 0.0
+ENDDO
+
+DO STEP = 1, 3
+  S := 0.0
+  DO I = 1, N
+    IF A(I) > 0.5 THEN
+      S := S + A(I)
+    ENDIF
+  ENDDO
+  WRITE(*, "step %d sum %f (want %d)") STEP, S, (STEP - 1) * 1000
+  DO I = 1, N
+    A(I) := A(I) + 1.0
+  ENDDO
+ENDDO
+STOP

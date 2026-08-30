@@ -109,25 +109,34 @@ This is precisely the ul18_stag5 PAIR_BLK idiom; M0 confirms it
 generalizes to a REBUILT (dynamic) slot list, not just init-time
 static pairs.
 
-## Compiler issue found (check-in item — NOT fixed here)
+## Compiler issue found (FIXED 2026-08-30, same window)
 
 `min/cell/mre_loop_carried_sync.ergo`: a GPU kernel at the BOTTOM of
 a loop body whose result is read by CPU code at the TOP of the next
-iteration is silently STALE — the host-download tracker
-(`core/ir_codegen.py`, download emission scans `remaining` body items
-linearly) syncs a CPU read only when a kernel write precedes it in the
-same body pass; the loop back-edge carries no device→host dirty mark.
-MRE output, GPU build: `step sums 0, 0, 0` where CPU correctly gives
-`0, 1000, 2000`. The probe's first draft (integrate at loop bottom)
-hit this: GPU step-2+ forces disagreed with the reference by O(1)
-because the CPU brute/cell build read stale positions. **Workaround
-used:** integrate at the TOP of the step body (leapfrog ordering —
-mathematically the same sequence), so every CPU read of positions is
-behind a kernel write in body order. This is a silent-wrong-answer
-hazard for any program of this shape; it deserves a compiler fix (mark
-kernel-written arrays host-dirty at the back-edge) or at minimum a
-lint. Deliberately NOT fixed in the compiler mid-milestone — the
-compiler is the certification base; flagging for the verifier.
+iteration read silently STALE host data — the host-download tracker
+(`core/ir_codegen.py`) only downloaded when a kernel write preceded
+the CPU read in one linear body pass; the loop back-edge carried no
+device→host dirty mark. Pre-fix GPU printed step sums `0, 0, 0` where
+CPU correctly gave `0, 1000, 2000`. The probe's first draft (integrate
+at loop bottom) hit this: GPU step-2+ forces disagreed with the
+reference by O(1) because the CPU brute/cell build read stale
+positions.
+
+**Fix (this window, verifier-approved task):** the frame-loop path now
+scopes the download tracker to the frame body and emits an
+end-of-iteration back-edge refresh — download arrays that are
+kernel-written anywhere in the body AND CPU-read anywhere in the body,
+minus arrays the mid-body logic already downloaded this iteration and
+minus CPU-written arrays (host copy fresh). Mirrors the existing
+nested-loop refresh. Regression test: `tests/gpu_backedge_sync.ergo`
+(corpus GPU-PASS). Verified: MRE prints 0/1000/2000 on GPU; this
+probe's output byte-identical pre/post fix on both targets;
+ul18_stag5 1000-frame GPU time unchanged (zero refreshes emitted for
+it — its CPU reads were already mid-body-covered); full gate green
+with zero output moves. Rule now written into Spec Part 8.1
+("Host-copy coherence"). The probe keeps its integrate-at-top
+ordering — it is the natural leapfrog form and its output is
+unchanged either way.
 
 ## Honest notes / known limits
 

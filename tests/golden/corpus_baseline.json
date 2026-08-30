@@ -65,6 +65,12 @@
   "last": "2.674800",
   "sha256": "97e01507c4bebfac"
  },
+ "gpu_backedge_sync (gpu)": {
+  "bytes": 99,
+  "first": "step 1 sum 0.000000 (want 0)",
+  "last": "step 3 sum 2000.000000 (want 2000)",
+  "sha256": "1e1c3ead4a906414"
+ },
  "gpu_clipmap (gpu)": {
   "bytes": 198,
   "first": "U0=3.324122429e-02 U1=4.887191234e-02 U2=3.438594624e-02",
