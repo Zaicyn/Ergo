@@ -1,0 +1,389 @@
+! NLIST_PROBE — Project CELL, milestone M0: dynamic neighbor list
+! =====================================================================
+! Proves the cell-list (spatial-hash) short-range force path against a
+! brute-force N^2 mirror, both in one program, same positions:
+!
+!   O1  max |dF| between cell-list and brute-force forces, f64.
+!       Expected in the 1e-12 class or below — the ONLY intended
+!       difference is floating-point summation order (documented in
+!       min/cell/M0_FINDINGS.md): brute force sums each bead's
+!       neighbors in index order j = 1..N; the cell list sums them in
+!       bucket-traversal order (27-cell stencil, bead-index order
+!       inside each bucket).
+!   O2  byte-determinism: same binary, two runs, identical stdout
+!       (checked externally with diff).
+!   NC  negative control: CORRUPT = 1 misassigns the bucket of every
+!       10th bead (cell id + 1, wrapping) — O1 must catch it.
+!
+! Configuration: near-lattice start (spacing 1.15 < RC, jitter ±0.03)
+! plus random initial velocities, so forces are O(1) (the absolute
+! 1e-12-class oracle is meaningful) and pairs form/break over the 25
+! drift steps (npair_ord changes — the list is rebuilt every step and
+! tracks it).
+!
+! Force law (LJ-ish, short-range): for 1e-12 < r < RC,
+!   F_i += 24*EPS*(2*(SIGMA/r)^12 - (SIGMA/r)^6) / r^2 * r_vec
+! Masks are exact 0/1 arithmetic (no IF in the hot loop) so the flat
+! packed slot loop stays GPU-extractable (engine idiom,
+! ul18_stag5.ergo): MS = 1 iff r < RC, MG = 1 iff r > 1e-12. The mask
+! is folded INSIDE the power (BR), so out-of-range candidates evaluate
+! to exactly 0 without overflow (DD floors r at 1e-16).
+!
+! List form: per-bead slot segments at FIXED STRIDE MAXNBR (256),
+! padded with self-slots (j = i) that the MG mask zeroes exactly —
+! the segmented-reduction geometry the GPU extractor proves
+! (seg_len = 256 = one workgroup per bead, ul18_stag5's PAIR_BLK
+! idiom). NBR_I(K) = slot owner (ascending), NBR_J(K) = neighbor.
+! Rebuild policy: buckets AND the slot list are rebuilt EVERY step
+! (no skin). Skin/rebuild-every-k is a perf knob for M1, not needed
+! to prove the machinery here.
+!
+! CPU:  python -m core min/cell/nlist_probe.ergo -o /tmp/nlist_cpu
+! GPU:  python -m core min/cell/nlist_probe.ergo --target spirv -o /tmp/nlist_gpu
+
+IMPLICIT NONE
+
+! ── Probe configuration ─────────────────────────────────────
+PARAMETER INTEGER :: N = 2000
+PARAMETER REAL :: LBOX = 16.0
+PARAMETER INTEGER :: NG = 13            ! lattice beads per axis (NG^3 >= N)
+PARAMETER REAL :: SPC = 1.15            ! lattice spacing (< RC)
+PARAMETER REAL :: V0 = 0.3              ! initial velocity amplitude
+PARAMETER REAL :: RC = 1.2
+PARAMETER INTEGER :: NC = 13            ! INT(LBOX/RC); cell edge >= RC
+PARAMETER REAL :: CE = 1.2307692307692308  ! LBOX / NC
+PARAMETER INTEGER :: NCELL = 2197       ! NC^3
+PARAMETER INTEGER :: MAXNBR = 256       ! slots per bead = GPU workgroup size
+PARAMETER INTEGER :: NSLOT = 512000     ! N * MAXNBR (padded fixed stride)
+PARAMETER REAL :: SIGMA = 1.0
+PARAMETER REAL :: EPSILON = 1.0
+PARAMETER INTEGER :: NSTEPS = 25
+PARAMETER REAL :: DT = 0.002
+PARAMETER INTEGER :: SEED = 424242
+! Negative-control switch: 0 = correct build, 1 = misassign every 10th
+! bead's bucket. The checked-in control file
+! nlist_probe_control_corrupt.ergo is this file with CORRUPT = 1.
+PARAMETER INTEGER :: CORRUPT = 0
+
+! ── 27-cell stencil offsets ─────────────────────────────────
+STATIC INTEGER :: OX(27), OY(27), OZ(27)
+DATA OX / -1, 0, 1, -1, 0, 1, -1, 0, 1, &
+          -1, 0, 1, -1, 0, 1, -1, 0, 1, &
+          -1, 0, 1, -1, 0, 1, -1, 0, 1 /
+DATA OY / -1, -1, -1, 0, 0, 0, 1, 1, 1, &
+          -1, -1, -1, 0, 0, 0, 1, 1, 1, &
+          -1, -1, -1, 0, 0, 0, 1, 1, 1 /
+DATA OZ / -1, -1, -1, -1, -1, -1, -1, -1, -1, &
+           0, 0, 0, 0, 0, 0, 0, 0, 0, &
+           1, 1, 1, 1, 1, 1, 1, 1, 1 /
+
+! ── Bead state ──────────────────────────────────────────────
+STATIC REAL :: PX(N), PY(N), PZ(N)
+STATIC REAL :: VX(N), VY(N), VZ(N)
+STATIC REAL :: FX(N), FY(N), FZ(N)        ! cell-list forces
+STATIC REAL :: FXR(N), FYR(N), FZR(N)     ! brute-force reference
+
+! ── Cell-list state ─────────────────────────────────────────
+STATIC INTEGER :: CELLOF(N), CELX(N), CELY(N), CELZ(N)
+STATIC INTEGER :: CNT(NCELL)              ! beads per cell
+STATIC INTEGER :: OFF(NCELL)              ! bucket start in SORTEDB
+STATIC INTEGER :: CUR(NCELL)              ! placement cursor
+STATIC INTEGER :: SORTEDB(N)              ! bead ids, bucket-sorted
+STATIC INTEGER :: NBR_I(NSLOT)            ! slot owner (i), ascending
+STATIC INTEGER :: NBR_J(NSLOT)            ! slot neighbor (j)
+
+! ── Working scalars ─────────────────────────────────────────
+STATIC INTEGER :: I, J, K, STEP, OVERFLOW, MAXNB, NP_REF, NCORR, NSUSED
+STATIC REAL :: DX, DY, DZ, D, DD, MS, MG, BR, B6, FM
+STATIC REAL :: SR, SR6, DF, MAXDF, EPOTR, EPOTC, CK
+
+! ── Initialize: jittered lattice + random velocities ────────
+CALL INIT_POS()
+
+WRITE(*, "# NLIST_PROBE M0  N=%d RC=%f NC=%d NCELL=%d MAXNBR=%d CORRUPT=%d") N, RC, NC, NCELL, MAXNBR, CORRUPT
+
+DO STEP = 1, NSTEPS
+  ! Drift FIRST (Euler, forces from the previous step; zero on step 1).
+  ! Order matters for the GPU build, not the math: the compiler's
+  ! host-download tracker is linear per loop body — a CPU read is
+  ! synced only when a kernel write precedes it IN THE SAME BODY
+  ! (min/cell/mre_loop_carried_sync.ergo shows the back-edge miss).
+  ! Integrate-at-top keeps every CPU read of PX/PY/PZ behind a kernel
+  ! write in body order, so the GPU build sees fresh positions.
+  DO I = 1, N
+    VX(I) := VX(I) + FX(I) * DT
+    VY(I) := VY(I) + FY(I) * DT
+    VZ(I) := VZ(I) + FZ(I) * DT
+    PX(I) := PX(I) + VX(I) * DT
+    PY(I) := PY(I) + VY(I) * DT
+    PZ(I) := PZ(I) + VZ(I) * DT
+  ENDDO
+
+  CALL CELL_BUILD()
+  CALL NBR_BUILD()
+  CALL FORCE_BRUTE()
+  CALL FORCE_CELL()
+
+  ! O1: max per-component force discrepancy + checksum
+  MAXDF := 0.0
+  CK := 0.0
+  DO I = 1, N
+    DF := ABS(FX(I) - FXR(I))
+    IF DF > MAXDF THEN
+      MAXDF := DF
+    ENDIF
+    DF := ABS(FY(I) - FYR(I))
+    IF DF > MAXDF THEN
+      MAXDF := DF
+    ENDIF
+    DF := ABS(FZ(I) - FZR(I))
+    IF DF > MAXDF THEN
+      MAXDF := DF
+    ENDIF
+    CK := CK + FX(I) * REAL(I) + FY(I) * REAL(I + N) + FZ(I) * REAL(I + 2 * N)
+  ENDDO
+
+  WRITE(*, "step %d maxdf %.6e npair_ord %d nslots %d maxnb %d ovf %d") STEP, MAXDF, NP_REF, NSUSED, MAXNB, OVERFLOW
+  WRITE(*, "step %d epot_cell %.17e epot_ref %.17e checksum %.17e") STEP, EPOTC, EPOTR, CK
+ENDDO
+
+IF CORRUPT = 1 THEN
+  WRITE(*, "[CONTROL] CORRUPT=1 active: %d bead buckets misassigned") NCORR
+ELSE
+  WRITE(*, "[CONTROL] CORRUPT=0 (clean build)")
+ENDIF
+
+STOP
+
+! ════════════════════════════════════════════════════════════
+! SUBROUTINES
+! ════════════════════════════════════════════════════════════
+
+SUBROUTINE INIT_POS()
+  INTEGER :: IX, IY, IZ
+  REAL :: ORG
+  ORG := (LBOX - REAL(NG - 1) * SPC) * 0.5
+  DO I = 1, N
+    IX := (I - 1) / (NG * NG)
+    IY := MOD((I - 1) / NG, NG)
+    IZ := MOD(I - 1, NG)
+    PX(I) := ORG + REAL(IX) * SPC + 0.06 * (RAND(SEED + 3 * I - 2) - 0.5)
+    PY(I) := ORG + REAL(IY) * SPC + 0.06 * (RAND(SEED + 3 * I - 1) - 0.5)
+    PZ(I) := ORG + REAL(IZ) * SPC + 0.06 * (RAND(SEED + 3 * I) - 0.5)
+    VX(I) := 2.0 * V0 * (RAND(SEED + 7000 + 3 * I - 2) - 0.5)
+    VY(I) := 2.0 * V0 * (RAND(SEED + 7000 + 3 * I - 1) - 0.5)
+    VZ(I) := 2.0 * V0 * (RAND(SEED + 7000 + 3 * I) - 0.5)
+  ENDDO
+  RETURN
+END
+
+! ── CELL_BUILD: bucket beads into the grid, counting sort ───
+! Deterministic: beads are placed in index order, so every bucket
+! holds its beads sorted by bead id. Non-periodic: indices clamped.
+SUBROUTINE CELL_BUILD()
+  INTEGER :: C, IX, IY, IZ
+  NCORR := 0
+  DO C = 1, NCELL
+    CNT(C) := 0
+  ENDDO
+  DO I = 1, N
+    IX := INT(PX(I) / CE) + 1
+    IY := INT(PY(I) / CE) + 1
+    IZ := INT(PZ(I) / CE) + 1
+    IF IX < 1 THEN
+      IX := 1
+    ENDIF
+    IF IX > NC THEN
+      IX := NC
+    ENDIF
+    IF IY < 1 THEN
+      IY := 1
+    ENDIF
+    IF IY > NC THEN
+      IY := NC
+    ENDIF
+    IF IZ < 1 THEN
+      IZ := 1
+    ENDIF
+    IF IZ > NC THEN
+      IZ := NC
+    ENDIF
+    C := IX + NC * (IY - 1) + NC * NC * (IZ - 1)
+    ! NEGATIVE CONTROL: misassign every 10th bead to the next cell.
+    IF CORRUPT = 1 THEN
+      IF MOD(I, 10) = 0 THEN
+        C := MOD(C, NCELL) + 1
+        NCORR := NCORR + 1
+      ENDIF
+    ENDIF
+    CELLOF(I) := C
+    CELX(I) := IX
+    CELY(I) := IY
+    CELZ(I) := IZ
+    CNT(C) := CNT(C) + 1
+  ENDDO
+  OFF(1) := 1
+  DO C = 2, NCELL
+    OFF(C) := OFF(C - 1) + CNT(C - 1)
+  ENDDO
+  DO C = 1, NCELL
+    CUR(C) := OFF(C)
+  ENDDO
+  DO I = 1, N
+    C := CELLOF(I)
+    SORTEDB(CUR(C)) := I
+    CUR(C) := CUR(C) + 1
+  ENDDO
+  RETURN
+END
+
+! ── NBR_BUILD: padded fixed-stride neighbor-slot segments ───
+! For each bead i (in index order), scan the 27 neighbor cells; every
+! bead j ≠ i in those buckets fills the next slot of bead i's segment
+! at (i-1)*MAXNBR+1 .. i*MAXNBR. Remaining slots stay self-slots
+! (j = i), which the force kernel's MG mask zeroes exactly. The fixed
+! 256-slot stride is the segmented-reduction geometry the GPU
+! extractor proves (one workgroup per bead).
+SUBROUTINE NBR_BUILD()
+  INTEGER :: CN, P, LO, HI, NX2, NY2, NZ2, CNTR, KK, S
+  OVERFLOW := 0
+  MAXNB := 0
+  NSUSED := 0
+  DO I = 1, N
+    DO KK = 1, MAXNBR
+      S := (I - 1) * MAXNBR + KK
+      NBR_I(S) := I
+      NBR_J(S) := I
+    ENDDO
+    CNTR := 0
+    DO K = 1, 27
+      NX2 := CELX(I) + OX(K)
+      NY2 := CELY(I) + OY(K)
+      NZ2 := CELZ(I) + OZ(K)
+      IF NX2 ≥ 1 .AND. NX2 ≤ NC .AND. NY2 ≥ 1 .AND. NY2 ≤ NC .AND. NZ2 ≥ 1 .AND. NZ2 ≤ NC THEN
+        CN := NX2 + NC * (NY2 - 1) + NC * NC * (NZ2 - 1)
+        IF CNT(CN) > 0 THEN
+          LO := OFF(CN)
+          HI := OFF(CN) + CNT(CN) - 1
+          DO P = LO, HI
+            J := SORTEDB(P)
+            IF J ≠ I THEN
+              CNTR := CNTR + 1
+              IF CNTR ≤ MAXNBR THEN
+                S := (I - 1) * MAXNBR + CNTR
+                NBR_J(S) := J
+              ELSE
+                OVERFLOW := 1
+              ENDIF
+            ENDIF
+          ENDDO
+        ENDIF
+      ENDIF
+    ENDDO
+    NSUSED := NSUSED + CNTR
+    IF CNTR > MAXNB THEN
+      MAXNB := CNTR
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── FORCE_BRUTE: O(N^2) reference, index-order summation ────
+SUBROUTINE FORCE_BRUTE()
+  NP_REF := 0
+  EPOTR := 0.0
+  DO I = 1, N
+    FXR(I) := 0.0
+    FYR(I) := 0.0
+    FZR(I) := 0.0
+  ENDDO
+  DO I = 1, N
+    DO J = 1, N
+      IF J ≠ I THEN
+        DX := PX(I) - PX(J)
+        DY := PY(I) - PY(J)
+        DZ := PZ(I) - PZ(J)
+        D := SQRT(DX * DX + DY * DY + DZ * DZ)
+        IF D < RC .AND. D > 1.0E-12 THEN
+          SR := SIGMA / D
+          SR6 := SR * SR * SR * SR * SR * SR
+          FM := 24.0 * EPSILON * (2.0 * SR6 * SR6 - SR6) / (D * D)
+          FXR(I) := FXR(I) + FM * DX
+          FYR(I) := FYR(I) + FM * DY
+          FZR(I) := FZR(I) + FM * DZ
+          NP_REF := NP_REF + 1
+          EPOTR := EPOTR + 4.0 * EPSILON * (SR6 * SR6 - SR6)
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+  RETURN
+END
+
+! ── FORCE_CELL: flat masked slot loops (GPU-extractable) ────
+! One straight-line pass per component over the padded slot array
+! (engine idiom: one RMW accumulator array per loop — the segred
+! candidate shape). MS zeroes out-of-range candidates; MG zeroes
+! padding self-slots (r = 0). Owners segment the loop by bead.
+SUBROUTINE FORCE_CELL()
+  DO I = 1, N
+    FX(I) := 0.0
+    FY(I) := 0.0
+    FZ(I) := 0.0
+  ENDDO
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MS := (1.0 - SIGN(1.0, DD - RC)) * 0.5
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    BR := MS * MG * SIGMA / DD
+    B6 := BR * BR * BR * BR * BR * BR
+    FM := 24.0 * EPSILON * (2.0 * B6 * B6 - B6) / (DD * DD)
+    FX(NBR_I(K)) := FX(NBR_I(K)) + FM * DX
+  ENDDO
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MS := (1.0 - SIGN(1.0, DD - RC)) * 0.5
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    BR := MS * MG * SIGMA / DD
+    B6 := BR * BR * BR * BR * BR * BR
+    FM := 24.0 * EPSILON * (2.0 * B6 * B6 - B6) / (DD * DD)
+    FY(NBR_I(K)) := FY(NBR_I(K)) + FM * DY
+  ENDDO
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MS := (1.0 - SIGN(1.0, DD - RC)) * 0.5
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    BR := MS * MG * SIGMA / DD
+    B6 := BR * BR * BR * BR * BR * BR
+    FM := 24.0 * EPSILON * (2.0 * B6 * B6 - B6) / (DD * DD)
+    FZ(NBR_I(K)) := FZ(NBR_I(K)) + FM * DZ
+  ENDDO
+  ! Potential energy, same masked form, separate pass (scalar staged
+  ! reduction; keeps the force kernels in the segred candidate shape).
+  EPOTC := 0.0
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MS := (1.0 - SIGN(1.0, DD - RC)) * 0.5
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    BR := MS * MG * SIGMA / DD
+    B6 := BR * BR * BR * BR * BR * BR
+    EPOTC := EPOTC + 4.0 * EPSILON * (B6 * B6 - B6)
+  ENDDO
+  RETURN
+END

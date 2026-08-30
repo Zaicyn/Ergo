@@ -1,0 +1,249 @@
+! NLIST_BENCH — Project CELL, milestone M0, oracle O3 (perf)
+! =====================================================================
+! Times the brute-force N^2 force path (PATH=1) against the cell-list
+! path (PATH=2: bucket build + slot build + 3 force passes), whole-
+! binary wall time, driven by run_m0_bench.py which rewrites the
+! @-tagged PARAMETER lines per (N, path) point and times externally.
+! Same physics and density regime as nlist_probe.ergo (lattice start,
+! spacing 1.15 < RC). No dynamics — pure force-path cost, 3 repeats
+! (STEPS) per run.
+!
+! CPU:  python -m core /tmp/m0bench.ergo -o /tmp/m0bench_cpu
+! GPU:  python -m core /tmp/m0bench.ergo --target spirv -o /tmp/m0bench_gpu
+
+IMPLICIT NONE
+
+PARAMETER INTEGER :: NB = 2000          ! @N beads
+PARAMETER INTEGER :: PATH = 2           ! @PATH 1 = brute N^2, 2 = cell list
+PARAMETER INTEGER :: STEPS = 3
+PARAMETER INTEGER :: NG = 13            ! @NG lattice beads per axis (NG^3 >= NB)
+PARAMETER REAL :: SPC = 1.15
+PARAMETER REAL :: LBOX = 16.0           ! @L
+PARAMETER REAL :: RC = 1.2
+PARAMETER INTEGER :: NC = 13            ! @NC INT(LBOX/RC)
+PARAMETER REAL :: CE = 1.2307692307692308  ! @CE LBOX/NC
+PARAMETER INTEGER :: NCELL = 2197       ! @NCELL NC^3
+PARAMETER INTEGER :: MAXNBR = 256       ! slots per bead (GPU workgroup stride)
+PARAMETER INTEGER :: NSLOT = 512000     ! @NSLOT NB * MAXNBR
+PARAMETER REAL :: SIGMA = 1.0
+PARAMETER REAL :: EPSILON = 1.0
+PARAMETER INTEGER :: SEED = 424242
+
+STATIC INTEGER :: OX(27), OY(27), OZ(27)
+DATA OX / -1, 0, 1, -1, 0, 1, -1, 0, 1, &
+          -1, 0, 1, -1, 0, 1, -1, 0, 1, &
+          -1, 0, 1, -1, 0, 1, -1, 0, 1 /
+DATA OY / -1, -1, -1, 0, 0, 0, 1, 1, 1, &
+          -1, -1, -1, 0, 0, 0, 1, 1, 1, &
+          -1, -1, -1, 0, 0, 0, 1, 1, 1 /
+DATA OZ / -1, -1, -1, -1, -1, -1, -1, -1, -1, &
+           0, 0, 0, 0, 0, 0, 0, 0, 0, &
+           1, 1, 1, 1, 1, 1, 1, 1, 1 /
+
+STATIC REAL :: PX(NB), PY(NB), PZ(NB)
+STATIC REAL :: FX(NB), FY(NB), FZ(NB)
+STATIC INTEGER :: CELLOF(NB), CELX(NB), CELY(NB), CELZ(NB)
+STATIC INTEGER :: CNT(NCELL), OFF(NCELL), CUR(NCELL), SORTEDB(NB)
+STATIC INTEGER :: NBR_I(NSLOT), NBR_J(NSLOT)
+
+STATIC INTEGER :: I, J, K, STEP, NP, NSUSED
+STATIC REAL :: DX, DY, DZ, D, DD, MS, MG, BR, B6, FM, SR, SR6, CK
+
+CALL INIT_POS()
+
+DO STEP = 1, STEPS
+  IF PATH = 1 THEN
+    CALL FORCE_BRUTE()
+  ELSE
+    CALL CELL_BUILD()
+    CALL NBR_BUILD()
+    CALL FORCE_CELL()
+  ENDIF
+ENDDO
+
+! Sink: keep the work observable and the binary honest.
+CK := 0.0
+DO I = 1, NB
+  CK := CK + FX(I) * REAL(I) + FY(I) * REAL(I + NB) + FZ(I) * REAL(I + 2 * NB)
+ENDDO
+WRITE(*, "bench N=%d path=%d npair_ord %d nslots %d checksum %.17e") NB, PATH, NP, NSUSED, CK
+
+STOP
+
+SUBROUTINE INIT_POS()
+  INTEGER :: IX, IY, IZ
+  REAL :: ORG
+  ORG := (LBOX - REAL(NG - 1) * SPC) * 0.5
+  DO I = 1, NB
+    IX := (I - 1) / (NG * NG)
+    IY := MOD((I - 1) / NG, NG)
+    IZ := MOD(I - 1, NG)
+    PX(I) := ORG + REAL(IX) * SPC + 0.06 * (RAND(SEED + 3 * I - 2) - 0.5)
+    PY(I) := ORG + REAL(IY) * SPC + 0.06 * (RAND(SEED + 3 * I - 1) - 0.5)
+    PZ(I) := ORG + REAL(IZ) * SPC + 0.06 * (RAND(SEED + 3 * I) - 0.5)
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE CELL_BUILD()
+  INTEGER :: C, IX, IY, IZ
+  DO C = 1, NCELL
+    CNT(C) := 0
+  ENDDO
+  DO I = 1, NB
+    IX := INT(PX(I) / CE) + 1
+    IY := INT(PY(I) / CE) + 1
+    IZ := INT(PZ(I) / CE) + 1
+    IF IX < 1 THEN
+      IX := 1
+    ENDIF
+    IF IX > NC THEN
+      IX := NC
+    ENDIF
+    IF IY < 1 THEN
+      IY := 1
+    ENDIF
+    IF IY > NC THEN
+      IY := NC
+    ENDIF
+    IF IZ < 1 THEN
+      IZ := 1
+    ENDIF
+    IF IZ > NC THEN
+      IZ := NC
+    ENDIF
+    C := IX + NC * (IY - 1) + NC * NC * (IZ - 1)
+    CELLOF(I) := C
+    CELX(I) := IX
+    CELY(I) := IY
+    CELZ(I) := IZ
+    CNT(C) := CNT(C) + 1
+  ENDDO
+  OFF(1) := 1
+  DO C = 2, NCELL
+    OFF(C) := OFF(C - 1) + CNT(C - 1)
+  ENDDO
+  DO C = 1, NCELL
+    CUR(C) := OFF(C)
+  ENDDO
+  DO I = 1, NB
+    C := CELLOF(I)
+    SORTEDB(CUR(C)) := I
+    CUR(C) := CUR(C) + 1
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE NBR_BUILD()
+  INTEGER :: CN, P, LO, HI, NX2, NY2, NZ2, CNTR, KK, S
+  NSUSED := 0
+  DO I = 1, NB
+    DO KK = 1, MAXNBR
+      S := (I - 1) * MAXNBR + KK
+      NBR_I(S) := I
+      NBR_J(S) := I
+    ENDDO
+    CNTR := 0
+    DO K = 1, 27
+      NX2 := CELX(I) + OX(K)
+      NY2 := CELY(I) + OY(K)
+      NZ2 := CELZ(I) + OZ(K)
+      IF NX2 ≥ 1 .AND. NX2 ≤ NC .AND. NY2 ≥ 1 .AND. NY2 ≤ NC .AND. NZ2 ≥ 1 .AND. NZ2 ≤ NC THEN
+        CN := NX2 + NC * (NY2 - 1) + NC * NC * (NZ2 - 1)
+        IF CNT(CN) > 0 THEN
+          LO := OFF(CN)
+          HI := OFF(CN) + CNT(CN) - 1
+          DO P = LO, HI
+            J := SORTEDB(P)
+            IF J ≠ I THEN
+              CNTR := CNTR + 1
+              IF CNTR ≤ MAXNBR THEN
+                S := (I - 1) * MAXNBR + CNTR
+                NBR_J(S) := J
+              ENDIF
+            ENDIF
+          ENDDO
+        ENDIF
+      ENDIF
+    ENDDO
+    NSUSED := NSUSED + CNTR
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE FORCE_BRUTE()
+  NP := 0
+  DO I = 1, NB
+    FX(I) := 0.0
+    FY(I) := 0.0
+    FZ(I) := 0.0
+  ENDDO
+  DO I = 1, NB
+    DO J = 1, NB
+      IF J ≠ I THEN
+        DX := PX(I) - PX(J)
+        DY := PY(I) - PY(J)
+        DZ := PZ(I) - PZ(J)
+        D := SQRT(DX * DX + DY * DY + DZ * DZ)
+        IF D < RC .AND. D > 1.0E-12 THEN
+          SR := SIGMA / D
+          SR6 := SR * SR * SR * SR * SR * SR
+          FM := 24.0 * EPSILON * (2.0 * SR6 * SR6 - SR6) / (D * D)
+          FX(I) := FX(I) + FM * DX
+          FY(I) := FY(I) + FM * DY
+          FZ(I) := FZ(I) + FM * DZ
+          NP := NP + 1
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE FORCE_CELL()
+  DO I = 1, NB
+    FX(I) := 0.0
+    FY(I) := 0.0
+    FZ(I) := 0.0
+  ENDDO
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MS := (1.0 - SIGN(1.0, DD - RC)) * 0.5
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    BR := MS * MG * SIGMA / DD
+    B6 := BR * BR * BR * BR * BR * BR
+    FM := 24.0 * EPSILON * (2.0 * B6 * B6 - B6) / (DD * DD)
+    FX(NBR_I(K)) := FX(NBR_I(K)) + FM * DX
+  ENDDO
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MS := (1.0 - SIGN(1.0, DD - RC)) * 0.5
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    BR := MS * MG * SIGMA / DD
+    B6 := BR * BR * BR * BR * BR * BR
+    FM := 24.0 * EPSILON * (2.0 * B6 * B6 - B6) / (DD * DD)
+    FY(NBR_I(K)) := FY(NBR_I(K)) + FM * DY
+  ENDDO
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MS := (1.0 - SIGN(1.0, DD - RC)) * 0.5
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    BR := MS * MG * SIGMA / DD
+    B6 := BR * BR * BR * BR * BR * BR
+    FM := 24.0 * EPSILON * (2.0 * B6 * B6 - B6) / (DD * DD)
+    FZ(NBR_I(K)) := FZ(NBR_I(K)) + FM * DZ
+  ENDDO
+  RETURN
+END
