@@ -23,6 +23,9 @@
 !min/ribosome/ul18_stag5.csv
 !min/ribosome/ul18_dom5.csv
 !min/ribosome/ul18_full_slot.csv
+# rail-map rotation series — small evidence data cited by RAIL_MAP.md
+!min/ribosome/rail_series/
+!min/ribosome/rail_series/*.csv
 !Spec/
 !Spec/**
 !tools/
