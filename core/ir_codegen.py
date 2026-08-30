@@ -265,6 +265,16 @@ class IRCodeGen:
         mod = self.module
         has_gpu = self.gpu_plan and self.gpu_plan.kernels
 
+        # Compiler-owned contraction (re-certification window, plan A):
+        # deterministic fusible sites (core/ir_contract.py) emit explicit
+        # fma()/fmaf(); call-factor (fusible-fragile) sites get a fusion
+        # barrier so the C compiler cannot luck-fuse them; everything
+        # else has no mul-feeding-add and cannot contract.  The SPIR-V
+        # backend emits OpFma at the same sites and NoContraction
+        # elsewhere — CPU==GPU by construction.
+        from .ir_contract import compute_fma_sites
+        self._fma_sites = compute_fma_sites(mod)
+
         self._put_raw("#include <stdio.h>")
         self._put_raw("#include <math.h>")
         self._put_raw("#include <stdlib.h>")
@@ -2112,6 +2122,41 @@ class IRCodeGen:
 
         # Arithmetic binary ops
         if op in (Op.ADD, Op.SUB, Op.MUL, Op.DIV):
+            # Compiler-owned contraction (core/ir_contract.py): a marked
+            # deterministic site emits explicit fma/fmaf; a call-factor
+            # (fusible-fragile) site gets a fusion barrier on the
+            # product temp so the C compiler cannot luck-fuse it
+            # (zero instructions: an opaque in-place value barrier).
+            if op in (Op.ADD, Op.SUB) and inst.type == IRType.REAL:
+                site = self._fma_sites.get(id(inst))
+                if site is not None:
+                    mul = site["mul"]
+                    fa = self._operand(mul.args[0])
+                    fb = self._operand(mul.args[1])
+                    if site["neg_mul"]:
+                        fa = f"(-{fa})"
+                    other = self._operand(
+                        args[1] if site["side"] == "L" else args[0])
+                    if site["fragile"]:
+                        # barrier on the product temp (must stay a plain
+                        # lvalue for the "+x" constraint — sign folds are
+                        # applied in the add expression, after the barrier)
+                        prod_var = self._operand(
+                            args[0] if site["side"] == "L" else args[1])
+                        self._put(f"__asm volatile(\"\" : \"+x\"({prod_var}));")
+                        prod = f"(-{prod_var})" if site["neg_mul"] else prod_var
+                        if site["neg_addend"]:
+                            other = f"(-{other})"
+                        c_op = "+" if op == Op.ADD else "-"
+                        lhs = (prod if site["side"] == "L" else other)
+                        rhs = (other if site["side"] == "L" else prod)
+                        self._put(f"{result} = ({lhs} {c_op} {rhs});")
+                        return
+                    if site["neg_addend"]:
+                        other = f"(-{other})"
+                    fn = _real_math("fma")
+                    self._put(f"{result} = {fn}({fa}, {fb}, {other});")
+                    return
             c_op = {Op.ADD: "+", Op.SUB: "-", Op.MUL: "*", Op.DIV: "/"}[op]
             self._put(f"{result} = ({self._operand(args[0])} {c_op} {self._operand(args[1])});")
             return

@@ -110,7 +110,10 @@ Design:
   excluded on RNA, here it is controlled by the simultaneous arm).
 - **ul18_dom5.ergo** (control): all 91 cross-seam contacts gate at the single
   certified DOCK_FROM = 48000. Legacy code path, gate expression untouched.
-- **ul18_stag5.ergo** (staged): seam k gates at T_k = 24000·k (24k/48k/72k/96k),
+- **ul18_stag5.ergo** (staged): seam k gates at T_k = 24000·k for the
+  seams that have contacts — 24k/48k/72k (erratum 2026-08-29, see
+  CODON_FINDINGS.md: the "96k" gate never existed; D5 has zero
+  cross-seam contacts to gate),
   pair opens at FRAME > T_k; DOCK_FROM left at default huge. Gate change is
   branchless exact-0/1 arithmetic, per-slot, and PROVEN bitwise-identical to
   the legacy expression for all WCI ∈ {0,1} (288002-evaluation mirror sweep,

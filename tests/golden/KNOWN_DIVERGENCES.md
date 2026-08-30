@@ -45,6 +45,18 @@ the harness flags as NEW-DIVERGENCE is a bug to burn down.
 - **Scalar subroutine dummies (A6, batch 1).** By-reference in both
   paths; tests/sub_scalar_ref.ergo is the golden.
 
+## Accepted with the compiler-owned FMA window (2026-08-29, plan A)
+
+- `tests/buc_colony.ergo` and `min/dendrite/laplace_annulus.ergo`.
+  The IR path now emits explicit `fma()` at deterministic mul+add
+  sites (and barriers fragile call-factor sites) while legacy still
+  relies on gcc `-ffp-contract=fast` luck, so the two paths diverge at
+  fused sites (buc_colony: byte 61981; laplace_annulus: byte 155).
+  Verified: legacy output remains byte-identical to the pre-plan-A
+  recorded corpus baseline; the IR output is the certified numerics
+  going forward and the corpus baselines were re-recorded under it
+  this window. This divergence class is permanent while legacy lives.
+
 ## Latent source bugs caught by the A4 WRITE audit (fixed in source)
 
 - `tests/waveform_cluster.ergo`: WRITE format had 43 conversions for

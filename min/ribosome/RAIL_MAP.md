@@ -19,9 +19,14 @@ docs):
 | 72000 | 16 + 7 | D2↔D4(190–252), D3↔D4 |
 | — | 0 | D5(253–293) has **zero** cross-seam contacts to gate |
 
-Discrepancy, recorded honestly: `CODON_FINDINGS.md` describes the arm as
+Discrepancy, recorded honestly: `CODON_FINDINGS.md` described the arm as
 "T_k = 24000·k (24k/48k/72k/96k)" — the file contains no 96000 gate.
-The 96k fourth gate exists only in that text.
+**Resolved 2026-08-29 (re-certification window, Phase 0):** the staged
+arm's gated pair set is byte-for-byte the dom5 control's 91 pairs
+(diff-verified); D5 has zero cross-seam contacts by the structural
+split, so a 96k gate had nothing to gate.  The doc text overstated the
+map; corrected in CODON_FINDINGS.md (+ the two sibling copies).  No
+contacts were dropped and no variant needed regeneration.
 
 ## Instrument (new files; ul18_stag5.ergo untouched)
 
@@ -127,15 +132,30 @@ once.  If a biologically-scaled ratchet is wanted, the gates would have
 to release before the offset accumulates — from Q1's formation numbers,
 a few hundred frames of separation at most.
 
-## Backend note (re-certification-relevant)
+## Backend note (re-certified 2026-08-29, plan-A window)
 
-Today's backend (post `ba3783d` segred/dock-gate extraction fix and
-`a905d80` NoContraction contraction policy) produces **zero** identical
-frame rows vs the certified `ul18_stag5.csv` (recorded at `cb4635f`)
-for the *pristine* program.  The rail arm is byte-identical to the
-pristine program built today, so the rail measurements are consistent
-with current reality; the certified CSV awaits the regeneration decision
-that was already pending.
+**Which backend produced the rail series:** `rail_series/*.csv`
+(2026-08-24) were recorded under the `cb4635f`-era backend — before
+the `ba3783d` segred/dock-gate extraction fix, the `a905d80`
+NoContraction policy, and the plan-A compiler-owned FMA. Every one of
+those backend moves shifted the pristine and rail programs *together*;
+verified again post-plan-A (2026-08-29): the rail arm
+(`ul18_stag5_rail.ergo`) rebuilt under the current backend produces
+frame rows byte-identical to the pristine program rebuilt the same way
+(14693/14693 rows match the re-certified CSV). The rail measurements
+remain consistent with current reality; only the absolute bits moved.
+
+**Certified CSVs regenerated 2026-08-29** under the plan-A backend:
+`ul18_stag5.csv` (144000 frames), `ul18_dom5.csv` (144000),
+`ul18_full_slot.csv` (96000) — GPU f32 (`--target spirv
+--precision f32`), each accepted only after two independent runs
+produced byte-identical output:
+
+```
+556fa32a1a5c85ea…  ul18_stag5.csv
+fc6f7709e928ae9f…  ul18_dom5.csv
+fb477e9bee902a73…  ul18_full_slot.csv
+```
 
 ## Reproduce
 

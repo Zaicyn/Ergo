@@ -555,6 +555,6 @@ recorded with the same precision as its positive ones.
 The known boundaries are written down where they live: the rung-4 RNA
 wall, the lattice topology barrier for Hopf charge, the CPU≠GPU
 transcendental and staged-reduction classes, the blindness ladder's
-next rung, and the corpus baselines awaiting their re-certification
-decision. Nothing in this document should be believed beyond what its
+next rung, and — closed in the 2026-08-29 window — the corpus
+baselines, now re-certified under compiler-owned contraction. Nothing in this document should be believed beyond what its
 citations support.

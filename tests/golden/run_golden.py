@@ -45,6 +45,18 @@ CORPUS = [
 # that differs is reported as NEW.
 KNOWN = {
     # "tests/example.ergo": "reason",
+    # Plan A (compiler-owned explicit FMA, 2026-08-29 window): the IR
+    # path fuses deterministic mul+add sites with explicit fma() and
+    # barrier-unfuses fragile call-factor sites; legacy still relies on
+    # gcc -ffp-contract=fast luck. Legacy output remains byte-identical
+    # to the pre-plan-A recorded corpus baselines; the IR output is the
+    # certified one going forward (baselines re-recorded this window).
+    "tests/buc_colony.ergo":
+        "IR explicit FMA vs legacy gcc-luck fusion (diverges at "
+        "byte 61981; legacy == pre-plan-A baseline)",
+    "min/dendrite/laplace_annulus.ergo":
+        "IR explicit FMA vs legacy gcc-luck fusion (diverges at "
+        "byte 155)",
 }
 
 RUN_TIMEOUT = 60  # seconds per binary

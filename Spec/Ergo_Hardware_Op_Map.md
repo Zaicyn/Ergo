@@ -237,48 +237,53 @@ known, separate follow-up.
    rule, and non-NaN-preserving min/max; bit-identity is explicitly
    sacrificed. Nothing in the asm core may depend on it.
 
-### Contraction policy (2026-08-29, measured)
+### Contraction policy (2026-08-29 — compiler-owned, plan A landed)
 
-**Who may contract a `a*b ± c` into an FMA is now decided per side:**
+**Who may contract a `a*b ± c` into an FMA is now decided by the
+Ergo compiler — identically on both paths — not by gcc's discretion
+and not by the Vulkan driver's:**
 
-- **CPU (generated C):** the recipe pins `-ffp-contract=fast`
-  (unchanged). Which sites actually fuse is gcc's SSA-level discretion —
-  measured below — and is *stable under the recipe* (same compiler
-  version, same flags, same source → same bits, which is all the Part 7
-  contract claims).
-- **GPU (SPIR-V):** every floating-point arithmetic result the backend
-  emits carries a `NoContraction` decoration. The Vulkan driver may
-  never fuse what we did not choose — GPU output is deterministic per
-  binary across driver versions.  This was NOT free: the RTX 2060
-  driver does contract undecorated `OpFMul`/`OpFAdd` pairs (measured
-  on tests/fusible_stress.ergo: R1(4096) = …97 fused vs …88 unfused).
-- **The lint:** when compiling `--target spirv`, the compiler reports
-  each kernel's fusible `a*b±c` sites (analysis:
-  `core/ir_contract.py:compute_fma_sites`). At those sites the CPU
-  recipe *may* contract while the GPU never will — a documented
-  last-ulp CPU≠GPU boundary. A kernel with no reported sites is
-  CPU==GPU-bitwise by construction (given no transcendentals, §9.10,
-  and no reductions, §9.9).
-
-**Why not IR-level `fma` emission matching gcc's fusion set (plan A)?**
-Measured: gcc's fused set is not computable from the IR. It depends on
-post-inlining PHI/sink behavior — in one and the same loop, the
-`S += sin(X)*0.37` site fused while `S += cos(X)*0.73` did not (the
-cos callee's four-return shape makes the multiply land in a PHI; the
-sin callee's single return doesn't). A minimal synthetic pair flips the
-other way (tests/contraction/probe9). A naive IR rule emitting fma at
-every `a*b±c` site moved 145/197 corpus programs' CPU outputs vs HEAD
-(chaotic amplifiers flip on one site). Any rule that mismatches gcc at
-one site flips every chaotic program containing it — so "match gcc" is
-out, and "uniform rule" moves CPU bits, which this phase forbids.
-
-**What full by-construction CPU==GPU equality takes** (deferred to the
-re-certification window, since it moves corpus CPU bits): emit explicit
-`fma()` at marked sites AND a fusion barrier (`asm volatile("" :
-"+x"(v))`, zero instructions) on every unmarked mul-feeding-add, on
-both CPU and GPU — then both sides execute exactly the compiler's rule.
-Pair with baseline re-record; the move set will be the fusible sites
-where gcc's PHI luck disagreed with the rule.
+- **The analysis** (`core/ir_contract.py:compute_fma_sites`) walks the
+  final IR in program order and classifies every REAL `a*b ± c` site:
+  - *deterministic* — both multiply factors are plain values. Both
+    backends emit an explicit fused multiply-add at exactly these
+    sites: C `fma()`/`fmaf()` on the CPU, `OpExtInst GLSL.std.450 Fma`
+    on the GPU. Same site, same instruction, both sides.
+  - *fragile* (call-factor) — a multiply factor is the direct result
+    of an intrinsic/call (e.g. `S += SIN(X)*0.37`). gcc's fusion at
+    these sites depends on post-inlining PHI/sink behavior that is not
+    computable from the IR (in one and the same loop the sin site
+    fused while the cos site did not; tests/contraction/probe9 flips a
+    minimal pair the other way). So the CPU backend emits the
+    multiply, a zero-instruction fusion barrier
+    (`asm volatile("" : "+x"(v))`) that gcc cannot fuse past, then the
+    plain add; the GPU emits the plain ops under `NoContraction`.
+    Both sides execute the unfused form.
+  - *residual* (GPU only) — a marked site whose product is computed
+    host-side (factor ids not resolvable in the kernel) falls back to
+    plain ops and is counted in the lint as a residual CPU≠GPU
+    boundary.
+- **Everything else** the SPIRV backend emits carries a
+  `NoContraction` decoration on every floating-point arithmetic
+  result — the Vulkan driver may never fuse what the compiler did not
+  choose. This was NOT free: the RTX 2060 driver does contract
+  undecorated `OpFMul`/`OpFAdd` pairs (measured on
+  tests/fusible_stress.ergo: R1(4096) = …97 fused vs …88 unfused).
+- **The lint** (`--target spirv`) reports per kernel only the fragile
+  and residual sites (deterministic sites are equal by construction,
+  silent). A kernel with no reported sites, no transcendentals
+  (§9.10), and no reductions (§9.9) is CPU==GPU-bitwise by
+  construction — verified: tests/fusible_stress.ergo is CPU==GPU
+  byte-identical at f64 AND f32 (it deliberately was not, before).
+- **Why compiler-owned instead of matching gcc's fusion set:** gcc's
+  fused set is not computable from the IR (the PHI/sink luck above),
+  and any uniform rule moves CPU bits — a naive emit-fma-everywhere
+  rule moved 145/197 corpus programs. The move was therefore taken
+  inside the 2026-08-29 re-certification window: corpus baselines
+  re-recorded (`tests/golden/run_corpus.py --record`, 197/197, audit
+  green), the certified ul18 CSVs regenerated as byte-reproducible GPU
+  f32 double-runs, and the two IR-vs-legacy A2 divergences this
+  creates carried as KNOWN (tests/golden/KNOWN_DIVERGENCES.md).
 
 **Classes that can never be CPU==GPU bitwise:** staged-vs-sequential
 reductions (Part 9.9), GPU f64 transcendentals (f64→f32→f64, Part

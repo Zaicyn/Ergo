@@ -146,21 +146,29 @@ class SPIRVBackend(KernelBackend):
             for kid in sorted(per_kernel):
                 ks = per_kernel[kid]
                 src = self.plan.kernels[kid].source_line
-                plain = sorted({ln for ln, fr in ks if not fr})
-                fragile = sorted({ln for ln, fr in ks if fr})
-                pl = ", ".join(str(x if x else src) for x in plain)
-                msg = (f"[spirv] NOTE kernel_{kid}: {len(plain)} fusible "
-                       f"a*b±c site(s) (source lines {pl}) — the CPU "
-                       f"recipe may contract these while the GPU never "
-                       f"will (NoContraction): last-ulp CPU≠GPU boundary, "
-                       f"Spec/Ergo_Hardware_Op_Map.md section 4")
+                plain = sorted({ln for ln, fr in ks if fr is False})
+                fragile = sorted({ln for ln, fr in ks if fr is True})
+                resid = sorted({ln for ln, fr in ks if fr is None})
+                parts = []
+                # plain deterministic sites emit explicit fma / OpFma —
+                # fused identically on both sides, no boundary, silent.
                 if fragile:
                     fl = ", ".join(str(x if x else src) for x in fragile)
-                    msg += (f"; {len(fragile)} of them call-factor sites "
-                            f"(lines {fl}) where CPU fusion is "
-                            f"callee-shape luck (fusible-fragile class — "
-                            f"least stable across compiler versions)")
-                print(msg, file=sys.stderr)
+                    parts.append(
+                        f"{len(fragile)} call-factor site(s) (lines {fl}) "
+                        f"unfused on both sides by construction (fusion "
+                        f"barrier CPU / NoContraction GPU) — the "
+                        f"fusible-fragile class, Spec/Ergo_Hardware_Op_Map.md "
+                        f"section 4")
+                if resid:
+                    rl = ", ".join(str(x if x else src) for x in resid)
+                    parts.append(
+                        f"{len(resid)} site(s) (lines {rl}) whose product "
+                        f"is host-side — fused on CPU, plain on GPU "
+                        f"(residual CPU≠GPU boundary)")
+                if parts:
+                    print(f"[spirv] NOTE kernel_{kid}: " +
+                          "; ".join(parts), file=sys.stderr)
         # Generate compiler-created sort-by-GEN kernels
         next_kid = len(self.plan.kernels)
         for sp in self.plan.sort_plans:
@@ -1216,6 +1224,12 @@ class _EmitContext:
                     if inst.op in (Op.CLAMP, Op.SIGN):
                         self._needs_glsl_ext = True
                     if inst.op == Op.LOG10:
+                        self._needs_glsl_ext = True
+                    # compiler-owned contraction: a marked deterministic
+                    # site emits OpExtInst GLSL.std.450 Fma
+                    if inst.op in (Op.ADD, Op.SUB) and \
+                            id(inst) in self._fma_sites and \
+                            not self._fma_sites[id(inst)].get("fragile"):
                         self._needs_glsl_ext = True
                     if inst.op in (Op.HASH, Op.RAND):
                         self._needs_int64 = True
@@ -2423,6 +2437,57 @@ class _EmitContext:
             is_fp = a_fp or b_fp or inst.type == IRType.REAL
 
             if is_fp:
+                # Compiler-owned contraction (plan A): a marked
+                # deterministic site emits OpExtInst GLSL.std.450 Fma
+                # with the mul's factors; fragile (call-factor) sites and
+                # everything else stay plain + NoContraction.  A marked
+                # site whose factors don't resolve in this kernel (the
+                # mul was host-side) falls back to plain with a note —
+                # that residual CPU≠GPU boundary is reported at assembly.
+                site = self._fma_sites.get(id(inst)) \
+                    if op in (Op.ADD, Op.SUB) else None
+                if site is not None and not site.get("fragile"):
+                    mul = site["mul"]
+                    try:
+                        fa = self._resolve(mul.args[0], pc_member_ids, ssa_map)
+                        fb = self._resolve(mul.args[1], pc_member_ids, ssa_map)
+                    except MCLError:
+                        fa = fb = None
+                    if fa is not None:
+                        if not self._is_real_id(fa):
+                            fa = self._ensure_f64(fa)
+                        if not self._is_real_id(fb):
+                            fb = self._ensure_f64(fb)
+                        other = b if site["side"] == "L" else a
+                        if site["neg_mul"]:
+                            nn = self._alloc()
+                            self._function.append(
+                                f"         {self._id(nn)} = OpFNegate "
+                                f"{self._id(self.id_real)} {self._id(fa)}")
+                            self._set_ssa_type(nn, self.id_real)
+                            self._nocontract.append(nn)
+                            fa = nn
+                        if site["neg_addend"]:
+                            nn = self._alloc()
+                            self._function.append(
+                                f"         {self._id(nn)} = OpFNegate "
+                                f"{self._id(self.id_real)} {self._id(other)}")
+                            self._set_ssa_type(nn, self.id_real)
+                            self._nocontract.append(nn)
+                            other = nn
+                        glsl = self._named_ids["glsl_ext"]
+                        result = self._alloc()
+                        self._function.append(
+                            f"         {self._id(result)} = OpExtInst "
+                            f"{self._id(self.id_real)} {self._id(glsl)} Fma "
+                            f"{self._id(fa)} {self._id(fb)} {self._id(other)}")
+                        self._set_ssa_type(result, self.id_real)
+                        if inst.result:
+                            ssa_map[inst.result] = result
+                        return False
+                    # factors unresolvable in this kernel: fall through to
+                    # the plain op (the residual boundary — lint counts it)
+                    self._fusible_lines.append((inst.line, None))
                 # Ensure both operands are f64
                 if not a_fp:
                     a = self._ensure_f64(a)

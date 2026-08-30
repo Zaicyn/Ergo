@@ -12,16 +12,16 @@
   "sha256": "2893e0eee99d1521"
  },
  "buc_colony": {
-  "bytes": 8356279,
+  "bytes": 4913989,
   "first": "\u001b[2J\u001b[?25l\u001b[H Frame     1  Cells   225  Noise  0.00000                    ",
   "last": "\u001b[?25h",
-  "sha256": "042f4196156e6e06"
+  "sha256": "ac3ebba800f2ef13"
  },
  "buc_membrane_unit": {
-  "bytes": 471995,
+  "bytes": 464817,
   "first": "run,tick,psi,h_in,k_in,atp,mesh,delta_p,pump_rate,synth_rate,i_leak,i_pump,e_k,e_h",
-  "last": "5,10000,-98.81,3.918e-03,203.757,0.0000,0.876,-194.39,0.0000,0.0000,0.000,0.000,-99.02,-97.97",
-  "sha256": "04745f47d099729a"
+  "last": "5,10000,-98.63,3.894e-03,202.352,0.0000,0.876,-3.21,0.0000,0.0000,0.000,0.000,-98.84,-97.81",
+  "sha256": "8e393080cd8ad353"
  },
  "do_neg_step": {
   "bytes": 19,
@@ -186,88 +186,88 @@
   "sha256": "e3158eb160e00d13"
  },
  "waveform_bba5": {
-  "bytes": 42700,
+  "bytes": 42300,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "9adcbb89a15a5258"
+  "sha256": "7d9da38c70305605"
  },
  "waveform_bba5_96k": {
-  "bytes": 979713,
+  "bytes": 970113,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "245c9aaf46ced8a8"
+  "sha256": "215515db8a13d5ea"
  },
  "waveform_bba5_lr": {
-  "bytes": 42292,
+  "bytes": 41892,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "95d5abd9dcf0f4ea"
+  "sha256": "b61c6c0f18a79ac9"
  },
  "waveform_bba5_lr_t02": {
-  "bytes": 41902,
+  "bytes": 41502,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "21ee02777758b435"
+  "sha256": "732e91950f477b31"
  },
  "waveform_bba5_nohb": {
-  "bytes": 42301,
+  "bytes": 41901,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "254d984181455bd9"
+  "sha256": "d29f33f80835a87d"
  },
  "waveform_bba5_seed_0.0": {
-  "bytes": 490111,
+  "bytes": 485311,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "c7f1994d26a386b2"
+  "sha256": "ef02bb952b83f542"
  },
  "waveform_bba5_seed_1.0": {
-  "bytes": 490039,
+  "bytes": 485237,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "721ae6b80fa55ec5"
+  "sha256": "acdc7bd40660746f"
  },
  "waveform_bba5_seed_2.0": {
-  "bytes": 490056,
+  "bytes": 485256,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "dd47d21a136b76f0"
+  "sha256": "94b697d8283a09ff"
  },
  "waveform_bba5_seed_3.0": {
-  "bytes": 490303,
+  "bytes": 485503,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "b291fc2353943d82"
+  "sha256": "be154258b3e86b2c"
  },
  "waveform_bba5_seed_4.0": {
-  "bytes": 490106,
+  "bytes": 485306,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "fa868eb56cc3d0f5"
+  "sha256": "624a9789e793fe19"
  },
  "waveform_bba5_t02": {
-  "bytes": 41908,
+  "bytes": 41508,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "a05728572b798504"
+  "sha256": "643883df933fba56"
  },
  "waveform_bba5_t02_long": {
-  "bytes": 122908,
+  "bytes": 121708,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "daaf44aa2b57ccc5"
+  "sha256": "9d3fb2006079cd64"
  },
  "waveform_bba5_v2": {
-  "bytes": 245310,
+  "bytes": 242910,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "85ba11ac6e294dc8"
+  "sha256": "16b3c4eb3c5f1f6a"
  },
  "waveform_bba5_v3": {
-  "bytes": 490111,
+  "bytes": 485311,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "c7f1994d26a386b2"
+  "sha256": "ef02bb952b83f542"
  },
  "waveform_bilayer": {
   "bytes": 4283,
@@ -278,98 +278,98 @@
  "waveform_chain_fold": {
   "bytes": 21261,
   "first": "frame,rgyr,e2e,nhbond,i3,i4,iL,bang_mean,bang_rms,coherence,thermal",
-  "last": "3000,9.256382,27.672088,5,5,0,0,102.299681,14.608631,0.998712,0.001000",
-  "sha256": "4cfc4d6570c9c3d9"
+  "last": "3000,9.256382,27.672076,5,5,0,0,102.299499,14.607933,0.998712,0.001000",
+  "sha256": "e1b38ff26345dccf"
  },
  "waveform_chain_fold_25": {
   "bytes": 22909,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,therma",
   "last": "2000,4.108698,12.364433,13,8,5,0,102.123565,18.685440,52.176795,0.863636,-37.363713,0.622699,0.51936",
-  "sha256": "d634c97a53886b76"
+  "sha256": "7e264ea07de71b6a"
  },
  "waveform_chain_fold_28": {
   "bytes": 45911,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,therma",
-  "last": "4000,4.189218,13.570472,18,10,6,2,94.505560,15.209924,50.936800,0.952381,-43.139150,0.365572,0.17362",
-  "sha256": "fbc18678993fe461"
+  "last": "4000,4.184741,13.574192,19,11,6,2,94.466617,15.178884,51.012331,0.952381,-43.420168,0.364600,0.17236",
+  "sha256": "4ee6fce3df25316d"
  },
  "waveform_chain_fold_95": {
-  "bytes": 21161,
+  "bytes": 21160,
   "first": "frame,rgyr,e2e,nhbond,i3,i4,iL,bang_mean,bang_rms,coherence,thermal",
-  "last": "3000,9.203921,27.195144,11,8,2,1,96.367551,20.418368,0.998712,0.001000",
-  "sha256": "24222b5b667159ab"
+  "last": "3000,9.291424,26.647141,8,8,0,0,93.739118,31.482681,0.998712,0.001000",
+  "sha256": "52de3d1319f2cd4b"
  },
  "waveform_chain_fold_fix": {
   "bytes": 45938,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,therma",
   "last": "4000,4.869026,13.438377,24,11,5,8,97.686006,15.329377,47.967762,0.958333,-56.027587,0.440405,0.22392",
-  "sha256": "d64454d84b9a14fb"
+  "sha256": "549018789c3981d7"
  },
  "waveform_chain_fold_vhs": {
-  "bytes": 46059,
+  "bytes": 46105,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,therma",
-  "last": "4000,4.384491,12.946443,27,13,7,7,94.563061,23.529962,47.201833,0.892857,-56.565561,0.855429,0.46854",
-  "sha256": "e58fa5c59f8a29b5"
+  "last": "4000,4.384643,12.949791,27,13,7,7,96.241174,27.718806,49.901119,0.892857,-56.536981,1.228504,0.42062",
+  "sha256": "0a28cc7b69ed0b03"
  },
  "waveform_chain_fold_vhs_rmsd": {
-  "bytes": 39111,
+  "bytes": 38707,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
-  "last": "4000,4.3310,11.8657,29,12,9,8,84.15,28.49,41.97,0.909,0.1037,1.5314,0.6609,-2.0830,0.0010,6.6276",
-  "sha256": "0730fc8169a4b596"
+  "last": "4000,4.3268,11.9147,30,12,9,9,83.98,24.30,39.58,0.848,0.1678,1.4657,1.0638,2.0641,0.0010,6.6271",
+  "sha256": "c599ca8035e76586"
  },
  "waveform_chignolin": {
-  "bytes": 41618,
+  "bytes": 41218,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "93561800dac4e508"
+  "sha256": "d384fb98805827f1"
  },
  "waveform_cluster": {
-  "bytes": 20392,
+  "bytes": 20377,
   "first": "frame,clusters,atoms,knots,mean_stress,max_stress,total_amp,max_amp,coherence,mean_arctan,max_arctan",
-  "last": "1000,14,252,72,0.088819,0.339201,1279.174166,44.472225,0.954699,0.055446,0.208189,22.528995,9.650864",
-  "sha256": "933b422803cc3c64"
+  "last": "1000,12,252,61,0.080248,0.403711,-742.572595,3.680193,0.956548,0.049274,0.244272,97.850360,11.480665",
+  "sha256": "45afdbae548630b1"
  },
  "waveform_gb1": {
-  "bytes": 252596,
+  "bytes": 250196,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "edd2ff528f95e2dd"
+  "sha256": "45c769634084b212"
  },
  "waveform_gb1_seed_0.0": {
-  "bytes": 252596,
+  "bytes": 250196,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "edd2ff528f95e2dd"
+  "sha256": "45c769634084b212"
  },
  "waveform_gb1_seed_1.0": {
-  "bytes": 252351,
+  "bytes": 250108,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "b3a7864d4e021b75"
+  "sha256": "bd44993f9de6b10f"
  },
  "waveform_gb1_seed_2.0": {
-  "bytes": 253938,
+  "bytes": 251363,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "3977e324bcbc6822"
+  "sha256": "8d4e6e078d2d715b"
  },
  "waveform_gb1_seed_3.0": {
-  "bytes": 254193,
+  "bytes": 251805,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "c729441723bef86f"
+  "sha256": "451bf694283537b7"
  },
  "waveform_gb1_seed_4.0": {
-  "bytes": 252718,
+  "bytes": 247752,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "3904040f9b374eeb"
+  "sha256": "b2a29eaed6c73f67"
  },
  "waveform_membrane": {
   "bytes": 7483,
   "first": "frame,active_atoms,n_head,n_tail,coherence,mean_w,flow_frac,nbond_bb,nbond_cross,max_component,mean_",
-  "last": "1000,256,123,133,0.997496,0.354493,1.000000,224,101,253,1.089367,13.038283",
-  "sha256": "1abcd91e63368a44"
+  "last": "1000,256,123,133,0.997496,0.270395,0.167969,224,101,253,1.089367,13.038283",
+  "sha256": "2c1c93217c3c5c88"
  },
  "waveform_molecule": {
   "bytes": 9585,
@@ -380,8 +380,8 @@
  "waveform_molecule_dynamics": {
   "bytes": 16697,
   "first": "frame,nbond,total_energy,mean_energy,max_energy,n_breaks,n_reforms,fingerprint,total_strength,cohere",
-  "last": "1500,39,-60.491188,-1.551056,-0.000185,0,0,10860,45.410358,0.997659,0.196199,3.550171,0.001000,3,4,9",
-  "sha256": "3ddfcf4e990e5435"
+  "last": "1500,39,-60.299466,-1.546140,-0.000185,0,0,10860,45.410358,0.997659,0.196199,3.550171,0.001000,3,4,9",
+  "sha256": "ecf09540152beba3"
  },
  "waveform_molecule_dynamics_geometric": {
   "bytes": 19596,
@@ -408,766 +408,766 @@
   "sha256": "1610e867a7004866"
  },
  "waveform_parkin_s223p_s0.0": {
-  "bytes": 533305,
+  "bytes": 528715,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "3e5a9931fcfae753"
+  "sha256": "b790c031fa7dc185"
  },
  "waveform_parkin_s223p_s1.0": {
-  "bytes": 546307,
+  "bytes": 539773,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "512ba86fe42be3b5"
+  "sha256": "252508d84b4c4e90"
  },
  "waveform_parkin_s223p_s2.0": {
-  "bytes": 537952,
+  "bytes": 532959,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "3668bfde44469424"
+  "sha256": "7deded43153d86e2"
  },
  "waveform_parkin_s223p_s3.0": {
-  "bytes": 543546,
+  "bytes": 539174,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "1c8073c8093eeb58"
+  "sha256": "b1cbfda96555654d"
  },
  "waveform_parkin_s223p_s4.0": {
-  "bytes": 536897,
+  "bytes": 531073,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "b25480e2ac86407f"
+  "sha256": "eb9d9ef1991bde96"
  },
  "waveform_parkin_wt_cb": {
-  "bytes": 533865,
+  "bytes": 529409,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "ad40ab0c0b2c859f"
+  "sha256": "c42daf6efcd925b1"
  },
  "waveform_parkin_wt_s0.0": {
-  "bytes": 533865,
+  "bytes": 529409,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "ad40ab0c0b2c859f"
+  "sha256": "c42daf6efcd925b1"
  },
  "waveform_parkin_wt_s1.0": {
-  "bytes": 578927,
+  "bytes": 574143,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "70244ebbd281b2e9"
+  "sha256": "14732c11efd4cfa2"
  },
  "waveform_parkin_wt_s2.0": {
-  "bytes": 540591,
+  "bytes": 535556,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "39341d95f08bab7c"
+  "sha256": "211796946e439f66"
  },
  "waveform_parkin_wt_s3.0": {
-  "bytes": 545981,
+  "bytes": 539709,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "6b1ce651fa9ccfef"
+  "sha256": "477653310a457ec7"
  },
  "waveform_parkin_wt_s4.0": {
-  "bytes": 536625,
+  "bytes": 532729,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "60caec47726d3dd4"
+  "sha256": "87dbb83261a2c630"
  },
  "waveform_snase": {
-  "bytes": 1013227,
+  "bytes": 1005716,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "92be3d068e1a7186"
+  "sha256": "d46b12b8ef7b1022"
  },
  "waveform_snase_seed_0.0": {
-  "bytes": 509228,
+  "bytes": 506517,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "b261a195ae4d6844"
+  "sha256": "c1042af99c7e7227"
  },
  "waveform_snase_seed_1.0": {
-  "bytes": 511742,
+  "bytes": 506677,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "85bd5b6a3c3aa101"
+  "sha256": "eadfefc2c5d98e70"
  },
  "waveform_snase_seed_2.0": {
-  "bytes": 512392,
+  "bytes": 507604,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "4447e6a542ab3dca"
+  "sha256": "4fe994d2098b20e0"
  },
  "waveform_snase_seed_3.0": {
-  "bytes": 518079,
+  "bytes": 512634,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "5d3f306d4d0f86f9"
+  "sha256": "737d99d3edd1ce10"
  },
  "waveform_snase_seed_4.0": {
-  "bytes": 515826,
+  "bytes": 511133,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "a1cdf61799337690"
+  "sha256": "2e5e4fcb13e2fdf7"
  },
  "waveform_t4lyso_l99a_192k": {
-  "bytes": 2002369,
+  "bytes": 1983199,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "6d03d4f5904f5f8b"
+  "sha256": "c52520edd5fd8a82"
  },
  "waveform_t4lyso_l99a_96k": {
-  "bytes": 1004369,
+  "bytes": 994799,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "6b4cc797a183f79b"
+  "sha256": "c0c67e4357d8b042"
  },
  "waveform_t4lyso_l99a_cb": {
-  "bytes": 509965,
+  "bytes": 505201,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "0a91e38bc32cd660"
+  "sha256": "499626ded8c95fdf"
  },
  "waveform_t4lyso_l99a_h01": {
-  "bytes": 512904,
+  "bytes": 508241,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "19561a19f7affbc6"
+  "sha256": "03c27d42a24aa6e4"
  },
  "waveform_t4lyso_l99a_s0.0": {
-  "bytes": 509965,
+  "bytes": 505201,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "0a91e38bc32cd660"
+  "sha256": "499626ded8c95fdf"
  },
  "waveform_t4lyso_l99a_s1.0": {
-  "bytes": 508830,
+  "bytes": 504027,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "508dd536baaf7e59"
+  "sha256": "599655d222d3b477"
  },
  "waveform_t4lyso_l99a_s2.0": {
-  "bytes": 506518,
+  "bytes": 501738,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "b944a74928926112"
+  "sha256": "10db4775af61a4bd"
  },
  "waveform_t4lyso_l99a_s2_192k": {
-  "bytes": 1998942,
+  "bytes": 1979764,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "033bd5546a4da238"
+  "sha256": "bb5d2093c2d2cf26"
  },
  "waveform_t4lyso_l99a_s3.0": {
-  "bytes": 510180,
+  "bytes": 505280,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "50aba4d02e89936b"
+  "sha256": "4383b49b0b770606"
  },
  "waveform_t4lyso_l99a_s4.0": {
-  "bytes": 512317,
+  "bytes": 507418,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "e0fa8b1d06f1a0f5"
+  "sha256": "07a1f302d56a4469"
  },
  "waveform_t4lyso_wt_192k": {
-  "bytes": 2003347,
+  "bytes": 1983959,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "6154e0ae67aeebea"
+  "sha256": "21a52622b8cbd28f"
  },
  "waveform_t4lyso_wt_96k": {
-  "bytes": 1005347,
+  "bytes": 995559,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "bf3f6ccefd8911af"
+  "sha256": "6422f46c5f533b90"
  },
  "waveform_t4lyso_wt_cb": {
-  "bytes": 510945,
+  "bytes": 505957,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "cab3cea871c28f51"
+  "sha256": "a39f44ecd2a5d60e"
  },
  "waveform_t4lyso_wt_h01": {
-  "bytes": 509298,
+  "bytes": 505747,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "7b6b865606f97b80"
+  "sha256": "6d4a24427ae6f5b5"
  },
  "waveform_t4lyso_wt_s0.0": {
-  "bytes": 510945,
+  "bytes": 505957,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "cab3cea871c28f51"
+  "sha256": "a39f44ecd2a5d60e"
  },
  "waveform_t4lyso_wt_s1.0": {
-  "bytes": 509035,
+  "bytes": 504215,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "11d1cad7e84ff89c"
+  "sha256": "c668555ce4180d54"
  },
  "waveform_t4lyso_wt_s2.0": {
-  "bytes": 508473,
+  "bytes": 503729,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "5ad9d916ecb478b5"
+  "sha256": "67fc632bbba0026d"
  },
  "waveform_t4lyso_wt_s2_192k": {
-  "bytes": 2000897,
+  "bytes": 1981748,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "2a940e785f2e8abf"
+  "sha256": "fc7f157b6febba20"
  },
  "waveform_t4lyso_wt_s3.0": {
-  "bytes": 514007,
+  "bytes": 509559,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "fd633d9a6a6ef7e8"
+  "sha256": "6b002122f5faefed"
  },
  "waveform_t4lyso_wt_s4.0": {
-  "bytes": 508689,
+  "bytes": 503844,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "6635d337548c6bac"
+  "sha256": "9ea15f789eb3e4b3"
  },
  "waveform_trpcage": {
-  "bytes": 42304,
+  "bytes": 41904,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "f7add281af5aae67"
+  "sha256": "16a483ee84a9e7ec"
  },
  "waveform_trpcage_cb": {
-  "bytes": 41770,
+  "bytes": 41370,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "e9422969c63d83f1"
+  "sha256": "7d8d87d038e7164e"
  },
  "waveform_trpcage_cb2": {
-  "bytes": 41770,
+  "bytes": 41370,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "c60a4e27e7bf678e"
+  "sha256": "741abd781b3db563"
  },
  "waveform_trpcage_cb2_ar0.05": {
-  "bytes": 41770,
+  "bytes": 41370,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "c60a4e27e7bf678e"
+  "sha256": "741abd781b3db563"
  },
  "waveform_trpcage_cb2_ar0.1": {
-  "bytes": 41789,
+  "bytes": 41389,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "79ee2afd6435d4db"
+  "sha256": "ab900e0d8c0164a6"
  },
  "waveform_trpcage_cb2_ar0.2": {
-  "bytes": 41829,
+  "bytes": 41428,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "31c662dbebb79564"
+  "sha256": "d2fbefab442894a7"
  },
  "waveform_trpcage_cb2_ar0.5": {
-  "bytes": 41872,
+  "bytes": 41472,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "42b938e05576bfcc"
+  "sha256": "109e37e18e6ee5a2"
  },
  "waveform_trpcage_cb2_ar1.0": {
-  "bytes": 41891,
+  "bytes": 41486,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "364a3a4b9acb6dfd"
+  "sha256": "8c2b03e758008311"
  },
  "waveform_trpcage_cb2_ar2.0": {
-  "bytes": 41948,
+  "bytes": 41546,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "b8eef0c71cb3b610"
+  "sha256": "0f41088ff06cab4d"
  },
  "waveform_trpcage_cb3": {
-  "bytes": 41751,
+  "bytes": 41351,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "c91ef70110f3ef7f"
+  "sha256": "0598576ba428a066"
  },
  "waveform_trpcage_cb3_ar0.01": {
-  "bytes": 41758,
+  "bytes": 41358,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "14a7e94523553476"
+  "sha256": "110f674868d083d0"
  },
  "waveform_trpcage_cb3_ar0.02": {
-  "bytes": 41756,
+  "bytes": 41356,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "20d229544ffc35fd"
+  "sha256": "2a654e11e65e803a"
  },
  "waveform_trpcage_cb3_ar0.05": {
-  "bytes": 41751,
+  "bytes": 41351,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "c91ef70110f3ef7f"
+  "sha256": "0598576ba428a066"
  },
  "waveform_trpcage_cb3_ar0.1": {
-  "bytes": 41755,
+  "bytes": 41355,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "4649399625ad7839"
+  "sha256": "a97f650e85597b14"
  },
  "waveform_trpcage_cb3_ar0.2": {
-  "bytes": 41767,
+  "bytes": 41367,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "907cce11e9c518b3"
+  "sha256": "bb089e09c3af5205"
  },
  "waveform_trpcage_cb3_ar0.5": {
-  "bytes": 41804,
+  "bytes": 41454,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "95e1de9cc199309d"
+  "sha256": "2dc337062e644152"
  },
  "waveform_trpcage_cb3_ar1.0": {
-  "bytes": 41917,
+  "bytes": 41498,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "c264e5c89388075f"
+  "sha256": "b5a7ae2c7754bbf6"
  },
  "waveform_trpcage_cb4": {
-  "bytes": 41750,
+  "bytes": 41351,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "699a71e1b36e051e"
+  "sha256": "e0b05724afff3ceb"
  },
  "waveform_trpcage_cb4_ar0.05": {
-  "bytes": 41750,
+  "bytes": 41351,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "699a71e1b36e051e"
+  "sha256": "e0b05724afff3ceb"
  },
  "waveform_trpcage_cb4_ar0.1": {
-  "bytes": 41741,
+  "bytes": 41341,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "b36536992a2fa03d"
+  "sha256": "184dfb32b5c77cd0"
  },
  "waveform_trpcage_cb4_ar0.2": {
-  "bytes": 41738,
+  "bytes": 41337,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "98f03fa9c96bd987"
+  "sha256": "47731167c3f94707"
  },
  "waveform_trpcage_cb4_ar0.5": {
-  "bytes": 41821,
+  "bytes": 41420,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "bf966a808fdac494"
+  "sha256": "359679f042230a2d"
  },
  "waveform_trpcage_cb4_ar1.0": {
-  "bytes": 41850,
+  "bytes": 41451,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "c8c6404a51f8b87c"
+  "sha256": "42524a93824452fd"
  },
  "waveform_trpcage_cb4_ar2.0": {
-  "bytes": 41898,
+  "bytes": 41501,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "e7122a71cbb5464f"
+  "sha256": "87709fb84f9069cc"
  },
  "waveform_trpcage_cb5": {
-  "bytes": 41758,
+  "bytes": 41358,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "cc4a78ebea7617e8"
+  "sha256": "b7de77bd18f5f472"
  },
  "waveform_trpcage_cb5_ar0.05": {
-  "bytes": 41758,
+  "bytes": 41358,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "cc4a78ebea7617e8"
+  "sha256": "b7de77bd18f5f472"
  },
  "waveform_trpcage_cb5_ar0.1": {
-  "bytes": 41746,
+  "bytes": 41345,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "64f5b05480ca92ca"
+  "sha256": "913d055905c72662"
  },
  "waveform_trpcage_cb5_ar0.2": {
-  "bytes": 41742,
+  "bytes": 41342,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "2e7d26685c2c0b9d"
+  "sha256": "a7df752b30c6b419"
  },
  "waveform_trpcage_cb5_ar0.5": {
-  "bytes": 41736,
+  "bytes": 41336,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "49bd9c8f18564f41"
+  "sha256": "6cfbb8a6d194b8c2"
  },
  "waveform_trpcage_cb5_ar1.0": {
-  "bytes": 41846,
+  "bytes": 41446,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "0332343faae54e40"
+  "sha256": "78e6af6f2f5398c3"
  },
  "waveform_trpcage_cb_ar0.05": {
-  "bytes": 41770,
+  "bytes": 41370,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "e9422969c63d83f1"
+  "sha256": "7d8d87d038e7164e"
  },
  "waveform_trpcage_cb_ar0.1": {
-  "bytes": 41779,
+  "bytes": 41379,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "e9a62dac327c70b2"
+  "sha256": "1a0bea564aa0c491"
  },
  "waveform_trpcage_cb_ar0.2": {
-  "bytes": 41798,
+  "bytes": 41399,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "8dbb95571f57f123"
+  "sha256": "a7ee74bef5454313"
  },
  "waveform_trpcage_cb_ar0.5": {
-  "bytes": 41919,
+  "bytes": 41519,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "0c06c2fe1346500f"
+  "sha256": "4d5d15efa8062be8"
  },
  "waveform_trpcage_cb_ar1.0": {
-  "bytes": 41881,
+  "bytes": 41480,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "fa727f488d62db70"
+  "sha256": "ad86245c64b15039"
  },
  "waveform_trpcage_cb_ar2.0": {
-  "bytes": 41974,
+  "bytes": 41574,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "a15936c4262c9e0f"
+  "sha256": "fd70c27b0a9cc70f"
  },
  "waveform_trpcage_w6f": {
-  "bytes": 41761,
+  "bytes": 41361,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "57a54049e5c84859"
+  "sha256": "133990b10255c7e3"
  },
  "waveform_trpcage_w6f_cb": {
-  "bytes": 41768,
+  "bytes": 41366,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "9ca7c8f1a1b0d1d3"
+  "sha256": "bc194f218624eb48"
  },
  "waveform_trpcage_w6f_cb2": {
-  "bytes": 41771,
+  "bytes": 41371,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "b62fdf1c8e19b083"
+  "sha256": "27871b28df747c98"
  },
  "waveform_trpcage_w6f_cb2_ar0.05": {
-  "bytes": 41771,
+  "bytes": 41371,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "b62fdf1c8e19b083"
+  "sha256": "27871b28df747c98"
  },
  "waveform_trpcage_w6f_cb2_ar0.1": {
-  "bytes": 41770,
+  "bytes": 41370,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "a06aa20c5d96f49a"
+  "sha256": "ba1dc9907adab23a"
  },
  "waveform_trpcage_w6f_cb2_ar0.2": {
-  "bytes": 41783,
+  "bytes": 41384,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "30200b719e91377c"
+  "sha256": "693a23aa4822b67d"
  },
  "waveform_trpcage_w6f_cb2_ar0.5": {
-  "bytes": 41822,
+  "bytes": 41422,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "5cad3865602b5e39"
+  "sha256": "2ed8efa16f28c8fd"
  },
  "waveform_trpcage_w6f_cb2_ar1.0": {
-  "bytes": 41980,
+  "bytes": 41580,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "c1d484cc16c3b9ce"
+  "sha256": "71047261c4e12692"
  },
  "waveform_trpcage_w6f_cb2_ar2.0": {
-  "bytes": 41960,
+  "bytes": 41560,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "12f845b419cc908c"
+  "sha256": "cd5f144c110661b0"
  },
  "waveform_trpcage_w6f_cb3": {
-  "bytes": 41761,
+  "bytes": 41361,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "49c2d618e28e34e1"
+  "sha256": "2b24dbdea8cb8be0"
  },
  "waveform_trpcage_w6f_cb3_ar0.01": {
-  "bytes": 41761,
+  "bytes": 41361,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "0c9522eccbd11ebc"
+  "sha256": "173dd43e215a81a2"
  },
  "waveform_trpcage_w6f_cb3_ar0.02": {
-  "bytes": 41761,
+  "bytes": 41361,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "dc5868511ddfd8c8"
+  "sha256": "34ec16a6850f8ee9"
  },
  "waveform_trpcage_w6f_cb3_ar0.05": {
-  "bytes": 41761,
+  "bytes": 41361,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "49c2d618e28e34e1"
+  "sha256": "2b24dbdea8cb8be0"
  },
  "waveform_trpcage_w6f_cb3_ar0.1": {
-  "bytes": 41758,
+  "bytes": 41358,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "66cf8a0e3811f7aa"
+  "sha256": "a7558dd19e0ed71d"
  },
  "waveform_trpcage_w6f_cb3_ar0.2": {
-  "bytes": 41757,
+  "bytes": 41357,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "d6906d9dd5fa83b2"
+  "sha256": "fbc22b333d5bbd94"
  },
  "waveform_trpcage_w6f_cb3_ar0.5": {
-  "bytes": 41765,
+  "bytes": 41365,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "c1888e7c05e3b101"
+  "sha256": "564e24d61bf3b454"
  },
  "waveform_trpcage_w6f_cb3_ar1.0": {
-  "bytes": 41766,
+  "bytes": 41366,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "a82305ec6a78b3af"
+  "sha256": "42ee3c17a32d5731"
  },
  "waveform_trpcage_w6f_cb4": {
-  "bytes": 41758,
+  "bytes": 41358,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "f8035ba5d8507ac6"
+  "sha256": "c2c8618201e2e23f"
  },
  "waveform_trpcage_w6f_cb4_ar0.05": {
-  "bytes": 41758,
+  "bytes": 41358,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "f8035ba5d8507ac6"
+  "sha256": "c2c8618201e2e23f"
  },
  "waveform_trpcage_w6f_cb4_ar0.1": {
-  "bytes": 41755,
+  "bytes": 41355,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "62a363f940e9125c"
+  "sha256": "077cee00b9b717f6"
  },
  "waveform_trpcage_w6f_cb4_ar0.2": {
-  "bytes": 41749,
+  "bytes": 41348,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "87343a43c6cd50de"
+  "sha256": "4a2dd7fe051e1200"
  },
  "waveform_trpcage_w6f_cb4_ar0.5": {
-  "bytes": 41745,
+  "bytes": 41344,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "77632b79b1d52db5"
+  "sha256": "55cf0e699ce0dc75"
  },
  "waveform_trpcage_w6f_cb4_ar1.0": {
-  "bytes": 41746,
+  "bytes": 41347,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "49988e9995cab574"
+  "sha256": "181edb475af936a4"
  },
  "waveform_trpcage_w6f_cb4_ar2.0": {
-  "bytes": 41781,
+  "bytes": 41381,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "8499ff0f7288b08c"
+  "sha256": "9ffe1dc38cd1b113"
  },
  "waveform_trpcage_w6f_cb5": {
-  "bytes": 41757,
+  "bytes": 41358,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "ccabddcfdee73ed7"
+  "sha256": "e5fb2e885532d006"
  },
  "waveform_trpcage_w6f_cb5_ar0.05": {
-  "bytes": 41757,
+  "bytes": 41358,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "ccabddcfdee73ed7"
+  "sha256": "e5fb2e885532d006"
  },
  "waveform_trpcage_w6f_cb5_ar0.1": {
-  "bytes": 41758,
+  "bytes": 41358,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "6bf0f5fb216fa292"
+  "sha256": "ef110f6f1f764adc"
  },
  "waveform_trpcage_w6f_cb5_ar0.2": {
-  "bytes": 41750,
+  "bytes": 41350,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "89caa2ba60752fcc"
+  "sha256": "31d4df731d8397a0"
  },
  "waveform_trpcage_w6f_cb5_ar0.5": {
-  "bytes": 41745,
+  "bytes": 41345,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "0930dc0cea9a973d"
+  "sha256": "0bfaa1ee6819b5e9"
  },
  "waveform_trpcage_w6f_cb5_ar1.0": {
-  "bytes": 41743,
+  "bytes": 41343,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "25582bb0ed181584"
+  "sha256": "94ea62770470b891"
  },
  "waveform_trpcage_w6f_cb_ar0.05": {
-  "bytes": 41768,
+  "bytes": 41366,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "9ca7c8f1a1b0d1d3"
+  "sha256": "bc194f218624eb48"
  },
  "waveform_trpcage_w6f_cb_ar0.1": {
-  "bytes": 41778,
+  "bytes": 41378,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "8fbf7bb5ddacfd5f"
+  "sha256": "ad8c5ec6f5e13ec1"
  },
  "waveform_trpcage_w6f_cb_ar0.2": {
-  "bytes": 41787,
+  "bytes": 41387,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "93dc03cc49c06e43"
+  "sha256": "0b84b5fd030cd9ca"
  },
  "waveform_trpcage_w6f_cb_ar0.5": {
-  "bytes": 41886,
+  "bytes": 41486,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "aaa3338c03180a43"
+  "sha256": "4ce2bf98192798f7"
  },
  "waveform_trpcage_w6f_cb_ar1.0": {
-  "bytes": 41887,
+  "bytes": 41487,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "a34d80121886305c"
+  "sha256": "b64285268f36e4bd"
  },
  "waveform_trpcage_w6f_cb_ar2.0": {
-  "bytes": 41979,
+  "bytes": 41572,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "f3e0d30aa043c29b"
+  "sha256": "de19bf28843c4281"
  },
  "waveform_uchl1_i93m_cb": {
-  "bytes": 518360,
+  "bytes": 512419,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "9c5a5d42c3787528"
+  "sha256": "407828b2d1537fc9"
  },
  "waveform_uchl1_i93m_s1.0": {
-  "bytes": 527744,
+  "bytes": 523072,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "518bb86af9d3bffc"
+  "sha256": "a2c7ba1a8c2db196"
  },
  "waveform_uchl1_i93m_s2.0": {
-  "bytes": 520225,
+  "bytes": 517264,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "01c64d7606867910"
+  "sha256": "709e14c35caf4f72"
  },
  "waveform_uchl1_i93m_s3.0": {
-  "bytes": 522100,
+  "bytes": 517814,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "de5043b561d802e5"
+  "sha256": "dc145be29d4039ab"
  },
  "waveform_uchl1_i93m_s4.0": {
-  "bytes": 514813,
+  "bytes": 509384,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "2405c71cb23a2ff8"
+  "sha256": "15f5635c9539c873"
  },
  "waveform_uchl1_i93m_s4_t06": {
-  "bytes": 519678,
+  "bytes": 517104,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "9e752f553130c598"
+  "sha256": "ca96c97c407c84f4"
  },
  "waveform_uchl1_wt_cb": {
-  "bytes": 519806,
+  "bytes": 512598,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "6cd5a6c014601854"
+  "sha256": "551d233b22e28f3b"
  },
  "waveform_uchl1_wt_s1.0": {
-  "bytes": 520960,
+  "bytes": 514117,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "3c23a4e3cac6b0b7"
+  "sha256": "33863704efcbb07c"
  },
  "waveform_uchl1_wt_s2.0": {
-  "bytes": 521978,
+  "bytes": 517390,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "135de512d292e835"
+  "sha256": "189161ad32dcdc0a"
  },
  "waveform_uchl1_wt_s3.0": {
-  "bytes": 523637,
+  "bytes": 520297,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "259ec6b031e8f1b7"
+  "sha256": "67179fc1b0a9caae"
  },
  "waveform_uchl1_wt_s4.0": {
-  "bytes": 515086,
+  "bytes": 509721,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "86933573ce84d8f2"
+  "sha256": "0e730ba40a9ec5b2"
  },
  "waveform_uchl1_wt_s4_t06": {
-  "bytes": 521077,
+  "bytes": 514065,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "23d3a98eadbb4420"
+  "sha256": "674fff857f130b9f"
  },
  "waveform_ww": {
-  "bytes": 44193,
+  "bytes": 43794,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "61d635e0519a2da0"
+  "sha256": "aa7aaeb3865913af"
  },
  "waveform_ww_lr": {
-  "bytes": 43642,
+  "bytes": 43235,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "0c56a9358a3c4df8"
+  "sha256": "b6b59f87fdd01786"
  },
  "waveform_ww_nohb": {
-  "bytes": 43383,
+  "bytes": 42983,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "77a35de1fafe20b2"
+  "sha256": "4a88df02071ab86e"
  },
  "waveform_ww_t02": {
-  "bytes": 43566,
+  "bytes": 43164,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "bd081e2b928af2c6"
+  "sha256": "23145ca70317b34c"
  },
  "waveform_ww_t02_long": {
-  "bytes": 126967,
+  "bytes": 125765,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "75381909565bb109"
+  "sha256": "5d285f996cbb726e"
  },
  "waveform_ww_v2": {
-  "bytes": 252988,
+  "bytes": 250588,
   "first": "frame,rgyr,e2e,nhb,i3,i4,iL,bang_mean,bang_rms,tors_mean,alpha_frac,e_morse,e_angle,e_torsion,e_hydr",
   "last": "END_FINAL_STRUCTURE",
-  "sha256": "f08a38d51649a942"
+  "sha256": "4222f48680555e3f"
  },
  "write_formats": {
   "bytes": 243,

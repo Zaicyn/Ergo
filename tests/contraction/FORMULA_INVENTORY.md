@@ -1,5 +1,13 @@
 # FORMULA_INVENTORY.md — the contraction lint's rules vs gcc reality
 
+> **Superseded 2026-08-29 (plan A landed):** this inventory documents
+> the PRE-plan-A world — what gcc fused at its own discretion under the
+> recipe. The shipped compiler now owns contraction: deterministic sites
+> get explicit `fma()` on both paths and fragile call-factor sites are
+> barrier-unfused, so "what gcc fuses" no longer decides program bits.
+> The measurements below remain the evidence for WHY plan A does not try
+> to match gcc's fusion set (it is not computable from the IR).
+
 2026-08-29. Question: does the rule set in `core/ir_contract.py` (the
 fusible-site analysis behind the contraction boundary lint) predict what
 gcc actually fuses under the recipe flags (`-O3 -fwrapv

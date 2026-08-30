@@ -458,11 +458,17 @@ build-ID, timestamp, and similar non-semantic metadata.
 The guarantee does **not** extend to:
 - Cross-target builds (x86 vs ARM vs RISC-V). Each target has its own
   determinism contract per its own audit.
-- CPU↔GPU at fusible `a*b±c` sites inside extracted kernels (the GPU
-  never contracts; the CPU recipe may). The compiler reports these
-  sites per kernel at compile time (Part 9.10); a kernel with no
-  reported sites, no transcendentals, and no reductions is
-  CPU==GPU-bitwise by construction.
+- CPU↔GPU at the classes the compiler cannot make bitwise (Parts
+  9.9/9.10): staged-vs-sequential reductions, GPU f64 transcendentals
+  evaluated f64→f32→f64, and driver-precision deviations (f32 `Sqrt`
+  measured 1 ulp low on the RTX 2060). Fusible `a*b±c` sites are NOT
+  such a class since 2026-08-29: both paths execute the compiler's own
+  FMA rule (plan A — explicit fma at deterministic sites, barriers at
+  fragile sites, `NoContraction` everywhere else; Op Map §4). Only
+  fragile/residual boundary sites are reported per kernel at compile
+  time (Part 9.10); a kernel with no reported sites, no
+  transcendentals, and no reductions is CPU==GPU-bitwise by
+  construction.
 - Builds with `--cpu-fast-math`. This flag explicitly permits
   reassociation and non-NaN-preserving min/max; bit-identity is
   sacrificed for speed.
@@ -905,15 +911,21 @@ relative to the CPU path for those calls. Programs that need full f64
 transcendentals on the GPU must use the CPU path (or restructure); the
 CPU backend always computes in the declared precision.
 
-**Contraction (2026-08-29):** every floating-point arithmetic result the
-SPIRV backend emits is decorated `NoContraction` — the Vulkan driver may
-never fuse an `a*b ± c` site on its own discretion. The CPU recipe still
-contracts per `-ffp-contract=fast` (Part 7); fusible sites inside
-extracted kernels are reported at compile time (a NOTE per kernel
-listing source lines). A kernel with no reported sites and no
-transcendentals is CPU==GPU-bitwise by construction. The full policy,
-the measurement evidence, and the deferred plan for by-construction
-equality at fusible sites: `Spec/Ergo_Hardware_Op_Map.md` §4.
+**Contraction (2026-08-29, compiler-owned):** fusible REAL `a*b ± c`
+sites are classified at compile time
+(`core/ir_contract.py:compute_fma_sites`) and lowered identically on
+both paths — explicit `fma()`/`fmaf()` (CPU) respectively
+`OpExtInst GLSL.std.450 Fma` (GPU) at deterministic sites, and the
+unfused form at fragile call-factor sites (CPU: fusion barrier gcc
+cannot contract past; GPU: plain ops). Every other floating-point
+arithmetic result the SPIRV backend emits is decorated
+`NoContraction` — the Vulkan driver may never fuse an `a*b ± c` site
+on its own discretion. The compile-time lint reports per kernel only
+the fragile and residual sites; a kernel with no reported sites, no
+transcendentals, and no reductions is CPU==GPU-bitwise by construction
+(verified: tests/fusible_stress.ergo, byte-identical at f64 and f32).
+The full policy and the measurement evidence:
+`Spec/Ergo_Hardware_Op_Map.md` §4.
 
 **Measured driver precision notes (2026-08-29, RTX 2060):** the Vulkan
 driver contracts undecorated fp arithmetic (consequence: before the
