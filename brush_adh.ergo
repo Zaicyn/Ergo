@@ -136,6 +136,7 @@ PARAMETER REAL :: KONA = 2.0               ! attachment rate while eligible
 PARAMETER REAL :: KOFFA = 0.02             ! zero-force rupture rate
 PARAMETER REAL :: FBA = 1.0                ! slip-bond force scale
 PARAMETER REAL :: SMAXA = 2.5              ! hard geometric release stretch
+PARAMETER REAL :: XSEED = 6.0              ! dynamic seed center (default = LBOX/2; R6-b unit smoke may use 3.5)
 
 ! ── Dynamics ────────────────────────────────────────────────
 PARAMETER REAL :: DT = 0.005
@@ -649,7 +650,7 @@ END
 SUBROUTINE INIT_DYN()
   NM := NMAX
   NACT := NB
-  CX0 := LBOX * 0.5
+  CX0 := XSEED
   DO I = 1, NB
     VX(I) := 0.0
     VY(I) := 0.0
