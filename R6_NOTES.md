@@ -96,3 +96,64 @@ draw attaches at step 438. Geometry and gate behavior are as registered;
 the outcome is the deterministic seed-77031 kinetics of the certified
 parent pointed-growth channel, which the XSEED amendment must not change.
 Diagnostic variants and logs live in /tmp, not in the repo.
+
+## Amendment PADHF (registered in plan_adhesion.md §4.4, §5 per-step force records)
+
+- `PARAMETER INTEGER :: PADHF = 0` added at the end of the R6 adhesion
+  parameter block; default 0 is inert.
+- `ADHESION_FORCE()`: after the spring force of an attached bond is
+  computed, emits the WRITE-only record
+  `adhf STEP F M force_x force_y force_z` (M=ADHM(F), %.6f, same
+  precision as adha/adhr) when `PADHF=1 .AND. MIRROR=0`. The record draws
+  no RNG and changes no state or force (ADHM(F) is read directly in the
+  WRITE; AFX/AFY/AFZ are already-computed scratch). No dynamics,
+  kinetics, RNG slots, adha/adhr/adhs records, or MIRROR/PADH=0 paths are
+  touched (diff = 1 parameter line + 3 force-routine lines + comment).
+- Rupture-step force stays in `adhr` only: ADHKIN runs before force
+  assembly each step, so a bond ruptured at step S has no adhf at S;
+  a bond attached at step S has its first adhf at S with fy=fz=0 (the
+  target yz is frozen at the current bead position in the same step).
+
+### Checks run for the amendment (short only; no gates/smokes)
+
+Toolchain: /mnt/agents/output/actin_swarm/toolchain/ergo_mcl (python3 -m
+core). All variants compiled cleanly. Test variants and logs in /tmp/adhf.
+
+1. PADH=0 vs parent brush_bfm.ergo, NSTEPS=3000, direct cmp = 0 diffs on
+   both gate arms; md5s identical to the XSEED-amendment certificates:
+   - arm 1 (PBR=0, FORMIN=0, DIMERS=0): md5 5c44db5775412be7b6d5a06a6adf3a6c
+   - arm 2 (PBR=1, FORMIN=1):           md5 ffb198c4b6efe5440b48aeeccb0160bf
+2. PADH=1, PADHF=0, 20k-step unit geometry (XSEED=3.5, PBR=0, FORMIN=0,
+   DIMERS=0, PSTN=1, F_EXT=1.0, seed 77031) vs the pre-amendment engine
+   (/mnt/agents/output/actin_phasespace/phi4/brush_adh.ergo, same
+   variant transform): cmp = 0 diffs, md5 2eeff360d2a5a2b0ca62cd5cef68467f.
+3. PADH=1, PADHF=1, same 20k unit geometry: exit 0, FINAL/FINAL_E
+   present; 33 adha / 32 adhr / 12908 adhf / 40 adhs. Parsed checks:
+   - every adhf record has an open attached bond: exact 1:1 match with
+     the adha/adhr step-resolved reconstruction (0 missing, 0 extra, no
+     duplicates); one bond (F=1, M=260) open at FINAL;
+   - no adhf at any rupture step (rupture force is in adhr, as designed);
+   - all force components finite, max |component| = 5.314234
+     (consistent with 2*KADH*d, d <= SMAXA=2.5);
+   - all 33 attach-step records have fy=fz=0 exactly (A frozen at the
+     bead yz in the same step), the component of 2*KADH*(A-R) checkable
+     without per-step positions;
+   - all 40 adhs traction windows satisfy
+     |trx - sum(-adhf_fx)/NDIAG| <= 4.98e-07 (and likewise try, trz),
+     i.e. exact to the %.6f output rounding of both records;
+   - final adhs nadh=1 equals net adha-adhr.
+4. MIRROR=1 PADH=0 dump byte-identical to parent MIRROR=1 dump:
+   md5 ff405b7ee69d179acb3150c9f63cb8bd.
+5. MIRROR=1 PADH=1 cert unchanged and analytically exact with the
+   amendment: CERT_ADH eadh=28.423286162412776 == KADH*d*d bitwise
+   (d=3.7698332962090495); FRC delta on bead 2 == 2*KADH*(A-R) bitwise;
+   all other bead forces and the legacy CERT record unchanged.
+6. MIRROR=1 PADH=1 PADHF=1 dump byte-identical to the PADHF=0 MIRROR
+   dump: PADHF adds no adhf records (or any other change) in MIRROR mode.
+
+Caveat: the 2*KADH*(A-R) identity per adhf record cannot be checked
+component-wise without per-step bead positions; the checks above cover
+the checkable components (attach-step yz = 0, magnitudes within the
+spring range, exact window-sum closure against adhs). Short checks only;
+the registered O-A1 300k gates and R6 smokes/ensembles are unchanged and
+still to be run by their stages.
