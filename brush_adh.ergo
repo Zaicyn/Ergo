@@ -137,6 +137,7 @@ PARAMETER REAL :: KOFFA = 0.02             ! zero-force rupture rate
 PARAMETER REAL :: FBA = 1.0                ! slip-bond force scale
 PARAMETER REAL :: SMAXA = 2.5              ! hard geometric release stretch
 PARAMETER REAL :: XSEED = 6.0              ! dynamic seed center (default = LBOX/2; R6-b unit smoke may use 3.5)
+PARAMETER INTEGER :: PADHF = 0             ! 1 = WRITE-only per-step adhf force record; default 0 is inert
 
 ! ── Dynamics ────────────────────────────────────────────────
 PARAMETER REAL :: DT = 0.005
@@ -2015,6 +2016,9 @@ END
 ! are accumulated per step for the adhs window record (exact bookkeeping:
 ! the reported traction IS the negative of the applied spring force).
 ! Called only when PADH=1.
+! PADHF=1 (MIRROR=0 only): WRITE-only per-step record
+!   adhf STEP F M force_x force_y force_z   (M=ADHM(F))
+! after the spring force is computed. No state, RNG, or force changes.
 SUBROUTINE ADHESION_FORCE()
   DO F = 1, MAXF
     IF FILACT(F) = 1 .AND. ADHM(F) > 0 THEN
@@ -2022,6 +2026,9 @@ SUBROUTINE ADHESION_FORCE()
       AFX := 2.0 * KADH * (ADHX(F) - PX(TB))
       AFY := 2.0 * KADH * (ADHY(F) - PY(TB))
       AFZ := 2.0 * KADH * (ADHZ(F) - PZ(TB))
+      IF PADHF = 1 .AND. MIRROR = 0 THEN
+        WRITE(*, "adhf %d %d %d %.6f %.6f %.6f") STEP, F, ADHM(F), AFX, AFY, AFZ
+      ENDIF
       FX(TB) := FX(TB) + AFX
       FY(TB) := FY(TB) + AFY
       FZ(TB) := FZ(TB) + AFZ
