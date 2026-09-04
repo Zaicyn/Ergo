@@ -1,0 +1,33 @@
+== sev_s84950.log SEVSTEP=500
+BOOKS: censuses=2000 myoa=1203 myor=1195 myost=37829 xlka=5570 xlkr=5567 adha=5311 adhr=5310 sfa=8062 sfr=8055 sev=4 netf_max=0.000e+00 NUL=0 FINAL=True
+  myor causes={1: 1134, 2: 48, 3: 12, 6: 1} xlkr causes={1: 3889, 2: 1655, 3: 23}
+  myost sign (range): {'L_ok': 2336, 'L_bad': 2156, 'R_ok': 16490, 'R_bad': 16847}  nfil_big_jumps=[]
+  nfil: first=10 last=10 min=10 max=10
+O-S3 end0: post(>=4000) windows=1993 bonded_windows=1690 (84.8%) event_duty=2.741 nb_mean=2.75
+  trx all windows: mean=0.139 med=0.000 [-2.098,2.623]
+  trx bonded windows: n=1690 mean=0.163 med=0.128 [-2.336,2.846]
+  fmag bonded: mean=2.038 med=2.020
+O-S3 end1: post(>=4000) windows=1993 bonded_windows=1718 (86.2%) event_duty=3.642 nb_mean=3.66
+  trx all windows: mean=0.038 med=0.000 [-2.742,2.824]
+  trx bonded windows: n=1718 mean=0.046 med=0.019 [-3.068,3.087]
+  fmag bonded: mean=2.035 med=2.015
+O-S3 tension post: mean=13.249 med=10.626 [1.757,28.392] min=-3.502 max=78.873 (note: includes erratum-5 0.42/motor preload, ~2.5 total at 3 motors)
+  tension>0 fraction: 1909/1993
+O-S2: (a) bond-assembly latency = 500 (window end step); (b) contractile equilibration (flen<1.0 x3 windows) = 39500
+O-S4: post windows w/ links+motors: xl_in_myo_region=7576 xl_outside=288; mean region x-len=8583.8 outside=488.4; density in=0.883 out=0.590 (links/unit-x); same-half links (buckled local-axis accepts)=890; bpol gate violations=0
+O-S5 flen post: mean=0.196 med=0.135 [-2.060,2.364] range=[-4.319,6.283]
+O-S5 drift: tension mean first-half=15.372 second-half=11.129; flen first-half=0.249 second-half=0.143
+O-S5 turnover per 1k steps (post): myosin=1.17 xlink=5.57 sfadh=8.00
+O-S5 nbound post: mean=339.4 [325,352] range=[246,364] (npoly drift proxy)
+O-S6: sev events=[(500, 1, 7, 11, 5), (500, 3, 8, 11, 4), (500, 4, 9, 14, 3), (500, 6, 10, 12, 5)]
+  reg-8 R6 transfers (no event, re-keyed): []
+  cause-5 coverage: myor5=0 xlkr5=0 total=0
+  tension last pre-sev=54.261; first 5 post: [45.89, 19.52, 9.69, 7.74, 2.34]
+  sustained tension>0 (>=10 windows) resumes at: 1000
+  end0: bonded windows post-sever=1696/1999 first=1000 trx_mean=0.159
+  end1: bonded windows post-sever=1721/1999 first=2000 trx_mean=0.047
+  remnant G7: first_len=5 last_len=5 at step 1000000 n_windows=2000
+  remnant G8: first_len=4 last_len=32 at step 1000000 n_windows=2000
+  remnant G9: first_len=3 last_len=14 at step 1000000 n_windows=2000
+  remnant G10: first_len=5 last_len=92 at step 1000000 n_windows=2000
+BOOKS PASS

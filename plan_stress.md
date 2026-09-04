@@ -340,3 +340,167 @@ distributions as-is (R9 lesson: never tune physics to hit a number).
    DO T = 1, 60 attempts, 5 draws per attempt, both beads tested,
    sample box [2, LBOX-2]^3, same RCNT=1000 hash stream). An earlier
    draft with an unbounded acceptance loop was replaced before any run.
+
+## Verifier errata (R11-a review, 2026-09-04)
+
+5. **Erratum 1 is itself incorrect (Concern C1 — corrected here):** the
+   as-built left-half grips are monomers (6, 15, 24) at head-x = 4.30,
+   NOT head-x = 5.5. Constructed grip distances measured from probe1.log
+   gm records: 1.9206–1.9216 (the registered same-x partner of monomer
+   31 is monomer 4, d = 1.5003). Consequences: (a) the three pre-bound
+   motors start stretched 0.42 (≈0.84 units contractile preload, SAME
+   sign as contraction — no gate breaks, but "exact rest" is false and
+   the O-S3 transient includes this preload; R11-c must report tension
+   with the preload noted); (b) RECORD-ACCURACY DEFECT: the step-0 myoa
+   records print the hardcoded RSF constant 1.500000 while the true
+   constructed distance is 1.92 (follows the parent SMYO convention,
+   where the constant matched reality). R11-c analysis must use
+   gm-derived distances for constructed motors, not the myoa field.
+6. **C2 wording correction:** the R11-a claim "the right end never
+   reattaches after its tips leave the zone" is FALSE as stated — 31
+   post-t=0 right-end attaches occurred (last at step 9940). What holds:
+   the right end is permanently bare for the final ~39.9k steps (80% of
+   the 50k run). R11-c must report per-end bonded fractions alongside
+   traction (registered rupture-dominated regime, reported as-is).
+7. **N4 coverage note:** the cause-5 sever-release path (MYO_MONDIE/
+   XL_MONDIE on severed remnants) is untested — no XL/motor touched the
+   remnant in the R11-a sever arm. R11-c must include a sever
+   configuration that cuts through link/motor density (or a construction
+   probe that forces cause-5 releases).
+8. **Standing rule (UB landmine):** NO non-literal code may be added to
+   INIT_CERT in any future rung until the pre-existing parent UB
+   (STATE(I) written over I=1..NB=800; STATE size NMAX=400) is fixed.
+   Fixing the parent requires a new parent rung — out of R11 scope.
+   Verifier confirmed: single OOB site, confined to the MIRROR=1 cert
+   path, structurally unable to reach dynamics; all R11-added code
+   bounded and unexposed.
+
+## R11-c registrations (runner R11-c, 2026-09-04, registered BEFORE any 1M run)
+
+**Run matrix (4 runs + 2 registered reserve, budget 6).** All runs use the
+reg. 11 config (anchored copy of certified `stress_fiber.ergo`): PSF=1,
+PXL=1, PBUND=2, PMYO=1, PADH=1, PBR=0, PSTN=0, DIMERS=0, live certified
+kinetics, PCAP=1, XLNF=0, NDIAG=500, NSTEPS=1000000. Edits are anchored
+`^PARAMETER`-only on copies; the certified file is never touched.
+  1. `main_s77031`  : PSEV=0, SEED=77031  (reg. 11 smoke seed, extended)
+  2. `main_s84950`  : PSEV=0, SEED=84950
+  3. `sev_s77031`   : PSEV=1, SEVSTEP=500, SEED=77031
+  4. `sev_s84950`   : PSEV=1, SEVSTEP=500, SEED=84950
+  Reserve (only if a measurement is ambiguous; use registered here if so):
+  none anticipated — 2 slots held.
+
+**SEVSTEP = 500 (both sever seeds) — justification from the 50k baseline
+(sf_50k.log, sf_sev_50k.log) + gm/myoa/myost/xlka reconstruction.**
+The midplane XSFM=5.5 is the contraction convergence point: the two halves
+slide pointed-end-first toward each other, so filament contours straddle
+the midplane ONLY during the early loaded transient. Reconstructed from
+the seed-77031 smoke (constructed-membership monomer spans + live motor/XL
+grip positions from gm censuses):
+  step  500: 6/6 filaments straddle, nmyo=8 (pool saturated), nxl=5;
+             sever would force ~1 motor + 2 crosslink cause-5 releases.
+  step 1000: 4/6 straddle, nmyo=8, nxl=4; ~2 crosslink cause-5 (1 borderline).
+  step 1500: 0/6 straddle — a sever at >=1500 cuts NOTHING on constructed
+             membership; the 25k smoke sever precedent cut exactly 1
+             filament (6->7) with ZERO cause-5 releases (erratum 7 gap).
+Step 500 is simultaneously (a) POST-ASSEMBLY by the registered O-S2(a)
+criterion below (both ends carried live bonds and bore windowed traction
+within window 1: end0 nb=3, end1 arate/rrate=0.006/0.012, fmag=2.88;
+tension>0), and (b) maximally LOADED (windowed midplane tension 37.7 at
+step 500 = run maximum; includes the erratum-5 0.42/motor preload), and
+(c) the ONLY epoch where the sever cuts through live link/motor density.
+Erratum 7 is binding; the geometry makes a late sever incapable of
+exercising cause-5, which is registered here as the reason for the early
+step. Predicted coverage at SEVSTEP=500 (seed 77031 baseline): 6 sev
+cuts, >=2 crosslink + >=1 motor cause-5 releases; per-seed counts
+reported from the actual sev/myor/xlkr records (O-S6).
+
+**O-S2 "assembled" criterion (two-part, both reported per seed).**
+  (a) Bond-assembly latency: first NDIAG window in which BOTH ends carried
+      a live SF bond at some time within the window (event-based from
+      sfa/sfr, NOT the instantaneous nb) AND windowed midplane tension
+      (fib ten) > 0. (Constructed fiber: expected = window 1; registered
+      as the honest construction result.)
+  (b) Contractile equilibration time: first step after which flen < 1.0
+      for >=3 consecutive NDIAG windows (tips converged; the non-trivial
+      assembly timescale; 50k baseline: between 2500 and 4000).
+**O-S3 reporting format (per seed, post-assembly = steps >= 4000 unless
+noted):** per-end (E=0 left / E=1 right) from `sfas`: windowed traction
+trx mean/median/[q10,q90] over ALL windows and over bonded windows
+(nb>0), bonded fraction (fraction of windows nb>0 AND event-based duty
+fraction from sfa/sfr), attach/rupture rates; fiber tension (fib ten)
+mean/median/[q10,q90]/min; sign check vs reg. 2 (left healthy trx>0,
+right healthy trx<0) reported while bonded. The erratum-5 0.42/motor
+constructed preload (~0.84 units contractile, 3 motors) is noted on all
+tension numbers; gm-derived (not myoa-field) distances used for
+constructed motors.
+**O-S4 method (registered):** polarity organization from gm + xlk/myos
+records. For each live crosslink (PBUND=2 => all accepted links are
+antiparallel by gate) and each live motor, grip x-positions from the
+same-step gm census; coarse spatial split = myosin-bearing region
+(x-interval covered by live motor grips, expanded by +/-DMY0) vs the
+remainder of the fiber x-extent. Report: antiparallel link density inside
+vs outside the myosin region (links/unit-x), and identification of
+parallel regions = same-half filament pairs (geometrically link-free by
+construction, distance 2.598 > RXLK) — verified post-hoc as zero
+same-half links in xlk records (gate check). Range finding, no gate.
+**O-S5 method (registered):** post-assembly (>=4000) distributions of
+flen (fib) and tension (fib ten); boundedness = finite range, no
+monotone drift (first-half vs second-half means within reported spread);
+turnover rates from event records per 1k steps: myosin
+(myoa+myor)/2/step, crosslinks (xlka+xlkr)/2/step, SF adhesion
+(sfa+sfr)/2/step, plus pointed-end actin turnover from census npoly
+drift. Force-domain no-runaway check: max|netf| from myos/xlks = 0 and
+tension stays within the observed envelope.
+**O-S6 classification (registered):** per sever arm — REPAIRED if
+post-sever the fiber (any slot set spanning the remnant pair) re-forms a
+continuous load path: both-end or single-end SF traction resumes
+(event-based bonded) AND midplane tension returns to >0 sustained
+(>=10 consecutive windows) within the run; FAILED-MEASURABLE otherwise,
+with the remnant fate (remnant slot lengths from fil, monomer census)
+and the tension/traction time course reported. Cause-5 release count
+(myor cause 5 + xlkr cause 5) reported per arm as the erratum-7 coverage
+metric; target >=2 per arm from the SEVSTEP=500 reconstruction.
+**O-S7 battery (hard, all 4 logs):** sf_books.py-equivalent checks
+re-derived in the R11-c analyzer (own code, SEVSTEP parameterized to 500
+for sever arms; sf_books.py itself hardcodes 25000 and is applied
+unmodified to the PSEV=0 main arms as cross-check): conservation,
+ghost scan, motor inv incl. causes 1-6, XL inv causes 1-5, R6-ADH inv,
+SF per-end inv, fib census cross-check, max|netf| <= 5e-7 (target 0),
+FINAL, NUL=0, nfil continuity; sever checks (sev only at SEVSTEP, G
+previously inactive, post-sev lengths). Sign spot-check: myost contour
+invariant MNEW=MOLD+1 is NOT the live-kinetics invariant (monomer slots
+recycle; sf_books live-mode checks mnew!=mold and stale-grip absence);
+the spot-check applied here = per-head dx sign vs its filament polarity
+on non-null steps (left-half head dx<0, right-half head dx>0) reported
+as a range, plus zero stale-grip/null-step events as the hard part.
+
+### R11-c run record + reserve decision (2026-09-04, post-run)
+
+Runs (runner_r6.sh, sequential, all attempt=1 OK, NUL=0, FINAL present):
+  main_s77031.log  57,934,755 B sha256 e72842a97c27a934c578fdd696a77663bd73d407e576459a6edf8f0c52a729e8
+  main_s84950.log  57,689,747 B sha256 e5b2b22636377c75ff93db71743ff75b9e4ab6139dba0f2b445e7ba972d1abce
+  sev_s77031.log   59,149,092 B sha256 f0a6e71e5e38598a096a0338345d8e22e241af2bc15c60b74982b983f6083afa
+  sev_s84950.log   58,791,632 B sha256 8cfd92401c0d031dc9e764303f8426e8a98bc288d95735bbcf6f821ac2f66e38
+Determinism: main_s77031 byte-identical to smokes/sf_50k.log through step
+50000 (only the FINAL block differs); each sev arm byte-identical to its
+main arm through step 499 (PSEV=1 inert until SEVSTEP, then sev records at
+exactly 500). Analyzer: r11c/r11c_analyze.py (SEVSTEP-parameterized
+re-derivation of sf_books.py + reg-8 R6 transfer re-key; cross-checked
+against sf_books.py on sf_50k.log — identical counts and PASS; independent
+awk spot-checks of conservation/netf/inventories on all 1M logs agree).
+RESERVE DECISION (registered): both reserve slots NOT spent. Erratum-7
+coverage was achieved program-wide in sev_s77031 (myor cause 5 x1 via
+MYO_MONDIE + xlkr cause 5 x2 via XL_MONDIE, all lifetime/endpoint-exact in
+books). sev_s84950 forced 0 cause-5 releases: reconstruction from
+main_s84950.log (gm census + live grips at step 500) shows this seed's
+motor heads had already walked off the midplane (left-half heads x<=3.5,
+right-half x>=6.2) and only 2 crosslinks were live, both grips landing on
+the kept barbed sides of the cut (nearest grip x=5.57 vs cut ~5.5); 4/6
+filaments straddled (F2/F5 did not). The O-S6 measurement itself is
+unambiguous (recovery time course, remnant fate, classification all
+measured), and a non-census-aligned SEVSTEP (e.g. 100/200, where
+constructed grips still sit at the midplane) would evade the
+census-anchored sever books checks (fil census at SEVSTEP and
+SEVSTEP-NDIAG), weakening O-S7 — not worth the trade. Registered per-arm
+target (>=2) is therefore reported as MISSED for sev_s84950 with the
+geometry reason above; erratum 7's program-level requirement is MET.
