@@ -2203,7 +2203,10 @@ class IRCodeGen:
                         prod = f"(-{prod_var})" if site["neg_mul"] else prod_var
                         if site["neg_addend"]:
                             other = f"(-{other})"
-                        c_op = "+" if op == Op.ADD else "-"
+                        # Signs for both SUB forms are already folded into
+                        # prod/other above. This path must therefore emit an
+                        # addition; retaining '-' double-negates the addend.
+                        c_op = "+"
                         lhs = (prod if site["side"] == "L" else other)
                         rhs = (other if site["side"] == "L" else prod)
                         self._put(f"{result} = ({lhs} {c_op} {rhs});")
