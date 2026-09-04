@@ -1,0 +1,34 @@
+! INLINE_EARLY_RETURN — regression: early RETURN in a CALLed subroutine
+! =====================================================================
+! Pre-fix (2026-09-04, vesicle printer EMIT): ir_inline.py dropped
+! RETURN ops when inlining subroutine calls on the spirv/render paths
+! — an early RETURN inside an IF silently vanished, so the guarded
+! code kept running (the printer's inclusion branch double-incremented
+! NEMIT and the GPU build decoded garbage). The inliner now refuses to
+! inline such subroutines (real C call — fully supported, including
+! call-site GPU residency sync).
+!
+! Correct on every path: N = 2+4+...+10 = 30. Pre-fix spirv: 55.
+!
+! CPU:  python -m core tests/inline_early_return.ergo -o /tmp/ier_cpu
+! GPU:  python -m core tests/inline_early_return.ergo --target spirv -o /tmp/ier_gpu
+
+IMPLICIT NONE
+PARAMETER INTEGER :: M = 10
+STATIC INTEGER :: N, K
+
+N := 0
+DO K = 1, M
+  CALL ADD_IF_EVEN(K)
+ENDDO
+WRITE(*, "N %d (want 30)") N
+STOP
+
+SUBROUTINE ADD_IF_EVEN(Q)
+  INTEGER :: Q
+  IF MOD(Q, 2) = 1 THEN
+    RETURN
+  ENDIF
+  N := N + Q
+  RETURN
+END

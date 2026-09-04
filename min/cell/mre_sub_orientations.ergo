@@ -1,0 +1,30 @@
+! SUB-ORIENTATION probe — spirv sign-fold verification (2026-09-04).
+! Result: CPU==GPU byte-identical at f64 AND f32, both orientations,
+! fragile and explicit-Fma sites — the spirv path never had the
+! fc721c2 bug shape. Kept as evidence. Original header:
+! SUB-orientation probe for the spirv path (mirror of
+! core/test_fragile_fma_regression.py, lifted into an extractable
+! kernel):  left-product SUB and right-product SUB with call-class
+! factors (RAND) — fragile sites — plus non-fragile neg-fold sites
+! (plain-variable products) to exercise explicit OpFma sign folds.
+IMPLICIT NONE
+PARAMETER REAL :: U0 = 1.25
+PARAMETER REAL :: V0 = 3.5
+PARAMETER REAL :: W0 = 0.75
+PARAMETER INTEGER :: N = 64
+STATIC REAL :: A(N), B(N), C(N), D(N), U(N), V(N), W(N)
+STATIC INTEGER :: I
+DO I = 1, N
+  U(I) := U0 * REAL(I)
+  V(I) := V0 * REAL(I)
+  W(I) := W0 * REAL(I)
+ENDDO
+DO I = 1, N
+  A(I) := 2.0 * RAND(100000 + I) - 1.0
+  B(I) := 3.0 - 2.0 * RAND(200000 + I)
+  C(I) := U(I) * V(I) - W(I)
+  D(I) := W(I) - U(I) * V(I)
+ENDDO
+WRITE(*, "%.17e %.17e %.17e %.17e") A(1), A(64), B(1), B(64)
+WRITE(*, "%.17e %.17e") C(3), D(3)
+STOP

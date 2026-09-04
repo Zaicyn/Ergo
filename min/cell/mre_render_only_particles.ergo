@@ -1,0 +1,22 @@
+! MRE: render-only particle SoA — does --render (no --target) compile
+! with POS_X/POS_Y/POS_Z point arrays?
+IMPLICIT NONE
+PARAMETER INTEGER :: NPART = 100
+PARAMETER INTEGER :: NSTEPS = 200
+PARAMETER REAL :: BOX_SIZE = 10.0
+STATIC REAL :: POS_X(NPART), POS_Y(NPART), POS_Z(NPART)
+STATIC REAL :: VEL_X(NPART)
+STATIC INTEGER :: I, STEP
+DO I = 1, NPART
+  POS_X(I) := RAND(1000 + I) * 10.0
+  POS_Y(I) := RAND(2000 + I) * 10.0
+  POS_Z(I) := RAND(3000 + I) * 10.0
+  VEL_X(I) := 0.0
+ENDDO
+DO STEP = 1, NSTEPS
+  DO I = 1, NPART
+    POS_X(I) := POS_X(I) + 0.001
+  ENDDO
+ENDDO
+WRITE(*, "done %f") POS_X(1)
+STOP

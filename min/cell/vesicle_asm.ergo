@@ -1,0 +1,866 @@
+! VESICLE_ASM — Project CELL, milestone M1: 3D vesicle self-assembly
+! =====================================================================
+! Two-bead dumbbell amphiphiles (Noguchi-style, solvent-free): HEAD at
+! bead 2I-1, TAIL at bead 2I, harmonic bond. Dispersed-gas start,
+! Langevin thermostat, run to assembly. Force set and pre-registered
+! oracle bands: min/cell/M1_FINDINGS.md (written before the runs).
+!
+! Short-range pairs use the M0 dynamic cell list (rebuilt every step,
+! no skin): TAIL-TAIL full LJ (attraction drives aggregation),
+! HEAD-HEAD and HEAD-TAIL WCA repulsion. Bending rigidity: an
+! orientation term on the dumbbell axes (the local normals) —
+! E = -KAL (A_I . A_J) for amph pairs within R_B, carried by a second
+! amph-level cell list; force on the axis +F_d to head, -F_d to tail.
+!
+! Extraction contract (M0): all slot passes are straight-line masked,
+! one RMW accumulator array per pass, owner table lookup INLINE in the
+! accumulator index, fixed 256-multiple segment stride. Bond/axis/
+! apply loops use affine head/tail indices (2I-1, 2I) — INJECTIVE.
+!
+! Modes:
+!   PURETAIL = 1  negative control: all beads free TAILs (no bonds, no
+!                 bending) — must NOT form a bilayer.
+!   MIRROR = 1    certification: compute forces once on the initial
+!                 configuration, dump config + forces to /tmp, STOP
+!                 (diffed against min/cell/m1_mirror.py at f64).
+!
+! CPU:  python -m core min/cell/vesicle_asm.ergo -o /tmp/vasm_cpu
+! GPU:  python -m core min/cell/vesicle_asm.ergo --target spirv -o /tmp/vasm_gpu
+
+IMPLICIT NONE
+
+! ── Population / box ────────────────────────────────────────
+PARAMETER INTEGER :: NAMPH = 1500
+PARAMETER INTEGER :: NB = 3000           ! 2 * NAMPH
+PARAMETER REAL :: LBOX = 36.0
+! ── Bead-level cell list (pair forces) ──────────────────────
+PARAMETER REAL :: RC = 2.6               ! largest cutoff (TAIL-TAIL)
+PARAMETER INTEGER :: NC = 13             ! INT(LBOX / RC); edge >= RC
+PARAMETER REAL :: CE = 2.7692307692307692  ! LBOX / NC
+PARAMETER INTEGER :: NCELL = 2197        ! NC^3
+PARAMETER INTEGER :: MAXNBR = 1024       ! slot stride (256-multiple)
+PARAMETER INTEGER :: NSLOT = 3072000     ! NB * MAXNBR
+! ── Amph-level cell list (bending/orientation) ──────────────
+PARAMETER REAL :: RB = 2.6               ! alignment range (centers)
+PARAMETER INTEGER :: NC2 = 13
+PARAMETER REAL :: CE2 = 2.7692307692307692
+PARAMETER INTEGER :: NCELL2 = 2197
+PARAMETER INTEGER :: MAXNB2 = 256
+PARAMETER INTEGER :: NSLOT2 = 384000     ! NAMPH * MAXNB2
+! ── Force parameters ────────────────────────────────────────
+PARAMETER REAL :: SIG = 1.0              ! TAIL-TAIL sigma/epsilon
+PARAMETER REAL :: SHH = 1.05             ! HEAD-HEAD WCA sigma
+PARAMETER REAL :: SHT = 0.95             ! HEAD-TAIL WCA sigma
+PARAMETER REAL :: RCTT = 2.6             ! TAIL-TAIL force cutoff
+PARAMETER REAL :: CWHH = 1.17858         ! 2^(1/6) * SHH
+PARAMETER REAL :: CWHT = 1.06634         ! 2^(1/6) * SHT
+PARAMETER REAL :: KBOND = 100.0
+PARAMETER REAL :: R0 = 0.5
+PARAMETER REAL :: KAL = 1.5              ! bending (axis alignment)
+! ── Dynamics ────────────────────────────────────────────────
+PARAMETER REAL :: DT = 0.002
+PARAMETER REAL :: GAMMA = 0.5
+PARAMETER REAL :: GAMMA_HOT = 10.0       ! equilibration damping…
+PARAMETER INTEGER :: N_HOT = 1500        ! …for the first N_HOT steps
+PARAMETER REAL :: FCAP = 500.0           ! pair-force magnitude cap
+                                         ! (gas-start overlaps reach
+                                         ! ~1e5; cap + hot damping is
+                                         ! the equilibration protocol)
+PARAMETER REAL :: KT = 0.2
+PARAMETER INTEGER :: NSTEPS = 15000
+PARAMETER INTEGER :: NDIAG = 100
+PARAMETER INTEGER :: SEED = 77031
+PARAMETER REAL :: POCKET = 13.4        ! gas-cloud half-width (0 = full
+                                       ! box); ~0.3 beads/sigma^3 inside
+! ── Modes ───────────────────────────────────────────────────
+PARAMETER INTEGER :: PURETAIL = 0
+PARAMETER INTEGER :: MIRROR = 0
+! ── Closure/thickness analysis ──────────────────────────────
+PARAMETER INTEGER :: NDIR = 162          ! Fibonacci directions
+PARAMETER INTEGER :: NRB = 64            ! radial bins of 0.5 sigma
+PARAMETER REAL :: PHI_G = 2.39996322972865332
+
+! ── 27-cell stencil ─────────────────────────────────────────
+STATIC INTEGER :: OX(27), OY(27), OZ(27)
+DATA OX / -1, 0, 1, -1, 0, 1, -1, 0, 1, &
+          -1, 0, 1, -1, 0, 1, -1, 0, 1, &
+          -1, 0, 1, -1, 0, 1, -1, 0, 1 /
+DATA OY / -1, -1, -1, 0, 0, 0, 1, 1, 1, &
+          -1, -1, -1, 0, 0, 0, 1, 1, 1, &
+          -1, -1, -1, 0, 0, 0, 1, 1, 1 /
+DATA OZ / -1, -1, -1, -1, -1, -1, -1, -1, -1, &
+           0, 0, 0, 0, 0, 0, 0, 0, 0, &
+           1, 1, 1, 1, 1, 1, 1, 1, 1 /
+
+! ── Bead state ──────────────────────────────────────────────
+STATIC REAL :: PX(NB), PY(NB), PZ(NB)
+STATIC REAL :: VX(NB), VY(NB), VZ(NB)
+STATIC REAL :: FX(NB), FY(NB), FZ(NB)
+! ── Bead cell list ──────────────────────────────────────────
+STATIC INTEGER :: CELLOF(NB), CELX(NB), CELY(NB), CELZ(NB)
+STATIC INTEGER :: CNT(NCELL), OFF(NCELL), CUR(NCELL), SORTEDB(NB)
+STATIC INTEGER :: NBR_I(NSLOT), NBR_J(NSLOT)
+STATIC REAL :: WCTT(NSLOT), WCHH(NSLOT), WCHT(NSLOT)
+! ── Amph state: axes, centers, bond forces, alignment sums ──
+STATIC REAL :: AX(NAMPH), AY(NAMPH), AZ(NAMPH), ALEN(NAMPH)
+STATIC REAL :: CXA(NAMPH), CYA(NAMPH), CZA(NAMPH)
+STATIC REAL :: FBX(NAMPH), FBY(NAMPH), FBZ(NAMPH)
+STATIC REAL :: SUMX(NAMPH), SUMY(NAMPH), SUMZ(NAMPH)
+! ── Amph cell list ──────────────────────────────────────────
+STATIC INTEGER :: CEL2OF(NAMPH), CEL2X(NAMPH), CEL2Y(NAMPH), CEL2Z(NAMPH)
+STATIC INTEGER :: CNT2(NCELL2), OFF2(NCELL2), CUR2(NCELL2), SORTED2(NAMPH)
+STATIC INTEGER :: NBR2_I(NSLOT2), NBR2_J(NSLOT2)
+STATIC REAL :: W2(NSLOT2)
+! ── Diagnostics / analysis ──────────────────────────────────
+STATIC INTEGER :: ZT(NB)
+STATIC INTEGER :: TBIN(NDIR, NRB), HBIN(NDIR, NRB)
+STATIC REAL :: DIRX(NDIR), DIRY(NDIR), DIRZ(NDIR)
+STATIC REAL :: EEDGE_PEAK
+
+! ── Working scalars ─────────────────────────────────────────
+STATIC INTEGER :: I, J, K, STEP, OVERFLOW, MAXNB, NSUSED, SN
+STATIC INTEGER :: I2, J2, OVERFLOW2, MXNB2, NSUSED2
+STATIC REAL :: DX, DY, DZ, D, DD, MG, BR, B6, FM, CK
+STATIC REAL :: MTT, MHH, MHT, BRT, B6T, BRH, B6H, BRX, B6X, FC
+STATIC REAL :: EP_PAIR, EP_TT, EP_HH, EP_HT, EP_BOND, EP_BEND
+STATIC REAL :: EEDGE, RMEAN, RSTD, THICK, ROUT, RIN, T2
+STATIC INTEGER :: NEXP, N1BAND, N0BAND, NMBAND
+
+CALL INIT_GAS()
+
+WRITE(*, "# VESICLE_ASM M1  NAMPH=%d L=%f RC=%f KAL=%f KT=%f PURETAIL=%d MIRROR=%d") NAMPH, LBOX, RC, KAL, KT, PURETAIL, MIRROR
+IF PURETAIL = 1 THEN
+  WRITE(*, "# [CONTROL] pure-TAIL fluid: NHEAD=0 NTAIL=%d (no bonds, no bending)") NB
+ENDIF
+
+IF MIRROR = 1 THEN
+  CALL CELL_BUILD()
+  CALL NBR_BUILD()
+  CALL FORCE_PAIR()
+  CALL BOND_AXES()
+  CALL CELL2_BUILD()
+  CALL NBR2_BUILD()
+  CALL ALIGN()
+  CALL APPLY_BB()
+  CALL DUMP_MIRROR()
+  STOP
+ENDIF
+
+DO STEP = 1, NSTEPS
+  ! Leapfrog ordering (integrate on last step's forces; zero at start).
+  CALL INTEGRATE()
+  CALL CELL_BUILD()
+  CALL NBR_BUILD()
+  CALL FORCE_PAIR()
+  IF PURETAIL = 0 THEN
+    CALL BOND_AXES()
+    CALL CELL2_BUILD()
+    CALL NBR2_BUILD()
+    CALL ALIGN()
+    CALL APPLY_BB()
+  ENDIF
+  IF MOD(STEP, NDIAG) = 0 .OR. STEP = NSTEPS THEN
+    CALL DIAG()
+  ENDIF
+ENDDO
+
+CALL ANALYZE_FINAL()
+STOP
+
+! ════════════════════════════════════════════════════════════
+! SUBROUTINES
+! ════════════════════════════════════════════════════════════
+
+! ── Dispersed gas start ─────────────────────────────────────
+SUBROUTINE INIT_GAS()
+  REAL :: CX0, CY0, CZ0, UX, UY, UZ, UN
+  DO I = 1, NAMPH
+    IF POCKET > 0.0 THEN
+      CX0 := LBOX * 0.5 + POCKET * (2.0 * RAND(SEED + 5 * I - 4) - 1.0)
+      CY0 := LBOX * 0.5 + POCKET * (2.0 * RAND(SEED + 5 * I - 3) - 1.0)
+      CZ0 := LBOX * 0.5 + POCKET * (2.0 * RAND(SEED + 5 * I - 2) - 1.0)
+    ELSE
+      CX0 := 2.0 + (LBOX - 4.0) * RAND(SEED + 5 * I - 4)
+      CY0 := 2.0 + (LBOX - 4.0) * RAND(SEED + 5 * I - 3)
+      CZ0 := 2.0 + (LBOX - 4.0) * RAND(SEED + 5 * I - 2)
+    ENDIF
+    UX := 2.0 * RAND(SEED + 5 * I - 1) - 1.0
+    UY := 2.0 * RAND(SEED + 5 * I) - 1.0
+    UZ := 2.0 * RAND(SEED + 91000 + I) - 1.0
+    UN := SQRT(UX * UX + UY * UY + UZ * UZ)
+    UN := MAX(UN, 1.0E-9)
+    ! head = center + 0.25 u, tail = center - 0.25 u (bond r0 = 0.5)
+    PX(2 * I - 1) := CX0 + 0.25 * UX / UN
+    PY(2 * I - 1) := CY0 + 0.25 * UY / UN
+    PZ(2 * I - 1) := CZ0 + 0.25 * UZ / UN
+    PX(2 * I) := CX0 - 0.25 * UX / UN
+    PY(2 * I) := CY0 - 0.25 * UY / UN
+    PZ(2 * I) := CZ0 - 0.25 * UZ / UN
+    VX(2 * I - 1) := 0.1 * (RAND(SEED + 77000 + 3 * I - 2) - 0.5)
+    VY(2 * I - 1) := 0.1 * (RAND(SEED + 77000 + 3 * I - 1) - 0.5)
+    VZ(2 * I - 1) := 0.1 * (RAND(SEED + 77000 + 3 * I) - 0.5)
+    VX(2 * I) := VX(2 * I - 1)
+    VY(2 * I) := VY(2 * I - 1)
+    VZ(2 * I) := VZ(2 * I - 1)
+  ENDDO
+  RETURN
+END
+
+! ── Langevin integrate (forces from previous step) ──────────
+SUBROUTINE INTEGRATE()
+  REAL :: GR, NA
+  IF STEP ≤ N_HOT THEN
+    GR := GAMMA_HOT
+  ELSE
+    GR := GAMMA
+  ENDIF
+  NA := SQRT(6.0 * GR * KT * DT)
+  SN := HASH(SEED + STEP)
+  DO I = 1, NB
+    VX(I) := VX(I) * (1.0 - GR * DT) + FX(I) * DT + NA * (RAND(SN + 3 * I - 2) - 0.5)
+    VY(I) := VY(I) * (1.0 - GR * DT) + FY(I) * DT + NA * (RAND(SN + 3 * I - 1) - 0.5)
+    VZ(I) := VZ(I) * (1.0 - GR * DT) + FZ(I) * DT + NA * (RAND(SN + 3 * I) - 0.5)
+    PX(I) := PX(I) + VX(I) * DT
+    PY(I) := PY(I) + VY(I) * DT
+    PZ(I) := PZ(I) + VZ(I) * DT
+  ENDDO
+  RETURN
+END
+
+! ── CELL_BUILD / NBR_BUILD: bead-level dynamic neighbor list ─
+! Identical machinery to M0's nlist_probe (counting sort, index-order
+! bucket placement, 27-cell stencil, fixed-stride padded segments).
+! Per-slot class weight arrays: exactly one of WCTT/WCHH/WCHT is 1.
+SUBROUTINE CELL_BUILD()
+  INTEGER :: C, IX, IY, IZ
+  DO C = 1, NCELL
+    CNT(C) := 0
+  ENDDO
+  DO I = 1, NB
+    IX := INT(PX(I) / CE) + 1
+    IY := INT(PY(I) / CE) + 1
+    IZ := INT(PZ(I) / CE) + 1
+    IF IX < 1 THEN
+      IX := 1
+    ENDIF
+    IF IX > NC THEN
+      IX := NC
+    ENDIF
+    IF IY < 1 THEN
+      IY := 1
+    ENDIF
+    IF IY > NC THEN
+      IY := NC
+    ENDIF
+    IF IZ < 1 THEN
+      IZ := 1
+    ENDIF
+    IF IZ > NC THEN
+      IZ := NC
+    ENDIF
+    C := IX + NC * (IY - 1) + NC * NC * (IZ - 1)
+    CELLOF(I) := C
+    CELX(I) := IX
+    CELY(I) := IY
+    CELZ(I) := IZ
+    CNT(C) := CNT(C) + 1
+  ENDDO
+  OFF(1) := 1
+  DO C = 2, NCELL
+    OFF(C) := OFF(C - 1) + CNT(C - 1)
+  ENDDO
+  DO C = 1, NCELL
+    CUR(C) := OFF(C)
+  ENDDO
+  DO I = 1, NB
+    C := CELLOF(I)
+    SORTEDB(CUR(C)) := I
+    CUR(C) := CUR(C) + 1
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE NBR_BUILD()
+  INTEGER :: CN, P, LO, HI, NX2, NY2, NZ2, CNTR, KK, S, TJ
+  OVERFLOW := 0
+  MAXNB := 0
+  NSUSED := 0
+  DO I = 1, NB
+    DO KK = 1, MAXNBR
+      S := (I - 1) * MAXNBR + KK
+      NBR_I(S) := I
+      NBR_J(S) := I
+      WCTT(S) := 0.0
+      WCHH(S) := 0.0
+      WCHT(S) := 0.0
+    ENDDO
+    CNTR := 0
+    DO K = 1, 27
+      NX2 := CELX(I) + OX(K)
+      NY2 := CELY(I) + OY(K)
+      NZ2 := CELZ(I) + OZ(K)
+      IF NX2 ≥ 1 .AND. NX2 ≤ NC .AND. NY2 ≥ 1 .AND. NY2 ≤ NC .AND. NZ2 ≥ 1 .AND. NZ2 ≤ NC THEN
+        CN := NX2 + NC * (NY2 - 1) + NC * NC * (NZ2 - 1)
+        IF CNT(CN) > 0 THEN
+          LO := OFF(CN)
+          HI := OFF(CN) + CNT(CN) - 1
+          DO P = LO, HI
+            J := SORTEDB(P)
+            ! exclude self AND (except in the pure-TAIL control) the
+            ! bonded partner — amph of bead b is (b+1)/2; without this
+            ! the head-tail WCA tears every dumbbell apart.
+            IF J ≠ I .AND. (PURETAIL = 1 .OR. (I + 1) / 2 ≠ (J + 1) / 2) THEN
+              CNTR := CNTR + 1
+              IF CNTR ≤ MAXNBR THEN
+                S := (I - 1) * MAXNBR + CNTR
+                NBR_J(S) := J
+                ! slot class by bead parity (odd = head, even = tail)
+                TJ := MOD(J, 2)
+                IF PURETAIL = 1 .OR. (MOD(I, 2) = 0 .AND. TJ = 0) THEN
+                  WCTT(S) := 1.0
+                ELSEIF MOD(I, 2) = 1 .AND. TJ = 1 THEN
+                  WCHH(S) := 1.0
+                ELSE
+                  WCHT(S) := 1.0
+                ENDIF
+              ELSE
+                OVERFLOW := 1
+              ENDIF
+            ENDIF
+          ENDDO
+        ENDIF
+      ENDIF
+    ENDDO
+    NSUSED := NSUSED + CNTR
+    IF CNTR > MAXNB THEN
+      MAXNB := CNTR
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── FORCE_PAIR: three masked slot passes (one accumulator each) ──
+! Masks folded inside the powers (engine idiom); WCA cutoffs are at
+! the LJ minimum so the force is continuous there.
+SUBROUTINE FORCE_PAIR()
+  DO I = 1, NB
+    FX(I) := 0.0
+    FY(I) := 0.0
+    FZ(I) := 0.0
+  ENDDO
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    MTT := (1.0 - SIGN(1.0, DD - RCTT)) * 0.5
+    MHH := (1.0 - SIGN(1.0, DD - CWHH)) * 0.5
+    MHT := (1.0 - SIGN(1.0, DD - CWHT)) * 0.5
+    BRT := WCTT(K) * MTT * MG * SIG / DD
+    B6T := BRT * BRT * BRT * BRT * BRT * BRT
+    BRH := WCHH(K) * MHH * MG * SHH / DD
+    B6H := BRH * BRH * BRH * BRH * BRH * BRH
+    BRX := WCHT(K) * MHT * MG * SHT / DD
+    B6X := BRX * BRX * BRX * BRX * BRX * BRX
+    FM := (24.0 * (2.0 * B6T * B6T - B6T) + 24.0 * (2.0 * B6H * B6H - B6H) + 24.0 * (2.0 * B6X * B6X - B6X)) / (DD * DD)
+    FM := FM * MIN(1.0, FCAP / ABS(FM))
+    FX(NBR_I(K)) := FX(NBR_I(K)) + FM * DX
+  ENDDO
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    MTT := (1.0 - SIGN(1.0, DD - RCTT)) * 0.5
+    MHH := (1.0 - SIGN(1.0, DD - CWHH)) * 0.5
+    MHT := (1.0 - SIGN(1.0, DD - CWHT)) * 0.5
+    BRT := WCTT(K) * MTT * MG * SIG / DD
+    B6T := BRT * BRT * BRT * BRT * BRT * BRT
+    BRH := WCHH(K) * MHH * MG * SHH / DD
+    B6H := BRH * BRH * BRH * BRH * BRH * BRH
+    BRX := WCHT(K) * MHT * MG * SHT / DD
+    B6X := BRX * BRX * BRX * BRX * BRX * BRX
+    FM := (24.0 * (2.0 * B6T * B6T - B6T) + 24.0 * (2.0 * B6H * B6H - B6H) + 24.0 * (2.0 * B6X * B6X - B6X)) / (DD * DD)
+    FM := FM * MIN(1.0, FCAP / ABS(FM))
+    FY(NBR_I(K)) := FY(NBR_I(K)) + FM * DY
+  ENDDO
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    MTT := (1.0 - SIGN(1.0, DD - RCTT)) * 0.5
+    MHH := (1.0 - SIGN(1.0, DD - CWHH)) * 0.5
+    MHT := (1.0 - SIGN(1.0, DD - CWHT)) * 0.5
+    BRT := WCTT(K) * MTT * MG * SIG / DD
+    B6T := BRT * BRT * BRT * BRT * BRT * BRT
+    BRH := WCHH(K) * MHH * MG * SHH / DD
+    B6H := BRH * BRH * BRH * BRH * BRH * BRH
+    BRX := WCHT(K) * MHT * MG * SHT / DD
+    B6X := BRX * BRX * BRX * BRX * BRX * BRX
+    FM := (24.0 * (2.0 * B6T * B6T - B6T) + 24.0 * (2.0 * B6H * B6H - B6H) + 24.0 * (2.0 * B6X * B6X - B6X)) / (DD * DD)
+    FM := FM * MIN(1.0, FCAP / ABS(FM))
+    FZ(NBR_I(K)) := FZ(NBR_I(K)) + FM * DZ
+  ENDDO
+  RETURN
+END
+
+! ── BOND_AXES: harmonic bonds + dumbbell axes (local normals) ──
+! Affine head/tail indices (2I-1, 2I) keep this INJECTIVE.
+SUBROUTINE BOND_AXES()
+  REAL :: BX, BY, BZ, FB
+  EP_BOND := 0.0
+  DO I = 1, NAMPH
+    BX := PX(2 * I - 1) - PX(2 * I)
+    BY := PY(2 * I - 1) - PY(2 * I)
+    BZ := PZ(2 * I - 1) - PZ(2 * I)
+    D := SQRT(BX * BX + BY * BY + BZ * BZ)
+    DD := MAX(D, 1.0E-16)
+    FB := 2.0 * KBOND * (DD - R0) / DD
+    FBX(I) := 0.0 - FB * BX
+    FBY(I) := 0.0 - FB * BY
+    FBZ(I) := 0.0 - FB * BZ
+    AX(I) := BX / DD
+    AY(I) := BY / DD
+    AZ(I) := BZ / DD
+    ALEN(I) := DD
+    CXA(I) := (PX(2 * I - 1) + PX(2 * I)) * 0.5
+    CYA(I) := (PY(2 * I - 1) + PY(2 * I)) * 0.5
+    CZA(I) := (PZ(2 * I - 1) + PZ(2 * I)) * 0.5
+    EP_BOND := EP_BOND + KBOND * (DD - R0) * (DD - R0)
+  ENDDO
+  RETURN
+END
+
+! ── Amph-level cell list (for the bending term) ─────────────
+SUBROUTINE CELL2_BUILD()
+  INTEGER :: C, IX, IY, IZ
+  DO C = 1, NCELL2
+    CNT2(C) := 0
+  ENDDO
+  DO I = 1, NAMPH
+    IX := INT(CXA(I) / CE2) + 1
+    IY := INT(CYA(I) / CE2) + 1
+    IZ := INT(CZA(I) / CE2) + 1
+    IF IX < 1 THEN
+      IX := 1
+    ENDIF
+    IF IX > NC2 THEN
+      IX := NC2
+    ENDIF
+    IF IY < 1 THEN
+      IY := 1
+    ENDIF
+    IF IY > NC2 THEN
+      IY := NC2
+    ENDIF
+    IF IZ < 1 THEN
+      IZ := 1
+    ENDIF
+    IF IZ > NC2 THEN
+      IZ := NC2
+    ENDIF
+    C := IX + NC2 * (IY - 1) + NC2 * NC2 * (IZ - 1)
+    CEL2OF(I) := C
+    CEL2X(I) := IX
+    CEL2Y(I) := IY
+    CEL2Z(I) := IZ
+    CNT2(C) := CNT2(C) + 1
+  ENDDO
+  OFF2(1) := 1
+  DO C = 2, NCELL2
+    OFF2(C) := OFF2(C - 1) + CNT2(C - 1)
+  ENDDO
+  DO C = 1, NCELL2
+    CUR2(C) := OFF2(C)
+  ENDDO
+  DO I = 1, NAMPH
+    C := CEL2OF(I)
+    SORTED2(CUR2(C)) := I
+    CUR2(C) := CUR2(C) + 1
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE NBR2_BUILD()
+  INTEGER :: CN, P, LO, HI, NX2, NY2, NZ2, CNTR, KK, S
+  OVERFLOW2 := 0
+  MXNB2 := 0
+  NSUSED2 := 0
+  DO I2 = 1, NAMPH
+    DO KK = 1, MAXNB2
+      S := (I2 - 1) * MAXNB2 + KK
+      NBR2_I(S) := I2
+      NBR2_J(S) := I2
+      W2(S) := 0.0
+    ENDDO
+    CNTR := 0
+    DO K = 1, 27
+      NX2 := CEL2X(I2) + OX(K)
+      NY2 := CEL2Y(I2) + OY(K)
+      NZ2 := CEL2Z(I2) + OZ(K)
+      IF NX2 ≥ 1 .AND. NX2 ≤ NC2 .AND. NY2 ≥ 1 .AND. NY2 ≤ NC2 .AND. NZ2 ≥ 1 .AND. NZ2 ≤ NC2 THEN
+        CN := NX2 + NC2 * (NY2 - 1) + NC2 * NC2 * (NZ2 - 1)
+        IF CNT2(CN) > 0 THEN
+          LO := OFF2(CN)
+          HI := OFF2(CN) + CNT2(CN) - 1
+          DO P = LO, HI
+            J2 := SORTED2(P)
+            IF J2 ≠ I2 THEN
+              CNTR := CNTR + 1
+              IF CNTR ≤ MAXNB2 THEN
+                S := (I2 - 1) * MAXNB2 + CNTR
+                NBR2_J(S) := J2
+                W2(S) := 1.0
+              ELSE
+                OVERFLOW2 := 1
+              ENDIF
+            ENDIF
+          ENDDO
+        ENDIF
+      ENDIF
+    ENDDO
+    NSUSED2 := NSUSED2 + CNTR
+    IF CNTR > MXNB2 THEN
+      MXNB2 := CNTR
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── ALIGN: orientation (bending) sums over amph neighbors ───
+! SUM_I = sum_j [A_J - (A_I.A_J) A_I] over center pairs within RB.
+! Three passes (one accumulator array each) + an energy pass.
+SUBROUTINE ALIGN()
+  REAL :: CX0, CY0, CZ0, DC, DDC, MR, DTA
+  DO I2 = 1, NAMPH
+    SUMX(I2) := 0.0
+    SUMY(I2) := 0.0
+    SUMZ(I2) := 0.0
+  ENDDO
+  DO K = 1, NSLOT2
+    CX0 := CXA(NBR2_I(K)) - CXA(NBR2_J(K))
+    CY0 := CYA(NBR2_I(K)) - CYA(NBR2_J(K))
+    CZ0 := CZA(NBR2_I(K)) - CZA(NBR2_J(K))
+    DC := SQRT(CX0 * CX0 + CY0 * CY0 + CZ0 * CZ0)
+    DDC := MAX(DC, 1.0E-16)
+    MR := W2(K) * (1.0 - SIGN(1.0, DDC - RB)) * 0.5
+    DTA := AX(NBR2_I(K)) * AX(NBR2_J(K)) + AY(NBR2_I(K)) * AY(NBR2_J(K)) + AZ(NBR2_I(K)) * AZ(NBR2_J(K))
+    SUMX(NBR2_I(K)) := SUMX(NBR2_I(K)) + MR * (AX(NBR2_J(K)) - DTA * AX(NBR2_I(K)))
+  ENDDO
+  DO K = 1, NSLOT2
+    CX0 := CXA(NBR2_I(K)) - CXA(NBR2_J(K))
+    CY0 := CYA(NBR2_I(K)) - CYA(NBR2_J(K))
+    CZ0 := CZA(NBR2_I(K)) - CZA(NBR2_J(K))
+    DC := SQRT(CX0 * CX0 + CY0 * CY0 + CZ0 * CZ0)
+    DDC := MAX(DC, 1.0E-16)
+    MR := W2(K) * (1.0 - SIGN(1.0, DDC - RB)) * 0.5
+    DTA := AX(NBR2_I(K)) * AX(NBR2_J(K)) + AY(NBR2_I(K)) * AY(NBR2_J(K)) + AZ(NBR2_I(K)) * AZ(NBR2_J(K))
+    SUMY(NBR2_I(K)) := SUMY(NBR2_I(K)) + MR * (AY(NBR2_J(K)) - DTA * AY(NBR2_I(K)))
+  ENDDO
+  DO K = 1, NSLOT2
+    CX0 := CXA(NBR2_I(K)) - CXA(NBR2_J(K))
+    CY0 := CYA(NBR2_I(K)) - CYA(NBR2_J(K))
+    CZ0 := CZA(NBR2_I(K)) - CZA(NBR2_J(K))
+    DC := SQRT(CX0 * CX0 + CY0 * CY0 + CZ0 * CZ0)
+    DDC := MAX(DC, 1.0E-16)
+    MR := W2(K) * (1.0 - SIGN(1.0, DDC - RB)) * 0.5
+    DTA := AX(NBR2_I(K)) * AX(NBR2_J(K)) + AY(NBR2_I(K)) * AY(NBR2_J(K)) + AZ(NBR2_I(K)) * AZ(NBR2_J(K))
+    SUMZ(NBR2_I(K)) := SUMZ(NBR2_I(K)) + MR * (AZ(NBR2_J(K)) - DTA * AZ(NBR2_I(K)))
+  ENDDO
+  EP_BEND := 0.0
+  DO K = 1, NSLOT2
+    CX0 := CXA(NBR2_I(K)) - CXA(NBR2_J(K))
+    CY0 := CYA(NBR2_I(K)) - CYA(NBR2_J(K))
+    CZ0 := CZA(NBR2_I(K)) - CZA(NBR2_J(K))
+    DC := SQRT(CX0 * CX0 + CY0 * CY0 + CZ0 * CZ0)
+    DDC := MAX(DC, 1.0E-16)
+    MR := W2(K) * (1.0 - SIGN(1.0, DDC - RB)) * 0.5
+    DTA := AX(NBR2_I(K)) * AX(NBR2_J(K)) + AY(NBR2_I(K)) * AY(NBR2_J(K)) + AZ(NBR2_I(K)) * AZ(NBR2_J(K))
+    EP_BEND := EP_BEND - KAL * MR * DTA
+  ENDDO
+  RETURN
+END
+
+! ── APPLY_BB: bond + bending forces onto the beads ──────────
+! Axis force F_d = KAL/L * SUM: +F_d on head, -F_d on tail.
+SUBROUTINE APPLY_BB()
+  REAL :: FAX, FAY, FAZ
+  DO I = 1, NAMPH
+    FAX := KAL * SUMX(I) / ALEN(I)
+    FAY := KAL * SUMY(I) / ALEN(I)
+    FAZ := KAL * SUMZ(I) / ALEN(I)
+    FX(2 * I - 1) := FX(2 * I - 1) + FBX(I) + FAX
+    FY(2 * I - 1) := FY(2 * I - 1) + FBY(I) + FAY
+    FZ(2 * I - 1) := FZ(2 * I - 1) + FBZ(I) + FAZ
+    FX(2 * I) := FX(2 * I) - FBX(I) - FAX
+    FY(2 * I) := FY(2 * I) - FBY(I) - FAY
+    FZ(2 * I) := FZ(2 * I) - FBZ(I) - FAZ
+  ENDDO
+  RETURN
+END
+
+! ── DIAG: energies, edge proxy, shell radius, checksum ──────
+SUBROUTINE DIAG()
+  REAL :: CX0, CY0, CZ0, RR, E1
+  INTEGER :: P, NBIN
+  ! pair energies (own masked pass, this cadence only)
+  EP_TT := 0.0
+  EP_HH := 0.0
+  EP_HT := 0.0
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    MTT := (1.0 - SIGN(1.0, DD - RCTT)) * 0.5
+    MHH := (1.0 - SIGN(1.0, DD - CWHH)) * 0.5
+    MHT := (1.0 - SIGN(1.0, DD - CWHT)) * 0.5
+    BRT := WCTT(K) * MTT * MG * SIG / DD
+    B6T := BRT * BRT * BRT * BRT * BRT * BRT
+    BRH := WCHH(K) * MHH * MG * SHH / DD
+    B6H := BRH * BRH * BRH * BRH * BRH * BRH
+    BRX := WCHT(K) * MHT * MG * SHT / DD
+    B6X := BRX * BRX * BRX * BRX * BRX * BRX
+    EP_TT := EP_TT + 4.0 * (B6T * B6T - B6T)
+    EP_HH := EP_HH + 4.0 * (B6H * B6H - B6H)
+    EP_HT := EP_HT + 4.0 * (B6X * B6X - B6X)
+  ENDDO
+  EP_PAIR := EP_TT + EP_HH + EP_HT
+  ! tail coordination histogram (CPU histogram; SCATTER-serialized)
+  DO I = 1, NB
+    ZT(I) := 0
+  ENDDO
+  DO K = 1, NSLOT
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    MTT := (1.0 - SIGN(1.0, DD - RCTT)) * 0.5
+    ZT(NBR_I(K)) := ZT(NBR_I(K)) + INT(WCTT(K) * MTT * MG)
+  ENDDO
+  NEXP := 0
+  EEDGE := 0.0
+  DO I = 2, NB, 2
+    IF ZT(I) < 6 THEN
+      NEXP := NEXP + 1
+      EEDGE := EEDGE + REAL(6 - ZT(I)) * 0.5
+    ENDIF
+  ENDDO
+  IF STEP = NDIAG .OR. EEDGE > EEDGE_PEAK THEN
+    EEDGE_PEAK := EEDGE
+  ENDIF
+  ! shell radius estimate: mean tail distance from centroid
+  CX0 := 0.0
+  CY0 := 0.0
+  CZ0 := 0.0
+  DO I = 2, NB, 2
+    CX0 := CX0 + PX(I)
+    CY0 := CY0 + PY(I)
+    CZ0 := CZ0 + PZ(I)
+  ENDDO
+  CX0 := CX0 / REAL(NAMPH)
+  CY0 := CY0 / REAL(NAMPH)
+  CZ0 := CZ0 / REAL(NAMPH)
+  RR := 0.0
+  DO I = 2, NB, 2
+    RR := RR + SQRT((PX(I) - CX0) * (PX(I) - CX0) + (PY(I) - CY0) * (PY(I) - CY0) + (PZ(I) - CZ0) * (PZ(I) - CZ0))
+  ENDDO
+  RMEAN := RR / REAL(NAMPH)
+  ! effective temperature (evaporation/heating diagnostic)
+  RR := 0.0
+  DO I = 1, NB
+    RR := RR + VX(I) * VX(I) + VY(I) * VY(I) + VZ(I) * VZ(I)
+  ENDDO
+  T2 := RR / (3.0 * REAL(NB))
+  ! force checksum (determinism canary)
+  CK := 0.0
+  DO I = 1, NB
+    CK := CK + FX(I) * REAL(I) + FY(I) * REAL(I + NB) + FZ(I) * REAL(I + 2 * NB)
+  ENDDO
+  WRITE(*, "step %d kt %.4f epair %.6e ett %.6e ehh %.6e eht %.6e ebond %.6e ebend %.6e nexp %d eedge %.6e rshell %.4f maxnb %d ovf %d ck %.17e") STEP, T2, EP_PAIR, EP_TT, EP_HH, EP_HT, EP_BOND, EP_BEND, NEXP, EEDGE, RMEAN, MAXNB, OVERFLOW, CK
+  RETURN
+END
+
+! ── ANALYZE_FINAL: closure (O1) + thickness (O2/O3) ─────────
+SUBROUTINE ANALYZE_FINAL()
+  REAL :: CX0, CY0, CZ0, ZZ, PHI, CP, SP, SR1, BD, RR, RPK, CNTMAX
+  REAL :: HPROF(NRB), TPROF(NRB)
+  REAL :: T1, T2, R1A, R2A, PMX, SECMX
+  INTEGER :: K2, RBIN, BEST, NBAND, INBAND, T1I, T2I, IPK, SECI
+  REAL :: THR
+  ! centroid over ALL beads
+  CX0 := 0.0
+  CY0 := 0.0
+  CZ0 := 0.0
+  DO I = 1, NB
+    CX0 := CX0 + PX(I)
+    CY0 := CY0 + PY(I)
+    CZ0 := CZ0 + PZ(I)
+  ENDDO
+  CX0 := CX0 / REAL(NB)
+  CY0 := CY0 / REAL(NB)
+  CZ0 := CZ0 / REAL(NB)
+  ! Fibonacci directions
+  DO K2 = 1, NDIR
+    ZZ := 1.0 - 2.0 * (REAL(K2) - 0.5) / REAL(NDIR)
+    PHI := REAL(K2) * PHI_G
+    SR1 := SQRT(MAX(0.0, 1.0 - ZZ * ZZ))
+    DIRX(K2) := SR1 * COS(PHI)
+    DIRY(K2) := SR1 * SIN(PHI)
+    DIRZ(K2) := ZZ
+  ENDDO
+  DO K2 = 1, NDIR
+    DO RBIN = 1, NRB
+      TBIN(K2, RBIN) := 0
+      HBIN(K2, RBIN) := 0
+    ENDDO
+  ENDDO
+  DO I = 1, NRB
+    HPROF(I) := 0.0
+    TPROF(I) := 0.0
+  ENDDO
+  ! assign beads to best direction + radial bin
+  DO I = 1, NB
+    DX := PX(I) - CX0
+    DY := PY(I) - CY0
+    DZ := PZ(I) - CZ0
+    RR := SQRT(DX * DX + DY * DY + DZ * DZ)
+    RBIN := INT(RR / 0.5) + 1
+    IF RBIN > NRB THEN
+      RBIN := NRB
+    ENDIF
+    BEST := 1
+    BD := -2.0
+    DO K2 = 1, NDIR
+      D := DX * DIRX(K2) + DY * DIRY(K2) + DZ * DIRZ(K2)
+      IF D > BD THEN
+        BD := D
+        BEST := K2
+      ENDIF
+    ENDDO
+    IF MOD(I, 2) = 0 .OR. PURETAIL = 1 THEN
+      TBIN(BEST, RBIN) := TBIN(BEST, RBIN) + 1
+      TPROF(RBIN) := TPROF(RBIN) + 1.0
+    ELSE
+      HBIN(BEST, RBIN) := HBIN(BEST, RBIN) + 1
+      HPROF(RBIN) := HPROF(RBIN) + 1.0
+    ENDIF
+  ENDDO
+  ! O1: per-direction contiguous-band count on the tail profile
+  N1BAND := 0
+  N0BAND := 0
+  NMBAND := 0
+  RMEAN := 0.0
+  DO K2 = 1, NDIR
+    CNTMAX := 0.0
+    IPK := 1
+    DO RBIN = 1, NRB
+      IF REAL(TBIN(K2, RBIN)) > CNTMAX THEN
+        CNTMAX := REAL(TBIN(K2, RBIN))
+        IPK := RBIN
+      ENDIF
+    ENDDO
+    THR := 0.25 * CNTMAX
+    NBAND := 0
+    INBAND := 0
+    DO RBIN = 1, NRB
+      IF REAL(TBIN(K2, RBIN)) ≥ THR .AND. THR > 0.0 THEN
+        IF INBAND = 0 THEN
+          NBAND := NBAND + 1
+          INBAND := 1
+        ENDIF
+      ELSE
+        INBAND := 0
+      ENDIF
+    ENDDO
+    IF NBAND = 1 THEN
+      N1BAND := N1BAND + 1
+    ELSEIF NBAND = 0 THEN
+      N0BAND := N0BAND + 1
+    ELSE
+      NMBAND := NMBAND + 1
+    ENDIF
+    RMEAN := RMEAN + (REAL(IPK) - 0.5) * 0.5
+  ENDDO
+  RMEAN := RMEAN / REAL(NDIR)
+  RSTD := 0.0
+  DO K2 = 1, NDIR
+    CNTMAX := 0.0
+    IPK := 1
+    DO RBIN = 1, NRB
+      IF REAL(TBIN(K2, RBIN)) > CNTMAX THEN
+        CNTMAX := REAL(TBIN(K2, RBIN))
+        IPK := RBIN
+      ENDIF
+    ENDDO
+    RR := (REAL(IPK) - 0.5) * 0.5 - RMEAN
+    RSTD := RSTD + RR * RR
+  ENDDO
+  RSTD := SQRT(RSTD / REAL(NDIR))
+  ! O2: pooled head radial profile -> outer/inner leaflet peaks
+  ! find outer peak (global max), scan inward for a dip below 40% and
+  ! a second rise above 40% -> inner peak; else THICK := 0 (no bilayer)
+  PMX := 0.0
+  IPK := 1
+  DO RBIN = 1, NRB
+    IF HPROF(RBIN) > PMX THEN
+      PMX := HPROF(RBIN)
+      IPK := RBIN
+    ENDIF
+  ENDDO
+  ROUT := (REAL(IPK) - 0.5) * 0.5
+  THICK := 0.0
+  RIN := 0.0
+  SECMX := 0.0
+  SECI := 0
+  INBAND := 0
+  DO RBIN = IPK, 1, -1
+    IF INBAND = 0 THEN
+      IF HPROF(RBIN) < 0.4 * PMX THEN
+        INBAND := 1
+      ENDIF
+    ELSE
+      IF HPROF(RBIN) > SECMX THEN
+        SECMX := HPROF(RBIN)
+        SECI := RBIN
+      ENDIF
+    ENDIF
+  ENDDO
+  IF INBAND = 1 .AND. SECMX ≥ 0.4 * PMX .AND. SECI ≥ 1 THEN
+    RIN := (REAL(SECI) - 0.5) * 0.5
+    THICK := ROUT - RIN
+  ENDIF
+  WRITE(*, "O1 single-band %d/%d zero-band %d multi-band %d rshell %.4f rstd %.4f") N1BAND, NDIR, N0BAND, NMBAND, RMEAN, RSTD
+  WRITE(*, "O2 thickness %.4f rout %.4f rin %.4f (band [2.0, 4.0])") THICK, ROUT, RIN
+  WRITE(*, "O3 surface %.6e (4 pi rshell^2; rshell from head peaks %.4f)") 4.0 * 3.14159265358979 * ((ROUT + RIN) * 0.5) * ((ROUT + RIN) * 0.5), (ROUT + RIN) * 0.5
+  WRITE(*, "O4 eedge_final %.6e eedge_peak %.6e nexp_final %d") EEDGE, EEDGE_PEAK, NEXP
+  RETURN
+END
+
+! ── DUMP_MIRROR: config + forces for the python mirror ──────
+SUBROUTINE DUMP_MIRROR()
+  OPEN(11, "/tmp/m1_config.txt", "WRITE")
+  WRITE(11, "%d %d") NAMPH, PURETAIL
+  DO I = 1, NB
+    WRITE(11, "%.17e %.17e %.17e") PX(I), PY(I), PZ(I)
+  ENDDO
+  CLOSE(11)
+  OPEN(12, "/tmp/m1_forces.txt", "WRITE")
+  DO I = 1, NB
+    WRITE(12, "%.17e %.17e %.17e") FX(I), FY(I), FZ(I)
+  ENDDO
+  CLOSE(12)
+  WRITE(*, "# mirror dump: /tmp/m1_config.txt /tmp/m1_forces.txt")
+  RETURN
+END

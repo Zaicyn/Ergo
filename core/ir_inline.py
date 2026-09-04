@@ -136,6 +136,36 @@ def inline_subroutines(module: IRModule) -> list[str]:
 
         return item
 
+    def _has_early_return(items, last_of_body):
+        """True if any RETURN is not the final instruction of the final
+        top-level block. Inlining drops RETURN ops (they have no meaning
+        inside the caller), so only subroutines whose RETURNs are purely
+        trailing may be inlined — an early RETURN (e.g. inside an IF)
+        changes semantics if inlined (found via the vesicle printer's
+        EMIT: its inclusion branch's RETURN was dropped, double-
+        incrementing NEMIT; tests/inline_early_return.ergo)."""
+        n = len(items)
+        for idx, item in enumerate(items):
+            last_item = last_of_body and idx == n - 1
+            if isinstance(item, IRBlock):
+                for j, inst in enumerate(item.insts):
+                    if inst.op in (Op.RETURN, Op.RETURN_VOID):
+                        if not (last_item and j == len(item.insts) - 1):
+                            return True
+            elif isinstance(item, (IRLoop, IRWhileLoop)):
+                if _has_early_return(item.body, False):
+                    return True
+            elif isinstance(item, IRIf):
+                if _has_early_return(item.then_body, False):
+                    return True
+                if item.else_body and _has_early_return(item.else_body, False):
+                    return True
+            elif isinstance(item, IRSelect):
+                for _, cb in item.cases:
+                    if _has_early_return(cb, False):
+                        return True
+        return False
+
     def _inline_block(block: IRBlock) -> list[IRItem]:
         """Process a single block. If it contains a CALL_VOID to a known
         subroutine, inline it."""
@@ -152,6 +182,16 @@ def inline_subroutines(module: IRModule) -> list[str]:
 
         sub_name = call_inst.meta["func"]
         sub = sub_map[sub_name]
+
+        # Early-RETURN subroutines must stay real calls: the inliner has
+        # no structured early-exit, and dropping a RETURN inside an IF
+        # silently changes semantics. The C call path is fully supported
+        # (call-site GPU residency sync in ir_codegen handles it).
+        if _has_early_return(sub.body, True):
+            diags.append(f"NOT inlined {sub_name}(): early RETURN "
+                         f"(semantics preserved via real call)")
+            return [block]
+
         prefix = _unique_prefix(sub_name)
 
         # All subroutine locals + params are "local names" that get prefixed.

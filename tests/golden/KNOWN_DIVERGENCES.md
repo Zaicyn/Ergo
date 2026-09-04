@@ -45,17 +45,17 @@ the harness flags as NEW-DIVERGENCE is a bug to burn down.
 - **Scalar subroutine dummies (A6, batch 1).** By-reference in both
   paths; tests/sub_scalar_ref.ergo is the golden.
 
-## Accepted with the compiler-owned FMA window (2026-08-29, plan A)
+## Accepted with the compiler-owned FMA window (2026-08-29, plan A) — CLOSED 2026-09-04
 
-- `tests/buc_colony.ergo` and `min/dendrite/laplace_annulus.ergo`.
-  The IR path now emits explicit `fma()` at deterministic mul+add
-  sites (and barriers fragile call-factor sites) while legacy still
-  relies on gcc `-ffp-contract=fast` luck, so the two paths diverge at
-  fused sites (buc_colony: byte 61981; laplace_annulus: byte 155).
-  Verified: legacy output remains byte-identical to the pre-plan-A
-  recorded corpus baseline; the IR output is the certified numerics
-  going forward and the corpus baselines were re-recorded under it
-  this window. This divergence class is permanent while legacy lives.
+- `tests/buc_colony.ergo` and `min/dendrite/laplace_annulus.ergo` were
+  listed here as IR-vs-legacy divergences "from plan-A explicit FMA".
+  **That attribution was wrong.** The true cause was the fragile-FMA
+  SUB mislowering (a SUB site with a call-class factor got its sign
+  folded into an operand but kept the `-` — `2*RAND(s)-1` computed as
+  `+1`), fixed in fc721c2. Since that fix, both programs match
+  byte-exact across IR and legacy; the KNOWN entries are removed and
+  the A2 harness reports 16/16 MATCH. Record kept here as the honest
+  erratum: a divergence class declared "permanent" was a bug.
 
 ## Latent source bugs caught by the A4 WRITE audit (fixed in source)
 

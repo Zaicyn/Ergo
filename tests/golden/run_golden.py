@@ -45,18 +45,12 @@ CORPUS = [
 # that differs is reported as NEW.
 KNOWN = {
     # "tests/example.ergo": "reason",
-    # Plan A (compiler-owned explicit FMA, 2026-08-29 window): the IR
-    # path fuses deterministic mul+add sites with explicit fma() and
-    # barrier-unfuses fragile call-factor sites; legacy still relies on
-    # gcc -ffp-contract=fast luck. Legacy output remains byte-identical
-    # to the pre-plan-A recorded corpus baselines; the IR output is the
-    # certified one going forward (baselines re-recorded this window).
-    "tests/buc_colony.ergo":
-        "IR explicit FMA vs legacy gcc-luck fusion (diverges at "
-        "byte 61981; legacy == pre-plan-A baseline)",
-    "min/dendrite/laplace_annulus.ergo":
-        "IR explicit FMA vs legacy gcc-luck fusion (diverges at "
-        "byte 155)",
+    # 2026-09-04: the two plan-A-window entries (buc_colony,
+    # laplace_annulus) were REMOVED — their IR-vs-legacy divergence was
+    # root-caused to the fragile-FMA SUB mislowering (2*RAND(s)-1
+    # computed as +1), fixed in fc721c2; both paths have matched
+    # byte-exact since. (The 8-29 plan-A attribution was wrong —
+    # recorded honestly in KNOWN_DIVERGENCES.md.)
 }
 
 RUN_TIMEOUT = 60  # seconds per binary
@@ -176,6 +170,24 @@ def main():
             print("  " + ln)
         if any(ln.lstrip().startswith("FAIL ") for ln in tail):
             print("  nodegraph suite FAIL — investigate before release.")
+
+    # Render codegen compile check (2026-09-04, B2): --render without
+    # --target must compile a particle-SoA program (compile only —
+    # running it opens a window). Pre-fix the particle epilogue
+    # referenced undeclared _color_buf / grid buffers.
+    rop = os.path.join(REPO, "tests", "render_only_particles.ergo")
+    if os.path.exists(rop):
+        out = "/tmp/render_only_particles_gate"
+        r = sh([sys.executable, "-m", "core", rop, "--render",
+                "-o", out], timeout=300)
+        print("-" * 68)
+        print("  RENDER COMPILE CHECK (tests/render_only_particles.ergo):")
+        if r.returncode == 0 and os.path.exists(out):
+            print("    PASS      render-only particle --render compiles")
+        else:
+            print("    FAIL      render-only particle --render "
+                  "compile failed — investigate before release.")
+            print(r.stderr.decode(errors="replace")[-800:])
     return 0
 
 

@@ -95,6 +95,12 @@
   "last": "0.000000",
   "sha256": "92cd030de199224c"
  },
+ "gpu_midbody_dirty (gpu)": {
+  "bytes": 188,
+  "first": "step 1 S 427.000000 (want 427)",
+  "last": "checksum 6405.000000 (want 6405)",
+  "sha256": "1feeae3768dd1096"
+ },
  "gpu_multired (gpu)": {
   "bytes": 59,
   "first": "8390656.000000",
@@ -142,6 +148,12 @@
   "first": "B1=1.000500 B2=1.000000 TOTAL=3749250.000000",
   "last": "B1=1.000500 B2=1.000000 TOTAL=3749250.000000",
   "sha256": "e1eaf0f2b8de1f61"
+ },
+ "inline_early_return (gpu)": {
+  "bytes": 15,
+  "first": "N 30 (want 30)",
+  "last": "N 30 (want 30)",
+  "sha256": "c54e4abc7260e289"
  },
  "int64": {
   "bytes": 206,

@@ -206,15 +206,65 @@ class IRCodeGen:
         self._body_downloaded: set[str] = set()
 
         # Pre-analyze subroutine array access for GPU sync around CPU calls.
-        # Maps func_name -> (arrays_read, arrays_written)
-        self._sub_array_access: dict[str, tuple[set[str], set[str]]] = {}
+        # Maps func_name -> (arrays_read, arrays_written); transitively
+        # expanded through nested calls (a CALL inside a sub is otherwise
+        # invisible to the body-level dirty tracking — 2026-09-04, B1/B2:
+        # RENDER_COPY's POS_* writes through CALL were never marked
+        # cpu_dirty, so render-only mode never uploaded the render
+        # arrays and drew black).
+        def _calls_in(items, out):
+            for it in items:
+                if isinstance(it, IRBlock):
+                    for inst in it.insts:
+                        if inst.op in (Op.CALL, Op.CALL_VOID):
+                            f = inst.meta.get("func", "")
+                            if f:
+                                out.add(f)
+                elif isinstance(it, (IRLoop, IRWhileLoop)):
+                    _calls_in(it.body, out)
+                elif isinstance(it, IRIf):
+                    _calls_in(it.then_body, out)
+                    if it.else_body:
+                        _calls_in(it.else_body, out)
+                elif isinstance(it, IRSelect):
+                    for _, cb in it.cases:
+                        _calls_in(cb, out)
+
+        direct_rw: dict[str, list] = {}
         for func in module.functions:
             reads: set[str] = set()
             writes: set[str] = set()
             self._collect_array_reads(func.body, reads)
             self._collect_array_writes(func.body, writes)
+            direct_rw[func.name] = [reads, writes]
+        changed = True
+        while changed:
+            changed = False
+            for func in module.functions:
+                calls: set[str] = set()
+                _calls_in(func.body, calls)
+                for callee in calls:
+                    if callee in direct_rw and callee != func.name:
+                        for k in (0, 1):
+                            new = direct_rw[func.name][k] | direct_rw[callee][k]
+                            if new != direct_rw[func.name][k]:
+                                direct_rw[func.name][k] = new
+                                changed = True
+        self._sub_array_access: dict[str, tuple[set[str], set[str]]] = {}
+        for fname, (reads, writes) in direct_rw.items():
             if reads or writes:
-                self._sub_array_access[func.name] = (reads, writes)
+                self._sub_array_access[fname] = (reads, writes)
+        # Written array-dummy positions per subroutine, for call-site
+        # aliasing: a write to an array dummy is a write to the ACTUAL
+        # array passed at the call site.
+        self._sub_dummy_writes: dict[str, set[int]] = {}
+        for func in module.functions:
+            if not func.is_subroutine:
+                continue
+            poss = {i for i, prm in enumerate(func.params)
+                    if prm.is_array and prm.name in direct_rw[func.name][1]}
+            if poss:
+                self._sub_dummy_writes[func.name] = poss
 
     def _detect_particle_soa(self) -> dict | None:
         """Detect SoA particle simulation pattern.
@@ -258,7 +308,11 @@ class IRCodeGen:
             "color": color_arr,
             "count_var": count_var,
             "world_scale": world_scale_expr,
-            "render_arrays": ["POS_X", "POS_Y", "POS_Z", color_arr],
+            # deduped: color_arr may BE one of the POS_ arrays (the
+            # default) — a duplicate entry double-declares the buffer
+            # in render-only init (vesicle_printer_gpu, 2026-09-04).
+            "render_arrays": list(dict.fromkeys(
+                ["POS_X", "POS_Y", "POS_Z", color_arr])),
         }
 
     def generate(self) -> str:
@@ -924,7 +978,8 @@ class IRCodeGen:
         # Instance-level set (shared across nested bodies — a CPU write
         # in an outer body must upload before kernels in inner loops).
         cpu_dirty_arrays = self._cpu_dirty
-        gpu_array_set = set(self._gpu_arrays()) if self.gpu_plan else set()
+        gpu_array_set = (set(self._gpu_arrays())
+                             if (self.gpu_plan or self.render) else set())
 
         for i, item in enumerate(items):
             # Coalesced reductions: the first non-dispatch item may read
@@ -1035,7 +1090,8 @@ class IRCodeGen:
                                     cpu_reads.add(a)
                                     arr_guard[a] = None
                             prev_ri = ri
-                        needed = last_dispatch_arrays & cpu_reads
+                        needed = ((last_dispatch_arrays & cpu_reads)
+                                  - cpu_dirty_arrays)
                         if needed:
                             # In batched frame mode, end the GPU command buffer
                             # and wait for the fence BEFORE any host↔device
@@ -1136,6 +1192,22 @@ class IRCodeGen:
                 if gpu_array_set:
                     block_writes: set[str] = set()
                     self._collect_array_writes([item], block_writes)
+                    # Writes through CALL_VOIDs: the callee's written
+                    # arrays (transitive) plus dummy→actual aliasing.
+                    # Without this, a block whose only writes happen
+                    # inside a subroutine call marks nothing dirty —
+                    # the render-upload and dispatch-upload paths then
+                    # never refresh the device copies (2026-09-04, B2).
+                    for inst in item.insts:
+                        if inst.op == Op.CALL_VOID:
+                            fn = inst.meta.get("func", "")
+                            acc = self._sub_array_access.get(fn)
+                            if acc:
+                                block_writes |= acc[1]
+                            for di in self._sub_dummy_writes.get(fn, ()):
+                                if (di < len(inst.args)
+                                        and isinstance(inst.args[di], IRRef)):
+                                    block_writes.add(inst.args[di].name)
                     block_writes &= gpu_array_set
                     # In batched mode, ZERO ops on GPU arrays emit frame_fill
                     # instead of memset — these are GPU-side ops, not CPU-dirty.
@@ -1151,15 +1223,61 @@ class IRCodeGen:
                     # CPU write invalidates GPU copies
                     self._gpu_current -= block_writes
             elif isinstance(item, IRIf):
+                if_writes: set[str] = set()
+                if gpu_array_set:
+                    self._collect_cpu_array_writes([item], if_writes)
+                    if_writes &= gpu_array_set
                 self._emit_if(item)
                 # Track CPU-dirty arrays from IF body writes (skipping
                 # sub-loops extracted as GPU kernels — device writes).
                 if gpu_array_set:
-                    if_writes: set[str] = set()
-                    self._collect_cpu_array_writes([item], if_writes)
-                    if_writes &= gpu_array_set
                     cpu_dirty_arrays |= if_writes
                     self._gpu_current -= if_writes
+                # Kernels dispatched INSIDE an IF must also register their
+                # writes: the mid-body download logic keys on
+                # last_dispatch_arrays, and an IF-wrapped kernel is
+                # invisible to it — the next CPU read then sees a stale
+                # host copy (found via the vesicle printer: BOND_AXES under
+                # `IF NACT > 0` left CXA/ALEN/FBX stale on the host,
+                # NaN cascade one step later). Mirrors the IRLoop case:
+                # arrays the CPU also wrote inside this same IF stay dirty
+                # (conservative, order-blind).
+                if self.gpu_plan:
+                    if_gpu_written: set[str] = set()
+
+                    def _scan_if_kernel_writes(bi_list):
+                        for bi in bi_list:
+                            if isinstance(bi, IRLoop):
+                                ik = self._kernel_by_line.get(bi.line)
+                                if ik and self._is_gpu_kernel(ik):
+                                    if_gpu_written.update(ik.arrays_written)
+                                else:
+                                    _scan_if_kernel_writes(bi.body)
+                            elif isinstance(bi, IRIf):
+                                _scan_if_kernel_writes(bi.then_body)
+                                if bi.else_body:
+                                    _scan_if_kernel_writes(bi.else_body)
+                            elif isinstance(bi, IRWhileLoop):
+                                _scan_if_kernel_writes(bi.body)
+                    _scan_if_kernel_writes(item.then_body)
+                    if item.else_body:
+                        _scan_if_kernel_writes(item.else_body)
+                    if if_gpu_written:
+                        if last_dispatch_arrays is None:
+                            last_dispatch_arrays = set()
+                        last_dispatch_arrays |= if_gpu_written
+                        # Device copies of these arrays are now newer: any
+                        # CPU-dirty flag set before the IF is stale and
+                        # must be cleared (a later dispatch would upload
+                        # stale host data over the kernel results). Reset
+                        # runtime dirty intervals for the same reason.
+                        fresh = if_gpu_written - if_writes
+                        cpu_dirty_arrays -= fresh
+                        self._gpu_current |= fresh
+                        for arr in sorted(fresh):
+                            if self._rg_tracked(arr):
+                                self._put(f"_rg_lo_{arr} = 2147483647; "
+                                          f"_rg_hi_{arr} = -1;")
             elif isinstance(item, IRLoop):
                 # Check if this loop is a GPU dispatch
                 kernel = self._kernel_by_line.get(item.line)
@@ -1356,7 +1474,8 @@ class IRCodeGen:
         # must be uploaded BEFORE the conditional. Otherwise the upload placed
         # inside the branch is skipped when the condition is false, and the
         # next GPU kernel outside the branch reads stale device data.
-        gpu_array_set = set(self._gpu_arrays()) if self.gpu_plan else set()
+        gpu_array_set = (set(self._gpu_arrays())
+                             if (self.gpu_plan or self.render) else set())
         if gpu_array_set:
             kernels = self._gpu_kernels_in_body([node])
             if kernels and self._cpu_dirty:
@@ -1665,14 +1784,16 @@ class IRCodeGen:
                                if a in gpu_set
                                and self._var_types.get(a) == IRType.REAL
                                and self._array_shapes[a] == self._array_shapes.get("POS_X")]
-                if real_arrays:
-                    self._put("/* Runtime color channel selection */")
-                    self._put("const char *_color_env = getenv(\"ERGO_COLOR\");")
-                    self._put(f"ErgoVkBuf _color_buf = d_{color_arr};")
-                    for arr in real_arrays:
-                        if arr != color_arr:
-                            self._put(f"if (_color_env && strcmp(_color_env, \"{arr}\") == 0) "
-                                      f"_color_buf = d_{arr};")
+                # _color_buf must exist even in render-only mode (no GPU
+                # arrays at all) — the render calls below reference it
+                # unconditionally (2026-09-04, B2).
+                self._put("/* Runtime color channel selection */")
+                self._put("const char *_color_env = getenv(\"ERGO_COLOR\");")
+                self._put(f"ErgoVkBuf _color_buf = d_{color_arr};")
+                for arr in real_arrays:
+                    if arr != color_arr:
+                        self._put(f"if (_color_env && strcmp(_color_env, \"{arr}\") == 0) "
+                                  f"_color_buf = d_{arr};")
 
                 # Add render arrays to upload set ONLY if CPU dirtied them.
                 # Arrays written by GPU kernels are already current on GPU —
@@ -1716,22 +1837,34 @@ class IRCodeGen:
                 if hasattr(self, '_pp_arrays') and self._pp_arrays:
                     self._put(f"ergo_vk_set_render_offset("
                               f"(size_t)_pp_wr_offset * sizeof(float));")
-                self._put(f"if (getenv(\"ERGO_RENDER\") && "
-                          f"strcmp(getenv(\"ERGO_RENDER\"), \"meshlet\") == 0)")
-                self._put(f"  ergo_vk_render_meshlets("
-                          f"d_{particle['pos_x']}, d_{particle['pos_y']}, "
-                          f"d_{particle['pos_z']}, _color_buf, {count}, "
-                          f"d_GRID_GRAD_X, d_GRID_GRAD_Y, "
-                          f"d_GRID_GRAD_Z, d_GRID_MET_GATE, "
-                          f"GRID_SIZE, _vmin, _vmax, {ws});")
-                self._put(f"else if (getenv(\"ERGO_RENDER\") && "
-                          f"strcmp(getenv(\"ERGO_RENDER\"), \"grid\") == 0)")
-                self._put(f"  ergo_vk_render_grid_gaussians("
-                          f"d_GRID_GRAD_X, d_GRID_GRAD_Y, "
-                          f"d_GRID_GRAD_Z, d_GRID_MET_GATE, "
-                          f"GRID_SIZE, _vmin, _vmax, {ws});")
-                self._put(f"else if (getenv(\"ERGO_RENDER\") && "
-                          f"strcmp(getenv(\"ERGO_RENDER\"), \"gauss\") == 0)")
+                # Meshlet/grid alternates reference the FDTD grid
+                # buffers — emit them only when those buffers exist
+                # (full-GPU FDTD builds). A particle-only program has no
+                # grid buffers and the references would not compile
+                # (render-only particle path, 2026-09-04, B2).
+                has_grid_bufs = all(
+                    n in gpu_set for n in ("GRID_GRAD_X", "GRID_GRAD_Y",
+                                           "GRID_GRAD_Z", "GRID_MET_GATE"))
+                if has_grid_bufs:
+                    self._put(f"if (getenv(\"ERGO_RENDER\") && "
+                              f"strcmp(getenv(\"ERGO_RENDER\"), \"meshlet\") == 0)")
+                    self._put(f"  ergo_vk_render_meshlets("
+                              f"d_{particle['pos_x']}, d_{particle['pos_y']}, "
+                              f"d_{particle['pos_z']}, _color_buf, {count}, "
+                              f"d_GRID_GRAD_X, d_GRID_GRAD_Y, "
+                              f"d_GRID_GRAD_Z, d_GRID_MET_GATE, "
+                              f"GRID_SIZE, _vmin, _vmax, {ws});")
+                    self._put(f"else if (getenv(\"ERGO_RENDER\") && "
+                              f"strcmp(getenv(\"ERGO_RENDER\"), \"grid\") == 0)")
+                    self._put(f"  ergo_vk_render_grid_gaussians("
+                              f"d_GRID_GRAD_X, d_GRID_GRAD_Y, "
+                              f"d_GRID_GRAD_Z, d_GRID_MET_GATE, "
+                              f"GRID_SIZE, _vmin, _vmax, {ws});")
+                    self._put(f"else if (getenv(\"ERGO_RENDER\") && "
+                              f"strcmp(getenv(\"ERGO_RENDER\"), \"gauss\") == 0)")
+                else:
+                    self._put(f"if (getenv(\"ERGO_RENDER\") && "
+                              f"strcmp(getenv(\"ERGO_RENDER\"), \"gauss\") == 0)")
                 self._put(f"  ergo_vk_render_gaussians("
                           f"d_{particle['pos_x']}, d_{particle['pos_y']}, "
                           f"d_{particle['pos_z']}, _color_buf, "
@@ -2455,7 +2588,8 @@ class IRCodeGen:
         # ZERO — zero entire array via memset (or GPU fill in batched frame)
         if op == Op.ZERO:
             array_name = inst.meta.get("array", "?")
-            gpu_array_set = set(self._gpu_arrays()) if self.gpu_plan else set()
+            gpu_array_set = (set(self._gpu_arrays())
+                             if (self.gpu_plan or self.render) else set())
             if self._batched_frame and array_name in gpu_array_set:
                 shape = self._array_shapes.get(array_name)
                 if shape:
@@ -2605,7 +2739,14 @@ class IRCodeGen:
                 reads, writes = sub_access
                 pp = getattr(self, '_pp_arrays', set())
                 # Download GPU arrays this sub reads
-                dl_arrays = (reads | writes) & gpu_arrays & self._gpu_current
+                # Download GPU arrays this sub reads — but never an
+                # array the CPU wrote without an intervening upload:
+                # its FRESH copy is the host one and downloading the
+                # stale device copy would clobber it (same rule as the
+                # host-fallback-kernel downloads; found via the vesicle
+                # printer, 2026-09-04).
+                dl_arrays = ((reads | writes) & gpu_arrays
+                             & self._gpu_current - self._cpu_dirty)
                 if dl_arrays:
                     # Ensure GPU cmd buf is submitted and idle before transfer
                     if self._batched_frame and not self._frame_ended_early:
@@ -2649,6 +2790,16 @@ class IRCodeGen:
                         else:
                             self._put_ranged_upload(arr, shape, sz)
                 self._gpu_current |= ul_arrays
+            # Re-open the frame the download above closed, so later
+            # dispatches in this iteration record into a live command
+            # buffer — mirrors every mid-body download site. Without it
+            # the next ergo_vk_frame_barrier records into an ended
+            # buffer and the NVIDIA driver segfaults (found via the
+            # vesicle printer's non-inlined EMIT call, 2026-09-04).
+            if need_sync and self._batched_frame and self._frame_ended_early:
+                self._put("ergo_vk_frame_begin();")
+                self._frame_ended_early = False
+                self._frame_gpu_dirty.clear()
             # NET hook: send census packet after adaptive census call
             if func == "SIM_CENSUS_ADAPTIVE" and self._has_net:
                 self._put("if (_consensus_enabled) {")
@@ -3690,10 +3841,35 @@ class IRCodeGen:
             f"compile-time-known shape (ALLOCATABLE, runtime-shaped and "
             f"assumed-shape arguments are not supported)", line or None)
 
+    def _render_arrays(self) -> list[str]:
+        """Arrays needing device buffers purely for --render display
+        (used by the frame epilogue's render call). Empty otherwise."""
+        if not self.render:
+            return []
+        p = self._detect_particle_soa()
+        if p:
+            return list(p["render_arrays"])
+        # grid/heightfield pick — mirrors _emit_render_only_init
+        render_arr = None
+        for name, shape in self._array_shapes.items():
+            t = self._var_types.get(name, IRType.REAL)
+            if t == IRType.REAL:
+                if "PSI" in name.upper():
+                    render_arr = name
+                    break
+                if render_arr is None:
+                    render_arr = name
+        return [render_arr] if render_arr else []
+
     def _gpu_arrays(self) -> list[str]:
-        """Arrays that need GPU buffers — only those used by frame-loop kernels.
+        """Arrays that need GPU buffers — those used by frame-loop kernels,
+        plus the --render display arrays (2026-09-04, B2: a render array no
+        compute kernel touches never got a buffer nor an upload, so the
+        window drew black — vesicle_printer_gpu's POS_* copies).
         Sorted largest-first to minimize VRAM fragmentation."""
         if not self.gpu_plan:
+            if self.render and self._array_shapes:
+                return sorted(set(self._render_arrays()))
             return []
         if not hasattr(self, '_cached_gpu_arrays'):
             frame_ids = self._frame_kernel_ids()
@@ -3704,6 +3880,8 @@ class IRCodeGen:
             for k in self.gpu_plan.kernels:
                 if k.kernel_id in frame_ids:
                     arrays |= k.arrays_read | k.arrays_written
+            if self.render and self._array_shapes:
+                arrays |= set(self._render_arrays())
             self._cached_gpu_arrays = sorted(arrays)
             self._cached_gpu_array_set = set(self._cached_gpu_arrays)
         return self._cached_gpu_arrays

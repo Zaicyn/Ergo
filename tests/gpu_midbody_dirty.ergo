@@ -1,0 +1,48 @@
+! GPU_MIDBODY_DIRTY — regression: mid-body download must not clobber
+! =====================================================================
+! Pre-fix (2026-09-04, vesicle printer): the batched-frame mid-body
+! download in ir_codegen (_emit_body) pulled device copies of arrays
+! that were kernel-written earlier in the body AND host-written since
+! (cpu_dirty) — clobbering the fresh host values with stale device
+! data. In the printer that ate the bond/bend force terms (dynamics
+! diverged during the march phase; static certs stayed exact).
+! Fix: mid-body and call-site downloads exclude cpu_dirty arrays (the
+! host copy is authoritative; the next dispatch re-uploads).
+!
+! Choreography (in a 5-step frame loop): kernel zeroes A on device;
+! host SCATTER loop accumulates A (cpu_dirty, not uploaded); host
+! guarded read of A — pre-fix the read triggered a download of the
+! device zeros and S printed 0; post-fix S sees the host values.
+!
+! Correct on every path: S = 427 every step (A(m) = last I with
+! I ≡ m-1 (mod 7), I=1..64 → 63+64+58+59+60+61+62); pre-fix the
+! guarded read downloads the device zeros and S prints 0.
+!
+! CPU:  python -m core tests/gpu_midbody_dirty.ergo -o /tmp/mbd_cpu
+! GPU:  python -m core tests/gpu_midbody_dirty.ergo --target spirv -o /tmp/mbd_gpu
+
+IMPLICIT NONE
+PARAMETER INTEGER :: N = 64
+STATIC REAL :: A(N)
+STATIC REAL :: S, CK
+STATIC INTEGER :: STEP, I
+
+CK := 0.0
+DO STEP = 1, 5
+  DO I = 1, N
+    A(I) := 0.0
+  ENDDO
+  DO I = 1, N
+    A(MOD(I, 7) + 1) := REAL(I)
+  ENDDO
+  S := 0.0
+  DO I = 1, 7
+    IF A(I) > 0.0 THEN
+      S := S + A(I)
+    ENDIF
+  ENDDO
+  CK := CK + S * REAL(STEP)
+  WRITE(*, "step %d S %f (want 427)") STEP, S
+ENDDO
+WRITE(*, "checksum %f (want 6405)") CK
+STOP

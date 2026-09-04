@@ -135,6 +135,16 @@
   },
   {
    "cls": "GPU-PASS",
+   "compile_s": 0.15,
+   "file": "tests/gpu_midbody_dirty.ergo",
+   "gpu_compile_s": 0.53,
+   "reason": "B1 regression: mid-body download cpu_dirty exclusion (2026-09-04)",
+   "run2_s": 0.2,
+   "run_s": 0.2,
+   "stdout_bytes": 188
+  },
+  {
+   "cls": "GPU-PASS",
    "compile_s": 0.17,
    "file": "tests/gpu_multired.ergo",
    "gpu_compile_s": 0.51,
@@ -210,6 +220,16 @@
    "run2_s": 0.01,
    "run_s": 0.01,
    "stdout_bytes": 45
+  },
+  {
+   "cls": "GPU-PASS",
+   "compile_s": 0.15,
+   "file": "tests/inline_early_return.ergo",
+   "gpu_compile_s": 0.14,
+   "reason": "B1 regression: inliner early-RETURN guard (2026-09-04)",
+   "run2_s": 0.0,
+   "run_s": 0.0,
+   "stdout_bytes": 15
   },
   {
    "cls": "PASS",
