@@ -46,7 +46,12 @@ void main() {
     }
 
     gl_Position = pc.viewProj * vec4(world_pos, 1.0);
-    gl_PointSize = 1.0;
+
+    /* Depth-attenuated point size (2026-09-04): near points render
+       bigger — the strongest monocular depth cue for point tracers.
+       pc.point_size is the host's base size (previously ignored). */
+    float depth = length(world_pos - vec3(pc.cam_x, pc.cam_y, pc.cam_z));
+    gl_PointSize = clamp(pc.point_size * 1.2 / max(depth, 0.05), 1.0, 12.0);
 
     v_value = clamp((cv[i] - pc.val_min) / (pc.val_max - pc.val_min + 1e-10),
                     0.0, 1.0);

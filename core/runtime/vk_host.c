@@ -324,6 +324,12 @@ static struct {
     double                   mouse_last_x;
     double                   mouse_last_y;
     int                      mouse_dragging;
+    /* Auto-orbit (2026-09-04): slow camera spin so point-tracer clouds
+       read as 3D without mouse input. rad/s; ERGO_ORBIT=deg/s overrides,
+       ERGO_ORBIT=0 disables. Suspended 4 s after any mouse interaction. */
+    float                    cam_spin_rate;
+    double                   cam_idle_until;
+    double                   cam_last_tick;
 #endif
 
     int                      headless;
@@ -449,6 +455,12 @@ int ergo_vk_init(int headless) {
 
     memset(&g, 0, sizeof(g));
     g.headless = headless;
+#if defined(ERGO_VK_ANDROID) || !defined(ERGO_VK_HEADLESS_ONLY)
+    { const char *_oe = getenv("ERGO_ORBIT");
+      g.cam_spin_rate = (_oe ? atof(_oe) : 8.0) * 0.0174532925f;
+      g.cam_idle_until = 0.0;
+      g.cam_last_tick = 0.0; }  /* lazily set on first tick */
+#endif
 
 #ifdef ERGO_VK_ANDROID
     if (!headless && g.android_window) {
@@ -1696,12 +1708,14 @@ static void camera_mouse_button_cb(GLFWwindow *w, int button, int action, int mo
         g.mouse_dragging = (action == GLFW_PRESS);
         if (g.mouse_dragging)
             glfwGetCursorPos(w, &g.mouse_last_x, &g.mouse_last_y);
+        g.cam_idle_until = glfwGetTime() + 4.0;
     }
 }
 
 static void camera_cursor_pos_cb(GLFWwindow *w, double xpos, double ypos) {
     (void)w;
     if (!g.mouse_dragging) return;
+    g.cam_idle_until = glfwGetTime() + 4.0;
     float dx = (float)(xpos - g.mouse_last_x);
     float dy = (float)(ypos - g.mouse_last_y);
     g.mouse_last_x = xpos;
@@ -1727,9 +1741,24 @@ static void camera_key_cb(GLFWwindow *w, int key, int scancode, int action, int 
 
 static void camera_scroll_cb(GLFWwindow *w, double xoff, double yoff) {
     (void)w; (void)xoff;
+    g.cam_idle_until = glfwGetTime() + 4.0;
     g.cam_distance -= (float)yoff * 0.1f;
     if (g.cam_distance < 0.1f) g.cam_distance = 0.1f;
     if (g.cam_distance > 10.0f) g.cam_distance = 10.0f;
+}
+
+/* Auto-orbit tick (2026-09-04): advance the camera azimuth gently so
+ * point clouds read as 3D without mouse input; suspended for 4 s after
+ * any mouse interaction (callbacks stamp g.cam_idle_until). */
+static void ergo_vk_camera_tick(void) {
+    if (g.cam_spin_rate <= 0.0f) return;
+    double now = glfwGetTime();
+    if (g.cam_last_tick == 0.0) { g.cam_last_tick = now; return; }
+    if (now < g.cam_idle_until) { g.cam_last_tick = now; return; }
+    double dt = now - g.cam_last_tick;
+    g.cam_last_tick = now;
+    if (dt <= 0.0 || dt > 0.25) dt = 0.016;  /* stall guard */
+    g.cam_azimuth += g.cam_spin_rate * (float)dt;
 }
 
 /* ── Swapchain creation ──────────────────────────────────── */
@@ -2858,8 +2887,12 @@ void ergo_vk_render_frame(ErgoVkBuf buf, int width, int height,
     write.pBufferInfo = &buf_info;
     vkUpdateDescriptorSets(g.device, 1, &write, 0, NULL);
 
+
+
     /* ── Build camera matrix ── */
+    ergo_vk_camera_tick();
     float aspect = (float)g.sc_extent.width / (float)g.sc_extent.height;
+    ergo_vk_camera_tick();
     Mat4 proj = mat4_perspective(45.0f * (float)M_PI / 180.0f, aspect, 0.01f, 100.0f);
 
     float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);
@@ -3001,6 +3034,7 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
 
     /* Build camera matrix */
     float aspect = (float)g.sc_extent.width / (float)g.sc_extent.height;
+    ergo_vk_camera_tick();
     Mat4 proj = mat4_perspective(45.0f * (float)M_PI / 180.0f, aspect, 0.01f, 100.0f);
 
     float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);
@@ -3149,6 +3183,7 @@ void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
 
     /* Camera */
     float aspect = (float)g.sc_extent.width / (float)g.sc_extent.height;
+    ergo_vk_camera_tick();
     Mat4 proj = mat4_perspective(45.0f * 3.14159265f / 180.0f, aspect,
                                  0.01f, 100.0f);
     float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);
@@ -3863,6 +3898,7 @@ void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
 
     /* Camera */
     float aspect = (float)g.sc_extent.width / (float)g.sc_extent.height;
+    ergo_vk_camera_tick();
     Mat4 proj = mat4_perspective(45.0f * (float)M_PI / 180.0f, aspect,
                                  0.01f, 100.0f);
     float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);

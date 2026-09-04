@@ -185,6 +185,36 @@ steps (rendering never touches physics bits), and the full
 `--target spirv --render` build (GPU compute + display) matches the
 headless spirv stdout.
 
+## True-3D rendering (2026-09-04, user report: "2 flat 2D layers")
+
+**Disambiguation:** the printer runs PRINTMODE=4 (stack): the print
+phase's true geometry IS two flat rings at z = cz ± 1.25 — "two flat
+layers" mid-print is correct physics, not a rendering artifact; the 3D
+structure emerges during the shrink (two caps closing, zstd 1.39). But
+the render had NO monocular depth cue at a fixed camera, so even the
+closed shell read flat. Two render-host additions (zero physics bits;
+verified: render-run stdout byte-identical to the CPU reference over
+all 14000 steps):
+
+1. **Auto-orbit** (`core/runtime/vk_host.c`): the camera azimuth
+   advances 8 deg/s by default — a rotating view resolves depth
+   immediately. `ERGO_ORBIT=<deg/s>` overrides, `ERGO_ORBIT=0`
+   disables; any mouse drag/scroll suspends the spin for 4 s. This is
+   the live render path in vk_host.c (`vk_render.c` is dead reference
+   code — found while editing; left untouched).
+2. **Depth-attenuated point size** (`core/runtime/render_points.vert`,
+   regenerated `render_shaders.h` with glslc): gl_PointSize was a
+   constant 1 px; now `base * 1.2 / depth` clamped to [1, 12] px.
+
+Evidence: captures at t1/t2 (/tmp/spin_t1_win.png,
+/tmp/spin_t2_win.png) show the printed rings at clearly different
+orientations (cluster extent x 603–673 → 281–690); the pre-fix phantom
+pile is gone (zero lit pixels at its old position). GPU budget: a few
+hundred point sprites + one matrix update per frame — trivially within
+RTX 2060 capacity; no fill-rate concern at this scale, the question was
+plumbing only.
+
+## Running the visual
 ## Running the visual
 
 ```
@@ -192,6 +222,8 @@ python -m core min/cell/vesicle_printer_gpu.ergo --render -o /tmp/vprt_ro
 /tmp/vprt_ro            # CPU physics + GPU display (certified numerics)
 python -m core min/cell/vesicle_printer_gpu.ergo --target spirv --render \
     -o /tmp/vprt_gpu    # GPU compute + display (galaxy's route)
+ERGO_ORBIT=0 /tmp/vprt_ro   # hold the camera still
+ERGO_ORBIT=20 /tmp/vprt_ro  # faster spin (deg/s)
 ```
 
 Window: 1280x720, orbit camera (mouse drag/scroll). Colors: COLR 0 =
