@@ -188,6 +188,66 @@ def main():
             print("    FAIL      render-only particle --render "
                   "compile failed — investigate before release.")
             print(r.stderr.decode(errors="replace")[-800:])
+
+    # W0 capture regression (2026-09-05): offscreen PNG dump,
+    # double-run byte-compare + nonblack content.  Runs the render-only
+    # MRE twice with ERGO_OFFSCREEN=1 ERGO_SHOT_EVERY=10 in two scratch
+    # dirs (headless, no window).  Spec/Ergo_Render_Capture_W0_Design.md.
+    if os.path.exists(rop):
+        import glob as _glob
+        import shutil as _shutil
+        import zlib as _zlib
+        print("-" * 68)
+        print("  CAPTURE REGRESSION (W0 offscreen PNG dump):")
+        ok = True
+        shots = []
+        for tag in ("w0cap_a", "w0cap_b"):
+            d = f"/tmp/{tag}"
+            _shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d)
+            r = sh(["/tmp/render_only_particles_gate"],
+                   timeout=120, cwd=d,
+                   env={**os.environ, "ERGO_OFFSCREEN": "1",
+                        "ERGO_SHOT_EVERY": "10", "ERGO_ORBIT": "0"})
+            got = sorted(_glob.glob(os.path.join(d, "shot_*.png")))
+            if r.returncode != 0 or not got:
+                ok = False
+                print(f"    FAIL      {tag}: rc={r.returncode} "
+                      f"shots={len(got)}")
+                print(r.stderr.decode(errors="replace")[-400:])
+            shots.append(got)
+        if ok:
+            a, b = shots
+            if len(a) != len(b):
+                ok = False
+                print(f"    FAIL      shot count differs "
+                      f"({len(a)} vs {len(b)})")
+            else:
+                import filecmp
+                moved = [os.path.basename(x) for x, y in zip(a, b)
+                         if not filecmp.cmp(x, y, shallow=False)]
+                if moved:
+                    ok = False
+                    print(f"    FAIL      double-run PNGs differ: {moved[:3]}")
+        if ok:
+            # nonblack: decode the last shot's IDAT (stored blocks) and
+            # require some nonzero pixel byte
+            raw = open(a[-1], "rb").read()
+            pos, idat = 8, b""
+            while pos < len(raw):
+                ln = int.from_bytes(raw[pos:pos + 4], "big")
+                typ = raw[pos + 4:pos + 8]
+                if typ == b"IDAT":
+                    idat += raw[pos + 8:pos + 8 + ln]
+                pos += 12 + ln
+            data = _zlib.decompress(idat)
+            if not any(b_ for i, b_ in enumerate(data)
+                       if b_ and (i % (800 * 3 + 1)) != 0):
+                ok = False
+                print("    FAIL      capture is all black")
+        if ok:
+            print(f"    PASS      offscreen double-run byte-identical, "
+                  f"nonblack ({len(shots[0])} shots)")
     return 0
 
 

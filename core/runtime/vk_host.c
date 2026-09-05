@@ -13,12 +13,17 @@
  *   (queried once) — oversized vectors must use gather-window streaming.
  */
 
+/* for clock_gettime under the driver's -std=c11 (must precede ALL
+ * includes — see the ERGO_BENCH_VK_ALLOC note below) */
+#define _POSIX_C_SOURCE 199309L
+
 #include "ergo_vk.h"
 
 #include <vulkan/vulkan.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>   /* W0 capture interval timer (CLOCK_MONOTONIC) */
 
 #include <math.h>
 
@@ -254,6 +259,14 @@ static struct {
 
     /* Render pass + grid mesh pipeline */
     VkRenderPass             render_pass;
+    /* W0 offscreen capture target (ERGO_OFFSCREEN=1): replaces the
+     * swapchain when set — render code runs unchanged, acquire/present
+     * skipped.  Design: Spec/Ergo_Render_Capture_W0_Design.md */
+    int                      offscreen;
+    VkImage                  off_image;
+    VkDeviceMemory           off_mem;
+    VkImageView              off_view;
+    VkFramebuffer            off_fb;
     VkPipeline               gfx_pipeline;
     VkPipelineLayout         gfx_layout;
     VkDescriptorSetLayout    gfx_ds_layout;
@@ -427,6 +440,7 @@ static void xfer_submit_and_wait(void) {
 /* ── Forward declarations for render init ────────────────── */
 #ifndef ERGO_VK_HEADLESS_ONLY
 static void render_create_swapchain(void);
+static void render_create_offscreen(void);
 static void render_create_pipeline(void);
 static void render_create_points_pipeline(void);
 static void render_create_gauss_pipeline(void);
@@ -475,21 +489,38 @@ int ergo_vk_init(int headless) {
     }
 #elif !defined(ERGO_VK_HEADLESS_ONLY)
     if (!headless) {
+        /* W0: ERGO_OFFSCREEN=1 — offscreen render target instead of a
+         * window (headless capture route; Spec/Ergo_Render_Capture_W0_
+         * Design.md).  g.headless stays 0 so the render path runs. */
+        { const char *_os = getenv("ERGO_OFFSCREEN");
+          g.offscreen = (_os && atoi(_os)); }
+        /* camera + extent defaults shared by windowed and offscreen */
+        g.cam_azimuth   = 0.5f;   /* slight angle */
+        g.cam_elevation = 0.6f;   /* looking down */
+        g.cam_distance  = 1.5f;
+        { const char *_ce = getenv("ERGO_CAM");
+          if (_ce) sscanf(_ce, "%f,%f,%f", &g.cam_azimuth,
+                          &g.cam_elevation, &g.cam_distance); }
+        /* Square by default (2026-09-04): a 16:9 window adds an aspect
+         * variable to every visual read; the projection compensates
+         * correctly (mat4_perspective m[0] = f/aspect over the actual
+         * framebuffer extent), but a square frame removes the variable
+         * entirely.  ERGO_WIN=WxH overrides (e.g. a grid multiple so one
+         * render cell is an integer number of lattice units).  Offscreen
+         * uses the same extent so captures are comparable. */
+        g.win_w = 800; g.win_h = 800;
+        { const char *_we = getenv("ERGO_WIN");
+          if (_we) sscanf(_we, "%dx%d", &g.win_w, &g.win_h); }
+        if (g.offscreen) {
+            g.sc_extent.width = (uint32_t)g.win_w;
+            g.sc_extent.height = (uint32_t)g.win_h;
+        } else {
         if (!glfwInit()) {
             fprintf(stderr, "ergo_vk: glfwInit failed\n");
             return 1;
         }
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
         glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-        /* Square by default (2026-09-04): a 16:9 window adds an aspect
-         * variable to every visual read; the projection compensates
-         * correctly (mat4_perspective m[0] = f/aspect over the actual
-         * framebuffer extent), but a square frame removes the variable
-         * entirely.  ERGO_WIN=WxH overrides (e.g. a grid multiple so one
-         * render cell is an integer number of lattice units). */
-        g.win_w = 800; g.win_h = 800;
-        { const char *_we = getenv("ERGO_WIN");
-          if (_we) sscanf(_we, "%dx%d", &g.win_w, &g.win_h); }
         g.window = glfwCreateWindow(g.win_w, g.win_h, "Ergo", NULL, NULL);
         if (!g.window) {
             fprintf(stderr, "ergo_vk: window creation failed\n");
@@ -497,18 +528,11 @@ int ergo_vk_init(int headless) {
             return 1;
         }
 
-        /* Default orbit camera */
-        g.cam_azimuth   = 0.5f;   /* slight angle */
-        g.cam_elevation = 0.6f;   /* looking down */
-        g.cam_distance  = 1.5f;
-        { const char *_ce = getenv("ERGO_CAM");
-          if (_ce) sscanf(_ce, "%f,%f,%f", &g.cam_azimuth,
-                          &g.cam_elevation, &g.cam_distance); }
-
         glfwSetMouseButtonCallback(g.window, camera_mouse_button_cb);
         glfwSetCursorPosCallback(g.window, camera_cursor_pos_cb);
         glfwSetScrollCallback(g.window, camera_scroll_cb);
         glfwSetKeyCallback(g.window, camera_key_cb);
+        }
     }
 #endif
 
@@ -531,7 +555,7 @@ int ergo_vk_init(int headless) {
         exts[ext_count++] = VK_KHR_ANDROID_SURFACE_EXTENSION_NAME;
     }
 #elif !defined(ERGO_VK_HEADLESS_ONLY)
-    if (!headless) {
+    if (!headless && !g.offscreen) {
         uint32_t glfw_ext_count = 0;
         const char **glfw_exts = glfwGetRequiredInstanceExtensions(&glfw_ext_count);
         for (uint32_t i = 0; i < glfw_ext_count && ext_count < 16; i++)
@@ -562,7 +586,7 @@ int ergo_vk_init(int headless) {
     }
 #elif !defined(ERGO_VK_HEADLESS_ONLY)
     /* --- Surface (render mode) --- */
-    if (!headless) {
+    if (!headless && !g.offscreen) {
         VK_CHECK(glfwCreateWindowSurface(g.instance, g.window, NULL,
                                           &g.surface));
     }
@@ -624,13 +648,17 @@ int ergo_vk_init(int headless) {
             int ok = (qf_props[q].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
 
 #ifndef ERGO_VK_HEADLESS_ONLY
-            /* In render mode, also require graphics + present support */
+            /* In render mode, also require graphics + present support
+             * (present check only when a real surface exists — the W0
+             * offscreen target has none) */
             if (!headless) {
                 ok = ok && (qf_props[q].queueFlags & VK_QUEUE_GRAPHICS_BIT);
-                VkBool32 present = VK_FALSE;
-                vkGetPhysicalDeviceSurfaceSupportKHR(devs[d], q,
-                                                      g.surface, &present);
-                ok = ok && present;
+                if (!g.offscreen) {
+                    VkBool32 present = VK_FALSE;
+                    vkGetPhysicalDeviceSurfaceSupportKHR(devs[d], q,
+                                                          g.surface, &present);
+                    ok = ok && present;
+                }
             }
 #endif
 
@@ -824,7 +852,10 @@ int ergo_vk_init(int headless) {
 #ifndef ERGO_VK_HEADLESS_ONLY
     /* --- Render mode setup --- */
     if (!headless) {
-        render_create_swapchain();
+        if (g.offscreen)
+            render_create_offscreen();
+        else
+            render_create_swapchain();
         render_create_pipeline();
         render_create_points_pipeline();
         render_create_gauss_pipeline();
@@ -1916,7 +1947,8 @@ static void render_create_swapchain(void) {
     sc_ci.imageColorSpace = color_space;
     sc_ci.imageExtent = g.sc_extent;
     sc_ci.imageArrayLayers = 1;
-    sc_ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    sc_ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  /* W0 capture */
     sc_ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sc_ci.preTransform = caps.currentTransform;
     sc_ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -2075,6 +2107,154 @@ static void render_cleanup_swapchain(void) {
     vkFreeMemory(g.device, g.depth_memory, NULL);
     vkDestroyRenderPass(g.device, g.render_pass, NULL);
     vkDestroySwapchainKHR(g.device, g.swapchain, NULL);
+    if (g.off_fb) {  /* W0 offscreen target */
+        vkDestroyFramebuffer(g.device, g.off_fb, NULL);
+        vkDestroyImageView(g.device, g.off_view, NULL);
+        vkDestroyImage(g.device, g.off_image, NULL);
+        vkFreeMemory(g.device, g.off_mem, NULL);
+    }
+}
+
+/* W0: offscreen render target (ERGO_OFFSCREEN=1) — one color image
+ * (same format the windowed path prefers, B8G8R8A8_SRGB) + depth + the
+ * render pass + one framebuffer.  Mirrors render_create_swapchain's
+ * render-pass/depth setup; there is no surface to consult, so the
+ * format is fixed and the extent comes from g.sc_extent (ERGO_WIN). */
+static void render_create_offscreen(void) {
+    g.sc_format = VK_FORMAT_B8G8R8A8_SRGB;
+
+    /* color image */
+    VkImageCreateInfo img_ci = {0};
+    img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_ci.imageType = VK_IMAGE_TYPE_2D;
+    img_ci.format = g.sc_format;
+    img_ci.extent.width = g.sc_extent.width;
+    img_ci.extent.height = g.sc_extent.height;
+    img_ci.extent.depth = 1;
+    img_ci.mipLevels = 1;
+    img_ci.arrayLayers = 1;
+    img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img_ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK_CHECK(vkCreateImage(g.device, &img_ci, NULL, &g.off_image));
+    VkMemoryRequirements mem_req;
+    vkGetImageMemoryRequirements(g.device, g.off_image, &mem_req);
+    VkMemoryAllocateInfo mem_ai = {0};
+    mem_ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mem_ai.allocationSize = mem_req.size;
+    mem_ai.memoryTypeIndex = find_memory_type(mem_req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(g.device, &mem_ai, NULL, &g.off_mem));
+    VK_CHECK(vkBindImageMemory(g.device, g.off_image, g.off_mem, 0));
+
+    VkImageViewCreateInfo iv_ci = {0};
+    iv_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    iv_ci.image = g.off_image;
+    iv_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    iv_ci.format = g.sc_format;
+    iv_ci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    iv_ci.subresourceRange.levelCount = 1;
+    iv_ci.subresourceRange.layerCount = 1;
+    VK_CHECK(vkCreateImageView(g.device, &iv_ci, NULL, &g.off_view));
+
+    /* depth (identical to the windowed path) */
+    VkImageCreateInfo depth_ci = {0};
+    depth_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    depth_ci.imageType = VK_IMAGE_TYPE_2D;
+    depth_ci.format = VK_FORMAT_D32_SFLOAT;
+    depth_ci.extent.width = g.sc_extent.width;
+    depth_ci.extent.height = g.sc_extent.height;
+    depth_ci.extent.depth = 1;
+    depth_ci.mipLevels = 1;
+    depth_ci.arrayLayers = 1;
+    depth_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    depth_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    depth_ci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    VK_CHECK(vkCreateImage(g.device, &depth_ci, NULL, &g.depth_image));
+    VkMemoryRequirements depth_mem_req;
+    vkGetImageMemoryRequirements(g.device, g.depth_image, &depth_mem_req);
+    VkMemoryAllocateInfo depth_mem_ai = {0};
+    depth_mem_ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    depth_mem_ai.allocationSize = depth_mem_req.size;
+    depth_mem_ai.memoryTypeIndex = find_memory_type(
+        depth_mem_req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(g.device, &depth_mem_ai, NULL,
+                              &g.depth_memory));
+    VK_CHECK(vkBindImageMemory(g.device, g.depth_image, g.depth_memory, 0));
+    VkImageViewCreateInfo depth_iv_ci = {0};
+    depth_iv_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    depth_iv_ci.image = g.depth_image;
+    depth_iv_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    depth_iv_ci.format = VK_FORMAT_D32_SFLOAT;
+    depth_iv_ci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depth_iv_ci.subresourceRange.levelCount = 1;
+    depth_iv_ci.subresourceRange.layerCount = 1;
+    VK_CHECK(vkCreateImageView(g.device, &depth_iv_ci, NULL,
+                               &g.depth_view));
+
+    /* render pass (identical to the windowed path's) */
+    VkAttachmentDescription attachments[2] = {{0},{0}};
+    attachments[0].format = g.sc_format;
+    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    attachments[1].format = VK_FORMAT_D32_SFLOAT;
+    attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference color_ref = {0};
+    color_ref.attachment = 0;
+    color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference depth_ref = {0};
+    depth_ref.attachment = 1;
+    depth_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkSubpassDescription subpass = {0};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_ref;
+    subpass.pDepthStencilAttachment = &depth_ref;
+    VkSubpassDependency dep = {0};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep.srcAccessMask = 0;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    VkRenderPassCreateInfo rp_ci = {0};
+    rp_ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rp_ci.attachmentCount = 2;
+    rp_ci.pAttachments = attachments;
+    rp_ci.subpassCount = 1;
+    rp_ci.pSubpasses = &subpass;
+    rp_ci.dependencyCount = 1;
+    rp_ci.pDependencies = &dep;
+    VK_CHECK(vkCreateRenderPass(g.device, &rp_ci, NULL, &g.render_pass));
+
+    VkImageView fb_attachments[2] = { g.off_view, g.depth_view };
+    VkFramebufferCreateInfo fb_ci = {0};
+    fb_ci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fb_ci.renderPass = g.render_pass;
+    fb_ci.attachmentCount = 2;
+    fb_ci.pAttachments = fb_attachments;
+    fb_ci.width = g.sc_extent.width;
+    fb_ci.height = g.sc_extent.height;
+    fb_ci.layers = 1;
+    VK_CHECK(vkCreateFramebuffer(g.device, &fb_ci, NULL, &g.off_fb));
+
+    fprintf(stderr, "[ergo_vk] offscreen target %ux%u (ERGO_OFFSCREEN)\n",
+            g.sc_extent.width, g.sc_extent.height);
 }
 
 /* ── Graphics pipeline ───────────────────────────────────── */
@@ -2944,23 +3124,275 @@ void ergo_vk_render_invalidate(void) {
     g.grid_gauss_ds_bound = 0;
 }
 
+/* ── W0 render-buffer capture (PNG dump) ─────────────────────
+ * Design: Spec/Ergo_Render_Capture_W0_Design.md.  Trigger:
+ * ERGO_SHOT_EVERY=N (every Nth render call) and/or
+ * ERGO_SHOT_INTERVAL=T (wall-clock seconds).  Filenames
+ * shot_<frame>.png in the CWD.  Works windowed (swapchain image,
+ * TRANSFER_SRC) and offscreen (ERGO_OFFSCREEN=1).  The copy rides
+ * g.render_cmd_buf/g.render_fence only — never the compute frame slots
+ * or the xfer channel (frame-choreography rule from the 2026-09-05
+ * stall fix). */
+
+/* minimal PNG writer: zlib stream of STORED deflate blocks, filter 0
+ * per row — uncompressed, so PNG bytes are a pure function of the
+ * pixels (byte determinism free).  Proven pixel-exact round-trip
+ * (PIL + stdlib zlib) as /tmp/png_proto.c. */
+static uint32_t _png_crc_table[256];
+static int _png_crc_ready = 0;
+
+static void _png_crc_init(void) {
+    for (uint32_t n = 0; n < 256; n++) {
+        uint32_t c = n;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+        _png_crc_table[n] = c;
+    }
+    _png_crc_ready = 1;
+}
+
+static uint32_t _png_crc32(const uint8_t *buf, size_t n, uint32_t crc) {
+    if (!_png_crc_ready) _png_crc_init();
+    crc = ~crc;
+    for (size_t i = 0; i < n; i++)
+        crc = _png_crc_table[(crc ^ buf[i]) & 0xff] ^ (crc >> 8);
+    return ~crc;
+}
+
+static uint32_t _png_adler32(const uint8_t *buf, size_t n) {
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < n; i++) {
+        a = (a + buf[i]) % 65521;
+        b = (b + a) % 65521;
+    }
+    return (b << 16) | a;
+}
+
+static void _png_be32(FILE *f, uint32_t v) {
+    uint8_t b[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16),
+                     (uint8_t)(v >> 8), (uint8_t)v };
+    fwrite(b, 1, 4, f);
+}
+
+static void _png_chunk(FILE *f, const char *type, const uint8_t *data,
+                       uint32_t len) {
+    _png_be32(f, len);
+    fwrite(type, 1, 4, f);
+    if (len) fwrite(data, 1, len, f);
+    uint32_t crc = _png_crc32((const uint8_t *)type, 4, 0);
+    if (len) crc = _png_crc32(data, len, crc);
+    _png_be32(f, crc);
+}
+
+static int png_write_rgb8(const char *path, const uint8_t *rgb,
+                          int w, int h) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 1;
+    static const uint8_t sig[8] = { 137, 80, 78, 71, 13, 10, 26, 10 };
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13];
+    ihdr[0] = (uint8_t)(w >> 24); ihdr[1] = (uint8_t)(w >> 16);
+    ihdr[2] = (uint8_t)(w >> 8);  ihdr[3] = (uint8_t)w;
+    ihdr[4] = (uint8_t)(h >> 24); ihdr[5] = (uint8_t)(h >> 16);
+    ihdr[6] = (uint8_t)(h >> 8);  ihdr[7] = (uint8_t)h;
+    ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    _png_chunk(f, "IHDR", ihdr, 13);
+
+    size_t stride = (size_t)w * 3 + 1;
+    size_t raw_n = stride * (size_t)h;
+    uint8_t *raw = malloc(raw_n);
+    for (int y = 0; y < h; y++) {
+        raw[y * stride] = 0;
+        memcpy(raw + y * stride + 1, rgb + (size_t)y * w * 3,
+               (size_t)w * 3);
+    }
+    size_t nblk = (raw_n + 65534) / 65535;
+    size_t idat_n = 2 + nblk * 5 + raw_n + 4;
+    uint8_t *idat = malloc(idat_n);
+    uint8_t *p = idat;
+    *p++ = 0x78; *p++ = 0x01;
+    size_t off = 0;
+    for (size_t b = 0; b < nblk; b++) {
+        uint32_t len = (uint32_t)((raw_n - off > 65535) ? 65535 : raw_n - off);
+        *p++ = (uint8_t)(b == nblk - 1 ? 1 : 0);
+        *p++ = (uint8_t)(len & 0xff);
+        *p++ = (uint8_t)(len >> 8);
+        *p++ = (uint8_t)(~len & 0xff);
+        *p++ = (uint8_t)((~len >> 8) & 0xff);
+        memcpy(p, raw + off, len);
+        p += len;
+        off += len;
+    }
+    uint32_t ad = _png_adler32(raw, raw_n);
+    *p++ = (uint8_t)(ad >> 24); *p++ = (uint8_t)(ad >> 16);
+    *p++ = (uint8_t)(ad >> 8);  *p++ = (uint8_t)ad;
+    _png_chunk(f, "IDAT", idat, (uint32_t)(p - idat));
+    _png_chunk(f, "IEND", NULL, 0);
+    free(raw);
+    free(idat);
+    fclose(f);
+    return 0;
+}
+
+/* capture trigger state */
+static int g_shot_every = -1;        /* ERGO_SHOT_EVERY */
+static int g_shot_interval = -1;     /* ERGO_SHOT_INTERVAL (seconds) */
+static unsigned long g_shot_frame = 0;   /* render-call counter */
+static unsigned long g_shot_last_at = 0; /* frame number of last shot */
+static double g_shot_last_time = 0.0;
+
+static double _shot_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* count one render call; return nonzero when a capture is due */
+static int ergo_vk_shot_due(void) {
+    if (g_shot_every < 0) {
+        const char *e = getenv("ERGO_SHOT_EVERY");
+        g_shot_every = e ? atoi(e) : 0;
+        e = getenv("ERGO_SHOT_INTERVAL");
+        g_shot_interval = e ? atoi(e) : 0;
+        if (g_shot_every || g_shot_interval)
+            fprintf(stderr, "[ergo_vk] capture: every=%d interval=%ds "
+                    "-> shot_<frame>.png\n", g_shot_every, g_shot_interval);
+    }
+    g_shot_frame++;
+    if (!g_shot_every && !g_shot_interval) return 0;
+    int due = 0;
+    if (g_shot_every > 0 && g_shot_frame % (unsigned long)g_shot_every == 0)
+        due = 1;
+    if (g_shot_interval > 0 &&
+        _shot_now() - g_shot_last_time >= (double)g_shot_interval)
+        due = 1;
+    if (due) {
+        g_shot_last_at = g_shot_frame;
+        g_shot_last_time = _shot_now();
+    }
+    return due;
+}
+
+/* capture staging buffer (persistently mapped, lazily sized) */
+static VkBuffer g_cap_buf = VK_NULL_HANDLE;
+static VkDeviceMemory g_cap_mem = VK_NULL_HANDLE;
+static void *g_cap_mapped = NULL;
+static size_t g_cap_bytes = 0;
+
+static void _capture_ensure_buf(void) {
+    size_t need = (size_t)g.sc_extent.width * g.sc_extent.height * 4;
+    if (need <= g_cap_bytes) return;
+    if (g_cap_buf) {
+        vkUnmapMemory(g.device, g_cap_mem);
+        vkDestroyBuffer(g.device, g_cap_buf, NULL);
+        vkFreeMemory(g.device, g_cap_mem, NULL);
+    }
+    VkBufferCreateInfo bci = {0};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = need;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VK_CHECK(vkCreateBuffer(g.device, &bci, NULL, &g_cap_buf));
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g.device, g_cap_buf, &req);
+    VkMemoryAllocateInfo ai = {0};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VK_CHECK(vkAllocateMemory(g.device, &ai, NULL, &g_cap_mem));
+    VK_CHECK(vkBindBufferMemory(g.device, g_cap_buf, g_cap_mem, 0));
+    VK_CHECK(vkMapMemory(g.device, g_cap_mem, 0, req.size, 0,
+                         &g_cap_mapped));
+    g_cap_bytes = need;
+}
+
+static VkImage g_cap_src = VK_NULL_HANDLE;   /* set by the render call */
+
+/* Record the readback into g.render_cmd_buf — called between
+ * vkCmdEndRenderPass and vkCmdEndCommandBuffer; the image is in
+ * PRESENT_SRC_KHR (the render pass's finalLayout) and is restored to it. */
+static void ergo_vk_capture_record(void) {
+    _capture_ensure_buf();
+    VkImageMemoryBarrier imb = {0};
+    imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    imb.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    imb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    imb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    imb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imb.image = g_cap_src;
+    imb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    imb.subresourceRange.levelCount = 1;
+    imb.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(g.render_cmd_buf,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, NULL, 0, NULL, 1, &imb);
+
+    VkBufferImageCopy region = {0};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent.width = g.sc_extent.width;
+    region.imageExtent.height = g.sc_extent.height;
+    region.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(g.render_cmd_buf, g_cap_src,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           g_cap_buf, 1, &region);
+
+    imb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    imb.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    imb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    imb.dstAccessMask = 0;
+    vkCmdPipelineBarrier(g.render_cmd_buf,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, 0, NULL, 0, NULL, 1, &imb);
+}
+
+/* Called after the render submission: block on the frame's own fence,
+ * then convert BGRA->RGB and write shot_<frame>.png. */
+static void ergo_vk_capture_write(void) {
+    VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence, VK_TRUE,
+                             UINT64_MAX));
+    int w = (int)g.sc_extent.width, h = (int)g.sc_extent.height;
+    uint8_t *rgb = malloc((size_t)w * h * 3);
+    const uint8_t *src = (const uint8_t *)g_cap_mapped;
+    for (int i = 0; i < w * h; i++) {
+        rgb[i * 3 + 0] = src[i * 4 + 2];   /* B */
+        rgb[i * 3 + 1] = src[i * 4 + 1];   /* G */
+        rgb[i * 3 + 2] = src[i * 4 + 0];   /* R */
+    }
+    char name[64];
+    snprintf(name, sizeof(name), "shot_%06lu.png", g_shot_last_at);
+    if (png_write_rgb8(name, rgb, w, h) == 0)
+        fprintf(stderr, "[ergo_vk] capture: wrote %s (%dx%d)\n",
+                name, w, h);
+    free(rgb);
+}
+
 /* ── ergo_vk_render_frame (3D) ───────────────────────────── */
 
 void ergo_vk_render_frame(ErgoVkBuf buf, int width, int height,
                            float val_min, float val_max,
                            float height_scale) {
     if (g.headless) return;
+    int cap_shot = ergo_vk_shot_due();
 
     /* Wait for previous frame */
     VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence, VK_TRUE, UINT64_MAX));
     VK_CHECK(vkResetFences(g.device, 1, &g.render_fence));
 
     /* Acquire swapchain image */
-    uint32_t img_idx;
-    VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX,
-                                          g.sem_available, VK_NULL_HANDLE,
-                                          &img_idx);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
+    uint32_t img_idx = 0;
+    if (!g.offscreen) {
+        VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain,
+                                             UINT64_MAX, g.sem_available,
+                                             VK_NULL_HANDLE, &img_idx);
+        if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
+    }
+    VkFramebuffer cap_fb = g.offscreen ? g.off_fb : g.sc_fbs[img_idx];
 
     /* Update descriptor set to point at the sim buffer */
     BufSlot *b = &g.bufs[buf];
@@ -3028,7 +3460,7 @@ void ergo_vk_render_frame(ErgoVkBuf buf, int width, int height,
     VkRenderPassBeginInfo rp_begin = {0};
     rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rp_begin.renderPass = g.render_pass;
-    rp_begin.framebuffer = g.sc_fbs[img_idx];
+    rp_begin.framebuffer = cap_fb;
     rp_begin.renderArea.extent = g.sc_extent;
     rp_begin.clearValueCount = 2;
     rp_begin.pClearValues = clears;
@@ -3049,6 +3481,10 @@ void ergo_vk_render_frame(ErgoVkBuf buf, int width, int height,
     vkCmdDraw(g.render_cmd_buf, n_cells * 6, 1, 0, 0);
 
     vkCmdEndRenderPass(g.render_cmd_buf);
+    if (cap_shot) {
+        g_cap_src = g.offscreen ? g.off_image : g.sc_images[img_idx];
+        ergo_vk_capture_record();
+    }
     VK_CHECK(vkEndCommandBuffer(g.render_cmd_buf));
 
     /* Submit with semaphore synchronization */
@@ -3062,19 +3498,30 @@ void ergo_vk_render_frame(ErgoVkBuf buf, int width, int height,
     si.pCommandBuffers = &g.render_cmd_buf;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &g.sem_finished;
+    if (g.offscreen) {  /* no acquire/present semaphores offscreen */
+        si.waitSemaphoreCount = 0;
+        si.pWaitSemaphores = NULL;
+        si.signalSemaphoreCount = 0;
+        si.pSignalSemaphores = NULL;
+    }
 
     VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.render_fence));
+    if (cap_shot)
+        ergo_vk_capture_write();
 
     /* Present */
-    VkPresentInfoKHR present = {0};
-    present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &g.sem_finished;
-    present.swapchainCount = 1;
-    present.pSwapchains = &g.swapchain;
-    present.pImageIndices = &img_idx;
+    /* Present (windowed only) */
+    if (!g.offscreen) {
+        VkPresentInfoKHR present = {0};
+        present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        present.waitSemaphoreCount = 1;
+        present.pWaitSemaphores = &g.sem_finished;
+        present.swapchainCount = 1;
+        present.pSwapchains = &g.swapchain;
+        present.pImageIndices = &img_idx;
 
-    vkQueuePresentKHR(g.compute_queue, &present);
+        vkQueuePresentKHR(g.compute_queue, &present);
+    }
 }
 
 /* ── ergo_vk_render_points (particle cloud) ─────────────── */
@@ -3088,17 +3535,21 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
                             float point_size, float val_min, float val_max,
                             float world_scale) {
     if (g.headless) return;
+    int cap_shot = ergo_vk_shot_due();
 
     /* Wait for previous render to finish before reusing command buffer */
     VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence, VK_TRUE, UINT64_MAX));
     VK_CHECK(vkResetFences(g.device, 1, &g.render_fence));
 
     /* Acquire swapchain image */
-    uint32_t img_idx;
-    VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX,
-                                          g.sem_available, VK_NULL_HANDLE,
-                                          &img_idx);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
+    uint32_t img_idx = 0;
+    if (!g.offscreen) {
+        VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain,
+                                             UINT64_MAX, g.sem_available,
+                                             VK_NULL_HANDLE, &img_idx);
+        if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
+    }
+    VkFramebuffer cap_fb = g.offscreen ? g.off_fb : g.sc_fbs[img_idx];
 
     /* Bind 4 SoA buffers — rebind after sort pointer swaps */
     if (!pts_ds_bound) {
@@ -3185,7 +3636,7 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     VkRenderPassBeginInfo rp_begin = {0};
     rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rp_begin.renderPass = g.render_pass;
-    rp_begin.framebuffer = g.sc_fbs[img_idx];
+    rp_begin.framebuffer = cap_fb;
     rp_begin.renderArea.extent = g.sc_extent;
     rp_begin.clearValueCount = 2;
     rp_begin.pClearValues = clears;
@@ -3204,6 +3655,10 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     vkCmdDraw(g.render_cmd_buf, n_points, 1, 0, 0);
 
     vkCmdEndRenderPass(g.render_cmd_buf);
+    if (cap_shot) {
+        g_cap_src = g.offscreen ? g.off_image : g.sc_images[img_idx];
+        ergo_vk_capture_record();
+    }
     VK_CHECK(vkEndCommandBuffer(g.render_cmd_buf));
 
     /* Submit */
@@ -3217,19 +3672,30 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     si.pCommandBuffers = &g.render_cmd_buf;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &g.sem_finished;
+    if (g.offscreen) {  /* no acquire/present semaphores offscreen */
+        si.waitSemaphoreCount = 0;
+        si.pWaitSemaphores = NULL;
+        si.signalSemaphoreCount = 0;
+        si.pSignalSemaphores = NULL;
+    }
 
     VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.render_fence));
+    if (cap_shot)
+        ergo_vk_capture_write();
 
     /* Present */
-    VkPresentInfoKHR present = {0};
-    present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &g.sem_finished;
-    present.swapchainCount = 1;
-    present.pSwapchains = &g.swapchain;
-    present.pImageIndices = &img_idx;
+    /* Present (windowed only) */
+    if (!g.offscreen) {
+        VkPresentInfoKHR present = {0};
+        present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        present.waitSemaphoreCount = 1;
+        present.pWaitSemaphores = &g.sem_finished;
+        present.swapchainCount = 1;
+        present.pSwapchains = &g.swapchain;
+        present.pImageIndices = &img_idx;
 
-    vkQueuePresentKHR(g.compute_queue, &present);
+        vkQueuePresentKHR(g.compute_queue, &present);
+    }
 }
 
 /* ── ergo_vk_render_gaussians ──────────────────────────────── */
@@ -3239,15 +3705,19 @@ void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
                                float point_size, float val_min, float val_max,
                                float world_scale) {
     if (g.headless) return;
+    int cap_shot = ergo_vk_shot_due();
 
     VK_CHECK(vkWaitForFences(g.device, 1, &g.render_fence, VK_TRUE, UINT64_MAX));
     VK_CHECK(vkResetFences(g.device, 1, &g.render_fence));
 
-    uint32_t img_idx;
-    VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX,
-                                          g.sem_available, VK_NULL_HANDLE,
-                                          &img_idx);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
+    uint32_t img_idx = 0;
+    if (!g.offscreen) {
+        VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain,
+                                             UINT64_MAX, g.sem_available,
+                                             VK_NULL_HANDLE, &img_idx);
+        if (acq == VK_ERROR_OUT_OF_DATE_KHR) return;
+    }
+    VkFramebuffer cap_fb = g.offscreen ? g.off_fb : g.sc_fbs[img_idx];
 
     /* Bind 4 SoA buffers */
     if (!g.gauss_ds_bound) {
@@ -3332,7 +3802,7 @@ void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     VkRenderPassBeginInfo rp_begin = {0};
     rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rp_begin.renderPass = g.render_pass;
-    rp_begin.framebuffer = g.sc_fbs[img_idx];
+    rp_begin.framebuffer = cap_fb;
     rp_begin.renderArea.extent = g.sc_extent;
     rp_begin.clearValueCount = 2;
     rp_begin.pClearValues = clears;
@@ -3352,6 +3822,10 @@ void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     vkCmdDraw(g.render_cmd_buf, 6, n_points, 0, 0);
 
     vkCmdEndRenderPass(g.render_cmd_buf);
+    if (cap_shot) {
+        g_cap_src = g.offscreen ? g.off_image : g.sc_images[img_idx];
+        ergo_vk_capture_record();
+    }
     VK_CHECK(vkEndCommandBuffer(g.render_cmd_buf));
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -3364,18 +3838,29 @@ void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     si.pCommandBuffers = &g.render_cmd_buf;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &g.sem_finished;
+    if (g.offscreen) {  /* no acquire/present semaphores offscreen */
+        si.waitSemaphoreCount = 0;
+        si.pWaitSemaphores = NULL;
+        si.signalSemaphoreCount = 0;
+        si.pSignalSemaphores = NULL;
+    }
 
     VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.render_fence));
+    if (cap_shot)
+        ergo_vk_capture_write();
 
-    VkPresentInfoKHR present = {0};
-    present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &g.sem_finished;
-    present.swapchainCount = 1;
-    present.pSwapchains = &g.swapchain;
-    present.pImageIndices = &img_idx;
+    /* Present (windowed only) */
+    if (!g.offscreen) {
+        VkPresentInfoKHR present = {0};
+        present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        present.waitSemaphoreCount = 1;
+        present.pWaitSemaphores = &g.sem_finished;
+        present.swapchainCount = 1;
+        present.pSwapchains = &g.swapchain;
+        present.pImageIndices = &img_idx;
 
-    vkQueuePresentKHR(g.compute_queue, &present);
+        vkQueuePresentKHR(g.compute_queue, &present);
+    }
 }
 
 /* (removed duplicate — actual octa section follows) */
@@ -3943,6 +4428,7 @@ void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
                               int grid_size, float val_min, float val_max,
                               float world_scale) {
     if (g.headless) return;
+    int cap_shot = ergo_vk_shot_due();
 
     meshlet_lazy_init();
     atlas_lazy_init();
@@ -4067,14 +4553,17 @@ void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     /* Now render — render_fence already waited above before compute */
     VK_CHECK(vkResetFences(g.device, 1, &g.render_fence));
 
-    uint32_t img_idx;
-    VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX,
-                                          g.sem_available, VK_NULL_HANDLE,
-                                          &img_idx);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
-        ergo_vk_frame_begin();
-        return;
+    uint32_t img_idx = 0;
+    if (!g.offscreen) {
+        VkResult acq = vkAcquireNextImageKHR(g.device, g.swapchain,
+                                             UINT64_MAX, g.sem_available,
+                                             VK_NULL_HANDLE, &img_idx);
+        if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
+            ergo_vk_frame_begin();
+            return;
+        }
     }
+    VkFramebuffer cap_fb = g.offscreen ? g.off_fb : g.sc_fbs[img_idx];
 
     /* One-time: create render UBO if needed */
     if (!g.render_ubo) {
@@ -4229,7 +4718,7 @@ void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     VkRenderPassBeginInfo rp_begin = {0};
     rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rp_begin.renderPass = g.render_pass;
-    rp_begin.framebuffer = g.sc_fbs[img_idx];
+    rp_begin.framebuffer = cap_fb;
     rp_begin.renderArea.extent = g.sc_extent;
     rp_begin.clearValueCount = 2;
     rp_begin.pClearValues = clears;
@@ -4247,6 +4736,10 @@ void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
                       4, 1, sizeof(VkDrawIndirectCommand));
 
     vkCmdEndRenderPass(g.render_cmd_buf);
+    if (cap_shot) {
+        g_cap_src = g.offscreen ? g.off_image : g.sc_images[img_idx];
+        ergo_vk_capture_record();
+    }
     VK_CHECK(vkEndCommandBuffer(g.render_cmd_buf));
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -4259,22 +4752,34 @@ void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     si.pCommandBuffers = &g.render_cmd_buf;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &g.sem_finished;
+    if (g.offscreen) {  /* no acquire/present semaphores offscreen */
+        si.waitSemaphoreCount = 0;
+        si.pWaitSemaphores = NULL;
+        si.signalSemaphoreCount = 0;
+        si.pSignalSemaphores = NULL;
+    }
 
     VK_CHECK(vkQueueSubmit(g.compute_queue, 1, &si, g.render_fence));
+    if (cap_shot)
+        ergo_vk_capture_write();
 
-    VkPresentInfoKHR present = {0};
-    present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &g.sem_finished;
-    present.swapchainCount = 1;
-    present.pSwapchains = &g.swapchain;
-    present.pImageIndices = &img_idx;
+    /* Present (windowed only) */
+    if (!g.offscreen) {
+        VkPresentInfoKHR present = {0};
+        present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        present.waitSemaphoreCount = 1;
+        present.pWaitSemaphores = &g.sem_finished;
+        present.swapchainCount = 1;
+        present.pSwapchains = &g.swapchain;
+        present.pImageIndices = &img_idx;
 
-    vkQueuePresentKHR(g.compute_queue, &present);
+        vkQueuePresentKHR(g.compute_queue, &present);
+    }
 }
 
 int ergo_vk_should_close(void) {
     if (g.headless) return 0;
+    if (g.offscreen) return 0;   /* W0: no window to close */
 #ifdef ERGO_VK_ANDROID
     return 0;  /* Android lifecycle managed by Java layer */
 #else
