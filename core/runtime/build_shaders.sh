@@ -18,10 +18,10 @@ glslc -fshader-stage=vertex   render_gauss.vert       -o render_gauss.vert.spv
 glslc -fshader-stage=fragment render_gauss.frag       -o render_gauss.frag.spv
 glslc -fshader-stage=vertex   render_grid_gauss.vert  -o render_grid_gauss.vert.spv
 glslc -fshader-stage=compute  meshlet_gen.comp        -o meshlet_gen.comp.spv
-glslc -fshader-stage=compute  atlas_gen.comp          -o atlas_gen.comp.spv
+glslc -fshader-stage=compute  -I . atlas_gen.comp     -o atlas_gen.comp.spv
 glslc -fshader-stage=vertex   render_octa_points.vert -o render_octa_points.vert.spv
 glslc -fshader-stage=vertex   render_meshlet.vert     -o render_meshlet.vert.spv
-glslc -fshader-stage=fragment render_meshlet.frag     -o render_meshlet.frag.spv
+glslc -fshader-stage=fragment -I . render_meshlet.frag -o render_meshlet.frag.spv
 
 echo "Generating render_shaders.h..."
 python3 -c "

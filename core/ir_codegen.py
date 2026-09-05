@@ -4905,6 +4905,15 @@ class IRCodeGen:
                         for arr in inst.meta.get("arrays", []):
                             if arr and arr != "?":
                                 reads.add(arr)
+                    elif inst.op == Op.WRITE and inst.meta.get("fmt") is None:
+                        # Raw-record WRITE (Part 10.4) reads the array's
+                        # storage directly — no LOAD op — so without this
+                        # the residency tracker never downloads it and the
+                        # file gets the stale host copy (2026-09-04, found
+                        # via tests/trig_identity).
+                        for name, _lo, _hi in inst.meta.get("sections", []):
+                            if name:
+                                reads.add(name)
             elif isinstance(item, IRIf):
                 self._collect_cpu_array_reads(item.then_body, reads)
                 if item.else_body:
@@ -4926,6 +4935,12 @@ class IRCodeGen:
                         for arr in inst.meta.get("arrays", []):
                             if arr and arr != "?":
                                 reads.add(arr)
+                    elif inst.op == Op.WRITE and inst.meta.get("fmt") is None:
+                        # Raw-record WRITE (Part 10.4) reads the array's
+                        # storage directly — see _collect_cpu_array_reads.
+                        for name, _lo, _hi in inst.meta.get("sections", []):
+                            if name:
+                                reads.add(name)
             elif isinstance(item, IRIf):
                 self._collect_array_reads(item.then_body, reads)
                 if item.else_body:

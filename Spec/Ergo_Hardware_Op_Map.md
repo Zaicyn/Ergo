@@ -139,6 +139,27 @@ robustness. Both gcc and clang fumble this identically.
 
 ## 2. The transcendental table
 
+**Status 2026-09-04: f32 SIN/COS are bit-identical across all three
+paths** — CPU (`ergo_math_kernels.h`), SPIR-V compute
+(`core/backends/spirv.py` emits an owned branchless core instead of
+GLSL.std.450 Sin/Cos), and GLSL render shaders
+(`core/runtime/ergo_trig32.glsl`). One shared core: specials →
+f32 3-word Cody-Waite (|x| ≤ 6400) → f64 3-word Cody-Waite
+(|x| ≤ 0x1.8p+20) → u64-only Payne-Hanek, then the same minimax
+kernels and k&3 quadrant fold. Verified by
+`tests/trig_identity/run_identity.py`: 1,400,093-sample domain
+(edges, ±7000 sweep, Payne-Hanek magnitudes, denormals, NaN/Inf), raw
+f32 bit sections byte-identical across all three paths — no ulp
+tolerance, no NaN-payload normalization. Two portability traps the
+shared core is explicitly armored against: the quadrant-index rint is
+written as an explicitly-fused magic-number fma (`fma(ax, 2/pi, m) - m`)
+because gcc's `-ffp-contract=fast` otherwise contracts it (unfused
+source flips k by 1 on double-rounding boundaries), and the GLSL core
+marks every fp temporary `precise` because the NVIDIA compiler
+otherwise contracts/const-folds under its default fast-math license
+(it even folded `x - x` to `+0.0` on the NaN path; the NaN result is
+the explicit constant `0xffc00000`).
+
 **Status 2026-08-29: the six core kernels are LANDED and are the
 default lowering** — `core/runtime/ergo_math_kernels.h` (inlined into
 generated C by `core/ir_codegen.py` when any of SIN/COS/EXP/LOG/ATAN2/
@@ -197,16 +218,29 @@ depends on the host libc is not a property of the program.
 
 ## 3. GPU note
 
-Every op here has a SPIR-V GLSL.std.450 counterpart on the GPU side,
-and the SPIRV backend already lowers to it — with the Part 9.10
-precision policy: SQRT native f64, all other transcendentals evaluated
-f64→f32→f64 (~1e-7 expected deviation, one compile-time warning per
-affected kernel; POW exists only at 16/32-bit in GLSL.std.450). GPU
-determinism is a separate story per Part 9.9 (SCATTER/atomics under
-`--gpu-fast-math`). The assembly core is a **CPU-side** project; nothing
-in this document changes the SPIRV path. If the CPU owned kernels land,
-the GPU f64-transcendental gap becomes the wider of the two — that is a
-known, separate follow-up.
+**Status 2026-09-04: the f32-on-GPU transcendental gap is closed for
+SIN/COS.** The SPIR-V backend no longer lowers f32 SIN/COS to
+GLSL.std.450 `Sin`/`Cos` (driver-owned, bit-unconstrained); it emits the
+owned core from §2 as a branchless `OpFunction` (Float64 + Int64
+capabilities, enabled at device creation) and calls it per site. The
+Part 9.10 f64→f32→f64 downgrade policy is unchanged in shape, but it
+now wraps the owned f32 core, so f64 GPU sin/cos results also come from
+the shared reduction — GPU f32/f64 sin/cos bits **move** against any
+baseline recorded with driver GLSL Sin/Cos (expected, one-time).
+
+The render pipeline is on the same core: `render_meshlet.frag` and
+`atlas_gen.comp` include `core/runtime/ergo_trig32.glsl` (compiled with
+`glslc -I .` by `build_shaders.sh`), and the vk_host.c camera matrix
+uses `_ergo_sinf`/`_ergo_cosf` instead of libm. A render frame's trig
+is now the same bits as the compute that produced the data. Render
+shaders still use GLSL built-ins for asin/atan/acos — those are not
+part of the shared core.
+
+Every other op here still has its SPIR-V GLSL.std.450 counterpart on
+the GPU side with the Part 9.10 precision policy: SQRT native f64, EXP/
+LOG/etc. evaluated f64→f32→f64 (POW exists only at 16/32-bit in
+GLSL.std.450). GPU determinism is a separate story per Part 9.9
+(SCATTER/atomics under `--gpu-fast-math`).
 
 ---
 

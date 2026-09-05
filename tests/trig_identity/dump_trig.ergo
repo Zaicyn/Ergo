@@ -1,0 +1,119 @@
+! DUMP_TRIG — trig_identity harness: domain generator + evaluator
+! =====================================================================
+! Generates the contract domain procedurally (exact constructs only:
+! decimal literals parse RNE-identically in ergo and C; powers of two
+! by exact doubling/halving; NaN/Inf by C99 division), evaluates
+! SIN/COS over it, and raw-writes three f32 sections to
+! /tmp/trig32_domain.bin: [M domain values][M sin bits][M cos bits]
+! (M x f32 little-endian each). The CPU C driver and the GLSL compute
+! runner read the same file — one domain, three paths.
+!
+! f32 only:  python -m core tests/trig_identity/dump_trig.ergo \
+!              --precision f32 -o /tmp/trig_cpu    (CPU owned kernel)
+!            ... --target spirv --precision f32    (owned SPIR-V core)
+
+IMPLICIT NONE
+PARAMETER INTEGER :: NHUGE = 14
+PARAMETER INTEGER :: NSW = 1400001
+PARAMETER INTEGER :: M = 64 + NSW + 2 * NHUGE
+
+STATIC REAL :: D(M), SD(M), CD(M)
+STATIC REAL :: X, V
+STATIC INTEGER :: I, K, P
+
+P := 0
+
+! ── edge cases (exact or RNE-consistent decimals) ───────────
+CALL PUT(0.0)
+CALL PUT(-0.0)
+CALL PUT(0.78539815)          ! pi/4 (RNE both sides)
+CALL PUT(-0.78539815)
+CALL PUT(0.7853982)           ! pi/4 + 1 ulp-ish
+CALL PUT(1.5707963)           ! pi/2 (RNE)
+CALL PUT(-1.5707963)
+CALL PUT(3.1415927)
+CALL PUT(-3.1415927)
+CALL PUT(6399.9995)           ! below the f32-CW cap
+CALL PUT(6400.0)
+CALL PUT(6400.5)              ! above the cap
+CALL PUT(-6400.5)
+CALL PUT(1572864.0)           ! 0x1.8p+20 boundary (medium/PH)
+CALL PUT(1572864.25)
+CALL PUT(1572865.0)
+CALL PUT(-1572865.0)
+CALL PUT(2.0e6)
+CALL PUT(-2.0e6)
+CALL PUT(1.0e10)
+CALL PUT(-1.0e10)
+CALL PUT(1.0e20)
+CALL PUT(-1.0e20)
+CALL PUT(3.0e38)
+CALL PUT(-3.0e38)
+CALL PUT(3.4028235e38)        ! ~FLT_MAX
+CALL PUT(-3.4028235e38)
+CALL PUT(1.0e-38)             ! min normal-ish
+CALL PUT(-1.0e-38)
+CALL PUT(1.0 / (1073741824.0 * 1073741824.0 * 4.0))   ! 2^-32 tiny
+! NaN / ±Inf via C99 division
+CALL PUT(1.0 / 0.0)
+CALL PUT(-1.0 / 0.0)
+CALL PUT(0.0 / 0.0)
+! exact powers of two near the tiny-identity threshold 2^-12
+V := 1.0
+DO K = 1, 15
+  V := V * 0.5
+  CALL PUT(V)
+  CALL PUT(-V)
+ENDDO
+! min subnormal + a few subnormals (exact halvings to 2^-126, then /2)
+V := 1.0
+DO K = 1, 149
+  V := V * 0.5
+ENDDO
+CALL PUT(V)                   ! 2^-149
+CALL PUT(-V)
+CALL PUT(V + V)               ! 2^-148
+CALL PUT(V * 128.0)           ! 2^-142
+CALL PUT(V * 8388608.0)       ! 2^-126 (normal boundary)
+
+! ── dense sweep: x = i * 0.01, i = -700000..700000 ──────────
+DO I = -700000, 700000
+  CALL PUT(REAL(I) * 0.01)
+ENDDO
+
+! ── huge args: 1.5 * 2^k and -1.5 * 2^k for k = 21..127 ─────
+DO K = 21, 127, 9
+  V := 1.5
+  DO I = 1, K
+    V := V * 2.0
+  ENDDO
+  CALL PUT(V)
+  CALL PUT(-V)
+ENDDO
+
+IF P ≠ M THEN
+  WRITE(0, "FATAL: P %d != M %d") P, M
+  STOP
+ENDIF
+
+! ── evaluate (one extractable loop) ─────────────────────────
+DO I = 1, M
+  SD(I) := SIN(D(I))
+  CD(I) := COS(D(I))
+ENDDO
+
+! ── raw dump: domain, sin bits, cos bits ────────────────────
+OPEN(11, "/tmp/trig32_domain.bin", "WRITE")
+WRITE(11) D(1:M)
+WRITE(11) SD(1:M)
+WRITE(11) CD(1:M)
+CLOSE(11)
+WRITE(*, "dumped %d domain values to /tmp/trig32_domain.bin") M
+STOP
+
+SUBROUTINE PUT(VAL)
+  REAL :: VAL
+  P := P + 1
+  D(P) := VAL
+  RETURN
+END

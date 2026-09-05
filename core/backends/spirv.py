@@ -994,6 +994,12 @@ class _EmitContext:
         self._needs_ballot = False
         # Track whether the kernel uses 64-bit integer ops (HASH/RAND)
         self._needs_int64 = False
+        # Track whether the kernel uses the owned f32 trig core (needs
+        # Float64 + Int64 capabilities even in f32 modules)
+        self._needs_trig32 = False
+        # Emitted helper OpFunctions (the trig32 core), spliced before
+        # the entry function at assembly
+        self._helper_funcs: list[str] = []
 
         # Section buffers — filled during emit, flushed in order
         self._header: list[str] = []
@@ -1156,6 +1162,429 @@ class _EmitContext:
         self._const_ids[key] = cid
         return cid
 
+    # ── shared f32 trig core (the N64 contract, 2026-09-04) ─────────
+    # SIN/COS do NOT lower to GLSL.std.450 Sin/Cos (driver-provided, not
+    # bitwise-stable).  They call _erg_sincos32, an OpFunction emitted
+    # once per module: quarter symmetry + minimax kernels + layered
+    # reduction (f32 Cody-Waite / f64 Cody-Waite / u64 Payne-Hanek),
+    # bit-identical to the certified CPU kernel
+    # (core/runtime/ergo_math_kernels.h) and the render-shader include
+    # (core/runtime/ergo_trig32.glsl).  Same coefficients, same
+    # expression order, same fma points in all three languages.
+    # Branchless: all tiers are computed and the in-range tier selected;
+    # shift amounts are clamped so no shift exceeds the word width
+    # (out-of-range tiers yield defined-but-discarded values).
+
+    _TRIG32_TABLE = [
+        0xa2f983, 0x6e4e44, 0x1529fc, 0x2757d1, 0xf534dd, 0xc0db62,
+        0x95993c, 0x439041, 0xfe5163, 0xabdebb, 0xc561b7, 0x246e3a,
+        0x424dd2, 0xe00649, 0x2eea09, 0xd1921c, 0xfe1deb, 0x1cb129,
+        0xa73ee8, 0x8235f5, 0x2ebb44, 0x84e99c, 0x7026b4, 0x5f7e41,
+        0x3991d6, 0x398353, 0x39f49c, 0x845f8b, 0xbdf928, 0x3b1ff8,
+        0x97ffde, 0x05980f, 0xef2f11, 0x8b5a0a, 0x6d1f6d, 0x367ecf,
+        0x27cb09, 0xb74f46, 0x3f669e, 0x5fea2d, 0x7527ba, 0xc7ebe5,
+        0xf17b3d, 0x0739f7, 0x8a5292, 0xea6bfb, 0x5fb11f, 0x8d5d08,
+        0x560330, 0x46fc7b, 0x6babf0, 0xcfbc20, 0x9af436, 0x1da9e3,
+        0x91615e, 0xe61b08, 0x659985, 0x5f14a0, 0x68408d, 0xffd880,
+    ]
+
+    def _f64_type(self) -> int:
+        """The f64 type id — declared lazily in f32 modules (trig32's
+        medium tier + PH fold evaluate in f64)."""
+        from ..ir import get_real_precision
+        if get_real_precision() == 32 and not getattr(self, "_f64_declared", False):
+            self._f64_declared = True
+            self._types.append(
+                f"     {self._id(self.id_f64)} = OpTypeFloat 64")
+        return self.id_f64
+
+    def _get_f32_const(self, hexlit: str) -> int:
+        key = ("f32", hexlit)
+        if key not in self._const_ids:
+            cid = self._alloc()
+            self._types.append(
+                f"         {self._id(cid)} = OpConstant {self._id(self.id_f32)} {hexlit}")
+            self._set_ssa_type(cid, self.id_f32)
+            self._const_ids[key] = cid
+        return self._const_ids[key]
+
+    def _get_f64_const(self, hexlit: str) -> int:
+        key = ("f64", hexlit)
+        if key not in self._const_ids:
+            cid = self._alloc()
+            self._types.append(
+                f"         {self._id(cid)} = OpConstant {self._id(self._f64_type())} {hexlit}")
+            self._set_ssa_type(cid, self.id_f64)
+            self._const_ids[key] = cid
+        return self._const_ids[key]
+
+    def _emit_trig32_call(self, op, a: int) -> int:
+        """Emit a call to the shared core for a SIN/COS site; returns the
+        result id at self.id_real (f64 sites keep the Part 9.10
+        f64->f32->f64 downgrade around the owned f32 core)."""
+        self._emit_trig32_helper()
+        f32t = self.id_f32
+        if self.real_size == 8:
+            if self._ssa_types.get(a) != f32t:
+                c = self._alloc()
+                self._function.append(
+                    f"         {self._id(c)} = OpFConvert {self._id(f32t)} {self._id(a)}")
+                self._set_ssa_type(c, f32t)
+                a = c
+        r = self._alloc()
+        self._function.append(
+            f"         {self._id(r)} = OpFunctionCall {self._id(self._trig32_v2f32)} "
+            f"{self._id(self._trig32_fn)} {self._id(a)}")
+        res = self._alloc()
+        idx = 0 if op == Op.SIN else 1
+        self._function.append(
+            f"         {self._id(res)} = OpCompositeExtract {self._id(f32t)} "
+            f"{self._id(r)} {idx}")
+        self._set_ssa_type(res, f32t)
+        if self.real_size == 8:
+            r64 = self._alloc()
+            self._function.append(
+                f"         {self._id(r64)} = OpFConvert {self._id(self._f64_type())} "
+                f"{self._id(res)}")
+            self._set_ssa_type(r64, self.id_f64)
+            res = r64
+        return res
+
+    def _emit_trig32_helper(self):
+        if getattr(self, "_trig32_helper_done", False):
+            return
+        self._trig32_helper_done = True
+
+        f32t = self.id_f32
+        f64t = self._f64_type()
+        u32t = self.id_u32
+        i32t = self.id_i32
+        u64t = self._u64_type()
+        boolt = self.id_bool
+        v2f32 = self._alloc("v2f32")
+        self._types.append(
+            f"     {self._id(v2f32)} = OpTypeVector {self._id(f32t)} 2")
+        fnty = self._alloc("fn_sincos32")
+        self._types.append(
+            f"     {self._id(fnty)} = OpTypeFunction {self._id(v2f32)} {self._id(f32t)}")
+        self._trig32_v2f32 = v2f32
+
+        H: list[str] = []
+
+        def put(s): H.append("         " + s)
+        def A(): return self._alloc()
+        def I(x): return self._id(x)
+
+        def c32(h):
+            key = ("f32", h)
+            if key not in self._const_ids:
+                cid = A()
+                self._types.append(f"         {I(cid)} = OpConstant {I(f32t)} {h}")
+                self._set_ssa_type(cid, f32t)
+                self._const_ids[key] = cid
+            return self._const_ids[key]
+
+        def c64(h):
+            key = ("f64", h)
+            if key not in self._const_ids:
+                cid = A()
+                self._types.append(f"         {I(cid)} = OpConstant {I(f64t)} {h}")
+                self._set_ssa_type(cid, f64t)
+                self._const_ids[key] = cid
+            return self._const_ids[key]
+
+        ci32 = self._get_i32_const
+        cu32 = self._get_u32_const
+
+        def cu64(v):
+            return self._get_u64_const(hex(v))
+
+        def f2(op, ty, a, b, nc=True):
+            r = A()
+            put(f"{I(r)} = {op} {I(ty)} {I(a)} {I(b)}")
+            if nc and ty in (f32t, f64t):
+                self._nocontract.append(r)
+            return r
+
+        def f1(op, ty, a, nc=True):
+            r = A()
+            put(f"{I(r)} = {op} {I(ty)} {I(a)}")
+            if nc and ty in (f32t, f64t):
+                self._nocontract.append(r)
+            return r
+
+        def fma(ty, a, b, c):
+            r = A()
+            gl = self._named_ids["glsl_ext"]
+            put(f"{I(r)} = OpExtInst {I(ty)} {I(gl)} Fma {I(a)} {I(b)} {I(c)}")
+            self._nocontract.append(r)
+            return r
+
+        def rne(ty, a):
+            r = A()
+            gl = self._named_ids["glsl_ext"]
+            put(f"{I(r)} = OpExtInst {I(ty)} {I(gl)} RoundEven {I(a)}")
+            return r
+
+        def ext2(name, ty, a, b):   # GLSL.std.450 two-arg op (SMax/SMin/...)
+            r = A()
+            gl = self._named_ids["glsl_ext"]
+            put(f"{I(r)} = OpExtInst {I(ty)} {I(gl)} {name} {I(a)} {I(b)}")
+            if ty in (f32t, f64t):
+                self._nocontract.append(r)
+            return r
+
+        def sel(ty, c, a, b):
+            r = A()
+            put(f"{I(r)} = OpSelect {I(ty)} {I(c)} {I(a)} {I(b)}")
+            return r
+
+        def cmpt(op, a, b):
+            r = A()
+            put(f"{I(r)} = {op} {I(boolt)} {I(a)} {I(b)}")
+            return r
+
+        def negf(ty, a):
+            return f1("OpFNegate", ty, a)
+
+        zero64 = cu64(0)
+        one64 = cu64(1)
+
+        # -- function header --
+        fid = A()
+        self._trig32_fn = fid
+        H.append("")
+        H.append(f"     {I(fid)} = OpFunction {I(v2f32)} None {I(fnty)}")
+        x = A()
+        H.append(f"     {I(x)} = OpFunctionParameter {I(f32t)}")
+        lb = A()
+        H.append(f"     {I(lb)} = OpLabel")
+
+        # |x| machinery (u32 compares against the raw bits)
+        u = f1("OpBitcast", u32t, x, nc=False)
+        au = f2("OpBitwiseAnd", u32t, u, cu32(0x7fffffff), nc=False)
+        ax = f1("OpBitcast", f32t, au, nc=False)
+
+        # ── tier 1: f32 Cody-Waite (ax <= 6400) ──
+        # kd via explicitly-fused magic-number rint (fma + subtract) so the
+        # result matches the CPU header's contract-proof form exactly.
+        m32 = c32("0x1.8p+23")
+        kd32 = f2("OpFSub", f32t,
+                  fma(f32t, ax, c32("0x1.45f306p-1"), m32), m32)
+        nkd32 = negf(f32t, kd32)
+        r1 = fma(f32t, nkd32, c32("0x1.921fb6p+0"), ax)
+        r1 = fma(f32t, nkd32, c32("-0x1.777a5cp-25"), r1)
+        r1 = fma(f32t, nkd32, c32("-0x1.ee59dap-50"), r1)
+        k1 = f1("OpConvertFToU", u32t, kd32, nc=False)
+
+        # ── tier 2: f64 Cody-Waite (6400 < ax <= 0x1.8p+20) ──
+        ax64 = f1("OpFConvert", f64t, ax)
+        m64 = c64("0x1.8p+52")
+        kd64 = f2("OpFSub", f64t,
+                  fma(f64t, ax64, c64("0x1.45f306dc9c883p-1"), m64), m64)
+        nkd64 = negf(f64t, kd64)
+        r2 = fma(f64t, nkd64, c64("0x1.921fb54442d18p+0"), ax64)
+        r2 = fma(f64t, nkd64, c64("0x1.1a62633145c07p-54"), r2)
+        r2 = fma(f64t, nkd64, c64("0x1.f1976b7ed8fbcep-110"), r2)
+        k2 = f1("OpConvertFToU", u32t, kd64, nc=False)
+
+        # ── tier 3: Payne-Hanek, u64-only (f32-sourced mantissa) ──
+        ux = f1("OpBitcast", u64t, ax64, nc=False)
+        e0 = f1("OpUConvert", u32t,
+                f2("OpShiftRightLogical", u64t, ux, cu32(52), nc=False), nc=False)
+        e = f2("OpISub", u32t, e0, cu32(994), nc=False)  # 1023-29
+        m64 = f2("OpShiftRightLogical", u64t,
+                 f2("OpBitwiseOr", u64t,
+                    f2("OpBitwiseAnd", u64t, ux, cu64(0x000fffffffffffff), nc=False),
+                    cu64(0x0010000000000000), nc=False),
+                 cu32(29), nc=False)
+        ilo = sel(u32t, cmpt("OpUGreaterThan", e, cu32(77)),
+                  f2("OpUDiv", u32t, f2("OpISub", u32t, e, cu32(54), nc=False),
+                     cu32(24), nc=False), cu32(0))
+        ihi = f2("OpIAdd", u32t, ilo, cu32(8), nc=False)
+        F = f2("OpISub", u32t,
+               f2("OpIAdd", u32t, f2("OpIMul", u32t, cu32(24), ihi, nc=False),
+                  cu32(76), nc=False),
+               e, nc=False)
+
+        T = self._TRIG32_TABLE
+        acc = [zero64] * 10
+
+        def pick(j):
+            r = cu64(T[4 + j])
+            for w in (3, 2, 1, 0):
+                r = sel(u64t, cmpt("OpIEqual", ilo, cu32(w)), cu64(T[w + j]), r)
+            return r
+
+        for j in range(9):
+            s = 24 * (8 - j)
+            limbC = 3 + (s >> 6)
+            off = s & 63
+            lj = pick(j)
+            p = f2("OpIMul", u64t, m64, lj, nc=False)   # exact: <= 2^48
+            if off == 0:
+                v0, v1 = p, zero64
+            else:
+                v0 = f2("OpShiftLeftLogical", u64t, p, cu32(off), nc=False)
+                v1 = f2("OpShiftRightLogical", u64t, p, cu32(64 - off), nc=False)
+            t = f2("OpIAdd", u64t, acc[limbC], v0, nc=False)
+            cA = cmpt("OpULessThan", t, acc[limbC])
+            acc[limbC] = t
+            t = f2("OpIAdd", u64t, acc[limbC + 1], v1, nc=False)
+            c1 = cmpt("OpULessThan", t, acc[limbC + 1])
+            nv = f2("OpIAdd", u64t, t, sel(u64t, cA, one64, zero64), nc=False)
+            c1b = cmpt("OpULessThan", nv, t)
+            c1 = f2("OpLogicalOr", boolt, c1, c1b, nc=False)
+            acc[limbC + 1] = nv
+            t = f2("OpIAdd", u64t, acc[limbC + 2], sel(u64t, c1, one64, zero64),
+                   nc=False)
+            c2a = cmpt("OpULessThan", t, acc[limbC + 2])
+            c2b = f2("OpLogicalAnd", boolt, c1,
+                     cmpt("OpIEqual", t, acc[limbC + 2]), nc=False)
+            c2 = f2("OpLogicalOr", boolt, c2a, c2b, nc=False)
+            acc[limbC + 2] = t
+            acc[limbC + 3] = f2("OpIAdd", u64t, acc[limbC + 3],
+                                sel(u64t, c2, one64, zero64), nc=False)
+
+        wl = f2("OpIAdd", u32t, f2("OpUDiv", u32t, F, cu32(64), nc=False),
+                cu32(3), nc=False)
+        wlc = ext2("UMin", u32t,
+                 ext2("UMax", u32t, wl, cu32(3)), cu32(6))
+        wo = f2("OpBitwiseAnd", u32t, F, cu32(63), nc=False)
+
+        def aget(idx):
+            r = acc[0]
+            for n in range(1, 10):
+                r = sel(u64t, cmpt("OpIEqual", idx, cu32(n)), acc[n], r)
+            return r
+
+        aW1 = aget(wlc)
+        aWp1 = aget(f2("OpIAdd", u32t, wlc, cu32(1), nc=False))
+        aWm1 = aget(f2("OpISub", u32t, wlc, cu32(1), nc=False))
+        aWm2 = aget(f2("OpISub", u32t, wlc, cu32(2), nc=False))
+        aWm3 = aget(f2("OpISub", u32t, wlc, cu32(3), nc=False))
+        wo0 = cmpt("OpIEqual", wo, cu32(0))
+        shc = ext2("UMin", u32t, f2("OpISub", u32t, cu32(64), wo, nc=False),
+                 cu32(63))
+        above = sel(u64t, wo0, aW1,
+                    f2("OpBitwiseOr", u64t,
+                       f2("OpShiftRightLogical", u64t, aW1, wo, nc=False),
+                       f2("OpShiftLeftLogical", u64t, aWp1, shc, nc=False), nc=False))
+        fr0 = sel(u64t, wo0, aWm1,
+                  f2("OpBitwiseOr", u64t,
+                     f2("OpShiftRightLogical", u64t, aWm1, wo, nc=False),
+                     f2("OpShiftLeftLogical", u64t, aW1, shc, nc=False), nc=False))
+        fr1 = sel(u64t, wo0, aWm2,
+                  f2("OpBitwiseOr", u64t,
+                     f2("OpShiftRightLogical", u64t, aWm2, wo, nc=False),
+                     f2("OpShiftLeftLogical", u64t, aWm1, shc, nc=False), nc=False))
+        fr2 = sel(u64t, wo0, aWm3,
+                  f2("OpBitwiseOr", u64t,
+                     f2("OpShiftRightLogical", u64t, aWm3, wo, nc=False),
+                     f2("OpShiftLeftLogical", u64t, aWm2, shc, nc=False), nc=False))
+
+        kW = f1("OpUConvert", u32t,
+                f2("OpBitwiseAnd", u64t, above, cu64(3), nc=False), nc=False)
+        rb = cmpt("OpINotEqual",
+                  f2("OpShiftRightLogical", u64t, fr0, cu32(63), nc=False),
+                  zero64)
+        k3 = f2("OpIAdd", u32t, kW, sel(u32t, rb, cu32(1), cu32(0)), nc=False)
+
+        sticky = acc[0]
+        for n in range(1, 4):
+            cond = cmpt("OpULessThan", cu32(n),
+                        f2("OpISub", u32t, wlc, cu32(3), nc=False))
+            sticky = f2("OpBitwiseOr", u64t, sticky,
+                        sel(u64t, cond, acc[n], zero64), nc=False)
+        maskWo = f2("OpISub", u64t, f2("OpShiftLeftLogical", u64t, one64, wo, nc=False),
+                    one64, nc=False)
+        st2 = f2("OpBitwiseAnd", u64t, aWm3, maskWo, nc=False)
+        sticky = f2("OpBitwiseOr", u64t, sticky,
+                    sel(u64t, wo0, zero64, st2), nc=False)
+
+        stz = cmpt("OpIEqual", sticky, zero64)
+        g0n = f2("OpIAdd", u64t, f1("OpNot", u64t, fr0, nc=False),
+                 sel(u64t, stz, one64, zero64), nc=False)
+        w0f = f2("OpLogicalAnd", boolt, stz, cmpt("OpIEqual", g0n, zero64),
+                 nc=False)
+        g1n = f2("OpIAdd", u64t, f1("OpNot", u64t, fr1, nc=False),
+                 sel(u64t, w0f, one64, zero64), nc=False)
+        w1f = f2("OpLogicalAnd", boolt, w0f, cmpt("OpIEqual", g1n, zero64),
+                 nc=False)
+        g2n = f2("OpIAdd", u64t, f1("OpNot", u64t, fr2, nc=False),
+                 sel(u64t, w1f, one64, zero64), nc=False)
+        g0 = sel(u64t, rb, g0n, fr0)
+        g1 = sel(u64t, rb, g1n, fr1)
+        g2 = sel(u64t, rb, g2n, fr2)
+
+        f0 = f2("OpFMul", f64t, f1("OpConvertUToF", f64t, g0, nc=False),
+                c64("0x1.0p-64"))
+        f1v = f2("OpFMul", f64t, f1("OpConvertUToF", f64t, g1, nc=False),
+                 c64("0x1.0p-128"))
+        f2v = f2("OpFMul", f64t, f1("OpConvertUToF", f64t, g2, nc=False),
+                 c64("0x1.0p-192"))
+        hi = f2("OpFMul", f64t, f0, c64("0x1.921fb54442d18p+0"))
+        lo = fma(f64t, f0, c64("0x1.921fb54442d18p+0"), negf(f64t, hi))
+        lo = fma(f64t, f1v, c64("0x1.921fb54442d18p+0"), lo)
+        lo = fma(f64t, f0, c64("0x1.1a62633145c07p-54"), lo)
+        lo = fma(f64t, f2v, c64("0x1.921fb54442d18p+0"), lo)
+        lo = fma(f64t, f0, c64("0x1.f1976b7ed8fbcep-110"), lo)
+        r3 = f2("OpFAdd", f64t, hi, lo)
+        rph = sel(f64t, rb, negf(f64t, r3), r3)
+
+        # ── tier select (C: ax<=6400 ? t1 : (ax64<=0x1.8p20 ? t2 : t3)) ──
+        usePH = cmpt("OpFOrdGreaterThan", ax64, c64("0x1.8p+20"))
+        r64 = sel(f64t, usePH, rph, r2)
+        k64 = sel(u32t, usePH, k3, k2)
+        inT1 = cmpt("OpFOrdLessThanEqual", ax, c32("6400.0"))
+        rf = sel(f32t, inT1, r1, f1("OpFConvert", f32t, r64))
+        kf = sel(u32t, inT1, k1, k64)
+
+        # ── minimax kernels ──
+        z = f2("OpFMul", f32t, rf, rf)
+        v = f2("OpFMul", f32t, z, rf)
+        p = fma(f32t, c32("0x1.6dbe08p-19"), z, c32("-0x1.a013a8p-13"))
+        p = fma(f32t, p, z, c32("0x1.11110ep-7"))
+        ks = fma(f32t, v, fma(f32t, z, p, c32("-0x1.555556p-3")), rf)
+        q = fma(f32t, c32("-0x1.25244ep-22"), z, c32("0x1.a015c4p-16"))
+        q = fma(f32t, q, z, c32("-0x1.6c16c0p-10"))
+        q = fma(f32t, q, z, c32("0x1.555556p-5"))
+        zz = f2("OpFMul", f32t, z, q)
+        hz = f2("OpFMul", f32t, c32("0.5"), z)
+        kc = f2("OpFSub", f32t, c32("1.0"), fma(f32t, negf(f32t, z), zz, hz))
+
+        # ── quadrant + sign + specials ──
+        kk = f2("OpBitwiseAnd", u32t, kf, cu32(3), nc=False)
+        k0 = cmpt("OpIEqual", kk, cu32(0))
+        k1b = cmpt("OpIEqual", kk, cu32(1))
+        k2b = cmpt("OpIEqual", kk, cu32(2))
+        sinq = sel(f32t, k0, ks,
+                   sel(f32t, k1b, kc,
+                       sel(f32t, k2b, negf(f32t, ks), negf(f32t, kc))))
+        cosq = sel(f32t, k0, kc,
+                   sel(f32t, k1b, negf(f32t, ks),
+                       sel(f32t, k2b, negf(f32t, kc), ks)))
+        sgn = cmpt("OpINotEqual",
+                   f2("OpShiftRightLogical", u32t, u, cu32(31), nc=False),
+                   cu32(0))
+        sinq = sel(f32t, sgn, negf(f32t, sinq), sinq)
+
+        naninf = cmpt("OpUGreaterThanEqual", au, cu32(0x7f800000))
+        tiny = cmpt("OpULessThan", au, cu32(0x39800000))
+        # NaN/Inf -> canonical qNaN 0xffc00000 (the x86 x-x value the C
+        # header produces); NOT OpFSub(x,x) — the driver's NaN payload is
+        # unconstrained there.  Policy allows any NaN; this keeps all
+        # three paths bit-identical even on payloads.
+        nanv = f1("OpBitcast", f32t, cu32(0xffc00000), nc=False)
+        sinr = sel(f32t, naninf, nanv, sel(f32t, tiny, x, sinq))
+        cosr = sel(f32t, naninf, nanv, sel(f32t, tiny, c32("1.0"), cosq))
+
+        res = A()
+        put(f"{I(res)} = OpCompositeConstruct {I(v2f32)} {I(sinr)} {I(cosr)}")
+        H.append(f"               OpReturnValue {I(res)}")
+        H.append("               OpFunctionEnd")
+        self._helper_funcs.extend(H)
+
     def _spirv_type_id(self, t: IRType) -> int:
         """Get the SPIR-V type ID for an IR type."""
         if t == IRType.REAL:
@@ -1212,6 +1641,7 @@ class _EmitContext:
         self.lines.append("")
         self.lines.extend(self._globals)
         self.lines.append("")
+        self.lines.extend(self._helper_funcs)
         self.lines.extend(self._function)
 
     def _scan_for_glsl_ext(self, items: list):
@@ -1221,6 +1651,10 @@ class _EmitContext:
                 for inst in item.insts:
                     if inst.op in GLSL_EXT:
                         self._needs_glsl_ext = True
+                    if inst.op in (Op.SIN, Op.COS):
+                        # owned trig core needs the medium tier's f64 and
+                        # the PH tier's u64 even in f32 modules
+                        self._needs_trig32 = True
                     if inst.op in (Op.CLAMP, Op.SIGN):
                         self._needs_glsl_ext = True
                     if inst.op == Op.LOG10:
@@ -1688,7 +2122,7 @@ class _EmitContext:
         if k.is_partial:
             self._header.append(f"; SPLIT kernel: flow prefix of loop at line {k.split_from}")
         self._header.append(f"               OpCapability Shader")
-        if self.real_size == 8:
+        if self.real_size == 8 or self._needs_trig32:
             self._header.append(f"               OpCapability Float64")
             self._header.append(f"               OpCapability Int64")
         elif self._needs_int64:
@@ -2657,6 +3091,18 @@ class _EmitContext:
             self._function.append(
                 f"         {self._id(result)} = {spv_cmp} {self._id(self.id_bool)} {self._id(a)} {self._id(b)}")
             self._set_ssa_type(result, self.id_bool)
+            if inst.result:
+                ssa_map[inst.result] = result
+            return False
+
+        # Shared f32 trig core (2026-09-04, the N64 contract): SIN/COS do
+        # NOT lower to GLSL.std.450 Sin/Cos (driver-provided, not
+        # bitwise-stable) — they call the owned OpFunction core,
+        # bit-identical to the CPU kernel and the render-shader include.
+        if op in (Op.SIN, Op.COS):
+            a = self._resolve(inst.args[0], pc_member_ids, ssa_map)
+            result = self._emit_trig32_call(op, a)
+            self._set_ssa_type(result, self.id_real)
             if inst.result:
                 ssa_map[inst.result] = result
             return False

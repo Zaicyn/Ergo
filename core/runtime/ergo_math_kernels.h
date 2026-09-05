@@ -358,6 +358,92 @@ static inline int _erg_ph_reduce(double ax, double *rp) {
 /* shared reduction: ax = |x| > 0, finite.  Returns k (mod-4 quadrant
  * in low bits) and *rp = remainder in [-pi/4, pi/4].  Also used by the
  * f32 large-argument path (f32 inputs promote to f64 exactly). */
+/* Payne-Hanek variant for F32-SOURCED arguments (|x| > 0x1.8p+20):
+ * identical to _erg_ph_reduce except the 128-bit products become
+ * 64-bit: an f32-sourced mantissa has <= 24 significant bits, so
+ * m*limb <= 2^48 fits u64 exactly and the high product word is
+ * identically zero.  Output is bit-identical to _erg_ph_reduce on every
+ * f32-sourced input (exact integer arithmetic is unique).  This is the
+ * form that ports 1:1 to GLSL (uint64) and SPIR-V (Int64) for the
+ * three-way f32 trig contract (2026-09-04) — no 128-bit type needed. */
+static inline int _erg_ph_reduce32(double ax, double *rp) {
+    uint64_t u = _eb2d(ax);
+    /* f32-sourced double: its 53-bit f64 mantissa field is the 24-bit
+     * f32 mantissa left-justified by 29 bits.  Right-justify it and
+     * compensate the exponent: ax = m23 * 2^(e'-52) with m23 < 2^24,
+     * so m23*limb <= 2^48 fits u64 exactly (high word identically
+     * zero) — this is what makes the __int128 unnecessary. */
+    int e = (int)(u >> 52) - 1023 + 29;
+    uint64_t m = ((u & 0x000fffffffffffffULL) | 0x0010000000000000ULL) >> 29;
+    int i_lo = (e > 77) ? (e - 77 + 23) / 24 : 0;
+    int i_hi = i_lo + 8;
+    int F = 24 * i_hi + 76 - e;
+    uint64_t acc[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (int i = i_lo; i <= i_hi; i++) {
+        uint64_t p = m * _erg_two_over_pi[i];   /* exact: <= 2^48 */
+        int s = 24 * (i_hi - i);
+        int limb = 3 + (s >> 6), off = s & 63;
+        uint64_t plo = p;                       /* high word is zero */
+        uint64_t v0, v1;
+        if (off == 0) {
+            v0 = plo; v1 = 0;
+        } else {
+            v0 = plo << off;
+            v1 = plo >> (64 - off);
+        }
+        uint64_t t = acc[limb] + v0;
+        int c = (t < acc[limb]);
+        acc[limb] = t;
+        t = acc[limb + 1] + v1;
+        int c1 = (t < acc[limb + 1]);
+        acc[limb + 1] = t + c;
+        c1 = c1 | (acc[limb + 1] < t);
+        t = acc[limb + 2] + c1;                 /* v2 == 0 for f32 m */
+        int c2 = (t < acc[limb + 2]) | (c1 & (t == acc[limb + 2]));
+        acc[limb + 2] = t;
+        acc[limb + 3] += c2;
+    }
+    int wl = (F >> 6) + 3, wo = F & 63;
+    uint64_t above;
+    uint64_t fr0, fr1, fr2;
+    if (wo == 0) {
+        above = acc[wl];
+        fr0 = acc[wl - 1]; fr1 = acc[wl - 2]; fr2 = acc[wl - 3];
+    } else {
+        above = (acc[wl] >> wo) | (acc[wl + 1] << (64 - wo));
+        fr0 = (acc[wl - 1] >> wo) | (acc[wl] << (64 - wo));
+        fr1 = (acc[wl - 2] >> wo) | (acc[wl - 1] << (64 - wo));
+        fr2 = (acc[wl - 3] >> wo) | (acc[wl - 2] << (64 - wo));
+    }
+    int k = (int)(above & 3);
+    uint64_t sticky = 0;
+    for (int j = 0; j < wl - 3; j++) sticky |= acc[j];
+    if (wo) sticky |= (acc[wl - 3] & ((1ULL << wo) - 1));
+    int neg;
+    uint64_t g0, g1, g2;
+    if (fr0 >> 63) {
+        k += 1;
+        neg = 1;
+        g0 = ~fr0; g1 = ~fr1; g2 = ~fr2;
+        if (!sticky) { g0 += 1; if (g0 == 0) { g1 += 1; if (g1 == 0) g2 += 1; } }
+    } else {
+        neg = 0;
+        g0 = fr0; g1 = fr1; g2 = fr2;
+    }
+    double f0 = (double)g0 * 0x1.0p-64;
+    double f1 = (double)g1 * 0x1.0p-128;
+    double f2 = (double)g2 * 0x1.0p-192;
+    double hi = f0 * _ERG_PIO2_HI;
+    double lo = fma(f0, _ERG_PIO2_HI, -hi);
+    lo = fma(f1, _ERG_PIO2_HI, lo);
+    lo = fma(f0, _ERG_PIO2_MID, lo);
+    lo = fma(f2, _ERG_PIO2_HI, lo);
+    lo = fma(f0, _ERG_PIO2_LO, lo);
+    double r = hi + lo;
+    *rp = neg ? -r : r;
+    return k & 3;
+}
+
 static inline int _erg_remod64(double ax, double *rp) {
     if (ax <= 0x1.8p+20) {                             /* 1.57e6 */
         double kd = _erint64(ax * _ERG_TWO_OVER_PI);
@@ -882,7 +968,13 @@ static inline float _erg_kcos32(float r) {
 }
 static inline int _erg_remod32(float ax, float *rp) {
     if (ax <= 6400.0f) {
-        float kd = _erint32(ax * 0x1.45f3060000000p-1f);  /* 2/pi */
+        /* kd via EXPLICITLY-fused magic-number rint: fma(ax, 2/pi, m) - m.
+         * Written fused so the result cannot depend on -ffp-contract:
+         * the driver's -O3 -ffp-contract=fast build contracts the plain
+         * mul-add to exactly this (verified 2026-09-04: unfused source
+         * flips kd by 1 where ax*2/pi sits on a double-rounding
+         * boundary).  GLSL/SPIR-V ports emit the same explicit fma. */
+        float kd = fmaf(ax, 0x1.45f3060000000p-1f, 0x1.8p+23f) - 0x1.8p+23f;
         float r = fmaf(-kd, 0x1.921fb60000000p+0f, ax);
         r = fmaf(-kd, -0x1.777a5c0000000p-25f, r);
         r = fmaf(-kd, -0x1.ee59da0000000p-50f, r);
@@ -890,7 +982,23 @@ static inline int _erg_remod32(float ax, float *rp) {
         return (int)kd;
     }
     double r64;
-    int k = _erg_remod64((double)ax, &r64);
+    int k;
+    double ax64 = (double)ax;
+    if (ax64 <= 0x1.8p+20) {
+        /* medium path, identical to _erg_remod64's first branch except
+         * the kd rint is explicitly fused (same reason as tier 1) */
+        double kd = fma(ax64, _ERG_TWO_OVER_PI, 0x1.8p+52) - 0x1.8p+52;
+        double r = fma(-kd, _ERG_PIO2_HI, ax64);
+        r = fma(-kd, _ERG_PIO2_MID, r);
+        r = fma(-kd, _ERG_PIO2_LO, r);
+        r64 = r;
+        k = (int)kd;
+    } else {
+        /* u64-only PH for f32-sourced args — bit-identical output to
+         * _erg_remod64's __int128 path (exact integer arithmetic is
+         * unique); this is the form ported to GLSL/SPIR-V (2026-09-04) */
+        k = _erg_ph_reduce32(ax64, &r64);
+    }
     *rp = (float)r64;
     return k;
 }

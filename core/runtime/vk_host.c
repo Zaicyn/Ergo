@@ -22,6 +22,10 @@
 
 #include <math.h>
 
+/* owned f32 trig for the camera path: same bits as the compute and
+ * render-shader cores (trig32 shared core, op map §3) */
+#include "ergo_math_kernels.h"
+
 #ifndef ERGO_BUILD_VERSION
 #define ERGO_BUILD_VERSION "unknown"
 #endif
@@ -487,6 +491,9 @@ int ergo_vk_init(int headless) {
         g.cam_azimuth   = 0.5f;   /* slight angle */
         g.cam_elevation = 0.6f;   /* looking down */
         g.cam_distance  = 1.5f;
+        { const char *_ce = getenv("ERGO_CAM");
+          if (_ce) sscanf(_ce, "%f,%f,%f", &g.cam_azimuth,
+                          &g.cam_elevation, &g.cam_distance); }
 
         glfwSetMouseButtonCallback(g.window, camera_mouse_button_cb);
         glfwSetCursorPosCallback(g.window, camera_cursor_pos_cb);
@@ -2895,8 +2902,8 @@ void ergo_vk_render_frame(ErgoVkBuf buf, int width, int height,
     ergo_vk_camera_tick();
     Mat4 proj = mat4_perspective(45.0f * (float)M_PI / 180.0f, aspect, 0.01f, 100.0f);
 
-    float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);
-    float ce = cosf(g.cam_elevation), se = sinf(g.cam_elevation);
+    float ca = _ergo_cosf(g.cam_azimuth), sa = _ergo_sinf(g.cam_azimuth);
+    float ce = _ergo_cosf(g.cam_elevation), se = _ergo_sinf(g.cam_elevation);
     float ex = g.cam_distance * ce * sa;
     float ey = g.cam_distance * se;
     float ez = g.cam_distance * ce * ca;
@@ -3037,8 +3044,8 @@ void ergo_vk_render_points(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     ergo_vk_camera_tick();
     Mat4 proj = mat4_perspective(45.0f * (float)M_PI / 180.0f, aspect, 0.01f, 100.0f);
 
-    float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);
-    float ce = cosf(g.cam_elevation), se = sinf(g.cam_elevation);
+    float ca = _ergo_cosf(g.cam_azimuth), sa = _ergo_sinf(g.cam_azimuth);
+    float ce = _ergo_cosf(g.cam_elevation), se = _ergo_sinf(g.cam_elevation);
     float ex = g.cam_distance * ce * sa;
     float ey = g.cam_distance * se;
     float ez = g.cam_distance * ce * ca;
@@ -3186,8 +3193,8 @@ void ergo_vk_render_gaussians(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     ergo_vk_camera_tick();
     Mat4 proj = mat4_perspective(45.0f * 3.14159265f / 180.0f, aspect,
                                  0.01f, 100.0f);
-    float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);
-    float ce = cosf(g.cam_elevation), se = sinf(g.cam_elevation);
+    float ca = _ergo_cosf(g.cam_azimuth), sa = _ergo_sinf(g.cam_azimuth);
+    float ce = _ergo_cosf(g.cam_elevation), se = _ergo_sinf(g.cam_elevation);
     float ex = g.cam_distance * ce * sa;
     float ey = g.cam_distance * se;
     float ez = g.cam_distance * ce * ca;
@@ -3901,8 +3908,8 @@ void ergo_vk_render_meshlets(ErgoVkBuf buf_x, ErgoVkBuf buf_y, ErgoVkBuf buf_z,
     ergo_vk_camera_tick();
     Mat4 proj = mat4_perspective(45.0f * (float)M_PI / 180.0f, aspect,
                                  0.01f, 100.0f);
-    float ca = cosf(g.cam_azimuth), sa = sinf(g.cam_azimuth);
-    float ce = cosf(g.cam_elevation), se = sinf(g.cam_elevation);
+    float ca = _ergo_cosf(g.cam_azimuth), sa = _ergo_sinf(g.cam_azimuth);
+    float ce = _ergo_cosf(g.cam_elevation), se = _ergo_sinf(g.cam_elevation);
     float ex = g.cam_distance * ce * sa;
     float ey = g.cam_distance * se;
     float ez = g.cam_distance * ce * ca;

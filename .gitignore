@@ -105,6 +105,15 @@
 !tests/contraction/*.py
 !tests/contraction/*.c
 !tests/contraction/*.md
+# trig_identity three-path f32 sin/cos bit-identity harness (domain
+# generator, GLSL compute runner, orchestrator) — the audit trail for
+# the shared trig32 core, so it must live in git, not /tmp
+!tests/trig_identity/
+!tests/trig_identity/*.ergo
+!tests/trig_identity/*.py
+!tests/trig_identity/*.c
+!tests/trig_identity/*.comp
+!tests/trig_identity/*.md
 
 # Always ignore build artifacts
 __pycache__/
