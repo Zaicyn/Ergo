@@ -315,6 +315,33 @@ class IRCodeGen:
                 ["POS_X", "POS_Y", "POS_Z", color_arr])),
         }
 
+    def _render_f32_shadows(self, particle: dict | None) -> list[str]:
+        """f64 render builds: the particle render shaders (render_points.vert,
+        render_gauss.vert) read f32 SoA buffers while the authoritative
+        device buffers are doubles.  Reading an f64 buffer as f32 splits
+        every double into two garbage floats (the square-ring quantization
+        pile, vesicle_printer_gpu 2026-09-04).  The fix: dedicated f32
+        shadow buffers (d_r<name>) filled on-device by the conversion
+        kernel (ergo_vk_convert_f32 / convert_f64_f32.comp) — device-side
+        so it is correct whether the source was last written by a GPU
+        kernel (RENDER_COPY extraction) or a host upload.
+
+        Returns the arrays needing shadows: the render arrays plus every
+        GPU-resident REAL array with POS_X's shape (the ERGO_COLOR
+        candidates at the render site).  Empty list in f32 builds (no
+        shadows needed — buffers are natively f32)."""
+        if not particle or get_real_precision() == 32:
+            return []
+        cands = list(particle["render_arrays"])
+        px_shape = self._array_shapes.get("POS_X")
+        gpu_set = set(self._gpu_arrays())
+        for a in self._array_shapes:
+            if (a in gpu_set
+                    and self._var_types.get(a) == IRType.REAL
+                    and self._array_shapes[a] == px_shape):
+                cands.append(a)
+        return list(dict.fromkeys(cands))
+
     def generate(self) -> str:
         mod = self.module
         has_gpu = self.gpu_plan and self.gpu_plan.kernels
@@ -1776,7 +1803,12 @@ class IRCodeGen:
                     self._array_shapes["POS_X"][0])
                 color_arr = particle["color"]
 
-                # Runtime color channel: ERGO_COLOR=VEL_X etc.
+                # f64 builds: render from f32 shadow buffers (see
+                # _render_f32_shadows).  _pfx prefixes the buffer name.
+                shadows = self._render_f32_shadows(particle)
+                _pfx = "d_r" if shadows else "d_"
+
+                # Runtime color channel selection: ERGO_COLOR=VEL_X etc.
                 # Only GPU-resident arrays have device buffers — filter
                 # candidates accordingly (PUMP_RESID etc. are CPU-only).
                 gpu_set = set(self._gpu_arrays())
@@ -1789,11 +1821,11 @@ class IRCodeGen:
                 # unconditionally (2026-09-04, B2).
                 self._put("/* Runtime color channel selection */")
                 self._put("const char *_color_env = getenv(\"ERGO_COLOR\");")
-                self._put(f"ErgoVkBuf _color_buf = d_{color_arr};")
+                self._put(f"ErgoVkBuf _color_buf = {_pfx}{color_arr};")
                 for arr in real_arrays:
                     if arr != color_arr:
                         self._put(f"if (_color_env && strcmp(_color_env, \"{arr}\") == 0) "
-                                  f"_color_buf = d_{arr};")
+                                  f"_color_buf = {_pfx}{arr};")
 
                 # Add render arrays to upload set ONLY if CPU dirtied them.
                 # Arrays written by GPU kernels are already current on GPU —
@@ -1834,7 +1866,18 @@ class IRCodeGen:
                     self._put("ergo_vk_frame_end();")
                     self._put("ergo_vk_frame_wait();")
                     self._frame_ended_early = True
-                if hasattr(self, '_pp_arrays') and self._pp_arrays:
+                if shadows:
+                    # Narrow the authoritative f64 buffers into the f32
+                    # render shadows (device-side: correct for both
+                    # GPU-kernel-written and host-uploaded sources).
+                    self._put("/* f64 -> f32 render shadow conversion */")
+                    _pp = getattr(self, '_pp_arrays', set())
+                    for arr in shadows:
+                        _off = ("(size_t)_pp_wr_offset * sizeof(double)"
+                                if arr in _pp else "0")
+                        self._put(f"ergo_vk_convert_f32(d_{arr}, {_off}, "
+                                  f"d_r{arr}, {count});")
+                elif hasattr(self, '_pp_arrays') and self._pp_arrays:
                     self._put(f"ergo_vk_set_render_offset("
                               f"(size_t)_pp_wr_offset * sizeof(float));")
                 # Meshlet/grid alternates reference the FDTD grid
@@ -1849,8 +1892,8 @@ class IRCodeGen:
                     self._put(f"if (getenv(\"ERGO_RENDER\") && "
                               f"strcmp(getenv(\"ERGO_RENDER\"), \"meshlet\") == 0)")
                     self._put(f"  ergo_vk_render_meshlets("
-                              f"d_{particle['pos_x']}, d_{particle['pos_y']}, "
-                              f"d_{particle['pos_z']}, _color_buf, {count}, "
+                              f"{_pfx}{particle['pos_x']}, {_pfx}{particle['pos_y']}, "
+                              f"{_pfx}{particle['pos_z']}, _color_buf, {count}, "
                               f"d_GRID_GRAD_X, d_GRID_GRAD_Y, "
                               f"d_GRID_GRAD_Z, d_GRID_MET_GATE, "
                               f"GRID_SIZE, _vmin, _vmax, {ws});")
@@ -1866,13 +1909,13 @@ class IRCodeGen:
                     self._put(f"if (getenv(\"ERGO_RENDER\") && "
                               f"strcmp(getenv(\"ERGO_RENDER\"), \"gauss\") == 0)")
                 self._put(f"  ergo_vk_render_gaussians("
-                          f"d_{particle['pos_x']}, d_{particle['pos_y']}, "
-                          f"d_{particle['pos_z']}, _color_buf, "
+                          f"{_pfx}{particle['pos_x']}, {_pfx}{particle['pos_y']}, "
+                          f"{_pfx}{particle['pos_z']}, _color_buf, "
                           f"{count}, 0.003f, _vmin, _vmax, {ws});")
                 self._put(f"else")
                 self._put(f"  ergo_vk_render_points("
-                          f"d_{particle['pos_x']}, d_{particle['pos_y']}, "
-                          f"d_{particle['pos_z']}, _color_buf, "
+                          f"{_pfx}{particle['pos_x']}, {_pfx}{particle['pos_y']}, "
+                          f"{_pfx}{particle['pos_z']}, _color_buf, "
                           f"{count}, 3.0f, _vmin, _vmax, {ws});")
             elif self.render:
                 # ── Grid / heightfield rendering ──
@@ -4152,6 +4195,23 @@ class IRCodeGen:
             else:
                 self._put(f"ErgoVkBuf d_{arr} = ergo_vk_create_buffer("
                           f"{sz}); /* scalar fallback */")
+        # f32 render shadow buffers (f64 + --render particle path; see
+        # _render_f32_shadows).  Same element count as the authoritative
+        # f64 buffer, float stride.
+        if self.render:
+            _sh_particle = self._detect_particle_soa()
+            _shadows = self._render_f32_shadows(_sh_particle)
+            if _shadows:
+                self._put("/* f32 render shadow buffers (f64 build) */")
+                for arr in _shadows:
+                    dims = []
+                    for d in self._array_shapes[arr]:
+                        expr = self._dim_expr(d)
+                        dims.append("CAPACITY" if expr == "MAXPART" else expr)
+                    size_expr = " * ".join(dims)
+                    self._put(f"ErgoVkBuf d_r{arr} = ergo_vk_create_buffer("
+                              f"{size_expr} * sizeof(float));")
+                self._put("")
         if pp_arrays:
             # Pre-swapped: first frame_begin swap flips to rd=0, wr=N
             # so frame 1 reads offset 0 (where the initial upload landed)
@@ -4303,6 +4363,18 @@ class IRCodeGen:
                     self._put(f"ErgoVkBuf d_{arr} = ergo_vk_create_buffer("
                               f"{size_expr} * {sz});")
             self._put("")
+            # f32 render shadow buffers (f64 build; see _render_f32_shadows)
+            _shadows = self._render_f32_shadows(particle)
+            if _shadows:
+                self._put("/* f32 render shadow buffers (f64 build) */")
+                for arr in _shadows:
+                    shape = self._array_shapes.get(arr)
+                    if shape:
+                        size_expr = " * ".join(
+                            self._dim_expr(d) for d in shape)
+                        self._put(f"ErgoVkBuf d_r{arr} = ergo_vk_create_buffer("
+                                  f"{size_expr} * sizeof(float));")
+                self._put("")
         else:
             # Grid-based: find best REAL array and create one buffer
             render_arr = None

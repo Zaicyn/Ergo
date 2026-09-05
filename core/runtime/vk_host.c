@@ -241,6 +241,7 @@ static struct {
     VkSwapchainKHR           swapchain;
     VkFormat                 sc_format;
     VkExtent2D               sc_extent;
+    int                      win_w, win_h;  /* requested window size */
     VkImage                  sc_images[ERGO_VK_MAX_SWAPCHAIN];
     VkImageView              sc_views[ERGO_VK_MAX_SWAPCHAIN];
     VkFramebuffer            sc_fbs[ERGO_VK_MAX_SWAPCHAIN];
@@ -480,7 +481,16 @@ int ergo_vk_init(int headless) {
         }
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
         glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-        g.window = glfwCreateWindow(1280, 720, "Ergo", NULL, NULL);
+        /* Square by default (2026-09-04): a 16:9 window adds an aspect
+         * variable to every visual read; the projection compensates
+         * correctly (mat4_perspective m[0] = f/aspect over the actual
+         * framebuffer extent), but a square frame removes the variable
+         * entirely.  ERGO_WIN=WxH overrides (e.g. a grid multiple so one
+         * render cell is an integer number of lattice units). */
+        g.win_w = 800; g.win_h = 800;
+        { const char *_we = getenv("ERGO_WIN");
+          if (_we) sscanf(_we, "%dx%d", &g.win_w, &g.win_h); }
+        g.window = glfwCreateWindow(g.win_w, g.win_h, "Ergo", NULL, NULL);
         if (!g.window) {
             fprintf(stderr, "ergo_vk: window creation failed\n");
             glfwTerminate();
@@ -1305,6 +1315,79 @@ void ergo_vk_upload_at(ErgoVkBuf buf, const void *data, size_t offset, size_t si
     xfer_submit_and_wait();
 }
 
+/* f64 -> f32 narrowing copy into a dedicated render buffer (device-side,
+ * so it is correct whether the source was last written by a GPU kernel
+ * or a host upload).  The particle render shaders read f32 SoA buffers;
+ * in f64 builds the authoritative buffers are doubles, and reading them
+ * as f32 splits every double into two garbage floats — the square-ring
+ * quantization pile (vesicle_printer_gpu, 2026-09-04).  src_off is the
+ * ping-pong read offset in BYTES (0 for non-ping-pong sources).
+ *
+ * Channel note (2026-09-05): this dispatches on the XFER command
+ * buffer/fence, never via ergo_vk_dispatch.  ergo_vk_dispatch resets and
+ * reuses g.cmd_buf/g.fence — the current frame slot — which is illegal
+ * where codegen emits this call: right after frame_end, when the frame
+ * is submitted and possibly still executing (windowed frame_wait is a
+ * no-op by design).  Resetting an in-flight cmd_buf wedged the frame
+ * accounting and stalled the process at end-of-run teardown.  The xfer
+ * channel is documented "safe to use during frame recording" and
+ * host-blocks on its own fence, so conversions are complete before the
+ * render call that follows. */
+void ergo_vk_convert_f32(ErgoVkBuf src, size_t src_off,
+                         ErgoVkBuf dst, int count) {
+#if !defined(ERGO_VK_HEADLESS_ONLY) && !defined(ERGO_VK_ANDROID)
+    if (!g.device || count <= 0) return;
+    static int conv_ready = 0;
+    static ErgoVkPipe conv_pipe;
+    if (!conv_ready) {
+        conv_pipe = ergo_vk_load_shader(convert_f64_f32_comp_spv,
+                                        convert_f64_f32_comp_spv_size,
+                                        2, sizeof(int));
+        conv_ready = 1;
+    }
+    PipeSlot *p = &g.pipes[conv_pipe];
+    BufSlot *s = &g.bufs[src];
+    BufSlot *d = &g.bufs[dst];
+    /* This pipe is dispatched only through the one-shot xfer channel, so
+     * binding BOTH descriptor slots is safe (no frame cmd buf can be
+     * referencing them — xfer_submit_and_wait always drains).  src needs
+     * an explicit byte offset (ping-pong), so write both descriptors
+     * by hand. */
+    for (int sl = 0; sl < 2; sl++) {
+        VkDescriptorBufferInfo infos[2] = {
+            { s->buffer, src_off, s->size - src_off },
+            { d->buffer, 0, d->size },
+        };
+        VkWriteDescriptorSet writes[2] = {0};
+        for (int b = 0; b < 2; b++) {
+            writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[b].dstSet = p->ds[sl];
+            writes[b].dstBinding = (uint32_t)b;
+            writes[b].descriptorCount = 1;
+            writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[b].pBufferInfo = &infos[b];
+        }
+        vkUpdateDescriptorSets(g.device, 2, writes, 0, NULL);
+    }
+    VkCommandBufferBeginInfo begin = {0};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkResetCommandBuffer(g.xfer_cmd_buf, 0));
+    VK_CHECK(vkBeginCommandBuffer(g.xfer_cmd_buf, &begin));
+    vkCmdBindPipeline(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      p->pipeline);
+    vkCmdBindDescriptorSets(g.xfer_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            p->layout, 0, 1, &p->ds[0], 0, NULL);
+    vkCmdPushConstants(g.xfer_cmd_buf, p->layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int), &count);
+    vkCmdDispatch(g.xfer_cmd_buf, (uint32_t)((count + 255) / 256), 1, 1);
+    VK_CHECK(vkEndCommandBuffer(g.xfer_cmd_buf));
+    xfer_submit_and_wait();
+#else
+    (void)src; (void)src_off; (void)dst; (void)count;
+#endif
+}
+
 /* ── Compute pipeline (unchanged from Phase B) ──────────── */
 
 ErgoVkPipe ergo_vk_load_shader(const void *spirv, size_t spirv_size,
@@ -1799,7 +1882,8 @@ static void render_create_swapchain(void) {
      * currentExtent than what was requested; use glfwGetFramebufferSize
      * as the authoritative source and clamp to surface limits. */
     {
-        int fb_w = 1280, fb_h = 720;
+        int fb_w = g.win_w > 0 ? g.win_w : 800;
+        int fb_h = g.win_h > 0 ? g.win_h : 800;
 #ifndef ERGO_VK_ANDROID
         if (!g.headless && g.window)
             glfwGetFramebufferSize(g.window, &fb_w, &fb_h);

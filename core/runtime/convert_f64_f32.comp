@@ -1,0 +1,27 @@
+#version 460
+#extension GL_ARB_gpu_shader_fp64 : require
+
+/*
+ * convert_f64_f32.comp — narrowing copy for render buffers.
+ *
+ * In f64 builds the simulation/authoritative buffers are doubles, but
+ * the particle render shaders (render_points.vert, render_gauss.vert)
+ * read f32 SoA buffers.  Reading the f64 buffer as f32 splits every
+ * double into two half-precision garbage floats — the "square ring"
+ * quantization pile (vesicle_printer_gpu, 2026-09-04).  This shader
+ * fills dedicated f32 render buffers from the f64 source on-device, so
+ * it works whether the source was last written by a GPU kernel or by a
+ * host upload.  OpFConvert f64->f32 is IEEE RNE — deterministic.
+ */
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer In { double d[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float f[]; };
+layout(push_constant) uniform PC { int count; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.count)) return;
+    f[i] = float(d[i]);
+}

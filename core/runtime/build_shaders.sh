@@ -22,6 +22,7 @@ glslc -fshader-stage=compute  -I . atlas_gen.comp     -o atlas_gen.comp.spv
 glslc -fshader-stage=vertex   render_octa_points.vert -o render_octa_points.vert.spv
 glslc -fshader-stage=vertex   render_meshlet.vert     -o render_meshlet.vert.spv
 glslc -fshader-stage=fragment -I . render_meshlet.frag -o render_meshlet.frag.spv
+glslc -fshader-stage=compute  convert_f64_f32.comp    -o convert_f64_f32.comp.spv
 
 echo "Generating render_shaders.h..."
 python3 -c "
@@ -72,6 +73,8 @@ header += '\n\n'
 header += emit_array('render_meshlet_vert_spv', 'render_meshlet.vert.spv')
 header += '\n\n'
 header += emit_array('render_meshlet_frag_spv', 'render_meshlet.frag.spv')
+header += '\n\n/* ── f64->f32 render-buffer conversion ── */\n\n'
+header += emit_array('convert_f64_f32_comp_spv', 'convert_f64_f32.comp.spv')
 header += '\n\n#endif /* ERGO_RENDER_SHADERS_H */\n'
 
 with open('render_shaders.h', 'w') as f:

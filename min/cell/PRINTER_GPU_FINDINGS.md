@@ -158,6 +158,85 @@ NACT ≤ 2·NMAX = 640 = NB exactly, NINC ≤ 64 = NINCM exactly — zero
 slack by construction). No fixes needed; `min/cell/` integration copy
 is clean.
 
+## The square-ring fix (2026-09-05, user report: "ring prints as a square
+## with rounded corners")
+
+**Mechanism (confirmed):** the particle render shaders
+(`render_points.vert`, `render_gauss.vert`) declare **f32** SoA buffers,
+but in an f64 build the device buffers are created with
+`sizeof(double)` — the shader reads each double's 8 bytes as two
+floats, quantizing every position to a few stacked garbage values: the
+"circle" collapsed into L-shaped corner fragments. (The grid/heightfield
+path was never affected — `render.vert` reads `float64_t`.) Projection,
+camera, and the +999-park were all re-verified innocent on the way
+(exact camera math over blueprint data projects to a clean ellipse;
+live mid-print frames showed corners while host data at the same step
+was a smooth arc).
+
+**Fix (compiler-owned, render path only):** dedicated f32 render shadow
+buffers + a device-side narrowing kernel:
+- `core/runtime/convert_f64_f32.comp` (new): one-in/one-out f64→f32
+  compute shader (OpFConvert, IEEE RNE), embedded by
+  `build_shaders.sh` into `render_shaders.h`.
+- `core/runtime/vk_host.c`: `ergo_vk_convert_f32(src, src_off, dst,
+  count)` — one-shot dispatch on the **xfer** command channel (see the
+  stall note below). Declared in `ergo_vk.h`.
+- `core/ir_codegen.py`: `_render_f32_shadows()` decides the shadow set
+  (render arrays + every GPU-resident REAL array with POS_X's shape —
+  the ERGO_COLOR candidates); `_emit_gpu_init` and
+  `_emit_render_only_init` allocate `d_r<name>` f32 buffers in f64
+  `--render` builds; the particle render site narrows the authoritative
+  f64 buffers into the shadows right after frame_end/frame_wait and
+  points the render calls at the shadows. Device-side conversion (not a
+  host round-trip) because the authoritative data may live on-device —
+  RENDER_COPY itself is an extracted GPU kernel here. f32 builds are
+  unchanged (buffers are natively f32, no shadows).
+
+**End-of-run stall found + fixed on the way (2026-09-05, user report):
+**the first cut of `ergo_vk_convert_f32` dispatched via
+`ergo_vk_dispatch`, which resets and reuses `g.cmd_buf`/`g.fence` — the
+current frame slot. Codegen emits the conversion right after
+`frame_end`, when that frame is submitted and possibly still executing
+(windowed `frame_wait` is a deliberate no-op). Resetting an in-flight
+command buffer wedged the frame accounting; the process never exited
+(reproduced: timeout-killed at 300 s, rc=124). Fixed by moving the
+conversion to the xfer channel (documented "safe during frame
+recording", host-blocks on its own fence). After the fix the GPU+render
+build runs all 14000 steps and exits rc=0.
+
+**Square window + aspect verification:** the window is now 800×800 by
+default (`ERGO_WIN=WxH` overrides — e.g. a grid multiple so one render
+cell is an integer number of lattice units), and the swapchain-extent
+fallback follows the requested size. The projection's aspect
+compensation was verified correct while there: `mat4_perspective` sets
+m[0] = f/aspect over the actual framebuffer extent from
+`glfwGetFramebufferSize` — a 16:9 window never squashed; the square
+window removes the variable from visual reads regardless.
+
+**Evidence (captures, X11 `import` on the GLFW window; face-on camera
+`ERGO_CAM=0,0.1,1.5`, `ERGO_ORBIT=0`):**
+- pre: `/tmp/full1_zoom.png` (old build) — the ring collapsed into
+  scattered L-corner fragments; circle fit residual RMS 34.1 px =
+  **32.9% of R**, whole 30° sectors empty, bin radii −55/+44 px.
+- post mid-print: `/tmp/fix2_early.png` — a clean circular arc
+  (printing head at the bright end).
+- post near-closed ring: `/tmp/fix2_mid.png` — all 12 angle bins
+  populated, radii within ±6 px of R=207.7 (±3%), fit residual RMS
+  5.2% of R (sprite rasterization + the designed azimuthal wobble, not
+  quantization).
+- post post-shrink shell: `/tmp/fix2_shell.png` — the closed vesicle,
+  compact rounded shell face-on.
+- user-confirmed live: rings spread into a proper membrane shape;
+  camera rotate + mouse-suspend of the auto-orbit exercised.
+
+**Numerics untouched:** render-only build (CPU physics + display)
+stdout byte-identical to the CPU reference across all 14000 steps;
+GPU+render build byte-identical to the headless GPU build on every
+step/FPOS line; headless GPU double-run byte-identical. (GPU-vs-CPU
+physics bit-identity was never the claim for this program — the GPU
+trajectory is its own numerics track, moved once more by the trig32
+core landing f28e9ab, whose SIN now matches the CPU kernel.)
+
 ## The corner-pile fix (2026-09-04, user report)
 
 The first working render showed point tracers piling onto a spot
@@ -224,20 +303,29 @@ python -m core min/cell/vesicle_printer_gpu.ergo --target spirv --render \
     -o /tmp/vprt_gpu    # GPU compute + display (galaxy's route)
 ERGO_ORBIT=0 /tmp/vprt_ro   # hold the camera still
 ERGO_ORBIT=20 /tmp/vprt_ro  # faster spin (deg/s)
+ERGO_CAM=0,0.1,1.5 /tmp/vprt_ro  # face-on to the rings (az,el,dist)
+ERGO_WIN=1024x1024 /tmp/vprt_ro  # override the square window size
 ```
 
-Window: 1280x720, orbit camera (mouse drag/scroll). Colors: COLR 0 =
+Window: 800x800 square by default (ERGO_WIN=WxH overrides), orbit
+camera (mouse drag/scroll). Colors: COLR 0 =
 head (dark), 1 = tail (bright), 2 = inclusion. The show: two rings
 print codon-by-codon (steps 0-3200), march inward (3200-7200), anchors
 release (7200-10200), cargo seats (10200-10700), free closed shell to
-14000. Headless capture: the render path has none; evidence here was
-X11 `scrot` + PIL occupancy analysis.
+14000, then the program EXITS CLEANLY (rc=0). Headless capture: the
+render path has none; evidence here was
+X11 `scrot`/`import` + PIL/circle-fit analysis.
 
 ## Files
 
 - `min/cell/vesicle_printer_gpu.ergo` — the render build (compact
   packing, runtime NPART; CPU-verified: byte-identical to the stack
   variant, deterministic double-run, GPU-tracked through the march).
+- `core/runtime/convert_f64_f32.comp` + `ergo_vk_convert_f32`
+  (vk_host.c/ergo_vk.h) + `_render_f32_shadows` (ir_codegen.py) — the
+  f32 render shadow-buffer fix (2026-09-05); vk_host.c also carries the
+  square-window default + ERGO_WIN and the xfer-channel conversion
+  (end-of-run stall fix).
 - `min/cell/mre_render_only_particles.ergo` — B2 MRE (gate copy:
   `tests/render_only_particles.ergo`).
 - `min/cell/mre_sub_orientations.ergo` — spirv SUB-orientation probe

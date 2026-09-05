@@ -98,6 +98,16 @@ void ergo_vk_download_multi(const ErgoVkBuf *bufs, void * const *dsts,
  */
 void ergo_vk_upload_at(ErgoVkBuf buf, const void *data, size_t offset, size_t size);
 
+/*
+ * Device-side f64 -> f32 narrowing copy: dst[i] = (float)src[i], i < count.
+ * Fills a dedicated f32 render buffer from an f64 authoritative buffer
+ * (f64 builds only; the particle render shaders read f32).  src_off is
+ * the ping-pong read offset in bytes, 0 for ordinary buffers.  Emitted
+ * by ir_codegen.py render sites — not for direct program use.
+ */
+void ergo_vk_convert_f32(ErgoVkBuf src, size_t src_off,
+                         ErgoVkBuf dst, int count);
+
 /* ── Compute pipeline ────────────────────────────────────── */
 
 /*
