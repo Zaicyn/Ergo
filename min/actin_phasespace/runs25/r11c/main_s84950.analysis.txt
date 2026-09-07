@@ -1,0 +1,23 @@
+== main_s84950.log SEVSTEP=500
+BOOKS: censuses=2000 myoa=1202 myor=1194 myost=41391 xlka=4029 xlkr=4027 adha=271 adhr=271 sfa=5221 sfr=5217 sev=0 netf_max=0.000e+00 NUL=0 FINAL=True
+  myor causes={1: 1113, 2: 55, 3: 25, 6: 1} xlkr causes={1: 2917, 2: 1098, 3: 12}
+  myost sign (range): {'L_ok': 12407, 'L_bad': 12493, 'R_ok': 8393, 'R_bad': 8098}  nfil_big_jumps=[]
+  nfil: first=6 last=6 min=6 max=6
+O-S3 end0: post(>=4000) windows=1993 bonded_windows=234 (11.7%) event_duty=0.116 nb_mean=0.12
+  trx all windows: mean=-0.000 med=0.000 [0.000,0.000]
+  trx bonded windows: n=234 mean=-0.056 med=0.008 [-1.720,1.427]
+  fmag bonded: mean=2.019 med=1.967
+O-S3 end1: post(>=4000) windows=1993 bonded_windows=1972 (98.9%) event_duty=3.953 nb_mean=3.94
+  trx all windows: mean=-0.278 med=-0.509 [-3.421,3.314]
+  trx bonded windows: n=1972 mean=-0.271 med=-0.491 [-3.423,3.318]
+  fmag bonded: mean=2.060 med=2.047
+O-S3 tension post: mean=10.307 med=8.890 [1.077,20.858] min=-2.121 max=58.394 (note: includes erratum-5 0.42/motor preload, ~2.5 total at 3 motors)
+  tension>0 fraction: 1880/1993
+O-S2: (a) bond-assembly latency = 500 (window end step); (b) contractile equilibration (flen<1.0 x3 windows) = 8500
+O-S4: post windows w/ links+motors: xl_in_myo_region=5823 xl_outside=216; mean region x-len=6529.3 outside=289.2; density in=0.892 out=0.747 (links/unit-x); same-half links (buckled local-axis accepts)=1599; bpol gate violations=0
+O-S5 flen post: mean=-0.002 med=-0.013 [-1.173,1.290] range=[-3.151,3.324]
+O-S5 drift: tension mean first-half=11.050 second-half=9.565; flen first-half=0.240 second-half=-0.244
+O-S5 turnover per 1k steps (post): myosin=1.18 xlink=4.03 sfadh=5.19
+O-S5 nbound post: mean=329.0 [310,346] range=[198,358] (npoly drift proxy)
+O-S6: no sever (main arm)
+BOOKS PASS
