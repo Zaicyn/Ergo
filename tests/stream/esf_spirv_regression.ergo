@@ -1,0 +1,23 @@
+! Regression test for the static-buffer issue in ergo_stream.h.
+! A 4 KB automatic array in a static inline header function corrupted
+! the host stack in f32 SPIR-V builds, causing ul18_stag5.ergo to hang
+! before frame 1. This test forces inclusion of ergo_stream.h and a
+! GPU-extractable loop, then verifies the program completes.
+
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: N = 1024
+INTEGER :: I, CH
+STATIC REAL :: A(1024)
+STATIC INTEGER :: BUF(1017)
+
+DO I = 1, N
+  A(I) := REAL(I) * 0.1
+ENDDO
+
+CALL ESF_OPEN(8, "tests/stream/out/esf_spirv_regression.esf", 1)
+CH := ESF_NEXT(8)
+CALL ESF_WRITE(8, CH, BUF, 1017)
+CALL ESF_CLOSE(8)
+
+WRITE(*, "('OK ESF_SPIRV_REGRESSION')")

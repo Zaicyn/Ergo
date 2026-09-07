@@ -122,9 +122,12 @@ __pycache__/
 *.spv
 *.o
 *.so
+*.zip
+*.png
 
 # Hard ban, kept last so no whitelist rule above can override it:
 # reference PDFs live in the tree for reading but never enter git.
 *.pdf
+
 
 reference/
