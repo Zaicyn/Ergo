@@ -1,0 +1,1401 @@
+! VESICLE_PRINTER — Project CELL, milestone M2: codon-driven 3-type printer
+! =====================================================================
+! A scripted print head reads REAL Syn3 tapes and emits monomers onto a
+! blueprint (ring or bilayer patch). Three monomer types, selected by the
+! functional class of the tape being read (classifier-validated classes):
+!   TAPEA = acpA (Lipid class, 73 codons)   -> species A amphiphile
+!   TAPEB = sepF (Membrane class, 138)      -> species B amphiphile
+!   TAPET = crr  (Transport class, 154)     -> inclusion bead (PtsG-like)
+! Print program PROG: emission k reads tape PROG(MOD(k,10)+1)
+! (5 A : 4 B : 1 inclusion per decade). Codon pole (c/32) selects the
+! leaflet, ring (MOD(c,32)) wobbles the azimuth by WW*w(c) with
+! w(c) = +- (1/3) sin(5 * 2 pi ring / 32)  (sign = + for pole 0).
+!
+! Printed monomers carry anchor springs (KANC) to their blueprint site;
+! anchors release linearly over NDECAY steps after the last emission
+! (the rail schedule made concrete: print -> gated release -> free
+! dynamics). Emission cadence K_EMIT steps per codon.
+!
+! Physics: M1 optimized force field, generalized to two amphiphile
+! species via per-bead sigma (Lorentz combining, HT shifted -0.10 so
+! species A is IDENTICAL to the validated M1 baseline) and per-amph
+! bond length. Bending defaults to the certified nematic (BENDMODE=1)
+! because a printed bilayer has antiparallel leaflets. Inclusion bead:
+! LJ attraction to tails (hydrophobic belt), WCA to heads/inclusions.
+!
+! Mirror: min/cell/printer_mirror.py (FD-validated; cert oracles:
+! patch EP_BEND = -1189.5 exactly at the blueprint).
+!
+! Modes:
+!   PRINTMODE = 1 ring (NMONO 64, R 12) / 2 patch (NMONO 144, 12x12)
+!               3 shrink: ring print -> anchor sites march inward
+!               RING_R -> SHRINK_R_END over N_SHRINK steps -> release
+!               (M3 cheap closure; use NSTEPS >= 12000)
+!   MIRROR = 1  emit all monomers statically, one force pass, dump
+!               CFG/FRC/CERT rows to stdout, STOP (cert vs mirror)
+!
+! CPU:  python -m core min/cell/vesicle_printer.ergo -o /tmp/vprt
+! =====================================================================
+
+IMPLICIT NONE
+
+! ── Population / box ────────────────────────────────────────
+PARAMETER INTEGER :: NMAX = 320
+PARAMETER INTEGER :: NB = 640              ! 2 * NMAX
+PARAMETER INTEGER :: NINCM = 64
+PARAMETER REAL :: LBOX = 36.0
+! ── Bead-level cell list (pair forces) ──────────────────────
+PARAMETER REAL :: RC = 2.6
+PARAMETER INTEGER :: NC = 13
+PARAMETER REAL :: CE = 2.7692307692307692
+PARAMETER INTEGER :: NCELL = 2197
+PARAMETER INTEGER :: MAXNBR = 1024
+PARAMETER INTEGER :: NSLOT = 655360        ! NB * MAXNBR
+! ── Amph-level cell list (bending) ──────────────────────────
+PARAMETER REAL :: RB = 2.6
+PARAMETER INTEGER :: NC2 = 13
+PARAMETER REAL :: CE2 = 2.7692307692307692
+PARAMETER INTEGER :: NCELL2 = 2197
+PARAMETER INTEGER :: MAXNB2 = 256
+PARAMETER INTEGER :: NSLOT2 = 81920        ! NMAX * MAXNB2
+! ── Force parameters ────────────────────────────────────────
+PARAMETER REAL :: SIG = 1.0                ! TAIL-TAIL sigma/epsilon
+PARAMETER REAL :: RCTT = 2.6
+PARAMETER REAL :: HSA = 1.05               ! species A head sigma
+PARAMETER REAL :: HSB = 0.95               ! species B head sigma
+PARAMETER REAL :: HTSHIFT = 0.10           ! HT sigma = comb - shift
+PARAMETER REAL :: C216 = 1.122462048309373 ! 2^(1/6)
+PARAMETER REAL :: KBOND = 100.0
+PARAMETER REAL :: R0A = 0.5
+PARAMETER REAL :: R0B = 0.45
+PARAMETER REAL :: KAL = 1.5
+PARAMETER INTEGER :: BENDMODE = 1          ! 1 = nematic q^2, 0 = polar
+! ── Inclusion (transmembrane protein) ───────────────────────
+PARAMETER REAL :: SIG_IT = 1.3             ! inclusion-tail LJ (attractive)
+PARAMETER REAL :: SIG_IH = 1.3             ! inclusion-head WCA
+PARAMETER REAL :: SIG_II = 1.5             ! inclusion-inclusion WCA
+PARAMETER REAL :: RCINC = 2.6
+! ── Printer ─────────────────────────────────────────────────
+PARAMETER INTEGER :: PRINTMODE = 4         ! 1 = ring, 2 = patch
+PARAMETER INTEGER :: NMONO = 128
+PARAMETER INTEGER :: K_EMIT = 25           ! steps per codon
+PARAMETER INTEGER :: NDECAY = 3000         ! anchor release ramp
+PARAMETER REAL :: KANC = 50.0              ! anchor spring
+PARAMETER REAL :: WW = 0.02                ! codon wobble amplitude (rad)
+PARAMETER REAL :: RING_R = 12.0
+PARAMETER INTEGER :: RING_N = 64
+! M3 cheap closure (PRINTMODE = 3): ring print, then anchor sites march
+! inward RING_R -> SHRINK_R_END over N_SHRINK steps at full KANC, then the
+! usual NDECAY release. The bilayer keeps its material; the shrinking
+! circumference must buckle out of plane. Geometry self-aligns — no
+! Helfrich machinery.
+PARAMETER REAL :: SHRINK_R_END = 3.0
+PARAMETER INTEGER :: N_SHRINK = 4000
+! M3b (PRINTMODE = 4): two 64-site rings at z = cz +- RING_HZ, emission k
+! alternates rings (MOD(k,2)), site index k/2. Seam gap 2.5 sits just
+! inside the tail LJ range. Inclusions ride ZI outward of their ring
+! plane (docking pose): same-plane printing puts the nearest belt tails
+! at d ~ 1.0, inside the IT LJ core -> capped forces, FD-invalid.
+PARAMETER REAL :: RING_HZ = 1.25
+PARAMETER REAL :: ZI = 0.7
+! Inclusions ride the rail at full KANC through print AND shrink (marching
+! with the scaffold, at their ring's plane z), then release over N_SEAT
+! into the closed structure's belt — dock after closure. (Early release
+! loses them: the ring marches inward faster than the IT attraction drags.)
+PARAMETER INTEGER :: N_SEAT = 500
+PARAMETER INTEGER :: PATCH_N = 12
+PARAMETER REAL :: PATCH_SP = 1.15
+PARAMETER REAL :: PATCH_Z = 0.55
+! ── Dynamics ────────────────────────────────────────────────
+PARAMETER REAL :: DT = 0.002
+PARAMETER REAL :: GAMMA = 0.5
+PARAMETER REAL :: GAMMA_HOT = 10.0
+PARAMETER REAL :: FCAP = 500.0
+PARAMETER REAL :: XWALL = 0.5
+PARAMETER REAL :: KWALL = 100.0
+PARAMETER REAL :: KT = 0.2
+PARAMETER INTEGER :: NSTEPS = 8000
+PARAMETER INTEGER :: NDIAG = 250
+PARAMETER INTEGER :: SEED = 77031
+! ── Modes ───────────────────────────────────────────────────
+PARAMETER INTEGER :: MIRROR = 1
+! ── Closure/thickness analysis ──────────────────────────────
+PARAMETER INTEGER :: NDIR = 162
+PARAMETER INTEGER :: NRB = 64
+PARAMETER REAL :: PHI_G = 2.39996322972865332
+! ── Tape sizes ──────────────────────────────────────────────
+PARAMETER INTEGER :: LENA = 73
+PARAMETER INTEGER :: LENB = 138
+PARAMETER INTEGER :: LENT = 154
+
+! ── 27-cell stencil ─────────────────────────────────────────
+STATIC INTEGER :: OX(27), OY(27), OZ(27)
+DATA OX / -1, 0, 1, -1, 0, 1, -1, 0, 1, &
+          -1, 0, 1, -1, 0, 1, -1, 0, 1, &
+          -1, 0, 1, -1, 0, 1, -1, 0, 1 /
+DATA OY / -1, -1, -1, 0, 0, 0, 1, 1, 1, &
+          -1, -1, -1, 0, 0, 0, 1, 1, 1, &
+          -1, -1, -1, 0, 0, 0, 1, 1, 1 /
+DATA OZ / -1, -1, -1, -1, -1, -1, -1, -1, -1, &
+           0, 0, 0, 0, 0, 0, 0, 0, 0, &
+           1, 1, 1, 1, 1, 1, 1, 1, 1 /
+
+! ── Syn3 tapes (boundary-aware extraction, stop codons dropped) ──
+STATIC INTEGER :: TAPEA(LENA), TAPEB(LENB), TAPET(LENT)
+DATA TAPEA / 6, 45, 5, 17, 1, 48, 5, 37, 0, 32, 20, 0, &
+       9, 8, 41, 45, 2, 41, 1, 5, 12, 0, 33, 11, &
+       32, 23, 0, 29, 52, 41, 20, 33, 29, 20, 35, 20, &
+       6, 33, 6, 36, 37, 12, 20, 32, 32, 0, 20, 1, &
+       5, 8, 7, 9, 33, 35, 48, 20, 52, 11, 20, 57, &
+       13, 5, 33, 33, 20, 20, 0, 39, 4, 34, 32, 20, &
+       48 /
+DATA TAPEB / 6, 21, 21, 0, 2, 0, 2, 1, 21, 21, 0, 48, &
+       3, 32, 48, 33, 48, 33, 48, 5, 32, 52, 32, 20, &
+       13, 33, 29, 33, 5, 21, 32, 48, 32, 9, 61, 37, &
+       20, 0, 33, 9, 17, 13, 50, 12, 29, 1, 48, 21, &
+       1, 48, 1, 49, 48, 12, 1, 13, 28, 1, 6, 3, &
+       48, 13, 33, 6, 1, 0, 9, 61, 5, 3, 13, 17, &
+       36, 21, 9, 61, 6, 0, 21, 29, 32, 37, 48, 28, &
+       5, 36, 33, 13, 20, 20, 33, 48, 0, 37, 37, 37, &
+       36, 33, 21, 0, 3, 20, 33, 33, 1, 0, 45, 0, &
+       57, 21, 0, 33, 21, 53, 29, 40, 37, 20, 17, 5, &
+       0, 0, 41, 32, 19, 7, 8, 53, 1, 32, 1, 5, &
+       17, 0, 21, 4, 5, 1 /
+DATA TAPET / 6, 24, 21, 21, 1, 0, 1, 20, 0, 37, 20, 45, &
+       61, 25, 33, 40, 0, 4, 5, 12, 20, 33, 32, 37, &
+       32, 33, 33, 37, 21, 8, 32, 8, 6, 20, 41, 33, &
+       40, 21, 44, 5, 17, 60, 12, 28, 3, 33, 21, 49, &
+       45, 60, 37, 9, 41, 0, 20, 36, 13, 45, 21, 60, &
+       12, 2, 49, 45, 21, 40, 5, 48, 12, 0, 1, 41, &
+       37, 32, 7, 20, 20, 49, 5, 41, 20, 33, 12, 36, &
+       9, 20, 33, 41, 1, 41, 21, 34, 28, 17, 36, 5, &
+       48, 33, 48, 32, 37, 1, 45, 40, 35, 0, 20, 36, &
+       13, 37, 33, 20, 48, 32, 36, 29, 0, 0, 37, 60, &
+       28, 5, 0, 29, 60, 7, 5, 21, 12, 3, 1, 41, &
+       40, 0, 13, 20, 32, 5, 36, 0, 6, 40, 32, 37, &
+       0, 0, 43, 33, 37, 37, 45, 5, 20, 0 /
+! print program: which tape each emission reads (0=A, 1=B, 2=inclusion)
+STATIC INTEGER :: PROG(10)
+DATA PROG / 0, 0, 1, 0, 1, 0, 0, 1, 0, 2 /
+
+! ── Bead state ──────────────────────────────────────────────
+STATIC REAL :: PX(NB), PY(NB), PZ(NB)
+STATIC REAL :: VX(NB), VY(NB), VZ(NB)
+STATIC REAL :: FX(NB), FY(NB), FZ(NB)
+STATIC REAL :: SIGB(NB)                    ! per-bead sigma
+STATIC REAL :: ANX(NB), ANY(NB), ANZ(NB)   ! anchor sites
+STATIC INTEGER :: HASA(NB)                 ! anchor flags
+STATIC REAL :: STH(NB), SROFF(NB)          ! blueprint azimuth / radial offset
+STATIC REAL :: SZ0(NB)                     ! blueprint plane z per bead
+STATIC REAL :: ISTH(NINCM), ISROFF(NINCM)  ! same for inclusions
+STATIC REAL :: ISZ0(NINCM)
+! ── Amph state ──────────────────────────────────────────────
+STATIC REAL :: AX(NMAX), AY(NMAX), AZ(NMAX), ALEN(NMAX)
+STATIC REAL :: CXA(NMAX), CYA(NMAX), CZA(NMAX), R0M(NMAX)
+STATIC REAL :: FBX(NMAX), FBY(NMAX), FBZ(NMAX)
+STATIC REAL :: SUMX(NMAX), SUMY(NMAX), SUMZ(NMAX)
+! ── Inclusion state ─────────────────────────────────────────
+STATIC REAL :: IPX(NINCM), IPY(NINCM), IPZ(NINCM)
+STATIC REAL :: IVX(NINCM), IVY(NINCM), IVZ(NINCM)
+STATIC REAL :: IFX(NINCM), IFY(NINCM), IFZ(NINCM)
+STATIC REAL :: IANX(NINCM), IANY(NINCM), IANZ(NINCM)
+! ── Bead cell list ──────────────────────────────────────────
+STATIC INTEGER :: CELLOF(NB), CELX(NB), CELY(NB), CELZ(NB)
+STATIC INTEGER :: CNT(NCELL), OFF(NCELL), CUR(NCELL), SORTEDB(NB)
+STATIC INTEGER :: NBR_I(NSLOT), NBR_J(NSLOT)
+STATIC REAL :: WCTT(NSLOT), WCHH(NSLOT), WCHT(NSLOT)
+! ── Amph cell list ──────────────────────────────────────────
+STATIC INTEGER :: CEL2OF(NMAX), CEL2X(NMAX), CEL2Y(NMAX), CEL2Z(NMAX)
+STATIC INTEGER :: CNT2(NCELL2), OFF2(NCELL2), CUR2(NCELL2), SORTED2(NMAX)
+STATIC INTEGER :: NBR2_I(NSLOT2), NBR2_J(NSLOT2)
+STATIC REAL :: W2(NSLOT2)
+! ── Diagnostics / analysis ──────────────────────────────────
+STATIC INTEGER :: ZT(NB)
+STATIC INTEGER :: TBIN(NDIR, NRB), HBIN(NDIR, NRB)
+STATIC REAL :: DIRX(NDIR), DIRY(NDIR), DIRZ(NDIR)
+STATIC REAL :: EEDGE_PEAK
+
+! ── Working scalars ─────────────────────────────────────────
+STATIC INTEGER :: I, J, K, STEP, OVERFLOW, MAXNB, NSUSED, SN
+STATIC INTEGER :: I2, J2, OVERFLOW2, MXNB2, NSUSED2
+STATIC INTEGER :: NACT, NAMPH, NINC, NEMIT, CURA, CURB, CURT
+STATIC INTEGER :: NPRINT, NPRINT2, NSH
+STATIC REAL :: KAC, RNOW, IAC
+STATIC REAL :: DX, DY, DZ, D, DD, MG, BR, B6, FM, CK
+STATIC REAL :: EP_PAIR, EP_BOND, EP_BEND, EP_INC, EP_ANCH, EP_WALL
+STATIC REAL :: EEDGE, RMEAN, RSTD, THICK, ROUT, RIN, T2, FMAX, ZSTD
+STATIC INTEGER :: NEXP, N1BAND, N0BAND, NMBAND, NOUT
+! ════════════════════════════════════════════════════════════
+! MAIN
+! ════════════════════════════════════════════════════════════
+
+NACT := 0
+NAMPH := 0
+NINC := 0
+NEMIT := 0
+CURA := 0
+CURB := 0
+CURT := 0
+NPRINT := NMONO * K_EMIT
+IF PRINTMODE = 3 .OR. PRINTMODE = 4 THEN
+  NSH := N_SHRINK
+ELSE
+  NSH := 0
+ENDIF
+NPRINT2 := NPRINT + NSH + NDECAY
+EEDGE_PEAK := 0.0
+
+WRITE(*, "# VESICLE_PRINTER M2 PRINTMODE=%d NMONO=%d KEMIT=%d KANC=%f BENDMODE=%d KT=%f") PRINTMODE, NMONO, K_EMIT, KANC, BENDMODE, KT
+
+IF MIRROR = 1 THEN
+  ! static certification: emit everything, one force pass, dump
+  DO K = 1, NMONO
+    CALL EMIT()
+  ENDDO
+  KAC := KANC
+  IAC := KANC
+  CALL CELL_BUILD()
+  CALL NBR_BUILD()
+  CALL FORCE_PAIR()
+  CALL BOND_AXES()
+  CALL CELL2_BUILD()
+  CALL NBR2_BUILD()
+  CALL ALIGN()
+  CALL APPLY_BB()
+  CALL INC_FORCE()
+  CALL ANCHORS()
+  CALL WALLS()
+  CALL CERT_ENERGY()
+  CALL DUMP_MIRROR()
+  STOP
+ENDIF
+
+DO STEP = 1, NSTEPS
+  ! anchor stiffness schedule: print -> shrink (full KANC) -> release
+  IF STEP ≤ NPRINT + NSH THEN
+    KAC := KANC
+  ELSE
+    KAC := KANC * MAX(0.0, 1.0 - REAL(STEP - NPRINT - NSH) / REAL(NDECAY))
+  ENDIF
+  ! inclusions: hold through print+shrink, dock after closure
+  IF STEP ≤ NPRINT + NSH THEN
+    IAC := KANC
+  ELSE
+    IAC := KANC * MAX(0.0, 1.0 - REAL(STEP - NPRINT - NSH) / REAL(N_SEAT))
+  ENDIF
+  ! M3: march anchor sites inward during the shrink phase
+  IF NSH > 0 THEN
+    IF STEP > NPRINT .AND. STEP ≤ NPRINT + NSH THEN
+      RNOW := RING_R + (SHRINK_R_END - RING_R) * REAL(STEP - NPRINT) / REAL(N_SHRINK)
+      CALL MARCH_ANCHORS()
+    ENDIF
+  ENDIF
+  CALL INTEGRATE()
+  IF NEMIT < NMONO THEN
+    IF MOD(STEP, K_EMIT) = 0 THEN
+      CALL EMIT()
+    ENDIF
+  ENDIF
+  IF NACT > 0 THEN
+    CALL CELL_BUILD()
+    CALL NBR_BUILD()
+    CALL FORCE_PAIR()
+    CALL BOND_AXES()
+    CALL CELL2_BUILD()
+    CALL NBR2_BUILD()
+    CALL ALIGN()
+    CALL APPLY_BB()
+  ENDIF
+  IF NINC > 0 THEN
+    CALL INC_FORCE()
+  ENDIF
+  CALL ANCHORS()
+  CALL WALLS()
+  IF MOD(STEP, NDIAG) = 0 .OR. STEP = NSTEPS THEN
+    CALL DIAG()
+  ENDIF
+ENDDO
+
+CALL ANALYZE_FINAL()
+STOP
+
+! ════════════════════════════════════════════════════════════
+! SUBROUTINES
+! ════════════════════════════════════════════════════════════
+
+! ── EMIT: read one codon, place one monomer at the head ─────
+! Site index = emission index (the head advances one site per codon,
+! regardless of monomer type). Codon pole selects leaflet, ring
+! wobbles azimuth by WW*w(c). Anchors freeze the printed monomer.
+SUBROUTINE EMIT()
+  INTEGER :: SEG, COD, POLE, RINGI, GX, GY, A2, KS, KR
+  REAL :: THT, WC, WOB, TH, RS, SGN, HOFF, BX0, BY0, BZ0, RH, CS, SS, ZPL
+  SEG := PROG(MOD(NEMIT, 10) + 1)
+  IF SEG = 0 THEN
+    COD := TAPEA(MOD(CURA, LENA) + 1)
+    CURA := CURA + 1
+  ELSEIF SEG = 1 THEN
+    COD := TAPEB(MOD(CURB, LENB) + 1)
+    CURB := CURB + 1
+  ELSE
+    COD := TAPET(MOD(CURT, LENT) + 1)
+    CURT := CURT + 1
+  ENDIF
+  POLE := COD / 32
+  RINGI := MOD(COD, 32)
+  THT := REAL(RINGI) * 0.19634954084936207
+  WC := 0.33333333333333333 * SIN(5.0 * THT)
+  IF POLE = 1 THEN
+    WC := 0.0 - WC
+  ENDIF
+  WOB := WW * WC
+  IF SEG = 2 THEN
+    ! ── inclusion bead occupies the current site ──
+    IF NINC ≥ NINCM THEN
+      RETURN
+    ENDIF
+    NINC := NINC + 1
+    IF PRINTMODE = 4 THEN
+      KS := NEMIT / 2
+      KR := MOD(NEMIT, 2)
+      TH := 6.2831853071795865 * REAL(KS) / REAL(RING_N) + WOB
+      IF KR = 0 THEN
+        ZPL := LBOX * 0.5 + RING_HZ + ZI
+      ELSE
+        ZPL := LBOX * 0.5 - RING_HZ - ZI
+      ENDIF
+      IPX(NINC) := LBOX * 0.5 + (RING_R - 0.5) * COS(TH)
+      IPY(NINC) := LBOX * 0.5 + (RING_R - 0.5) * SIN(TH)
+      IPZ(NINC) := ZPL
+      ISTH(NINC) := TH
+      ISROFF(NINC) := -0.5
+      ! march target sits in the belt (ring plane), not the outward ZI
+      ! print pose: the first march step slides it in.
+      IF KR = 0 THEN
+        ISZ0(NINC) := LBOX * 0.5 + RING_HZ
+      ELSE
+        ISZ0(NINC) := LBOX * 0.5 - RING_HZ
+      ENDIF
+    ELSEIF PRINTMODE ≠ 2 THEN
+      TH := 6.2831853071795865 * REAL(NEMIT) / REAL(RING_N) + WOB
+      IPX(NINC) := LBOX * 0.5 + (RING_R - 0.5) * COS(TH)
+      IPY(NINC) := LBOX * 0.5 + (RING_R - 0.5) * SIN(TH)
+      IPZ(NINC) := LBOX * 0.5
+      ISTH(NINC) := TH
+      ISROFF(NINC) := -0.5
+      ISZ0(NINC) := LBOX * 0.5
+    ELSE
+      GX := MOD(NEMIT, PATCH_N)
+      GY := MOD(NEMIT / PATCH_N, PATCH_N)
+      IPX(NINC) := LBOX * 0.5 + (REAL(GX) - 0.5 * REAL(PATCH_N - 1)) * PATCH_SP
+      IPY(NINC) := LBOX * 0.5 + (REAL(GY) - 0.5 * REAL(PATCH_N - 1)) * PATCH_SP
+      IPZ(NINC) := LBOX * 0.5
+    ENDIF
+    IVX(NINC) := 0.0
+    IVY(NINC) := 0.0
+    IVZ(NINC) := 0.0
+    IANX(NINC) := IPX(NINC)
+    IANY(NINC) := IPY(NINC)
+    IANZ(NINC) := IPZ(NINC)
+    NEMIT := NEMIT + 1
+    WRITE(*, "PRT %d inc %d cod %d pole %d") NEMIT, NINC, COD, POLE
+    RETURN
+  ENDIF
+  ! ── amphiphile ──
+  IF NAMPH ≥ NMAX THEN
+    RETURN
+  ENDIF
+  NAMPH := NAMPH + 1
+  A2 := NAMPH
+  IF SEG = 0 THEN
+    SIGB(2 * A2 - 1) := HSA
+    R0M(A2) := R0A
+  ELSE
+    SIGB(2 * A2 - 1) := HSB
+    R0M(A2) := R0B
+  ENDIF
+  SIGB(2 * A2) := 1.0
+  HOFF := 0.5 * R0M(A2)
+  IF POLE = 0 THEN
+    SGN := 1.0
+  ELSE
+    SGN := -1.0
+  ENDIF
+  IF PRINTMODE ≠ 2 THEN
+    IF PRINTMODE = 4 THEN
+      KS := NEMIT / 2
+      KR := MOD(NEMIT, 2)
+      TH := 6.2831853071795865 * REAL(KS) / REAL(RING_N) + WOB
+      IF KR = 0 THEN
+        BZ0 := LBOX * 0.5 + RING_HZ
+      ELSE
+        BZ0 := LBOX * 0.5 - RING_HZ
+      ENDIF
+    ELSE
+      TH := 6.2831853071795865 * REAL(NEMIT) / REAL(RING_N) + WOB
+      BZ0 := LBOX * 0.5
+    ENDIF
+    CS := COS(TH)
+    SS := SIN(TH)
+    IF POLE = 0 THEN
+      RS := RING_R
+    ELSE
+      RS := RING_R - 1.0
+    ENDIF
+    BX0 := LBOX * 0.5 + RS * CS
+    BY0 := LBOX * 0.5 + RS * SS
+    RH := RS + SGN * HOFF
+    PX(2 * A2 - 1) := LBOX * 0.5 + RH * CS
+    PY(2 * A2 - 1) := LBOX * 0.5 + RH * SS
+    PZ(2 * A2 - 1) := BZ0
+    RH := RS - SGN * HOFF
+    PX(2 * A2) := LBOX * 0.5 + RH * CS
+    PY(2 * A2) := LBOX * 0.5 + RH * SS
+    PZ(2 * A2) := BZ0
+    STH(2 * A2 - 1) := TH
+    STH(2 * A2) := TH
+    SROFF(2 * A2 - 1) := (RS - RING_R) + SGN * HOFF
+    SROFF(2 * A2) := (RS - RING_R) - SGN * HOFF
+    SZ0(2 * A2 - 1) := BZ0
+    SZ0(2 * A2) := BZ0
+  ELSE
+    GX := MOD(NEMIT, PATCH_N)
+    GY := MOD(NEMIT / PATCH_N, PATCH_N)
+    BX0 := LBOX * 0.5 + (REAL(GX) - 0.5 * REAL(PATCH_N - 1)) * PATCH_SP
+    BY0 := LBOX * 0.5 + (REAL(GY) - 0.5 * REAL(PATCH_N - 1)) * PATCH_SP
+    BZ0 := LBOX * 0.5 + SGN * PATCH_Z + WOB
+    PX(2 * A2 - 1) := BX0
+    PY(2 * A2 - 1) := BY0
+    PZ(2 * A2 - 1) := BZ0 + SGN * HOFF
+    PX(2 * A2) := BX0
+    PY(2 * A2) := BY0
+    PZ(2 * A2) := BZ0 - SGN * HOFF
+  ENDIF
+  VX(2 * A2 - 1) := 0.0
+  VY(2 * A2 - 1) := 0.0
+  VZ(2 * A2 - 1) := 0.0
+  VX(2 * A2) := 0.0
+  VY(2 * A2) := 0.0
+  VZ(2 * A2) := 0.0
+  ANX(2 * A2 - 1) := PX(2 * A2 - 1)
+  ANY(2 * A2 - 1) := PY(2 * A2 - 1)
+  ANZ(2 * A2 - 1) := PZ(2 * A2 - 1)
+  ANX(2 * A2) := PX(2 * A2)
+  ANY(2 * A2) := PY(2 * A2)
+  ANZ(2 * A2) := PZ(2 * A2)
+  HASA(2 * A2 - 1) := 1
+  HASA(2 * A2) := 1
+  NACT := NACT + 2
+  NEMIT := NEMIT + 1
+  WRITE(*, "PRT %d amph %d sp %d cod %d pole %d") NEMIT, NAMPH, SEG, COD, POLE
+  RETURN
+END
+
+! ── MARCH_ANCHORS: move ring anchor sites to radius RNOW ────
+! Sites keep their blueprint azimuth and radial offset; z stays on
+! the midplane — out-of-plane buckling is the physics' job, not
+! the schedule's. (STATIC RNOW: no scalar-arg copy-out, bug A6.)
+SUBROUTINE MARCH_ANCHORS()
+  REAL :: RR
+  DO I = 1, NACT
+    RR := RNOW + SROFF(I)
+    ANX(I) := LBOX * 0.5 + RR * COS(STH(I))
+    ANY(I) := LBOX * 0.5 + RR * SIN(STH(I))
+    ANZ(I) := SZ0(I)
+  ENDDO
+  DO I = 1, NINC
+    RR := RNOW + ISROFF(I)
+    IANX(I) := LBOX * 0.5 + RR * COS(ISTH(I))
+    IANY(I) := LBOX * 0.5 + RR * SIN(ISTH(I))
+    IANZ(I) := ISZ0(I)
+  ENDDO
+  RETURN
+END
+
+! ── Langevin integrate (forces from previous step) ──────────
+SUBROUTINE INTEGRATE()
+  REAL :: GR, NA
+  IF STEP ≤ NPRINT2 THEN
+    GR := GAMMA_HOT
+  ELSE
+    GR := GAMMA
+  ENDIF
+  NA := SQRT(12.0 * KT * (1.0 - (1.0 - GR * DT) * (1.0 - GR * DT)))
+  SN := HASH(SEED + STEP)
+  IF NACT > 0 THEN
+    DO I = 1, NACT
+      VX(I) := VX(I) * (1.0 - GR * DT) + FX(I) * DT + NA * (RAND(SN + 3 * I - 2) - 0.5)
+      VY(I) := VY(I) * (1.0 - GR * DT) + FY(I) * DT + NA * (RAND(SN + 3 * I - 1) - 0.5)
+      VZ(I) := VZ(I) * (1.0 - GR * DT) + FZ(I) * DT + NA * (RAND(SN + 3 * I) - 0.5)
+      PX(I) := PX(I) + VX(I) * DT
+      PY(I) := PY(I) + VY(I) * DT
+      PZ(I) := PZ(I) + VZ(I) * DT
+    ENDDO
+  ENDIF
+  IF NINC > 0 THEN
+    DO I = 1, NINC
+      IVX(I) := IVX(I) * (1.0 - GR * DT) + IFX(I) * DT + NA * (RAND(SN + 300000 + 3 * I - 2) - 0.5)
+      IVY(I) := IVY(I) * (1.0 - GR * DT) + IFY(I) * DT + NA * (RAND(SN + 300000 + 3 * I - 1) - 0.5)
+      IVZ(I) := IVZ(I) * (1.0 - GR * DT) + IFZ(I) * DT + NA * (RAND(SN + 300000 + 3 * I) - 0.5)
+      IPX(I) := IPX(I) + IVX(I) * DT
+      IPY(I) := IPY(I) + IVY(I) * DT
+      IPZ(I) := IPZ(I) + IVZ(I) * DT
+    ENDDO
+  ENDIF
+  RETURN
+END
+
+! ── CELL_BUILD / NBR_BUILD: bead-level dynamic neighbor list ─
+! Compact active pair lists over NACT beads (owner order), one of
+! WCTT/WCHH/WCHT = 1 per row by bead parity (odd = head, even = tail).
+SUBROUTINE CELL_BUILD()
+  INTEGER :: C, IX, IY, IZ
+  DO C = 1, NCELL
+    CNT(C) := 0
+  ENDDO
+  DO I = 1, NACT
+    IX := INT(PX(I) / CE) + 1
+    IY := INT(PY(I) / CE) + 1
+    IZ := INT(PZ(I) / CE) + 1
+    IF IX < 1 THEN
+      IX := 1
+    ENDIF
+    IF IX > NC THEN
+      IX := NC
+    ENDIF
+    IF IY < 1 THEN
+      IY := 1
+    ENDIF
+    IF IY > NC THEN
+      IY := NC
+    ENDIF
+    IF IZ < 1 THEN
+      IZ := 1
+    ENDIF
+    IF IZ > NC THEN
+      IZ := NC
+    ENDIF
+    C := IX + NC * (IY - 1) + NC * NC * (IZ - 1)
+    CELLOF(I) := C
+    CELX(I) := IX
+    CELY(I) := IY
+    CELZ(I) := IZ
+    CNT(C) := CNT(C) + 1
+  ENDDO
+  OFF(1) := 1
+  DO C = 2, NCELL
+    OFF(C) := OFF(C - 1) + CNT(C - 1)
+  ENDDO
+  DO C = 1, NCELL
+    CUR(C) := OFF(C)
+  ENDDO
+  DO I = 1, NACT
+    C := CELLOF(I)
+    SORTEDB(CUR(C)) := I
+    CUR(C) := CUR(C) + 1
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE NBR_BUILD()
+  INTEGER :: CN, P, LO, HI, NX2, NY2, NZ2, CNTR, S, TJ
+  REAL :: LDX, LDY, LDZ, LD
+  OVERFLOW := 0
+  MAXNB := 0
+  NSUSED := 0
+  DO I = 1, NACT
+    CNTR := 0
+    DO K = 1, 27
+      NX2 := CELX(I) + OX(K)
+      NY2 := CELY(I) + OY(K)
+      NZ2 := CELZ(I) + OZ(K)
+      IF NX2 ≥ 1 .AND. NX2 ≤ NC .AND. NY2 ≥ 1 .AND. NY2 ≤ NC .AND. NZ2 ≥ 1 .AND. NZ2 ≤ NC THEN
+        CN := NX2 + NC * (NY2 - 1) + NC * NC * (NZ2 - 1)
+        IF CNT(CN) > 0 THEN
+          LO := OFF(CN)
+          HI := OFF(CN) + CNT(CN) - 1
+          DO P = LO, HI
+            J := SORTEDB(P)
+            IF J ≠ I .AND. (I + 1) / 2 ≠ (J + 1) / 2 THEN
+              LDX := PX(I) - PX(J)
+              LDY := PY(I) - PY(J)
+              LDZ := PZ(I) - PZ(J)
+              LD := SQRT(LDX * LDX + LDY * LDY + LDZ * LDZ)
+              IF LD ≤ RCTT THEN
+                CNTR := CNTR + 1
+                IF CNTR ≤ MAXNBR THEN
+                  NSUSED := NSUSED + 1
+                  S := NSUSED
+                  NBR_I(S) := I
+                  NBR_J(S) := J
+                  WCTT(S) := 0.0
+                  WCHH(S) := 0.0
+                  WCHT(S) := 0.0
+                  TJ := MOD(J, 2)
+                  IF MOD(I, 2) = 0 .AND. TJ = 0 THEN
+                    WCTT(S) := 1.0
+                  ELSEIF MOD(I, 2) = 1 .AND. TJ = 1 THEN
+                    WCHH(S) := 1.0
+                  ELSE
+                    WCHT(S) := 1.0
+                  ENDIF
+                ELSE
+                  OVERFLOW := 1
+                ENDIF
+              ENDIF
+            ENDIF
+          ENDDO
+        ENDIF
+      ENDIF
+    ENDDO
+    IF CNTR > MAXNB THEN
+      MAXNB := CNTR
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── FORCE_PAIR: fused pass with per-pair sigma combining ────
+! TT: sigma = 1, LJ to RCTT. HH: sigma = (SIGB_i+SIGB_j)/2, WCA.
+! HT: sigma = (SIGB_i+SIGB_j)/2 - HTSHIFT, WCA. Species A pairs are
+! identical to the validated M1 baseline (1.05 / 0.95 / 1.0).
+SUBROUTINE FORCE_PAIR()
+  INTEGER :: II, JJ
+  REAL :: LDX, LDY, LDZ, LD, LDD, LMG, LMTT, LMH, LSP, LCW
+  REAL :: LBRT, LB6T, LBRH, LB6H, LFM
+  DO I = 1, NACT
+    FX(I) := 0.0
+    FY(I) := 0.0
+    FZ(I) := 0.0
+  ENDDO
+  DO K = 1, NSUSED
+    II := NBR_I(K)
+    JJ := NBR_J(K)
+    LDX := PX(II) - PX(JJ)
+    LDY := PY(II) - PY(JJ)
+    LDZ := PZ(II) - PZ(JJ)
+    LD := SQRT(LDX * LDX + LDY * LDY + LDZ * LDZ)
+    LDD := MAX(LD, 1.0E-16)
+    LMG := (1.0 - SIGN(1.0, 1.0E-12 - LDD)) * 0.5
+    LMTT := (1.0 - SIGN(1.0, LDD - RCTT)) * 0.5
+    LBRT := WCTT(K) * LMTT * LMG * SIG / LDD
+    LB6T := LBRT * LBRT * LBRT * LBRT * LBRT * LBRT
+    LSP := 0.5 * (SIGB(II) + SIGB(JJ))
+    IF WCHT(K) > 0.5 THEN
+      LSP := LSP - HTSHIFT
+    ENDIF
+    LCW := C216 * LSP
+    LMH := (1.0 - SIGN(1.0, LDD - LCW)) * 0.5
+    LBRH := (WCHH(K) + WCHT(K)) * LMH * LMG * LSP / LDD
+    LB6H := LBRH * LBRH * LBRH * LBRH * LBRH * LBRH
+    LFM := (24.0 * (2.0 * LB6T * LB6T - LB6T) + 24.0 * (2.0 * LB6H * LB6H - LB6H)) / (LDD * LDD)
+    LFM := LFM * MIN(1.0, FCAP / MAX(ABS(LFM) * LDD, 1.0E-16))
+    FX(II) := FX(II) + LFM * LDX
+    FY(II) := FY(II) + LFM * LDY
+    FZ(II) := FZ(II) + LFM * LDZ
+  ENDDO
+  RETURN
+END
+
+! ── BOND_AXES: per-species harmonic bonds + axes ────────────
+SUBROUTINE BOND_AXES()
+  REAL :: BX, BY, BZ, FB
+  IF NAMPH > 0 THEN
+    DO I = 1, NAMPH
+      BX := PX(2 * I - 1) - PX(2 * I)
+      BY := PY(2 * I - 1) - PY(2 * I)
+      BZ := PZ(2 * I - 1) - PZ(2 * I)
+      D := SQRT(BX * BX + BY * BY + BZ * BZ)
+      DD := MAX(D, 1.0E-16)
+      FB := 2.0 * KBOND * (DD - R0M(I)) / DD
+      FBX(I) := 0.0 - FB * BX
+      FBY(I) := 0.0 - FB * BY
+      FBZ(I) := 0.0 - FB * BZ
+      AX(I) := BX / DD
+      AY(I) := BY / DD
+      AZ(I) := BZ / DD
+      ALEN(I) := DD
+      CXA(I) := (PX(2 * I - 1) + PX(2 * I)) * 0.5
+      CYA(I) := (PY(2 * I - 1) + PY(2 * I)) * 0.5
+      CZA(I) := (PZ(2 * I - 1) + PZ(2 * I)) * 0.5
+    ENDDO
+  ENDIF
+  RETURN
+END
+
+! ── Amph-level cell list (bending term) ─────────────────────
+SUBROUTINE CELL2_BUILD()
+  INTEGER :: C, IX, IY, IZ
+  DO C = 1, NCELL2
+    CNT2(C) := 0
+  ENDDO
+  DO I = 1, NAMPH
+    IX := INT(CXA(I) / CE2) + 1
+    IY := INT(CYA(I) / CE2) + 1
+    IZ := INT(CZA(I) / CE2) + 1
+    IF IX < 1 THEN
+      IX := 1
+    ENDIF
+    IF IX > NC2 THEN
+      IX := NC2
+    ENDIF
+    IF IY < 1 THEN
+      IY := 1
+    ENDIF
+    IF IY > NC2 THEN
+      IY := NC2
+    ENDIF
+    IF IZ < 1 THEN
+      IZ := 1
+    ENDIF
+    IF IZ > NC2 THEN
+      IZ := NC2
+    ENDIF
+    C := IX + NC2 * (IY - 1) + NC2 * NC2 * (IZ - 1)
+    CEL2OF(I) := C
+    CEL2X(I) := IX
+    CEL2Y(I) := IY
+    CEL2Z(I) := IZ
+    CNT2(C) := CNT2(C) + 1
+  ENDDO
+  OFF2(1) := 1
+  DO C = 2, NCELL2
+    OFF2(C) := OFF2(C - 1) + CNT2(C - 1)
+  ENDDO
+  DO C = 1, NCELL2
+    CUR2(C) := OFF2(C)
+  ENDDO
+  DO I = 1, NAMPH
+    C := CEL2OF(I)
+    SORTED2(CUR2(C)) := I
+    CUR2(C) := CUR2(C) + 1
+  ENDDO
+  RETURN
+END
+
+SUBROUTINE NBR2_BUILD()
+  INTEGER :: CN, P, LO, HI, NX2, NY2, NZ2, CNTR, S
+  REAL :: LDX, LDY, LDZ, LD
+  OVERFLOW2 := 0
+  MXNB2 := 0
+  NSUSED2 := 0
+  DO I2 = 1, NAMPH
+    CNTR := 0
+    DO K = 1, 27
+      NX2 := CEL2X(I2) + OX(K)
+      NY2 := CEL2Y(I2) + OY(K)
+      NZ2 := CEL2Z(I2) + OZ(K)
+      IF NX2 ≥ 1 .AND. NX2 ≤ NC2 .AND. NY2 ≥ 1 .AND. NY2 ≤ NC2 .AND. NZ2 ≥ 1 .AND. NZ2 ≤ NC2 THEN
+        CN := NX2 + NC2 * (NY2 - 1) + NC2 * NC2 * (NZ2 - 1)
+        IF CNT2(CN) > 0 THEN
+          LO := OFF2(CN)
+          HI := OFF2(CN) + CNT2(CN) - 1
+          DO P = LO, HI
+            J2 := SORTED2(P)
+            IF J2 ≠ I2 THEN
+              LDX := CXA(I2) - CXA(J2)
+              LDY := CYA(I2) - CYA(J2)
+              LDZ := CZA(I2) - CZA(J2)
+              LD := SQRT(LDX * LDX + LDY * LDY + LDZ * LDZ)
+              IF LD ≤ RB THEN
+                CNTR := CNTR + 1
+                IF CNTR ≤ MAXNB2 THEN
+                  NSUSED2 := NSUSED2 + 1
+                  S := NSUSED2
+                  NBR2_I(S) := I2
+                  NBR2_J(S) := J2
+                  W2(S) := 1.0
+                ELSE
+                  OVERFLOW2 := 1
+                ENDIF
+              ENDIF
+            ENDIF
+          ENDDO
+        ENDIF
+      ENDIF
+    ENDDO
+    IF CNTR > MXNB2 THEN
+      MXNB2 := CNTR
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── ALIGN: polar or nematic axis alignment ──────────────────
+! BENDMODE=0: E = -KAL q,        SUM = [A_J - q A_I]
+! BENDMODE=1: E = -KAL q^2,      SUM = 2q [A_J - q A_I]  (nematic;
+! accepts antiparallel leaflets — certified in vesicle_asm_nematic)
+SUBROUTINE ALIGN()
+  INTEGER :: II, JJ
+  REAL :: CX0, CY0, CZ0, DC, DDC, MR, DTA, QW
+  DO I2 = 1, NAMPH
+    SUMX(I2) := 0.0
+    SUMY(I2) := 0.0
+    SUMZ(I2) := 0.0
+  ENDDO
+  DO K = 1, NSUSED2
+    II := NBR2_I(K)
+    JJ := NBR2_J(K)
+    CX0 := CXA(II) - CXA(JJ)
+    CY0 := CYA(II) - CYA(JJ)
+    CZ0 := CZA(II) - CZA(JJ)
+    DC := SQRT(CX0 * CX0 + CY0 * CY0 + CZ0 * CZ0)
+    DDC := MAX(DC, 1.0E-16)
+    MR := W2(K) * (1.0 - SIGN(1.0, DDC - RB)) * 0.5
+    DTA := AX(II) * AX(JJ) + AY(II) * AY(JJ) + AZ(II) * AZ(JJ)
+    IF BENDMODE = 1 THEN
+      QW := 2.0 * DTA
+    ELSE
+      QW := 1.0
+    ENDIF
+    SUMX(II) := SUMX(II) + MR * QW * (AX(JJ) - DTA * AX(II))
+    SUMY(II) := SUMY(II) + MR * QW * (AY(JJ) - DTA * AY(II))
+    SUMZ(II) := SUMZ(II) + MR * QW * (AZ(JJ) - DTA * AZ(II))
+  ENDDO
+  RETURN
+END
+
+! ── APPLY_BB: bond + bending forces onto the beads ──────────
+SUBROUTINE APPLY_BB()
+  REAL :: FAX, FAY, FAZ
+  DO I = 1, NAMPH
+    FAX := KAL * SUMX(I) / ALEN(I)
+    FAY := KAL * SUMY(I) / ALEN(I)
+    FAZ := KAL * SUMZ(I) / ALEN(I)
+    FX(2 * I - 1) := FX(2 * I - 1) + FBX(I) + FAX
+    FY(2 * I - 1) := FY(2 * I - 1) + FBY(I) + FAY
+    FZ(2 * I - 1) := FZ(2 * I - 1) + FBZ(I) + FAZ
+    FX(2 * I) := FX(2 * I) - FBX(I) - FAX
+    FY(2 * I) := FY(2 * I) - FBY(I) - FAY
+    FZ(2 * I) := FZ(2 * I) - FBZ(I) - FAZ
+  ENDDO
+  RETURN
+END
+
+! ── INC_FORCE: inclusion interactions (direct loops) ────────
+! INC-INC WCA (SIG_II); INC-HEAD WCA (SIG_IH); INC-TAIL LJ to RCINC
+! (SIG_IT) — the hydrophobic belt that seats the protein in the shell.
+SUBROUTINE INC_FORCE()
+  INTEGER :: II
+  REAL :: LDX, LDY, LDZ, LD, LDD, LMG, LM, LBR, LB6, LFM, LSP, LRC
+  DO I = 1, NINC
+    IFX(I) := 0.0
+    IFY(I) := 0.0
+    IFZ(I) := 0.0
+  ENDDO
+  DO I = 1, NINC
+    DO II = I + 1, NINC
+      LDX := IPX(I) - IPX(II)
+      LDY := IPY(I) - IPY(II)
+      LDZ := IPZ(I) - IPZ(II)
+      LD := SQRT(LDX * LDX + LDY * LDY + LDZ * LDZ)
+      LDD := MAX(LD, 1.0E-16)
+      LMG := (1.0 - SIGN(1.0, 1.0E-12 - LDD)) * 0.5
+      LM := (1.0 - SIGN(1.0, LDD - C216 * SIG_II)) * 0.5
+      LBR := LM * LMG * SIG_II / LDD
+      LB6 := LBR * LBR * LBR * LBR * LBR * LBR
+      LFM := 24.0 * (2.0 * LB6 * LB6 - LB6) / (LDD * LDD)
+      LFM := LFM * MIN(1.0, FCAP / MAX(ABS(LFM) * LDD, 1.0E-16))
+      IFX(I) := IFX(I) + LFM * LDX
+      IFY(I) := IFY(I) + LFM * LDY
+      IFZ(I) := IFZ(I) + LFM * LDZ
+      IFX(II) := IFX(II) - LFM * LDX
+      IFY(II) := IFY(II) - LFM * LDY
+      IFZ(II) := IFZ(II) - LFM * LDZ
+    ENDDO
+    DO J = 1, NACT
+      LDX := IPX(I) - PX(J)
+      LDY := IPY(I) - PY(J)
+      LDZ := IPZ(I) - PZ(J)
+      LD := SQRT(LDX * LDX + LDY * LDY + LDZ * LDZ)
+      LDD := MAX(LD, 1.0E-16)
+      LMG := (1.0 - SIGN(1.0, 1.0E-12 - LDD)) * 0.5
+      IF MOD(J, 2) = 0 THEN
+        LSP := SIG_IT
+        LRC := RCINC
+      ELSE
+        LSP := SIG_IH
+        LRC := C216 * SIG_IH
+      ENDIF
+      LM := (1.0 - SIGN(1.0, LDD - LRC)) * 0.5
+      LBR := LM * LMG * LSP / LDD
+      LB6 := LBR * LBR * LBR * LBR * LBR * LBR
+      LFM := 24.0 * (2.0 * LB6 * LB6 - LB6) / (LDD * LDD)
+      LFM := LFM * MIN(1.0, FCAP / MAX(ABS(LFM) * LDD, 1.0E-16))
+      IFX(I) := IFX(I) + LFM * LDX
+      IFY(I) := IFY(I) + LFM * LDY
+      IFZ(I) := IFZ(I) + LFM * LDZ
+      FX(J) := FX(J) - LFM * LDX
+      FY(J) := FY(J) - LFM * LDY
+      FZ(J) := FZ(J) - LFM * LDZ
+    ENDDO
+  ENDDO
+  RETURN
+END
+
+! ── ANCHORS: print-site springs, stiffness KAC ──────────────
+SUBROUTINE ANCHORS()
+  IF KAC > 0.0 THEN
+    DO I = 1, NACT
+      IF HASA(I) = 1 THEN
+        FX(I) := FX(I) + 2.0 * KAC * (ANX(I) - PX(I))
+        FY(I) := FY(I) + 2.0 * KAC * (ANY(I) - PY(I))
+        FZ(I) := FZ(I) + 2.0 * KAC * (ANZ(I) - PZ(I))
+      ENDIF
+    ENDDO
+  ENDIF
+  IF IAC > 0.0 THEN
+    DO I = 1, NINC
+      IFX(I) := IFX(I) + 2.0 * IAC * (IANX(I) - IPX(I))
+      IFY(I) := IFY(I) + 2.0 * IAC * (IANY(I) - IPY(I))
+      IFZ(I) := IFZ(I) + 2.0 * IAC * (IANZ(I) - IPZ(I))
+    ENDDO
+  ENDIF
+  RETURN
+END
+
+! ── WALLS: soft harmonic box boundary ───────────────────────
+SUBROUTINE WALLS()
+  DO I = 1, NACT
+    IF PX(I) < XWALL THEN
+      FX(I) := FX(I) + 2.0 * KWALL * (XWALL - PX(I))
+    ENDIF
+    IF PX(I) > LBOX - XWALL THEN
+      FX(I) := FX(I) - 2.0 * KWALL * (PX(I) - (LBOX - XWALL))
+    ENDIF
+    IF PY(I) < XWALL THEN
+      FY(I) := FY(I) + 2.0 * KWALL * (XWALL - PY(I))
+    ENDIF
+    IF PY(I) > LBOX - XWALL THEN
+      FY(I) := FY(I) - 2.0 * KWALL * (PY(I) - (LBOX - XWALL))
+    ENDIF
+    IF PZ(I) < XWALL THEN
+      FZ(I) := FZ(I) + 2.0 * KWALL * (XWALL - PZ(I))
+    ENDIF
+    IF PZ(I) > LBOX - XWALL THEN
+      FZ(I) := FZ(I) - 2.0 * KWALL * (PZ(I) - (LBOX - XWALL))
+    ENDIF
+  ENDDO
+  DO I = 1, NINC
+    IF IPX(I) < XWALL THEN
+      IFX(I) := IFX(I) + 2.0 * KWALL * (XWALL - IPX(I))
+    ENDIF
+    IF IPX(I) > LBOX - XWALL THEN
+      IFX(I) := IFX(I) - 2.0 * KWALL * (IPX(I) - (LBOX - XWALL))
+    ENDIF
+    IF IPY(I) < XWALL THEN
+      IFY(I) := IFY(I) + 2.0 * KWALL * (XWALL - IPY(I))
+    ENDIF
+    IF IPY(I) > LBOX - XWALL THEN
+      IFY(I) := IFY(I) - 2.0 * KWALL * (IPY(I) - (LBOX - XWALL))
+    ENDIF
+    IF IPZ(I) < XWALL THEN
+      IFZ(I) := IFZ(I) + 2.0 * KWALL * (XWALL - IPZ(I))
+    ENDIF
+    IF IPZ(I) > LBOX - XWALL THEN
+      IFZ(I) := IFZ(I) - 2.0 * KWALL * (IPZ(I) - (LBOX - XWALL))
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── DIAG: energies, edge proxy, radius, checksum ────────────
+SUBROUTINE DIAG()
+  REAL :: CX0, CY0, CZ0, RR, SIGP
+  EP_PAIR := 0.0
+  DO K = 1, NSUSED
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    IF WCTT(K) > 0.5 THEN
+      IF DD ≤ RCTT THEN
+        BR := SIG / DD
+        B6 := BR * BR * BR * BR * BR * BR
+        EP_PAIR := EP_PAIR + 4.0 * (B6 * B6 - B6) * MG
+      ENDIF
+    ELSE
+      SIGP := 0.5 * (SIGB(NBR_I(K)) + SIGB(NBR_J(K)))
+      IF WCHT(K) > 0.5 THEN
+        SIGP := SIGP - HTSHIFT
+      ENDIF
+      IF DD ≤ C216 * SIGP THEN
+        BR := SIGP / DD
+        B6 := BR * BR * BR * BR * BR * BR
+        EP_PAIR := EP_PAIR + 4.0 * (B6 * B6 - B6) * MG
+      ENDIF
+    ENDIF
+  ENDDO
+  EP_BOND := 0.0
+  DO I = 1, NAMPH
+    DX := PX(2 * I - 1) - PX(2 * I)
+    DY := PY(2 * I - 1) - PY(2 * I)
+    DZ := PZ(2 * I - 1) - PZ(2 * I)
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    EP_BOND := EP_BOND + KBOND * (DD - R0M(I)) * (DD - R0M(I))
+  ENDDO
+  EP_BEND := 0.0
+  DO K = 1, NSUSED2
+    I2 := NBR2_I(K)
+    J2 := NBR2_J(K)
+    CX0 := CXA(I2) - CXA(J2)
+    CY0 := CYA(I2) - CYA(J2)
+    CZ0 := CZA(I2) - CZA(J2)
+    D := SQRT(CX0 * CX0 + CY0 * CY0 + CZ0 * CZ0)
+    DD := MAX(D, 1.0E-16)
+    IF DD ≤ RB THEN
+      MG := AX(I2) * AX(J2) + AY(I2) * AY(J2) + AZ(I2) * AZ(J2)
+      IF BENDMODE = 1 THEN
+        EP_BEND := EP_BEND - KAL * MG * MG
+      ELSE
+        EP_BEND := EP_BEND - KAL * MG
+      ENDIF
+    ENDIF
+  ENDDO
+  ! tail coordination histogram
+  DO I = 1, NACT
+    ZT(I) := 0
+  ENDDO
+  DO K = 1, NSUSED
+    DX := PX(NBR_I(K)) - PX(NBR_J(K))
+    DY := PY(NBR_I(K)) - PY(NBR_J(K))
+    DZ := PZ(NBR_I(K)) - PZ(NBR_J(K))
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    MG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+    IF DD ≤ RCTT THEN
+      ZT(NBR_I(K)) := ZT(NBR_I(K)) + INT(WCTT(K) * MG)
+    ENDIF
+  ENDDO
+  NEXP := 0
+  EEDGE := 0.0
+  DO I = 2, NACT, 2
+    IF ZT(I) < 6 THEN
+      NEXP := NEXP + 1
+      EEDGE := EEDGE + REAL(6 - ZT(I)) * 0.5
+    ENDIF
+  ENDDO
+  IF STEP = NDIAG .OR. EEDGE > EEDGE_PEAK THEN
+    EEDGE_PEAK := EEDGE
+  ENDIF
+  CX0 := 0.0
+  CY0 := 0.0
+  CZ0 := 0.0
+  IF NACT ≥ 2 THEN
+    DO I = 2, NACT, 2
+      CX0 := CX0 + PX(I)
+      CY0 := CY0 + PY(I)
+      CZ0 := CZ0 + PZ(I)
+    ENDDO
+    CX0 := CX0 / REAL(NAMPH)
+    CY0 := CY0 / REAL(NAMPH)
+    CZ0 := CZ0 / REAL(NAMPH)
+    RR := 0.0
+    DO I = 2, NACT, 2
+      RR := RR + SQRT((PX(I) - CX0) * (PX(I) - CX0) + (PY(I) - CY0) * (PY(I) - CY0) + (PZ(I) - CZ0) * (PZ(I) - CZ0))
+    ENDDO
+    RMEAN := RR / REAL(NAMPH)
+  ELSE
+    RMEAN := 0.0
+  ENDIF
+  RR := 0.0
+  DO I = 1, NACT
+    RR := RR + VX(I) * VX(I) + VY(I) * VY(I) + VZ(I) * VZ(I)
+  ENDDO
+  DO I = 1, NINC
+    RR := RR + IVX(I) * IVX(I) + IVY(I) * IVY(I) + IVZ(I) * IVZ(I)
+  ENDDO
+  IF NACT + NINC > 0 THEN
+    T2 := RR / (3.0 * REAL(NACT + NINC))
+  ELSE
+    T2 := 0.0
+  ENDIF
+  CK := 0.0
+  NOUT := 0
+  FMAX := 0.0
+  DO I = 1, NACT
+    CK := CK + FX(I) * REAL(I) + FY(I) * REAL(I + NB) + FZ(I) * REAL(I + 2 * NB)
+    IF PX(I) < 0.0 .OR. PX(I) ≥ LBOX .OR. PY(I) < 0.0 .OR. PY(I) ≥ LBOX .OR. PZ(I) < 0.0 .OR. PZ(I) ≥ LBOX THEN
+      NOUT := NOUT + 1
+    ENDIF
+    RR := SQRT(FX(I) * FX(I) + FY(I) * FY(I) + FZ(I) * FZ(I))
+    IF RR > FMAX THEN
+      FMAX := RR
+    ENDIF
+  ENDDO
+  DO I = 1, NINC
+    CK := CK + IFX(I) * REAL(I + 3 * NB) + IFY(I) * REAL(I + 3 * NB + NINCM) + IFZ(I) * REAL(I + 3 * NB + 2 * NINCM)
+    IF IPX(I) < 0.0 .OR. IPX(I) ≥ LBOX .OR. IPY(I) < 0.0 .OR. IPY(I) ≥ LBOX .OR. IPZ(I) < 0.0 .OR. IPZ(I) ≥ LBOX THEN
+      NOUT := NOUT + 1
+    ENDIF
+  ENDDO
+  WRITE(*, "step %d kt %.4f epair %.6e ebond %.6e ebend %.6e nexp %d eedge %.6e rshell %.4f nact %d ninc %d maxnb %d ovf %d nout %d fmax %.6e kanc %.3f ck %.17e") STEP, T2, EP_PAIR, EP_BOND, EP_BEND, NEXP, EEDGE, RMEAN, NACT, NINC, MAXNB, OVERFLOW, NOUT, FMAX, KAC, CK
+  RETURN
+END
+
+! ── CERT_ENERGY: total energy by component, direct loops ────
+! Replicates printer_mirror.total_energy EXACTLY (same summation
+! order: bead pairs i<j, bonds, bend pairs a<b, inclusions,
+! anchors, walls) so the MIRROR=1 dump is a valid oracle.
+! Results in EP_PAIR/EP_BOND/EP_BEND/EP_INC/EP_ANCH/EP_WALL.
+SUBROUTINE CERT_ENERGY()
+  INTEGER :: II, JJ, A2, B2
+  REAL :: D2, SIGP, Q
+  ! ── bead-bead pairs ──
+  EP_PAIR := 0.0
+  DO II = 1, NACT
+    DO JJ = II + 1, NACT
+      IF (II + 1) / 2 ≠ (JJ + 1) / 2 THEN
+        DX := PX(II) - PX(JJ)
+        DY := PY(II) - PY(JJ)
+        DZ := PZ(II) - PZ(JJ)
+        D2 := DX * DX + DY * DY + DZ * DZ
+        IF D2 ≤ RCTT * RCTT .AND. D2 ≥ 1.0E-24 THEN
+          DD := SQRT(D2)
+          IF DD ≥ 1.0E-12 THEN
+            IF MOD(II, 2) = 0 .AND. MOD(JJ, 2) = 0 THEN
+              IF DD < RCTT THEN
+                BR := SIG / DD
+                B6 := BR * BR * BR * BR * BR * BR
+                EP_PAIR := EP_PAIR + 4.0 * (B6 * B6 - B6)
+              ENDIF
+            ELSE
+              SIGP := 0.5 * (SIGB(II) + SIGB(JJ))
+              IF MOD(II, 2) ≠ MOD(JJ, 2) THEN
+                SIGP := SIGP - HTSHIFT
+              ENDIF
+              IF DD < C216 * SIGP THEN
+                BR := SIGP / DD
+                B6 := BR * BR * BR * BR * BR * BR
+                EP_PAIR := EP_PAIR + 4.0 * (B6 * B6 - B6)
+              ENDIF
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+  ! ── bonds (also refreshes axes/centres for the bend pass) ──
+  EP_BOND := 0.0
+  DO A2 = 1, NAMPH
+    DX := PX(2 * A2 - 1) - PX(2 * A2)
+    DY := PY(2 * A2 - 1) - PY(2 * A2)
+    DZ := PZ(2 * A2 - 1) - PZ(2 * A2)
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    EP_BOND := EP_BOND + KBOND * (DD - R0M(A2)) * (DD - R0M(A2))
+    AX(A2) := DX / DD
+    AY(A2) := DY / DD
+    AZ(A2) := DZ / DD
+    CXA(A2) := (PX(2 * A2 - 1) + PX(2 * A2)) * 0.5
+    CYA(A2) := (PY(2 * A2 - 1) + PY(2 * A2)) * 0.5
+    CZA(A2) := (PZ(2 * A2 - 1) + PZ(2 * A2)) * 0.5
+  ENDDO
+  ! ── bend pairs ──
+  EP_BEND := 0.0
+  DO A2 = 1, NAMPH
+    DO B2 = A2 + 1, NAMPH
+      DX := CXA(A2) - CXA(B2)
+      DY := CYA(A2) - CYA(B2)
+      DZ := CZA(A2) - CZA(B2)
+      D2 := DX * DX + DY * DY + DZ * DZ
+      IF D2 ≤ RB * RB .AND. D2 ≥ 1.0E-24 THEN
+        Q := AX(A2) * AX(B2) + AY(A2) * AY(B2) + AZ(A2) * AZ(B2)
+        IF BENDMODE = 1 THEN
+          EP_BEND := EP_BEND - KAL * Q * Q
+        ELSE
+          EP_BEND := EP_BEND - KAL * Q
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+  ! ── inclusions ──
+  EP_INC := 0.0
+  DO II = 1, NINC
+    DO JJ = II + 1, NINC
+      DX := IPX(II) - IPX(JJ)
+      DY := IPY(II) - IPY(JJ)
+      DZ := IPZ(II) - IPZ(JJ)
+      D2 := DX * DX + DY * DY + DZ * DZ
+      DD := SQRT(D2)
+      IF DD < C216 * SIG_II .AND. DD ≥ 1.0E-12 THEN
+        BR := SIG_II / DD
+        B6 := BR * BR * BR * BR * BR * BR
+        EP_INC := EP_INC + 4.0 * (B6 * B6 - B6)
+      ENDIF
+    ENDDO
+    DO JJ = 1, NACT
+      DX := IPX(II) - PX(JJ)
+      DY := IPY(II) - PY(JJ)
+      DZ := IPZ(II) - PZ(JJ)
+      D2 := DX * DX + DY * DY + DZ * DZ
+      DD := SQRT(D2)
+      IF MOD(JJ, 2) = 1 THEN
+        IF DD < C216 * SIG_IH .AND. DD ≥ 1.0E-12 THEN
+          BR := SIG_IH / DD
+          B6 := BR * BR * BR * BR * BR * BR
+          EP_INC := EP_INC + 4.0 * (B6 * B6 - B6)
+        ENDIF
+      ELSE
+        IF DD < RCINC .AND. DD ≥ 1.0E-12 THEN
+          BR := SIG_IT / DD
+          B6 := BR * BR * BR * BR * BR * BR
+          EP_INC := EP_INC + 4.0 * (B6 * B6 - B6)
+        ENDIF
+      ENDIF
+    ENDDO
+  ENDDO
+  ! ── anchors (KAC: full KANC at cert, 0 after release) ──
+  EP_ANCH := 0.0
+  IF KAC > 0.0 THEN
+    DO II = 1, NACT
+      IF HASA(II) = 1 THEN
+        DX := ANX(II) - PX(II)
+        DY := ANY(II) - PY(II)
+        DZ := ANZ(II) - PZ(II)
+        EP_ANCH := EP_ANCH + KAC * (DX * DX + DY * DY + DZ * DZ)
+      ENDIF
+    ENDDO
+  ENDIF
+  IF IAC > 0.0 THEN
+    DO II = 1, NINC
+      DX := IANX(II) - IPX(II)
+      DY := IANY(II) - IPY(II)
+      DZ := IANZ(II) - IPZ(II)
+      EP_ANCH := EP_ANCH + IAC * (DX * DX + DY * DY + DZ * DZ)
+    ENDDO
+  ENDIF
+  ! ── walls ──
+  EP_WALL := 0.0
+  DO II = 1, NACT
+    IF PX(II) < XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (XWALL - PX(II)) * (XWALL - PX(II))
+    ENDIF
+    IF PX(II) > LBOX - XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (PX(II) - (LBOX - XWALL)) * (PX(II) - (LBOX - XWALL))
+    ENDIF
+    IF PY(II) < XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (XWALL - PY(II)) * (XWALL - PY(II))
+    ENDIF
+    IF PY(II) > LBOX - XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (PY(II) - (LBOX - XWALL)) * (PY(II) - (LBOX - XWALL))
+    ENDIF
+    IF PZ(II) < XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (XWALL - PZ(II)) * (XWALL - PZ(II))
+    ENDIF
+    IF PZ(II) > LBOX - XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (PZ(II) - (LBOX - XWALL)) * (PZ(II) - (LBOX - XWALL))
+    ENDIF
+  ENDDO
+  DO II = 1, NINC
+    IF IPX(II) < XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (XWALL - IPX(II)) * (XWALL - IPX(II))
+    ENDIF
+    IF IPX(II) > LBOX - XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (IPX(II) - (LBOX - XWALL)) * (IPX(II) - (LBOX - XWALL))
+    ENDIF
+    IF IPY(II) < XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (XWALL - IPY(II)) * (XWALL - IPY(II))
+    ENDIF
+    IF IPY(II) > LBOX - XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (IPY(II) - (LBOX - XWALL)) * (IPY(II) - (LBOX - XWALL))
+    ENDIF
+    IF IPZ(II) < XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (XWALL - IPZ(II)) * (XWALL - IPZ(II))
+    ENDIF
+    IF IPZ(II) > LBOX - XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (IPZ(II) - (LBOX - XWALL)) * (IPZ(II) - (LBOX - XWALL))
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── DUMP_MIRROR: certification dump to stdout ───────────────
+! Rows are tagged CFG/FRC so the harness can strip PRT/DIAG
+! telemetry. Order: bead positions, inclusion positions, bead
+! forces, inclusion forces — row-for-row vs the mirror's
+! printer_cert_<mode>_{config,forces}.txt.
+SUBROUTINE DUMP_MIRROR()
+  WRITE(*, "MIRROR_DUMP namph %d ninc %d nact %d mode %d") NAMPH, NINC, NACT, PRINTMODE
+  DO I = 1, NACT
+    WRITE(*, "CFG %.17e %.17e %.17e") PX(I), PY(I), PZ(I)
+  ENDDO
+  DO I = 1, NINC
+    WRITE(*, "CFG %.17e %.17e %.17e") IPX(I), IPY(I), IPZ(I)
+  ENDDO
+  DO I = 1, NACT
+    WRITE(*, "FRC %.17e %.17e %.17e") FX(I), FY(I), FZ(I)
+  ENDDO
+  DO I = 1, NINC
+    WRITE(*, "FRC %.17e %.17e %.17e") IFX(I), IFY(I), IFZ(I)
+  ENDDO
+  CALL CERT_ENERGY()
+  WRITE(*, "CERT epair %.17e ebond %.17e ebend %.17e einc %.17e eanch %.17e ewall %.17e") EP_PAIR, EP_BOND, EP_BEND, EP_INC, EP_ANCH, EP_WALL
+  RETURN
+END
+
+! ── ANALYZE_FINAL: end-of-run summary ───────────────────────
+! Tail-radius stats about the tail centroid + free energy
+! (KAC = 0 after the release ramp, so anchors contribute 0).
+! NEXP/ZT come from the final DIAG (STEP = NSTEPS always diags).
+SUBROUTINE ANALYZE_FINAL()
+  REAL :: CX0, CY0, CZ0, RR, RMIN, RMAX
+  CALL CERT_ENERGY()
+  CX0 := 0.0
+  CY0 := 0.0
+  CZ0 := 0.0
+  IF NAMPH > 0 THEN
+    DO I = 2, NACT, 2
+      CX0 := CX0 + PX(I)
+      CY0 := CY0 + PY(I)
+      CZ0 := CZ0 + PZ(I)
+    ENDDO
+    CX0 := CX0 / REAL(NAMPH)
+    CY0 := CY0 / REAL(NAMPH)
+    CZ0 := CZ0 / REAL(NAMPH)
+    RMEAN := 0.0
+    RMIN := 1.0E30
+    RMAX := 0.0
+    DO I = 2, NACT, 2
+      RR := SQRT((PX(I) - CX0) * (PX(I) - CX0) + (PY(I) - CY0) * (PY(I) - CY0) + (PZ(I) - CZ0) * (PZ(I) - CZ0))
+      RMEAN := RMEAN + RR
+      IF RR < RMIN THEN
+        RMIN := RR
+      ENDIF
+      IF RR > RMAX THEN
+        RMAX := RR
+      ENDIF
+    ENDDO
+    RMEAN := RMEAN / REAL(NAMPH)
+    RSTD := 0.0
+    DO I = 2, NACT, 2
+      RR := SQRT((PX(I) - CX0) * (PX(I) - CX0) + (PY(I) - CY0) * (PY(I) - CY0) + (PZ(I) - CZ0) * (PZ(I) - CZ0))
+      RSTD := RSTD + (RR - RMEAN) * (RR - RMEAN)
+    ENDDO
+    RSTD := SQRT(RSTD / REAL(NAMPH))
+    ZSTD := 0.0
+    DO I = 2, NACT, 2
+      ZSTD := ZSTD + (PZ(I) - CZ0) * (PZ(I) - CZ0)
+    ENDDO
+    ZSTD := SQRT(ZSTD / REAL(NAMPH))
+  ELSE
+    RMEAN := 0.0
+    RSTD := 0.0
+    RMIN := 0.0
+    RMAX := 0.0
+    ZSTD := 0.0
+  ENDIF
+  WRITE(*, "FINAL namph %d ninc %d nexp %d rmean %.4f rstd %.4f rmin %.4f rmax %.4f zstd %.4f nout %d") NAMPH, NINC, NEXP, RMEAN, RSTD, RMIN, RMAX, ZSTD, NOUT
+  WRITE(*, "FINAL_E epair %.6e ebond %.6e ebend %.6e einc %.6e eanch %.6e ewall %.6e") EP_PAIR, EP_BOND, EP_BEND, EP_INC, EP_ANCH, EP_WALL
+  ! morphology dump: FPOS type index x y z (type 1 head, 0 tail, 2 inclusion)
+  DO I = 1, NACT
+    WRITE(*, "FPOS %d %d %.6e %.6e %.6e") MOD(I, 2), I, PX(I), PY(I), PZ(I)
+  ENDDO
+  DO I = 1, NINC
+    WRITE(*, "FPOS %d %d %.6e %.6e %.6e") 2, I, IPX(I), IPY(I), IPZ(I)
+  ENDDO
+  RETURN
+END
