@@ -1,0 +1,634 @@
+"""NVIDIA NVVM IR backend for Ergo GPU kernels.
+
+**EXPERIMENTAL — KNOWN BROKEN. Do not use.** The backend raises MCLError
+on instantiation; the code below is kept for reference until the CUDA
+path is revived. Use `--target spirv`.
+
+Known-broken catalog (from the 2026-07 audit): TAN/SINH/COSH/TANH map to
+.approx intrinsics unconditionally; fast-math EXP/LOG swap to ex2/lg2
+WITHOUT the required scale correction (EXP returns 2^x); no atomics or
+serialization for SCATTER kernels (data race); invalid LLVM IR for
+integer arrays (hardcoded double* params), mixed int/real arithmetic
+(no sitofp), binary intrinsics declared unary (pow/maxnum/minnum),
+CYCLE/IF emission (double terminators, no phi nodes); fcmp one vs the
+CPU's unordered-not-equal NaN semantics.
+
+Consumes KernelPlan objects (from ir_gpu.py) and the parent IRModule,
+and emits NVVM IR text (.ll) for each kernel function. Also generates
+the host-side C99 code that loads and launches kernels via the CUDA
+Driver API.
+
+NVVM IR is LLVM IR constrained to the NVVM dialect. libNVVM compiles
+it to PTX, which the CUDA driver loads at runtime.
+"""
+
+from __future__ import annotations
+
+from ..ir import (
+    IRModule, IRVar, IRBlock, IRIf, IRLoop, IRSelect,
+    IRInst, IRConst, IRRef, IRType, StorageClass, Op, Operand,
+)
+from ..ir_gpu import KernelPlan, GPUPlan
+from . import KernelBackend, register_backend
+
+
+# ── Type mappings ───────────────────────────────────────────
+
+NVVM_TYPE = {
+    IRType.REAL: "double",
+    IRType.INTEGER: "i32",
+    IRType.LOGICAL: "i1",
+}
+
+# Math intrinsics -> NVVM intrinsic name (IEEE-correct versions)
+NVVM_MATH = {
+    Op.SIN:   "@llvm.sin.f64",
+    Op.COS:   "@llvm.cos.f64",
+    Op.TAN:   "@llvm.nvvm.tan.approx.d",   # no IEEE tan in NVVM
+    Op.EXP:   "@llvm.exp.f64",
+    Op.LOG:   "@llvm.log.f64",
+    Op.LOG10: "@llvm.log10.f64",
+    Op.SQRT:  "@llvm.nvvm.sqrt.rn.d",
+    Op.ABS:   "@llvm.fabs.f64",
+    Op.SINH:  "@llvm.nvvm.sinh.approx.d",
+    Op.COSH:  "@llvm.nvvm.cosh.approx.d",
+    Op.TANH:  "@llvm.nvvm.tanh.approx.d",
+}
+
+# Fast-math variants (used with --gpu-fast-math)
+NVVM_MATH_FAST = {
+    Op.SIN:   "@llvm.nvvm.sin.approx.d",
+    Op.COS:   "@llvm.nvvm.cos.approx.d",
+    Op.EXP:   "@llvm.nvvm.ex2.approx.d",
+    Op.LOG:   "@llvm.nvvm.lg2.approx.d",
+    Op.SQRT:  "@llvm.nvvm.sqrt.approx.d",
+}
+
+# Binary FP ops
+NVVM_BINOP = {
+    Op.ADD: "fadd", Op.SUB: "fsub", Op.MUL: "fmul", Op.DIV: "fdiv",
+}
+
+# Binary integer ops
+NVVM_INTOP = {
+    Op.ADD: "add", Op.SUB: "sub", Op.MUL: "mul", Op.DIV: "sdiv",
+}
+
+# Relational ops -> fcmp/icmp predicates
+NVVM_FCMP = {
+    Op.LT: "olt", Op.GT: "ogt", Op.EQ: "oeq",
+    Op.NE: "one", Op.LE: "ole", Op.GE: "oge",
+}
+NVVM_ICMP = {
+    Op.LT: "slt", Op.GT: "sgt", Op.EQ: "eq",
+    Op.NE: "ne", Op.LE: "sle", Op.GE: "sge",
+}
+
+
+class NVVMBackend(KernelBackend):
+    """Emit NVVM IR text for a set of extracted kernels."""
+
+    name = "nvvm"
+    device_ext = ".ll"
+
+    def __init__(self, module: IRModule, plan: GPUPlan,
+                 gpu_fast_math: bool = False):
+        super().__init__(module, plan, gpu_fast_math)
+        from ..errors import MCLError
+        raise MCLError(
+            "--target nvvm is experimental and currently broken "
+            "(see the docstring banner in core/backends/nvvm.py); "
+            "use --target spirv")
+        self._lines: list[str] = []
+        self._ssa_counter = 0
+
+        # Build type lookup from module
+        self._var_types: dict[str, IRType] = {}
+        self._var_storage: dict[str, StorageClass] = {}
+        for g in module.globals:
+            self._var_types[g.name] = g.type
+            self._var_storage[g.name] = g.storage
+        for v in module.main_locals:
+            self._var_types[v.name] = v.type
+            self._var_storage[v.name] = v.storage
+
+    def _fresh_ssa(self) -> str:
+        self._ssa_counter += 1
+        return f"%t{self._ssa_counter}"
+
+    def _nvvm_type(self, t: IRType) -> str:
+        return NVVM_TYPE.get(t, "double")
+
+    def _is_real(self, op: Operand) -> bool:
+        if isinstance(op, IRConst):
+            return op.type == IRType.REAL
+        if isinstance(op, IRRef):
+            t = self._var_types.get(op.name, op.type)
+            return t == IRType.REAL
+        return False
+
+    # ── top-level ───────────────────────────────────────────
+
+    def generate(self) -> str:
+        """Generate complete NVVM IR module text."""
+        self._emit_header()
+
+        for kernel in self.plan.kernels:
+            self._emit_kernel(kernel)
+
+        self._emit_metadata()
+        return "\n".join(self._lines) + "\n"
+
+    def generate_host_launches(self) -> str:
+        """Generate C99 host code for CUDA Driver API kernel launches."""
+        lines = []
+        for kernel in self.plan.kernels:
+            lines.extend(self._host_launch_code(kernel))
+            lines.append("")
+        return "\n".join(lines)
+
+    # ── NVVM IR header ──────────────────────────────────────
+
+    def _emit_header(self):
+        self._put("; NVVM IR generated by Ergo compiler")
+        self._put(f"; Source: {self.module.source_file or '<unknown>'}")
+        self._put("")
+        self._put("target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64\"")
+        self._put("target triple = \"nvptx64-nvidia-cuda\"")
+        self._put("")
+
+        # Declare thread index intrinsics
+        self._put("; Thread index intrinsics")
+        self._put("declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()")
+        self._put("declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()")
+        self._put("declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x()")
+        self._put("")
+
+        # Declare any math intrinsics used
+        declared = set()
+        for kernel in self.plan.kernels:
+            self._collect_math_intrinsics(kernel.loop.body, declared)
+        for intrinsic in sorted(declared):
+            self._put(f"declare double {intrinsic}(double)")
+        if declared:
+            self._put("")
+
+    # ── kernel emission ─────────────────────────────────────
+
+    def _emit_kernel(self, kernel: KernelPlan):
+        self._ssa_counter = 0
+        name = f"_ergo_kernel_{kernel.kernel_id}"
+
+        # Build parameter list: arrays as pointers, scalars by value
+        params = []
+        param_names: dict[str, str] = {}  # ergo name -> NVVM param name
+
+        # Arrays (written first, then read-only)
+        for arr in sorted(kernel.arrays_written):
+            pname = f"%{arr}"
+            params.append(f"double* {pname}")
+            param_names[arr] = pname
+
+        for arr in sorted(kernel.arrays_read - kernel.arrays_written):
+            pname = f"%{arr}"
+            params.append(f"double* {pname}")
+            param_names[arr] = pname
+
+        # Scalar parameters (PARAMETER constants passed by value)
+        for s in sorted(kernel.scalars_read):
+            t = self._var_types.get(s, IRType.REAL)
+            nvt = self._nvvm_type(t)
+            pname = f"%{s}"
+            params.append(f"{nvt} {pname}")
+            param_names[s] = pname
+
+        # Loop bound (N) — resolve to either a param ref or a constant
+        if isinstance(kernel.loop_bound, IRRef):
+            bound_name = kernel.loop_bound.name
+        else:
+            bound_name = None
+
+        param_str = ", ".join(params)
+        self._put(f"; Kernel from source line {kernel.source_line}")
+        if kernel.is_partial:
+            self._put(f"; SPLIT kernel: flow prefix of loop at line {kernel.split_from}")
+        self._put(f"define void @{name}({param_str}) #0 {{")
+        self._put("entry:")
+
+        # Thread index computation
+        tid = self._fresh_ssa()
+        bid = self._fresh_ssa()
+        bsz = self._fresh_ssa()
+        tmp = self._fresh_ssa()
+        gid = self._fresh_ssa()
+        self._put(f"    {tid} = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()")
+        self._put(f"    {bid} = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()")
+        self._put(f"    {bsz} = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()")
+        self._put(f"    {tmp} = mul i32 {bid}, {bsz}")
+        self._put(f"    {gid} = add i32 {tid}, {tmp}")
+
+        # Ergo is 1-based: i = gid + 1
+        i_val = self._fresh_ssa()
+        self._put(f"    {i_val} = add i32 {gid}, 1")
+
+        # Bounds check: i <= N
+        if bound_name:
+            bound_val = f"%{bound_name}"
+            if self._var_types.get(bound_name) == IRType.REAL:
+                cast = self._fresh_ssa()
+                self._put(f"    {cast} = fptosi double {bound_val} to i32")
+                bound_val = cast
+        elif isinstance(kernel.loop_bound, IRConst):
+            bound_val = str(kernel.loop_bound.value)
+        else:
+            bound_val = "0"
+
+        in_bounds = self._fresh_ssa()
+        self._put(f"    {in_bounds} = icmp sle i32 {i_val}, {bound_val}")
+        self._put(f"    br i1 {in_bounds}, label %body, label %exit")
+
+        self._put("")
+        self._put("body:")
+
+        # 0-based index for array access
+        idx_0 = self._fresh_ssa()
+        self._put(f"    {idx_0} = sub i32 {i_val}, 1")
+
+        # Emit the loop body instructions
+        ssa_map: dict[str, str] = {}
+        ssa_map[kernel.loop_var] = i_val
+
+        self._emit_kernel_body(kernel, kernel.loop.body, param_names,
+                               ssa_map, idx_0)
+
+        self._put("    br label %exit")
+        self._put("")
+        self._put("exit:")
+        self._put("    ret void")
+        self._put("}")
+        self._put("")
+
+    def _emit_kernel_body(self, kernel: KernelPlan, items: list,
+                          param_names: dict[str, str],
+                          ssa_map: dict[str, str], idx_0: str):
+        """Emit NVVM IR for the kernel body instructions."""
+        for item in items:
+            if isinstance(item, IRBlock):
+                for inst in item.insts:
+                    self._emit_kernel_inst(kernel, inst, param_names,
+                                           ssa_map, idx_0)
+            elif isinstance(item, IRIf):
+                self._emit_kernel_if(kernel, item, param_names,
+                                     ssa_map, idx_0)
+
+    def _emit_kernel_inst(self, kernel: KernelPlan, inst: IRInst,
+                          param_names: dict[str, str],
+                          ssa_map: dict[str, str], idx_0: str):
+        """Emit a single IR instruction as NVVM IR."""
+        op = inst.op
+
+        # SUB for index computation (i - 1) -> reuse idx_0
+        if op == Op.SUB and inst.result and inst.result.startswith("_idx"):
+            ssa_map[inst.result] = idx_0
+            return
+
+        # LOAD from array
+        if op == Op.LOAD:
+            arr = inst.meta.get("array", "")
+            arr_ptr = param_names.get(arr, f"%{arr}")
+            idx = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            gep = self._fresh_ssa()
+            result = self._fresh_ssa()
+            self._put(f"    {gep} = getelementptr double, double* {arr_ptr}, i32 {idx}")
+            self._put(f"    {result} = load double, double* {gep}")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        # STORE to array
+        if op == Op.STORE:
+            arr = inst.meta.get("array", "")
+            arr_ptr = param_names.get(arr, f"%{arr}")
+            val = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            idx = self._resolve_operand(inst.args[1], param_names, ssa_map)
+            gep = self._fresh_ssa()
+            self._put(f"    {gep} = getelementptr double, double* {arr_ptr}, i32 {idx}")
+            self._put(f"    store double {val}, double* {gep}")
+            return
+
+        # Arithmetic binary ops
+        if op in NVVM_BINOP:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            b = self._resolve_operand(inst.args[1], param_names, ssa_map)
+            result = self._fresh_ssa()
+
+            if self._is_real(inst.args[0]) or self._is_real(inst.args[1]) or inst.type == IRType.REAL:
+                llvm_op = NVVM_BINOP[op]
+                self._put(f"    {result} = {llvm_op} double {a}, {b}")
+            else:
+                llvm_op = NVVM_INTOP.get(op, "add")
+                self._put(f"    {result} = {llvm_op} i32 {a}, {b}")
+
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        # NEG
+        if op == Op.NEG:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            result = self._fresh_ssa()
+            if inst.type == IRType.REAL:
+                self._put(f"    {result} = fsub double 0.0, {a}")
+            else:
+                self._put(f"    {result} = sub i32 0, {a}")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        # POW
+        if op == Op.POW:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            b = self._resolve_operand(inst.args[1], param_names, ssa_map)
+            result = self._fresh_ssa()
+            self._put(f"    {result} = call double @llvm.pow.f64(double {a}, double {b})")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        # MOD
+        if op == Op.MOD:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            b = self._resolve_operand(inst.args[1], param_names, ssa_map)
+            result = self._fresh_ssa()
+            if inst.type == IRType.REAL:
+                self._put(f"    {result} = frem double {a}, {b}")
+            else:
+                self._put(f"    {result} = srem i32 {a}, {b}")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        # Relational
+        if op in NVVM_FCMP:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            b = self._resolve_operand(inst.args[1], param_names, ssa_map)
+            result = self._fresh_ssa()
+            if self._is_real(inst.args[0]):
+                pred = NVVM_FCMP[op]
+                self._put(f"    {result} = fcmp {pred} double {a}, {b}")
+            else:
+                pred = NVVM_ICMP[op]
+                self._put(f"    {result} = icmp {pred} i32 {a}, {b}")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        # Math intrinsics
+        if op in NVVM_MATH:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            result = self._fresh_ssa()
+            if self.gpu_fast_math and op in NVVM_MATH_FAST:
+                intrinsic = NVVM_MATH_FAST[op]
+            else:
+                intrinsic = NVVM_MATH[op]
+            self._put(f"    {result} = call double {intrinsic}(double {a})")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        # MAX/MIN (branchless)
+        if op == Op.MAX:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            b = self._resolve_operand(inst.args[1], param_names, ssa_map)
+            result = self._fresh_ssa()
+            self._put(f"    {result} = call double @llvm.maxnum.f64(double {a}, double {b})")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        if op == Op.MIN:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            b = self._resolve_operand(inst.args[1], param_names, ssa_map)
+            result = self._fresh_ssa()
+            self._put(f"    {result} = call double @llvm.minnum.f64(double {a}, double {b})")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        # CLAMP (branchless via minnum/maxnum)
+        if op == Op.CLAMP:
+            x = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            lo = self._resolve_operand(inst.args[1], param_names, ssa_map)
+            hi = self._resolve_operand(inst.args[2], param_names, ssa_map)
+            t1 = self._fresh_ssa()
+            result = self._fresh_ssa()
+            self._put(f"    {t1} = call double @llvm.maxnum.f64(double {x}, double {lo})")
+            self._put(f"    {result} = call double @llvm.minnum.f64(double {t1}, double {hi})")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        # Type conversion
+        if op == Op.TO_REAL:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            result = self._fresh_ssa()
+            self._put(f"    {result} = sitofp i32 {a} to double")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        if op == Op.TO_INT:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            result = self._fresh_ssa()
+            self._put(f"    {result} = fptosi double {a} to i32")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        # Logical AND/OR/NOT
+        if op == Op.AND:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            b = self._resolve_operand(inst.args[1], param_names, ssa_map)
+            result = self._fresh_ssa()
+            self._put(f"    {result} = and i1 {a}, {b}")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        if op == Op.OR:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            b = self._resolve_operand(inst.args[1], param_names, ssa_map)
+            result = self._fresh_ssa()
+            self._put(f"    {result} = or i1 {a}, {b}")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        if op == Op.NOT:
+            a = self._resolve_operand(inst.args[0], param_names, ssa_map)
+            result = self._fresh_ssa()
+            self._put(f"    {result} = xor i1 {a}, 1")
+            if inst.result:
+                ssa_map[inst.result] = result
+            return
+
+        # COPY — scalar assignment or CYCLE
+        if op == Op.COPY:
+            if inst.meta.get("kind") == "cycle":
+                # CYCLE in kernel context = early exit for this thread
+                self._put("    br label %exit")
+                return
+            if inst.result and inst.args:
+                val = self._resolve_operand(inst.args[0], param_names, ssa_map)
+                ssa_map[inst.result] = val
+            return
+
+        # Fallback: emit comment for unhandled ops
+        self._put(f"    ; unhandled op: {op.value}")
+
+    def _emit_kernel_if(self, kernel: KernelPlan, node: IRIf,
+                        param_names: dict[str, str],
+                        ssa_map: dict[str, str], idx_0: str):
+        """Emit divergent branch for IF inside a kernel."""
+        cond = self._resolve_operand(node.condition, param_names, ssa_map)
+        then_label = f"if_then_{self._ssa_counter}"
+        else_label = f"if_else_{self._ssa_counter}"
+        merge_label = f"if_merge_{self._ssa_counter}"
+
+        if node.else_body:
+            self._put(f"    br i1 {cond}, label %{then_label}, label %{else_label}")
+        else:
+            self._put(f"    br i1 {cond}, label %{then_label}, label %{merge_label}")
+
+        self._put(f"{then_label}:")
+        self._emit_kernel_body(kernel, node.then_body, param_names,
+                               ssa_map, idx_0)
+        self._put(f"    br label %{merge_label}")
+
+        if node.else_body:
+            self._put(f"{else_label}:")
+            self._emit_kernel_body(kernel, node.else_body, param_names,
+                                   ssa_map, idx_0)
+            self._put(f"    br label %{merge_label}")
+
+        self._put(f"{merge_label}:")
+
+    # ── operand resolution ──────────────────────────────────
+
+    def _resolve_operand(self, op: Operand, param_names: dict[str, str],
+                         ssa_map: dict[str, str]) -> str:
+        """Resolve an IR operand to an NVVM IR value reference."""
+        if isinstance(op, IRConst):
+            if op.type == IRType.REAL:
+                return self._double_hex(op.value)
+            if op.type == IRType.INTEGER:
+                return str(op.value)
+            if op.type == IRType.LOGICAL:
+                return "1" if op.value else "0"
+            return str(op.value)
+
+        if isinstance(op, IRRef):
+            if op.name in ssa_map:
+                return ssa_map[op.name]
+            if op.name in param_names:
+                return param_names[op.name]
+            return f"%{op.name}"
+
+        return "0"
+
+    def _double_hex(self, value) -> str:
+        """Convert a Python float to LLVM's hex double format."""
+        import struct
+        packed = struct.pack(">d", float(value))
+        hex_str = packed.hex()
+        return f"0x{hex_str.upper()}"
+
+    # ── metadata ────────────────────────────────────────────
+
+    def _emit_metadata(self):
+        self._put("; Kernel annotations")
+        self._put("!nvvm.annotations = !{" +
+                  ", ".join(f"!{k.kernel_id}" for k in self.plan.kernels) +
+                  "}")
+        for kernel in self.plan.kernels:
+            name = f"@_ergo_kernel_{kernel.kernel_id}"
+            self._put(f"!{kernel.kernel_id} = !{{void (...)* bitcast "
+                      f"(void (...)* {name} to void (...)*), "
+                      f"!\"kernel\", i32 1}}")
+        self._put("")
+        self._put(f"!nvvm.module.flags = !{{!{len(self.plan.kernels)}}}")
+        self._put(f"!{len(self.plan.kernels)} = !{{i32 4, !\"nvvm-reflect-ftz\", i32 0}}")
+
+    # ── host launch code ────────────────────────────────────
+
+    def _host_launch_code(self, kernel: KernelPlan) -> list[str]:
+        """Generate C99 code to launch a kernel via CUDA Driver API."""
+        lines = []
+        name = f"_ergo_kernel_{kernel.kernel_id}"
+        bound = self._host_operand(kernel.loop_bound)
+
+        lines.append(f"    /* Launch kernel {name} (source line {kernel.source_line}) */")
+        lines.append(f"    {{")
+        lines.append(f"        CUfunction kern;")
+        lines.append(f"        cuModuleGetFunction(&kern, gpu_module, \"{name}\");")
+
+        all_args = []
+        for arr in sorted(kernel.arrays_written):
+            all_args.append(f"&d_{arr}")
+        for arr in sorted(kernel.arrays_read - kernel.arrays_written):
+            all_args.append(f"&d_{arr}")
+        for s in sorted(kernel.scalars_read):
+            all_args.append(f"&{s}")
+
+        lines.append(f"        void *args[] = {{{', '.join(all_args)}}};")
+        lines.append(f"        int _grid = ({bound} + 255) / 256;")
+        lines.append(f"        cuLaunchKernel(kern,")
+        lines.append(f"            _grid, 1, 1,")
+        lines.append(f"            256, 1, 1,")
+        lines.append(f"            0, NULL,")
+        lines.append(f"            args, NULL);")
+        lines.append(f"        cuCtxSynchronize();")
+        lines.append(f"    }}")
+        return lines
+
+    def _host_operand(self, op: Operand) -> str:
+        if isinstance(op, IRConst):
+            return str(op.value)
+        if isinstance(op, IRRef):
+            return op.name
+        return "0"
+
+    # ── math intrinsic collection ───────────────────────────
+
+    def _collect_math_intrinsics(self, items: list, declared: set[str]):
+        """Walk body and collect NVVM math intrinsic declarations needed."""
+        for item in items:
+            if isinstance(item, IRBlock):
+                for inst in item.insts:
+                    if inst.op in NVVM_MATH:
+                        if self.gpu_fast_math and inst.op in NVVM_MATH_FAST:
+                            declared.add(NVVM_MATH_FAST[inst.op])
+                        else:
+                            declared.add(NVVM_MATH[inst.op])
+                    if inst.op == Op.MAX:
+                        declared.add("@llvm.maxnum.f64")
+                    if inst.op == Op.MIN:
+                        declared.add("@llvm.minnum.f64")
+                    if inst.op == Op.CLAMP:
+                        declared.add("@llvm.maxnum.f64")
+                        declared.add("@llvm.minnum.f64")
+                    if inst.op == Op.POW:
+                        declared.add("@llvm.pow.f64")
+            elif isinstance(item, IRIf):
+                self._collect_math_intrinsics(item.then_body, declared)
+                if item.else_body:
+                    self._collect_math_intrinsics(item.else_body, declared)
+
+    # ── helpers ─────────────────────────────────────────────
+
+    def _put(self, line: str):
+        self._lines.append(line)
+
+
+# Register this backend
+register_backend("nvvm", NVVMBackend)

@@ -1,0 +1,1311 @@
+! CROSSLINK — M4d: transient crosslinking (fascin/alpha-actinin-like)
+! =====================================================================
+! M4a baseline + dynamic crosslink bonds: harmonic springs (KLINK, rest
+! L0 fixed) between beads of BOUND monomers on different monomers that
+! are NOT ladder-bonded to each other. Birth: candidate pairs within
+! RLINK found by the SAME 27-cell scan as WCA (second list, no extra
+! O(N^2)); each unlinked eligible pair accepts with P = KLINKF*DT per
+! step. Death: each live link breaks with P = KLINKB*DT per step. Links
+! are stripped when either endpoint monomer unbinds. Fixed-size slot
+! arrays (MAXL) with active flags; slot index = death-draw slot.
+!
+! WCA policy: linked pairs are NOT WCA-excluded. L0=0.7 > WCUT=0.5612,
+! spring and WCA agree in sign everywhere (both push apart below the
+! rest/cut), so keeping WCA live removes the death-while-compressed
+! catapult channel by construction (exclusion set is static).
+!
+! Rest length: FIXED L0=0.7 (not birth distance). Fixed rest stores a
+! mechanical preference that actively pulls filaments into register
+! (fascin-like tight bundle spacing); birth-distance rests are
+! zero-strain at birth and store no preference.
+!
+! Two seeds (justify): crosslinks on one filament give loops only;
+! fascin-like bundling needs >=2 filaments. Two anchored trimers seeded
+! parallel at lateral offset 2.0. Pool: N=96 -> c0 = 90/1728 = 0.052,
+! kon*c0 = 9.0e-4 = 2*koff nominal; with the M4a return-capture factor
+! (koff_eff ~ 0.8x) steady bound ~ N - 72 = 24 -> ~12 monomers per
+! filament: short rods, not coils -> inter-filament contacts are
+! geometrically frequent and links mostly inter-filament.
+! Same-filament links need contour separation >= LOOPMIN=6 (loop
+! closure / coil control only, no local crumple links).
+!
+! Draw slots (hash RNG, pure function of SEED+STEP):
+!   3I-2..3I (I<=240) integrator noise -> <= 720
+!   800/801 bind/unbind filament 1, 802/803 filament 2
+!   810+k  birth draw for k-th candidate (k<=MAXCB=600)
+!   1500+L death draw for link slot L (L<=MAXL=64)
+! =====================================================================
+IMPLICIT NONE
+
+! ── System ──────────────────────────────────────────────────
+PARAMETER INTEGER :: NMAX = 96             ! monomers (two-seed pool, see header)
+PARAMETER INTEGER :: NB = 192              ! 2 * NMAX
+PARAMETER INTEGER :: NBMAX = 288           ! 3 * NMAX junction springs
+PARAMETER REAL :: LBOX = 12.0
+! ── Neighbor list (bead level) ──────────────────────────────
+PARAMETER INTEGER :: NC = 16
+PARAMETER REAL :: CE = 0.75               ! LBOX/NC >= WCUT
+PARAMETER INTEGER :: NCELL = 4096         ! NC^3
+PARAMETER INTEGER :: MAXNBR = 64
+PARAMETER INTEGER :: NSLOT = 15360         ! NB * MAXNBR
+! ── Force field ─────────────────────────────────────────────
+PARAMETER REAL :: SIG = 0.5                ! bead WCA sigma
+PARAMETER REAL :: C216 = 1.122462048309373 ! 2^(1/6)
+PARAMETER REAL :: WCUT = 0.5612310241546865! C216 * SIG
+PARAMETER REAL :: KBOND = 100.0            ! intra-monomer bond
+PARAMETER REAL :: R0 = 0.5                 ! monomer length
+PARAMETER REAL :: KFIL = 100.0             ! junction springs
+PARAMETER REAL :: PITCH = 0.6              ! filament pitch
+PARAMETER REAL :: RCROSS = 0.1             ! PITCH - R0
+! ── Kinetics (polymerization, M4a-certified) ────────────────
+PARAMETER REAL :: RCAP = 1.4               ! capture radius (tail->barbed head)
+PARAMETER REAL :: QMIN = 0.0               ! alignment gate a_m . a_barbed
+PARAMETER REAL :: KON = 500.0              ! bind prob/step = KON*DT in window
+PARAMETER REAL :: KOFF = 0.09              ! unbind prob/step = KOFF*DT
+PARAMETER REAL :: KSEED = 5.0              ! nucleator spring (seed monomers)
+PARAMETER INTEGER :: NSEEDP = 3            ! stable nucleus size (trimer)
+PARAMETER INTEGER :: NFIL = 2              ! two seeds (bundling assay)
+PARAMETER REAL :: YSEEDA = 5.0             ! seed A lateral position
+PARAMETER REAL :: YSEEDB = 6.5             ! seed B lateral position (gap 1.5)
+! ── Crosslinking (M4d) ──────────────────────────────────────
+PARAMETER REAL :: KLINK = 20.0             ! link spring stiffness
+PARAMETER REAL :: L0 = 0.7                 ! FIXED link rest length
+PARAMETER REAL :: RLINK = 1.0              ! birth capture radius; needs the 125-cell
+                                           ! candidate stencil (diff<=2 cells cover all
+                                           ! pairs with d<=1.5); 27-stencil would miss
+                                           ! diff-2 pairs (|dx|>0.75) -> engine/mirror
+                                           ! candidate-set asymmetry (caught in dyn cmp)
+PARAMETER REAL :: KLINKF = 0.3             ! birth P/step/pair = KLINKF*DT
+PARAMETER REAL :: KLINKB = 3.0             ! death P/step/link = KLINKB*DT
+PARAMETER INTEGER :: MAXL = 64             ! link slots
+PARAMETER INTEGER :: MAXCB = 600           ! birth draw slots per step
+PARAMETER INTEGER :: MAXCL = 1024          ! candidate list capacity
+PARAMETER INTEGER :: LOOPMIN = 6           ! same-filament links need |dpos|>=LOOPMIN
+! ── Dynamics ────────────────────────────────────────────────
+PARAMETER REAL :: DT = 0.005
+PARAMETER REAL :: GAMMA = 2.0
+PARAMETER REAL :: FCAP = 500.0
+PARAMETER REAL :: XWALL = 0.5
+PARAMETER REAL :: KWALL = 100.0
+PARAMETER REAL :: KT = 0.4
+PARAMETER INTEGER :: NSTEPS = 150000
+PARAMETER INTEGER :: NDIAG = 500
+PARAMETER INTEGER :: SEED = 77031
+! ── Modes ───────────────────────────────────────────────────
+PARAMETER INTEGER :: MIRROR = 0            ! 1 = static cert dump
+! ── Cert geometry ───────────────────────────────────────────
+PARAMETER REAL :: THB = 0.03               ! arc bend per junction
+PARAMETER REAL :: PHI_G = 2.39996322972865332
+PARAMETER REAL :: CERTDY = 0.85            ! cert chain-B lateral offset
+
+! ── 27-cell stencil + far (diff=2) cells for candidates ─────
+STATIC INTEGER :: OX(27), OY(27), OZ(27)
+STATIC INTEGER :: OX2(98), OY2(98), OZ2(98)   ! max(|d|)=2 shell, filled at init
+STATIC INTEGER :: NOFF2                        ! = 98
+DATA OX / -1, 0, 1, -1, 0, 1, -1, 0, 1, &
+          -1, 0, 1, -1, 0, 1, -1, 0, 1, &
+          -1, 0, 1, -1, 0, 1, -1, 0, 1 /
+DATA OY / -1, -1, -1, 0, 0, 0, 1, 1, 1, &
+          -1, -1, -1, 0, 0, 0, 1, 1, 1, &
+          -1, -1, -1, 0, 0, 0, 1, 1, 1 /
+DATA OZ / -1, -1, -1, -1, -1, -1, -1, -1, -1, &
+           0, 0, 0, 0, 0, 0, 0, 0, 0, &
+           1, 1, 1, 1, 1, 1, 1, 1, 1 /
+
+! ── Bead state ──────────────────────────────────────────────
+STATIC REAL :: PX(NB), PY(NB), PZ(NB)
+STATIC REAL :: VX(NB), VY(NB), VZ(NB)
+STATIC REAL :: FX(NB), FY(NB), FZ(NB)
+STATIC INTEGER :: BP1(NB), BP2(NB)         ! bonded partners (junction)
+STATIC REAL :: ANX(NB), ANY(NB), ANZ(NB)   ! seed anchor targets
+STATIC INTEGER :: HASA(NB)
+! ── Monomer / filament state ────────────────────────────────
+STATIC INTEGER :: STATE(NMAX)              ! 0 free, 1 bound
+STATIC INTEGER :: PREVM(NMAX), NEXTM(NMAX) ! chain pointers (0 = null)
+STATIC INTEGER :: FILID(NMAX)              ! 0 free, 1/2 filament membership
+STATIC INTEGER :: POSI(NMAX)               ! contour index along chain (0=free)
+STATIC INTEGER :: BARBF(2), MLE(2), HEADM(2)
+STATIC REAL :: AX(NMAX), AY(NMAX), AZ(NMAX), ALEN(NMAX)
+STATIC REAL :: CXA(NMAX), CYA(NMAX), CZA(NMAX)
+STATIC REAL :: FBX(NMAX), FBY(NMAX), FBZ(NMAX)
+STATIC INTEGER :: FBI(NBMAX), FBJ(NBMAX)
+STATIC REAL :: FR0(NBMAX)
+! ── Crosslink state ─────────────────────────────────────────
+STATIC INTEGER :: LNKI(MAXL), LNKJ(MAXL)   ! link endpoint beads (1-based)
+STATIC INTEGER :: LACT(MAXL)               ! slot active flag
+STATIC INTEGER :: LBORN(MAXL)              ! birth step (lifetime stats)
+STATIC INTEGER :: CLISTI(MAXCL), CLISTJ(MAXCL)
+! ── Cell list ───────────────────────────────────────────────
+STATIC INTEGER :: CELLOF(NB), CELX(NB), CELY(NB), CELZ(NB)
+STATIC INTEGER :: CNT(NCELL), OFF(NCELL), CUR(NCELL), SORTEDB(NB)
+STATIC INTEGER :: NBR_I(NSLOT), NBR_J(NSLOT)
+! ── Working scalars ─────────────────────────────────────────
+STATIC INTEGER :: I, J, K, M, Q, L, FL, STEP, SN, RCNT
+STATIC INTEGER :: DX2, DY2, DZ2
+STATIC INTEGER :: NACT, NM, BARB, MLEN, NFILB
+STATIC INTEGER :: NBINDT, NUNBT, DIDB, OK, OK2, T
+STATIC INTEGER :: HP, TP, HQ, TQ, HB, TB, A2, B2, MI, MJ
+STATIC INTEGER :: OVERFLOW, MAXNB, NSUSED, NOUT, LCNT
+STATIC INTEGER :: NLINK, NCAND, CLOVF, NLINKI, NCSKIP
+STATIC INTEGER :: LBIRTHT, LDEATHT, LSTRIPT, LTCNT
+STATIC INTEGER :: NA1, NA2, SHCNT
+STATIC REAL :: DX, DY, DZ, D, DD, MG, LM, LMG, BR, B6, FM, FB
+STATIC REAL :: NA, UON, UOFF, UB, UD, CX0, PHI, AXX, AXY, AXZ
+STATIC REAL :: POSX, POSY, POSZ
+STATIC REAL :: CENX, CENY, CENZ, ZZ, TH, SS, HBX, HBY, HBZ, TBX, TBY, TBZ
+STATIC REAL :: ABX, ABY, ABZ, QQ, LSUM, KT2, FMAX, EE, LMEAN
+STATIC REAL :: A1X, A1Y, A1Z, A2X, A2Y, A2Z, A1N, A2N
+STATIC REAL :: AL, SEP, SEPT, EE1, EE2, DMIN, LTSUM
+STATIC REAL :: SHNL, SHNC, SHAL, SHSEP, SHEE1, SHEE2, SHNLI
+STATIC REAL :: EP_WCA, EP_BOND, EP_FIL, EP_ANCH, EP_WALL, EP_LINK
+
+! ════════════════════════════════════════════════════════════
+! MAIN
+! ════════════════════════════════════════════════════════════
+
+NBINDT := 0
+NUNBT := 0
+OVERFLOW := 0
+LBIRTHT := 0
+LDEATHT := 0
+LSTRIPT := 0
+LTSUM := 0.0
+LTCNT := 0
+NCSKIP := 0
+! far-cell (diff=2) stencil for the candidate scan: all offsets with
+! max(|dx|,|dy|,|dz|) = 2 (the 27 inner cells are covered by OX/OY/OZ)
+NOFF2 := 0
+DO DX2 = -2, 2
+  DO DY2 = -2, 2
+    DO DZ2 = -2, 2
+      IF MAX(ABS(DX2), MAX(ABS(DY2), ABS(DZ2))) = 2 THEN
+        NOFF2 := NOFF2 + 1
+        OX2(NOFF2) := DX2
+        OY2(NOFF2) := DY2
+        OZ2(NOFF2) := DZ2
+      ENDIF
+    ENDDO
+  ENDDO
+ENDDO
+
+IF MIRROR = 1 THEN
+  CALL INIT_CERT()
+ELSE
+  CALL INIT_DYN()
+ENDIF
+CALL REBUILD_BONDS()
+
+WRITE(*, "# CROSSLINK M4d NMAX=%d KON=%f KOFF=%f KT=%f MIRROR=%d") NMAX, KON, KOFF, KT, MIRROR
+WRITE(*, "# LINK KLINK=%f L0=%f RLINK=%f KLINKF=%f KLINKB=%f MAXL=%d NFIL=%d") KLINK, L0, RLINK, KLINKF, KLINKB, MAXL, NFIL
+
+IF MIRROR = 1 THEN
+  CALL BOND_AXES()
+  CALL CELL_BUILD()
+  CALL NBR_BUILD()
+  CALL FORCE_PAIR()
+  CALL APPLY_BB()
+  CALL FILBONDS()
+  CALL LINKFORCE()
+  CALL ANCHORS()
+  CALL WALLS()
+  CALL CERT_ENERGY()
+  CALL DUMP_MIRROR()
+  STOP
+ENDIF
+
+LSUM := 0.0
+LCNT := 0
+SHCNT := 0
+SHNL := 0.0
+SHNC := 0.0
+SHAL := 0.0
+SHSEP := 0.0
+SHEE1 := 0.0
+SHEE2 := 0.0
+SHNLI := 0.0
+DO STEP = 1, NSTEPS
+  CALL INTEGRATE()
+  CALL BOND_AXES()
+  CALL KINETICS()
+  CALL CELL_BUILD()
+  CALL NBR_BUILD()
+  CALL LINKBIRTH()
+  CALL LINKDEATH()
+  CALL FORCE_PAIR()
+  CALL APPLY_BB()
+  CALL FILBONDS()
+  CALL LINKFORCE()
+  CALL ANCHORS()
+  CALL WALLS()
+  IF MOD(STEP, NDIAG) = 0 THEN
+    CALL DIAG()
+  ENDIF
+ENDDO
+
+CALL ANALYZE_FINAL()
+STOP
+
+! ════════════════════════════════════════════════════════════
+! SUBROUTINES
+! ════════════════════════════════════════════════════════════
+
+! ── INIT_CERT: hexamer arc (1..6) + parallel tetramer (7..10) at
+! lateral offset CERTDY + 3 static links + 10 spiral + close pair ──
+! Formula-identical to crosslink_mirror.py cert_config(). No RNG.
+SUBROUTINE INIT_CERT()
+  NM := 22
+  NACT := 2 * NM
+  CX0 := LBOX * 0.5
+  DO I = 1, NB
+    VX(I) := 0.0
+    VY(I) := 0.0
+    VZ(I) := 0.0
+    HASA(I) := 0
+  ENDDO
+  DO M = 1, NMAX
+    STATE(M) := 0
+    PREVM(M) := 0
+    NEXTM(M) := 0
+    FILID(M) := 0
+  ENDDO
+  DO L = 1, MAXL
+    LACT(L) := 0
+    LNKI(L) := 0
+    LNKJ(L) := 0
+    LBORN(L) := 0
+  ENDDO
+  ! chain A: hexamer (monomers 1..6) on arc, THB rad per junction
+  POSX := CX0
+  POSY := CX0
+  DO I = 1, 6
+    IF I > 1 THEN
+      PHI := THB * REAL(I - 1)
+      AXX := COS(PHI)
+      AXY := SIN(PHI)
+      POSX := POSX + PITCH * COS(THB * REAL(I - 2))
+      POSY := POSY + PITCH * SIN(THB * REAL(I - 2))
+    ELSE
+      AXX := 1.0
+      AXY := 0.0
+    ENDIF
+    HP := 2 * I - 1
+    TP := 2 * I
+    PX(HP) := POSX + 0.25 * AXX
+    PY(HP) := POSY + 0.25 * AXY
+    PZ(HP) := CX0
+    PX(TP) := POSX - 0.25 * AXX
+    PY(TP) := POSY - 0.25 * AXY
+    PZ(TP) := CX0
+  ENDDO
+  ! chain B: tetramer (monomers 7..10) straight along +x at y = CX0-CERTDY
+  DO K = 0, 3
+    M := 7 + K
+    HP := 2 * M - 1
+    TP := 2 * M
+    CENX := CX0 + REAL(K) * PITCH
+    CENY := CX0 - CERTDY
+    PX(HP) := CENX + 0.25
+    PY(HP) := CENY
+    PZ(HP) := CX0
+    PX(TP) := CENX - 0.25
+    PY(TP) := CENY
+    PZ(TP) := CX0
+  ENDDO
+  ! free spiral monomers 11..20
+  DO K = 0, 9
+    M := 11 + K
+    PHI := REAL(K) * PHI_G
+    CENX := CX0 + 4.5 * COS(PHI)
+    CENY := CX0 + 4.5 * SIN(PHI)
+    CENZ := CX0 - 1.5 + 3.0 * REAL(MOD(K, 2))
+    AXX := COS(PHI + 1.0)
+    AXY := SIN(PHI + 1.0)
+    AXZ := 0.5
+    DD := SQRT(AXX * AXX + AXY * AXY + AXZ * AXZ)
+    AXX := AXX / DD
+    AXY := AXY / DD
+    AXZ := AXZ / DD
+    HP := 2 * M - 1
+    TP := 2 * M
+    PX(HP) := CENX + 0.25 * AXX
+    PY(HP) := CENY + 0.25 * AXY
+    PZ(HP) := CENZ + 0.25 * AXZ
+    PX(TP) := CENX - 0.25 * AXX
+    PY(TP) := CENY - 0.25 * AXY
+    PZ(TP) := CENZ - 0.25 * AXZ
+  ENDDO
+  ! close pair (monomers 21, 22): centers 0.55 apart in y, axes along x
+  DO M = 21, 22
+    HP := 2 * M - 1
+    TP := 2 * M
+    CENX := CX0 + 3.0
+    CENY := CX0 - 3.0 + 0.55 * REAL(M - 21)
+    CENZ := CX0
+    PX(HP) := CENX + 0.25
+    PY(HP) := CENY
+    PZ(HP) := CENZ
+    PX(TP) := CENX - 0.25
+    PY(TP) := CENY
+    PZ(TP) := CENZ
+  ENDDO
+  ! topology: chain A = 1..6, chain B = 7..10
+  DO M = 1, 6
+    STATE(M) := 1
+    PREVM(M) := M - 1
+    NEXTM(M) := M + 1
+    FILID(M) := 1
+  ENDDO
+  DO M = 7, 10
+    STATE(M) := 1
+    PREVM(M) := M - 1
+    NEXTM(M) := M + 1
+    FILID(M) := 2
+  ENDDO
+  PREVM(1) := 0
+  NEXTM(6) := 0
+  PREVM(7) := 0
+  NEXTM(10) := 0
+  HEADM(1) := 1
+  HEADM(2) := 7
+  BARBF(1) := 6
+  BARBF(2) := 10
+  MLE(1) := 6
+  MLE(2) := 4
+  MLEN := 10
+  ! anchor targets = UN-jittered first-monomer beads of each chain
+  HASA(1) := 1
+  HASA(2) := 1
+  ANX(1) := PX(1)
+  ANY(1) := PY(1)
+  ANZ(1) := PZ(1)
+  ANX(2) := PX(2)
+  ANY(2) := PY(2)
+  ANZ(2) := PZ(2)
+  HASA(13) := 1
+  HASA(14) := 1
+  ANX(13) := PX(13)
+  ANY(13) := PY(13)
+  ANZ(13) := PZ(13)
+  ANX(14) := PX(14)
+  ANY(14) := PY(14)
+  ANZ(14) := PZ(14)
+  ! 3 static crosslinks, rest L0=0.7, born at d~0.85 (strain ~0.15)
+  NLINK := 3
+  LACT(1) := 1
+  LNKI(1) := 1
+  LNKJ(1) := 13
+  LACT(2) := 1
+  LNKI(2) := 3
+  LNKJ(2) := 15
+  LACT(3) := 1
+  LNKI(3) := 6
+  LNKJ(3) := 18
+  ! deterministic jitter, identical formula to the mirror
+  DO I = 1, NACT
+    PX(I) := PX(I) + 0.02 * SIN(REAL(I - 1) * 1.7)
+    PY(I) := PY(I) + 0.02 * COS(REAL(I - 1) * 2.3)
+    PZ(I) := PZ(I) + 0.02 * SIN(REAL(I - 1) * 0.9 + 1.0)
+  ENDDO
+  RETURN
+END
+
+! ── INIT_DYN: TWO trimer nuclei (parallel, gap 2.0) + random gas ──
+SUBROUTINE INIT_DYN()
+  NM := NMAX
+  NACT := NB
+  CX0 := LBOX * 0.5
+  DO I = 1, NB
+    VX(I) := 0.0
+    VY(I) := 0.0
+    VZ(I) := 0.0
+    HASA(I) := 0
+  ENDDO
+  DO M = 1, NMAX
+    STATE(M) := 0
+    PREVM(M) := 0
+    NEXTM(M) := 0
+    FILID(M) := 0
+  ENDDO
+  DO L = 1, MAXL
+    LACT(L) := 0
+    LNKI(L) := 0
+    LNKJ(L) := 0
+    LBORN(L) := 0
+  ENDDO
+  NLINK := 0
+  ! filament A: monomers 1..3 along x at y=YSEEDA
+  DO I = 1, NSEEDP
+    HP := 2 * I - 1
+    TP := 2 * I
+    CENX := CX0 + REAL(I - 2) * PITCH
+    PX(HP) := CENX + 0.25
+    PY(HP) := YSEEDA
+    PZ(HP) := CX0
+    PX(TP) := CENX - 0.25
+    PY(TP) := YSEEDA
+    PZ(TP) := CX0
+    STATE(I) := 1
+    PREVM(I) := I - 1
+    NEXTM(I) := I + 1
+    FILID(I) := 1
+  ENDDO
+  PREVM(1) := 0
+  NEXTM(NSEEDP) := 0
+  ! filament B: monomers 4..6 along x at y=YSEEDB
+  DO I = 1, NSEEDP
+    M := 3 + I
+    HP := 2 * M - 1
+    TP := 2 * M
+    CENX := CX0 + REAL(I - 2) * PITCH
+    PX(HP) := CENX + 0.25
+    PY(HP) := YSEEDB
+    PZ(HP) := CX0
+    PX(TP) := CENX - 0.25
+    PY(TP) := YSEEDB
+    PZ(TP) := CX0
+    STATE(M) := 1
+    PREVM(M) := M - 1
+    NEXTM(M) := M + 1
+    FILID(M) := 2
+  ENDDO
+  PREVM(4) := 0
+  NEXTM(6) := 0
+  HEADM(1) := 1
+  HEADM(2) := 4
+  BARBF(1) := NSEEDP
+  BARBF(2) := 6
+  MLE(1) := NSEEDP
+  MLE(2) := NSEEDP
+  MLEN := 6
+  ! anchors on both seed first-monomers
+  HASA(1) := 1
+  HASA(2) := 1
+  ANX(1) := PX(1)
+  ANY(1) := PY(1)
+  ANZ(1) := PZ(1)
+  ANX(2) := PX(2)
+  ANY(2) := PY(2)
+  ANZ(2) := PZ(2)
+  HASA(7) := 1
+  HASA(8) := 1
+  ANX(7) := PX(7)
+  ANY(7) := PY(7)
+  ANZ(7) := PZ(7)
+  ANX(8) := PX(8)
+  ANY(8) := PY(8)
+  ANZ(8) := PZ(8)
+  ! gas: rejection-sampled positions, random axes, RAND stream from SEED
+  RCNT := 1000
+  SN := HASH(SEED)
+  DO M = 7, NMAX
+    OK := 0
+    DO T = 1, 60
+      IF OK = 0 THEN
+        CENX := 2.0 + (LBOX - 4.0) * RAND(SN + RCNT)
+        RCNT := RCNT + 1
+        CENY := 2.0 + (LBOX - 4.0) * RAND(SN + RCNT)
+        RCNT := RCNT + 1
+        CENZ := 2.0 + (LBOX - 4.0) * RAND(SN + RCNT)
+        RCNT := RCNT + 1
+        ZZ := 2.0 * RAND(SN + RCNT) - 1.0
+        RCNT := RCNT + 1
+        TH := 6.2831853071795865 * RAND(SN + RCNT)
+        RCNT := RCNT + 1
+        SS := SQRT(MAX(0.0, 1.0 - ZZ * ZZ))
+        AXX := SS * COS(TH)
+        AXY := SS * SIN(TH)
+        AXZ := ZZ
+        HBX := CENX + 0.25 * AXX
+        HBY := CENY + 0.25 * AXY
+        HBZ := CENZ + 0.25 * AXZ
+        TBX := CENX - 0.25 * AXX
+        TBY := CENY - 0.25 * AXY
+        TBZ := CENZ - 0.25 * AXZ
+        OK2 := 1
+        DO J = 1, 2 * M - 2
+          DX := HBX - PX(J)
+          DY := HBY - PY(J)
+          DZ := HBZ - PZ(J)
+          IF DX * DX + DY * DY + DZ * DZ <= 0.3844 THEN
+            OK2 := 0
+          ENDIF
+          DX := TBX - PX(J)
+          DY := TBY - PY(J)
+          DZ := TBZ - PZ(J)
+          IF DX * DX + DY * DY + DZ * DZ <= 0.3844 THEN
+            OK2 := 0
+          ENDIF
+        ENDDO
+        IF OK2 = 1 THEN
+          OK := 1
+        ENDIF
+      ENDIF
+    ENDDO
+    HP := 2 * M - 1
+    TP := 2 * M
+    PX(HP) := HBX
+    PY(HP) := HBY
+    PZ(HP) := HBZ
+    PX(TP) := TBX
+    PY(TP) := TBY
+    PZ(TP) := TBZ
+  ENDDO
+  RETURN
+END
+
+! ── REBUILD_BONDS: walk EVERY chain head (STATE=1, PREVM=0) ──
+SUBROUTINE REBUILD_BONDS()
+  NFILB := 0
+  DO I = 1, NB
+    BP1(I) := 0
+    BP2(I) := 0
+  ENDDO
+  DO M = 1, NMAX
+    IF STATE(M) = 1 .AND. PREVM(M) = 0 THEN
+      Q := M
+      DO K = 1, NMAX
+        IF NEXTM(Q) > 0 THEN
+          I := Q
+          Q := NEXTM(Q)
+          HP := 2 * I - 1
+          TP := 2 * I
+          HQ := 2 * Q - 1
+          TQ := 2 * Q
+          NFILB := NFILB + 1
+          FBI(NFILB) := HP
+          FBJ(NFILB) := HQ
+          FR0(NFILB) := PITCH
+          NFILB := NFILB + 1
+          FBI(NFILB) := TP
+          FBJ(NFILB) := TQ
+          FR0(NFILB) := PITCH
+          NFILB := NFILB + 1
+          FBI(NFILB) := HP
+          FBJ(NFILB) := TQ
+          FR0(NFILB) := RCROSS
+          BP1(HP) := HQ
+          BP2(HP) := TQ
+          BP1(TP) := TQ
+          BP1(HQ) := HP
+          BP1(TQ) := TP
+          BP2(TQ) := HP
+        ENDIF
+      ENDDO
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── INTEGRATE: Langevin velocity-Verlet, deterministic hash noise ──
+SUBROUTINE INTEGRATE()
+  SN := HASH(SEED + STEP)
+  NA := SQRT(12.0 * KT * (1.0 - (1.0 - GAMMA * DT) * (1.0 - GAMMA * DT)))
+  DO I = 1, NACT
+    VX(I) := VX(I) * (1.0 - GAMMA * DT) + FX(I) * DT + NA * (RAND(SN + 3 * I - 2) - 0.5)
+    VY(I) := VY(I) * (1.0 - GAMMA * DT) + FY(I) * DT + NA * (RAND(SN + 3 * I - 1) - 0.5)
+    VZ(I) := VZ(I) * (1.0 - GAMMA * DT) + FZ(I) * DT + NA * (RAND(SN + 3 * I) - 0.5)
+    PX(I) := PX(I) + VX(I) * DT
+    PY(I) := PY(I) + VY(I) * DT
+    PZ(I) := PZ(I) + VZ(I) * DT
+  ENDDO
+  RETURN
+END
+
+! ── BOND_AXES: intra-monomer bonds + polarity axes ──────────
+SUBROUTINE BOND_AXES()
+  DO M = 1, NM
+    HP := 2 * M - 1
+    TP := 2 * M
+    DX := PX(HP) - PX(TP)
+    DY := PY(HP) - PY(TP)
+    DZ := PZ(HP) - PZ(TP)
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    FB := 2.0 * KBOND * (DD - R0) / DD
+    FBX(M) := 0.0 - FB * DX
+    FBY(M) := 0.0 - FB * DY
+    FBZ(M) := 0.0 - FB * DZ
+    AX(M) := DX / DD
+    AY(M) := DY / DD
+    AZ(M) := DZ / DD
+    ALEN(M) := DD
+    CXA(M) := (PX(HP) + PX(TP)) * 0.5
+    CYA(M) := (PY(HP) + PY(TP)) * 0.5
+    CZA(M) := (PZ(HP) + PZ(TP)) * 0.5
+  ENDDO
+  RETURN
+END
+
+! ── KINETICS: per-filament barbed-end reversible binding ────
+! Draws per filament f: RAND(SN+798+2f) bind, RAND(SN+799+2f) unbind.
+! Unbind strips any links touching the freed monomer (LSTRIPT).
+SUBROUTINE KINETICS()
+  DO FL = 1, NFIL
+    UON := RAND(SN + 798 + 2 * FL)
+    UOFF := RAND(SN + 799 + 2 * FL)
+    BARB := BARBF(FL)
+    HB := 2 * BARB - 1
+    DIDB := 0
+    DO M = 1, NM
+      IF STATE(M) = 0 .AND. DIDB = 0 THEN
+        TB := 2 * M
+        DX := PX(TB) - PX(HB)
+        DY := PY(TB) - PY(HB)
+        DZ := PZ(TB) - PZ(HB)
+        D := SQRT(DX * DX + DY * DY + DZ * DZ)
+        QQ := AX(M) * AX(BARB) + AY(M) * AY(BARB) + AZ(M) * AZ(BARB)
+        IF D < RCAP .AND. QQ > QMIN THEN
+          DIDB := 1
+          IF UON < MIN(1.0, KON * DT) THEN
+            ABX := AX(BARB)
+            ABY := AY(BARB)
+            ABZ := AZ(BARB)
+            HP := 2 * M - 1
+            PX(TB) := PX(HB) + RCROSS * ABX
+            PY(TB) := PY(HB) + RCROSS * ABY
+            PZ(TB) := PZ(HB) + RCROSS * ABZ
+            PX(HP) := PX(TB) + R0 * ABX
+            PY(HP) := PY(TB) + R0 * ABY
+            PZ(HP) := PZ(TB) + R0 * ABZ
+            STATE(M) := 1
+            PREVM(M) := BARB
+            NEXTM(BARB) := M
+            NEXTM(M) := 0
+            BARBF(FL) := M
+            MLE(FL) := MLE(FL) + 1
+            MLEN := MLEN + 1
+            FILID(M) := FL
+            NBINDT := NBINDT + 1
+            CALL REBUILD_BONDS()
+          ENDIF
+        ENDIF
+      ENDIF
+    ENDDO
+    IF MLE(FL) > NSEEDP THEN
+      IF UOFF < KOFF * DT THEN
+        M := BARBF(FL)
+        Q := PREVM(M)
+        NEXTM(Q) := 0
+        BARBF(FL) := Q
+        STATE(M) := 0
+        PREVM(M) := 0
+        MLE(FL) := MLE(FL) - 1
+        MLEN := MLEN - 1
+        FILID(M) := 0
+        NUNBT := NUNBT + 1
+        ! strip links touching the freed monomer's beads
+        HP := 2 * M - 1
+        TP := 2 * M
+        DO L = 1, MAXL
+          IF LACT(L) = 1 THEN
+            IF LNKI(L) = HP .OR. LNKI(L) = TP .OR. LNKJ(L) = HP .OR. LNKJ(L) = TP THEN
+              LACT(L) := 0
+              NLINK := NLINK - 1
+              LSTRIPT := LSTRIPT + 1
+            ENDIF
+          ENDIF
+        ENDDO
+        ! release-clear teleport: park OUTSIDE the capture window at
+        ! RCAP+0.25 = 1.65 along Q's axis (M4a instant-rebind lesson).
+        ABX := AX(Q)
+        ABY := AY(Q)
+        ABZ := AZ(Q)
+        HB := 2 * Q - 1
+        PX(TP) := PX(HB) + (RCAP + 0.25) * ABX
+        PY(TP) := PY(HB) + (RCAP + 0.25) * ABY
+        PZ(TP) := PZ(HB) + (RCAP + 0.25) * ABZ
+        PX(HP) := PX(TP) + R0 * ABX
+        PY(HP) := PY(TP) + R0 * ABY
+        PZ(HP) := PZ(TP) + R0 * ABZ
+        CALL REBUILD_BONDS()
+      ENDIF
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── CELL_BUILD: bead cell list ──────────────────────────────
+SUBROUTINE CELL_BUILD()
+  INTEGER :: C, IX, IY, IZ
+  DO C = 1, NCELL
+    CNT(C) := 0
+  ENDDO
+  DO I = 1, NACT
+    IX := INT(PX(I) / CE) + 1
+    IY := INT(PY(I) / CE) + 1
+    IZ := INT(PZ(I) / CE) + 1
+    IF IX < 1 THEN
+      IX := 1
+    ENDIF
+    IF IX > NC THEN
+      IX := NC
+    ENDIF
+    IF IY < 1 THEN
+      IY := 1
+    ENDIF
+    IF IY > NC THEN
+      IY := NC
+    ENDIF
+    IF IZ < 1 THEN
+      IZ := 1
+    ENDIF
+    IF IZ > NC THEN
+      IZ := NC
+    ENDIF
+    C := IX + NC * (IY - 1) + NC * NC * (IZ - 1)
+    CELLOF(I) := C
+    CELX(I) := IX
+    CELY(I) := IY
+    CELZ(I) := IZ
+    CNT(C) := CNT(C) + 1
+  ENDDO
+  OFF(1) := 1
+  DO C = 2, NCELL
+    OFF(C) := OFF(C - 1) + CNT(C - 1)
+  ENDDO
+  DO C = 1, NCELL
+    CUR(C) := OFF(C)
+  ENDDO
+  DO I = 1, NACT
+    C := CELLOF(I)
+    SORTEDB(CUR(C)) := I
+    CUR(C) := CUR(C) + 1
+  ENDDO
+  RETURN
+END
+
+! ── NBR_BUILD: WCA directed list (d<=WCUT) + link candidate list ──
+! Same 27-cell scan serves both: candidates are unordered (I<J) pairs
+! of beads on BOUND, distinct, non-ladder-bonded, not-yet-linked
+! monomers with d <= RLINK. No second O(N^2) pass anywhere.
+SUBROUTINE NBR_BUILD()
+  INTEGER :: CN, P, LO, HI, NX2, NY2, NZ2, CNTR, S
+  OVERFLOW := 0
+  MAXNB := 0
+  NSUSED := 0
+  NCAND := 0
+  CLOVF := 0
+  DO I = 1, NACT
+    MI := (I + 1) / 2
+    CNTR := 0
+    DO K = 1, 27
+      NX2 := CELX(I) + OX(K)
+      NY2 := CELY(I) + OY(K)
+      NZ2 := CELZ(I) + OZ(K)
+      IF NX2 >= 1 .AND. NX2 <= NC .AND. NY2 >= 1 .AND. NY2 <= NC .AND. NZ2 >= 1 .AND. NZ2 <= NC THEN
+        CN := NX2 + NC * (NY2 - 1) + NC * NC * (NZ2 - 1)
+        IF CNT(CN) > 0 THEN
+          LO := OFF(CN)
+          HI := OFF(CN) + CNT(CN) - 1
+          DO P = LO, HI
+            J := SORTEDB(P)
+            IF J /= I .AND. (I + 1) / 2 /= (J + 1) / 2 .AND. J /= BP1(I) .AND. J /= BP2(I) THEN
+              DX := PX(I) - PX(J)
+              DY := PY(I) - PY(J)
+              DZ := PZ(I) - PZ(J)
+              D := SQRT(DX * DX + DY * DY + DZ * DZ)
+              IF D <= WCUT THEN
+                CNTR := CNTR + 1
+                IF CNTR <= MAXNBR THEN
+                  NSUSED := NSUSED + 1
+                  S := NSUSED
+                  NBR_I(S) := I
+                  NBR_J(S) := J
+                ELSE
+                  OVERFLOW := OVERFLOW + 1
+                ENDIF
+              ENDIF
+              IF D <= RLINK .AND. I < J .AND. STATE(MI) = 1 THEN
+                MJ := (J + 1) / 2
+                IF STATE(MJ) = 1 THEN
+                  ! loop rule: same-filament pairs must be contour-distant
+                  OK2 := 1
+                  IF FILID(MI) = FILID(MJ) THEN
+                    IF ABS(POSI(MI) - POSI(MJ)) < LOOPMIN THEN
+                      OK2 := 0
+                    ENDIF
+                  ENDIF
+                  DO L = 1, MAXL
+                    IF LACT(L) = 1 THEN
+                      IF LNKI(L) = I .AND. LNKJ(L) = J THEN
+                        OK2 := 0
+                      ENDIF
+                    ENDIF
+                  ENDDO
+                  IF OK2 = 1 THEN
+                    IF NCAND < MAXCL THEN
+                      NCAND := NCAND + 1
+                      CLISTI(NCAND) := I
+                      CLISTJ(NCAND) := J
+                    ELSE
+                      CLOVF := CLOVF + 1
+                    ENDIF
+                  ENDIF
+                ENDIF
+              ENDIF
+            ENDIF
+          ENDDO
+        ENDIF
+      ENDIF
+    ENDDO
+    IF CNTR > MAXNB THEN
+      MAXNB := CNTR
+    ENDIF
+  ENDDO
+  ! far-cell pass: candidates only (diff=2 shell; WCA is complete at 27)
+  DO I = 1, NACT
+    MI := (I + 1) / 2
+    IF STATE(MI) = 1 THEN
+      DO K = 1, NOFF2
+        NX2 := CELX(I) + OX2(K)
+        NY2 := CELY(I) + OY2(K)
+        NZ2 := CELZ(I) + OZ2(K)
+        IF NX2 >= 1 .AND. NX2 <= NC .AND. NY2 >= 1 .AND. NY2 <= NC .AND. NZ2 >= 1 .AND. NZ2 <= NC THEN
+          CN := NX2 + NC * (NY2 - 1) + NC * NC * (NZ2 - 1)
+          IF CNT(CN) > 0 THEN
+            LO := OFF(CN)
+            HI := OFF(CN) + CNT(CN) - 1
+            DO P = LO, HI
+              J := SORTEDB(P)
+              IF J > I .AND. (I + 1) / 2 /= (J + 1) / 2 .AND. J /= BP1(I) .AND. J /= BP2(I) THEN
+                DX := PX(I) - PX(J)
+                DY := PY(I) - PY(J)
+                DZ := PZ(I) - PZ(J)
+                D := SQRT(DX * DX + DY * DY + DZ * DZ)
+                IF D <= RLINK THEN
+                  MJ := (J + 1) / 2
+                  IF STATE(MJ) = 1 THEN
+                    OK2 := 1
+                    IF FILID(MI) = FILID(MJ) THEN
+                      IF ABS(POSI(MI) - POSI(MJ)) < LOOPMIN THEN
+                        OK2 := 0
+                      ENDIF
+                    ENDIF
+                    DO L = 1, MAXL
+                      IF LACT(L) = 1 THEN
+                        IF LNKI(L) = I .AND. LNKJ(L) = J THEN
+                          OK2 := 0
+                        ENDIF
+                      ENDIF
+                    ENDDO
+                    IF OK2 = 1 THEN
+                      IF NCAND < MAXCL THEN
+                        NCAND := NCAND + 1
+                        CLISTI(NCAND) := I
+                        CLISTJ(NCAND) := J
+                      ELSE
+                        CLOVF := CLOVF + 1
+                      ENDIF
+                    ENDIF
+                  ENDIF
+                ENDIF
+              ENDIF
+            ENDDO
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDIF
+  ENDDO
+  IF NCAND > MAXCB THEN
+    NCSKIP := NCSKIP + NCAND - MAXCB
+  ENDIF
+  RETURN
+END
+
+! ── LINKBIRTH: per-candidate-pair draw, P = KLINKF*DT ───────
+! Draw slot 810+k always evaluated for the first MAXCB candidates
+! (pure hash function of SEED+STEP; slot k <-> k-th candidate in
+! deterministic scan order). Births beyond MAXCB are skipped
+! (CLOVF-tracked; not seen in practice at these densities).
+SUBROUTINE LINKBIRTH()
+  DO K = 1, NCAND
+    IF K <= MAXCB THEN
+      UB := RAND(SN + 809 + K)
+      IF UB < KLINKF * DT .AND. NLINK < MAXL THEN
+        L := 0
+        DO Q = 1, MAXL
+          IF LACT(Q) = 0 .AND. L = 0 THEN
+            L := Q
+          ENDIF
+        ENDDO
+        IF L > 0 THEN
+          LACT(L) := 1
+          LNKI(L) := CLISTI(K)
+          LNKJ(L) := CLISTJ(K)
+          LBORN(L) := STEP
+          NLINK := NLINK + 1
+          LBIRTHT := LBIRTHT + 1
+        ENDIF
+      ENDIF
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── LINKDEATH: per-link draw, P = KLINKB*DT; slot 1100+L fixed ──
+SUBROUTINE LINKDEATH()
+  DO L = 1, MAXL
+    IF LACT(L) = 1 THEN
+      UD := RAND(SN + 1500 + L)
+      IF UD < KLINKB * DT THEN
+        LACT(L) := 0
+        NLINK := NLINK - 1
+        LDEATHT := LDEATHT + 1
+        LTSUM := LTSUM + REAL(STEP - LBORN(L))
+        LTCNT := LTCNT + 1
+      ENDIF
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── FORCE_PAIR: WCA on the directed list (force on I) ───────
+! Linked pairs are NOT excluded here: L0=0.7 > WCUT and both forces
+! agree in sign, so the static exclusion set kills the
+! death-while-compressed catapult channel by construction.
+SUBROUTINE FORCE_PAIR()
+  INTEGER :: II, JJ
+  REAL :: LDX, LDY, LDZ, LD, LDD, LMG2, LM2, LBR, LB6, LFM
+  DO I = 1, NACT
+    FX(I) := 0.0
+    FY(I) := 0.0
+    FZ(I) := 0.0
+  ENDDO
+  DO K = 1, NSUSED
+    II := NBR_I(K)
+    JJ := NBR_J(K)
+    LDX := PX(II) - PX(JJ)
+    LDY := PY(II) - PY(JJ)
+    LDZ := PZ(II) - PZ(JJ)
+    LD := SQRT(LDX * LDX + LDY * LDY + LDZ * LDZ)
+    LDD := MAX(LD, 1.0E-16)
+    LMG2 := (1.0 - SIGN(1.0, 1.0E-12 - LDD)) * 0.5
+    LM2 := (1.0 - SIGN(1.0, LDD - WCUT)) * 0.5
+    LBR := LM2 * LMG2 * SIG / LDD
+    LB6 := LBR * LBR * LBR * LBR * LBR * LBR
+    LFM := 24.0 * (2.0 * LB6 * LB6 - LB6) / (LDD * LDD)
+    LFM := LFM * MIN(1.0, FCAP / MAX(ABS(LFM) * LDD, 1.0E-16))
+    FX(II) := FX(II) + LFM * LDX
+    FY(II) := FY(II) + LFM * LDY
+    FZ(II) := FZ(II) + LFM * LDZ
+  ENDDO
+  RETURN
+END
+
+! ── APPLY_BB: intra-monomer bond forces onto beads ──────────
+SUBROUTINE APPLY_BB()
+  DO M = 1, NM
+    HP := 2 * M - 1
+    TP := 2 * M
+    FX(HP) := FX(HP) + FBX(M)
+    FY(HP) := FY(HP) + FBY(M)
+    FZ(HP) := FZ(HP) + FBZ(M)
+    FX(TP) := FX(TP) - FBX(M)
+    FY(TP) := FY(TP) - FBY(M)
+    FZ(TP) := FZ(TP) - FBZ(M)
+  ENDDO
+  RETURN
+END
+
+! ── FILBONDS: junction springs (both beads) ─────────────────
+SUBROUTINE FILBONDS()
+  DO K = 1, NFILB
+    A2 := FBI(K)
+    B2 := FBJ(K)
+    DX := PX(A2) - PX(B2)
+    DY := PY(A2) - PY(B2)
+    DZ := PZ(A2) - PZ(B2)
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    FB := 2.0 * KFIL * (DD - FR0(K)) / DD
+    FX(A2) := FX(A2) - FB * DX
+    FY(A2) := FY(A2) - FB * DY
+    FZ(A2) := FZ(A2) - FB * DZ
+    FX(B2) := FX(B2) + FB * DX
+    FY(B2) := FY(B2) + FB * DY
+    FZ(B2) := FZ(B2) + FB * DZ
+  ENDDO
+  RETURN
+END
+
+! ── LINKFORCE: crosslink springs, KLINK at fixed rest L0 ────
+SUBROUTINE LINKFORCE()
+  DO L = 1, MAXL
+    IF LACT(L) = 1 THEN
+      A2 := LNKI(L)
+      B2 := LNKJ(L)
+      DX := PX(A2) - PX(B2)
+      DY := PY(A2) - PY(B2)
+      DZ := PZ(A2) - PZ(B2)
+      D := SQRT(DX * DX + DY * DY + DZ * DZ)
+      DD := MAX(D, 1.0E-16)
+      FB := 2.0 * KLINK * (DD - L0) / DD
+      FX(A2) := FX(A2) - FB * DX
+      FY(A2) := FY(A2) - FB * DY
+      FZ(A2) := FZ(A2) - FB * DZ
+      FX(B2) := FX(B2) + FB * DX
+      FY(B2) := FY(B2) + FB * DY
+      FZ(B2) := FZ(B2) + FB * DZ
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── ANCHORS: nucleator springs on seed first-monomer beads ──
+SUBROUTINE ANCHORS()
+  DO I = 1, NACT
+    IF HASA(I) = 1 THEN
+      FX(I) := FX(I) + 2.0 * KSEED * (ANX(I) - PX(I))
+      FY(I) := FY(I) + 2.0 * KSEED * (ANY(I) - PY(I))
+      FZ(I) := FZ(I) + 2.0 * KSEED * (ANZ(I) - PZ(I))
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── WALLS: soft harmonic box boundary ───────────────────────
+SUBROUTINE WALLS()
+  DO I = 1, NACT
+    IF PX(I) < XWALL THEN
+      FX(I) := FX(I) + 2.0 * KWALL * (XWALL - PX(I))
+    ENDIF
+    IF PX(I) > LBOX - XWALL THEN
+      FX(I) := FX(I) - 2.0 * KWALL * (PX(I) - (LBOX - XWALL))
+    ENDIF
+    IF PY(I) < XWALL THEN
+      FY(I) := FY(I) + 2.0 * KWALL * (XWALL - PY(I))
+    ENDIF
+    IF PY(I) > LBOX - XWALL THEN
+      FY(I) := FY(I) - 2.0 * KWALL * (PY(I) - (LBOX - XWALL))
+    ENDIF
+    IF PZ(I) < XWALL THEN
+      FZ(I) := FZ(I) + 2.0 * KWALL * (XWALL - PZ(I))
+    ENDIF
+    IF PZ(I) > LBOX - XWALL THEN
+      FZ(I) := FZ(I) - 2.0 * KWALL * (PZ(I) - (LBOX - XWALL))
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── CERT_ENERGY: direct single-count loops (mirror order) ───
+! WCA pairs i<j ascending (static exclusion set: intra + junction
+! only), then intra bonds, junction springs, CROSSLINKS, anchor, walls.
+SUBROUTINE CERT_ENERGY()
+  EP_WCA := 0.0
+  EP_BOND := 0.0
+  EP_FIL := 0.0
+  EP_LINK := 0.0
+  EP_ANCH := 0.0
+  EP_WALL := 0.0
+  DO I = 1, NACT - 1
+    DO J = I + 1, NACT
+      IF (I + 1) / 2 /= (J + 1) / 2 .AND. J /= BP1(I) .AND. J /= BP2(I) .AND. I /= BP1(J) .AND. I /= BP2(J) THEN
+        DX := PX(I) - PX(J)
+        DY := PY(I) - PY(J)
+        DZ := PZ(I) - PZ(J)
+        D := SQRT(DX * DX + DY * DY + DZ * DZ)
+        DD := MAX(D, 1.0E-16)
+        LMG := (1.0 - SIGN(1.0, 1.0E-12 - DD)) * 0.5
+        LM := (1.0 - SIGN(1.0, DD - WCUT)) * 0.5
+        BR := LM * LMG * SIG / DD
+        B6 := BR * BR * BR * BR * BR * BR
+        EP_WCA := EP_WCA + 4.0 * (B6 * B6 - B6) * LM * LMG
+      ENDIF
+    ENDDO
+  ENDDO
+  DO M = 1, NM
+    HP := 2 * M - 1
+    TP := 2 * M
+    DX := PX(HP) - PX(TP)
+    DY := PY(HP) - PY(TP)
+    DZ := PZ(HP) - PZ(TP)
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    EP_BOND := EP_BOND + KBOND * (DD - R0) * (DD - R0)
+  ENDDO
+  DO K = 1, NFILB
+    A2 := FBI(K)
+    B2 := FBJ(K)
+    DX := PX(A2) - PX(B2)
+    DY := PY(A2) - PY(B2)
+    DZ := PZ(A2) - PZ(B2)
+    D := SQRT(DX * DX + DY * DY + DZ * DZ)
+    DD := MAX(D, 1.0E-16)
+    EP_FIL := EP_FIL + KFIL * (DD - FR0(K)) * (DD - FR0(K))
+  ENDDO
+  DO L = 1, MAXL
+    IF LACT(L) = 1 THEN
+      A2 := LNKI(L)
+      B2 := LNKJ(L)
+      DX := PX(A2) - PX(B2)
+      DY := PY(A2) - PY(B2)
+      DZ := PZ(A2) - PZ(B2)
+      D := SQRT(DX * DX + DY * DY + DZ * DZ)
+      DD := MAX(D, 1.0E-16)
+      EP_LINK := EP_LINK + KLINK * (DD - L0) * (DD - L0)
+    ENDIF
+  ENDDO
+  DO I = 1, NACT
+    IF HASA(I) = 1 THEN
+      DX := ANX(I) - PX(I)
+      DY := ANY(I) - PY(I)
+      DZ := ANZ(I) - PZ(I)
+      EP_ANCH := EP_ANCH + KSEED * (DX * DX + DY * DY + DZ * DZ)
+    ENDIF
+  ENDDO
+  DO I = 1, NACT
+    IF PX(I) < XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (XWALL - PX(I)) * (XWALL - PX(I))
+    ENDIF
+    IF PX(I) > LBOX - XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (PX(I) - (LBOX - XWALL)) * (PX(I) - (LBOX - XWALL))
+    ENDIF
+    IF PY(I) < XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (XWALL - PY(I)) * (XWALL - PY(I))
+    ENDIF
+    IF PY(I) > LBOX - XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (PY(I) - (LBOX - XWALL)) * (PY(I) - (LBOX - XWALL))
+    ENDIF
+    IF PZ(I) < XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (XWALL - PZ(I)) * (XWALL - PZ(I))
+    ENDIF
+    IF PZ(I) > LBOX - XWALL THEN
+      EP_WALL := EP_WALL + KWALL * (PZ(I) - (LBOX - XWALL)) * (PZ(I) - (LBOX - XWALL))
+    ENDIF
+  ENDDO
+  RETURN
+END
+
+! ── DUMP_MIRROR: static cert dump ───────────────────────────
+SUBROUTINE DUMP_MIRROR()
+  WRITE(*, "MIRROR_DUMP nmono %d mlen %d nlink %d") NM, MLEN, NLINK
+  DO I = 1, NACT
+    WRITE(*, "CFG %.17e %.17e %.17e") PX(I), PY(I), PZ(I)
+  ENDDO
+  DO I = 1, NACT
+    WRITE(*, "FRC %.17e %.17e %.17e") FX(I), FY(I), FZ(I)
+  ENDDO
+  WRITE(*, "CERT ewca %.17e ebond %.17e efil %.17e elink %.17e eanch %.17e ewall %.17e") EP_WCA, EP_BOND, EP_FIL, EP_LINK, EP_ANCH, EP_WALL
+  RETURN
+END
+
+! ── DIAG: physical energies + bundle observables ────────────
+! AL = signed cos of mean filament axes (parallel bundle -> +1).
+! SEP = mean over filament-2 monomers of min center distance to
+! filament-1 monomers (bundle registry -> ~L0). EE1/EE2 end-to-end.
+SUBROUTINE DIAG()
+  CALL CERT_ENERGY()
+  KT2 := 0.0
+  FMAX := 0.0
+  NOUT := 0
+  DO I = 1, NACT
+    KT2 := KT2 + VX(I) * VX(I) + VY(I) * VY(I) + VZ(I) * VZ(I)
+    FM := SQRT(FX(I) * FX(I) + FY(I) * FY(I) + FZ(I) * FZ(I))
+    IF FM > FMAX THEN
+      FMAX := FM
+    ENDIF
+    IF PX(I) < 0.0 .OR. PX(I) > LBOX .OR. PY(I) < 0.0 .OR. PY(I) > LBOX .OR. PZ(I) < 0.0 .OR. PZ(I) > LBOX THEN
+      NOUT := NOUT + 1
+    ENDIF
+  ENDDO
+  KT2 := KT2 / (3.0 * REAL(NACT))
+  ! inter-filament link count
+  NLINKI := 0
+  DO L = 1, MAXL
+    IF LACT(L) = 1 THEN
+      MI := (LNKI(L) + 1) / 2
+      MJ := (LNKJ(L) + 1) / 2
+      IF FILID(MI) /= FILID(MJ) .AND. FILID(MI) > 0 .AND. FILID(MJ) > 0 THEN
+        NLINKI := NLINKI + 1
+      ENDIF
+    ENDIF
+  ENDDO
+  ! alignment of mean axes
+  A1X := 0.0
+  A1Y := 0.0
+  A1Z := 0.0
+  A2X := 0.0
+  A2Y := 0.0
+  A2Z := 0.0
+  NA1 := 0
+  NA2 := 0
+  DO M = 1, NM
+    IF STATE(M) = 1 .AND. FILID(M) = 1 THEN
+      A1X := A1X + AX(M)
+      A1Y := A1Y + AY(M)
+      A1Z := A1Z + AZ(M)
+      NA1 := NA1 + 1
+    ENDIF
+    IF STATE(M) = 1 .AND. FILID(M) = 2 THEN
+      A2X := A2X + AX(M)
+      A2Y := A2Y + AY(M)
+      A2Z := A2Z + AZ(M)
+      NA2 := NA2 + 1
+    ENDIF
+  ENDDO
+  AL := 0.0
+  IF NA1 > 0 .AND. NA2 > 0 THEN
+    A1N := SQRT(A1X * A1X + A1Y * A1Y + A1Z * A1Z)
+    A2N := SQRT(A2X * A2X + A2Y * A2Y + A2Z * A2Z)
+    IF A1N > 1.0E-12 .AND. A2N > 1.0E-12 THEN
+      AL := (A1X * A2X + A1Y * A2Y + A1Z * A2Z) / (A1N * A2N)
+    ENDIF
+  ENDIF
+  ! separation: filament-2 monomers to nearest filament-1 center
+  SEP := 0.0
+  IF NA1 > 0 .AND. NA2 > 0 THEN
+    DO M = 1, NM
+      IF STATE(M) = 1 .AND. FILID(M) = 2 THEN
+        DMIN := 1.0E9
+        DO Q = 1, NM
+          IF STATE(Q) = 1 .AND. FILID(Q) = 1 THEN
+            DX := CXA(M) - CXA(Q)
+            DY := CYA(M) - CYA(Q)
+            DZ := CZA(M) - CZA(Q)
+            D := SQRT(DX * DX + DY * DY + DZ * DZ)
+            IF D < DMIN THEN
+              DMIN := D
+            ENDIF
+          ENDIF
+        ENDDO
+        SEP := SEP + DMIN
+      ENDIF
+    ENDDO
+    SEP := SEP / REAL(NA2)
+  ENDIF
+  ! end-to-end distances
+  DX := CXA(BARBF(1)) - CXA(HEADM(1))
+  DY := CYA(BARBF(1)) - CYA(HEADM(1))
+  DZ := CZA(BARBF(1)) - CZA(HEADM(1))
+  EE1 := SQRT(DX * DX + DY * DY + DZ * DZ)
+  DX := CXA(BARBF(2)) - CXA(HEADM(2))
+  DY := CYA(BARBF(2)) - CYA(HEADM(2))
+  DZ := CZA(BARBF(2)) - CZA(HEADM(2))
+  EE2 := SQRT(DX * DX + DY * DY + DZ * DZ)
+  IF STEP > NSTEPS / 2 THEN
+    LSUM := LSUM + REAL(MLEN)
+    LCNT := LCNT + 1
+    SHCNT := SHCNT + 1
+    SHNL := SHNL + REAL(NLINK)
+    SHNC := SHNC + REAL(NCAND)
+    SHAL := SHAL + AL
+    SHSEP := SHSEP + SEP
+    SHEE1 := SHEE1 + EE1
+    SHEE2 := SHEE2 + EE2
+    SHNLI := SHNLI + REAL(NLINKI)
+  ENDIF
+  WRITE(*, "step %d kt %.4f ewca %.4e efil %.4e elink %.4e len1 %d len2 %d nfree %d binds %d unb %d nlink %d nli %d ncand %d lb %d ld %d ls %d fmax %.3e nout %d al %.3f sep %.3f ee1 %.3f ee2 %.3f") STEP, KT2, EP_WCA, EP_FIL, EP_LINK, MLE(1), MLE(2), NM - MLEN, NBINDT, NUNBT, NLINK, NLINKI, NCAND, LBIRTHT, LDEATHT, LSTRIPT, FMAX, NOUT, AL, SEP, EE1, EE2
+  RETURN
+END
+
+! ── ANALYZE_FINAL ───────────────────────────────────────────
+SUBROUTINE ANALYZE_FINAL()
+  CALL CERT_ENERGY()
+  LMEAN := LSUM / MAX(REAL(LCNT), 1.0)
+  WRITE(*, "FINAL len1 %d len2 %d lmean %.4f nfree %d ee1 %.4f ee2 %.4f contour1 %.4f contour2 %.4f binds %d unbinds %d") MLE(1), MLE(2), LMEAN, NM - MLEN, EE1, EE2, REAL(MLE(1) - 1) * PITCH, REAL(MLE(2) - 1) * PITCH, NBINDT, NUNBT
+  WRITE(*, "FINAL_L lbirths %d ldeaths %d lstrips %d nlmean %.4f nlimean %.4f ncmean %.4f almean %.4f sepmean %.4f ee1mean %.4f ee2mean %.4f") LBIRTHT, LDEATHT, LSTRIPT, SHNL / MAX(REAL(SHCNT), 1.0), SHNLI / MAX(REAL(SHCNT), 1.0), SHNC / MAX(REAL(SHCNT), 1.0), SHAL / MAX(REAL(SHCNT), 1.0), SHSEP / MAX(REAL(SHCNT), 1.0), SHEE1 / MAX(REAL(SHCNT), 1.0), SHEE2 / MAX(REAL(SHCNT), 1.0)
+  WRITE(*, "FINAL_T lifemean %.4f lifenom %.4f ltcnt %d clovf %d overflow %d ncskip %d") LTSUM / MAX(REAL(LTCNT), 1.0), 1.0 / (KLINKB * DT), LTCNT, CLOVF, OVERFLOW, NCSKIP
+  WRITE(*, "FINAL_E ewca %.10e ebond %.10e efil %.10e elink %.10e eanch %.10e ewall %.10e") EP_WCA, EP_BOND, EP_FIL, EP_LINK, EP_ANCH, EP_WALL
+  RETURN
+END
