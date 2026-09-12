@@ -12,7 +12,7 @@ original concept.
 | V22 (OG residual) | `V22/` | `r=0 sink=0` | same | — | Baseline only. Algebraic-zero invariant holds cross-libc. V22 alloc bug characterized 2026-09-11 (220/256, 14.1% silent rejects, unbalanced Viviani scatter, no fallback) — fix deliberately open, Sq2B supersedes. |
 | Sq2B (fixed V22) | `Sq2B/` | cert passes | byte-identical | matches (`sq2b`, 9120 B, AVX2 mismatch + syn + fused cohere + inlined sweep, cell via shared `sqb_cell.inc`) | Full port + driver; cell logic extracted shared (oracle-identical after). Verified at 7/30/1500 rounds. Fused cohere 2026-09-12: 150 → 130 ms. Inlined sweep + O9 line: 130 → 122 ms, parity with gcc. |
 | SQM (moment-Merkle) | `SQM/` | all 9 pass | byte-identical | matches (`sqm`, 8505 B, AVX2 mom integrated) | Full port: dispatched `mom` (AVX2 u32 lanes w/ scalar fallback), `idiv` Vandermonde solve, own `%.6f`/`%.2f`. Verified at 7/30/1000/2000 rounds. |
-| SQ5 | `SQ5/` | O1-O7 + auxB match pre-registered table; audit byte-identical; mirror S1-S4 PASS on FASM audit | GCC+musl filed, cross-identical modulo SQ5T; audits byte-identical (211647 B) | matches (`sq5`, 11379 B, scalar + SSE4.1 journal) | RNG is xoshiro256** here; libm vestigial; newest/least-tested → repeat-determinism + 30/7 gates added. |
+| SQ5 | `SQ5/` | O1-O7 + auxB match pre-registered table; audit byte-identical; mirror S1-S4 PASS on FASM audit | GCC+musl filed, cross-identical modulo SQ5T; audits byte-identical (211647 B) | matches (`sq5`, 13153 B, AVX2 flux + AVX2 pay_ok + SSE4.1 journal) | RNG is xoshiro256** here; libm vestigial; newest/least-tested → repeat-determinism + 30/7 gates added. AVX2 flux + pay_ok 2026-09-12: 341 → 61 ms (0.90× of gcc). |
 | SQW (memoized duplex) | `SQW/` | all 12 pass incl. 428/428 poison-failsafe | byte-identical | matches (`sqw`, 8156 B, shared `sqb_cell.inc` + recognition layer) | Recognition/cache/refcounts/audit new; cell rides free. Verified at 30/1500 rounds. |
 | SQFH (+SQF) | `SQFH/` | O1-O5 + O7/O8 match; O6 lanes match (timing varies) | GCC+musl filed, identical modulo O6; **zero FMA** | matches (`sqfh`, 8221 B, owned f64 trig) | Fast pass done; cert is legacy-only (no exp/model-M); repeat-deterministic. |
 | SQ4 (metadata torus) | `SQ4/` | O1-O4 counts match fixed C bench; victims byte-identical | C bench is the spec (no cert.c) | matches (`sq4`, 3248 B) | Completes the set. Ports the overflow-probe fix; fixed protocol (256/391/0.01). |
@@ -240,7 +240,7 @@ FASM 122 vs C 123 ms best-of-5 — parity at 1.00×.
 | `sq2b.gcc` (C `-O2`) | 212 ms | 28784 B |
 | `SQM/sqm` (FASM) | 23 ms scalar → **8.9 ms AVX2 (2.6×)** | 7938 → 8505 → 9041 B (shared incs) |
 | `SQW/sqw` (FASM) | 129 ms → 99 ms (+decode) → **44.6 ms (+pay_ok via shared cell)** | 8156 → 8252 → 8786 → 9106 B |
-| `SQ5/sq5` (FASM, scalar + SSE4.1 journal) | 344 ms | 11379 → 11926 B (shared incs) |
+| `SQ5/sq5` (FASM, scalar + SSE4.1 journal) | 344 ms → **61 ms (+AVX2 flux +AVX2 pay_ok, 5.6×)** | 11379 → 11926 → 13153 B (shared incs + flux/pay_ok AVX2) |
 | `sq5.gcc` (C `-O2 -mavx2 -msse4.1`) | 61 ms | 29632 B |
 | `sq5` scalar-C (`-O2`, no SIMD flags) | 154 ms | — |
 | `SQFH/sqfh` (FASM, owned f64 trig + rotation recurrence) | 8 ms | 8700 → 9158 B (shared incs) |
@@ -272,6 +272,25 @@ replay, the property sequential streams cannot give. Intended use:
 deterministic event streams for second-pass/failure analysis where
 independent recompute of a single failing index matters. Deterministic
 across runs; ports untouched (their streams are the oracles).
+
+## SQ5 parity push: AVX2 flux + AVX2 pay_ok (DONE 2026-09-12)
+
+Cycle-exact attribution (rdtsc both sides) showed flux_bin at 93% of
+runtime, 7.8× slower than gcc per call (scalar dependent-imul chains
+vs gcc's auto-vectorization). The old "AVX2 2.5× worse, reverted"
+verdict dated from the pitfall-17/18 era and was re-tested, not trusted.
+
+1. AVX2 flux (unroll x2, 8B lanes, cross-g vector accs, hsum once per
+shell group): microbench 5.9× per 64B stream, bit-identical sums.
+Applied with `use_avx2` dispatch (new `check_avx2`, scalar body kept
+as `flux_bin_scalar`). 341 → 90 ms. Oracle + 211647 B audit clean
+at 7/30/1500.
+2. AVX2 `sq5_pay_ok` (8x8B lanes, same proven shape as shared pay_ok):
+microbench 3.8×, dispatched. 90 → 61 ms (0.90× of gcc 54.8 ms).
+3. Cohsweep fusion (call-per-slot → slot-direct inline): microbench
+0.98× on synthetic fixture — REJECTED, not applied. The call tax is
+smaller than the fused setup cost at this shape; recorded so nobody
+re-tries it blind.
 
 ## Shared playbook (reuse for each port)
 

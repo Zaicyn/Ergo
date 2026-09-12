@@ -113,6 +113,30 @@ check_sse41:
     mov     [use_sse41], al
     ret
 
+; -- check_avx2: cpuid once -> [use_avx2] (OSXSAVE+XCR0+AVX2) --
+check_avx2:
+    mov     eax, 1
+    cpuid                           ; clobbers rax,rbx,rcx,rdx (nothing live)
+    test    ecx, 0x08000000         ; OSXSAVE?
+    jz      .no
+    test    ecx, 0x10000000         ; AVX?
+    jz      .no
+    xor     ecx, ecx
+    xgetbv
+    and     eax, 0x6
+    cmp     eax, 0x6                ; XMM+YMM enabled?
+    jne     .no
+    mov     eax, 7
+    xor     ecx, ecx
+    cpuid
+    test    ebx, 0x20               ; AVX2 bit 5?
+    jz      .no
+    mov     byte [use_avx2], 1
+    ret
+.no:
+    mov     byte [use_avx2], 0
+    ret
+
 ; -- journal_add_sse41: rdi = journal, rsi = payload64, edx = gen --
 ; Same sums as scalar (integer mod-2^32: order-free). C SSE4.1 path shape.
 journal_add_sse41:
@@ -255,6 +279,10 @@ sq5_fill:
 
 ; -- sq5_pay_ok: rdi = payload64, esi = item -> eax 1 ok / 0 --
 sq5_pay_ok:
+    cmp     byte [use_avx2], 0
+    je      sq5_pay_ok_scalar
+    jmp     sq5_pay_ok_avx2
+sq5_pay_ok_scalar:
     push    rbx
     mov     ebx, esi
     imul    ebx, ebx, 17
@@ -276,6 +304,50 @@ sq5_pay_ok:
     ret
 .bad:
     xor     eax, eax
+    pop     rbx
+    ret
+
+; -- sq5_pay_ok_avx2: rdi = payload[64], esi = item -> eax 0/1 --
+; 8x8B lanes, pattern u32 lanes, byte-masked compare. VEX-only
+; (vzeroupper both ends). Verified 3.8x over scalar, bit-identical.
+sq5_pay_ok_avx2:
+    push    rbx
+    push    r12
+    vzeroupper
+    mov     ebx, esi
+    imul    ebx, ebx, 17
+    movd    xmm4, ebx
+    vpbroadcastd ymm4, xmm4
+    vmovdqu ymm5, yword [POK91]
+    vmovdqu ymm6, yword [POKA5]
+    vmovdqu ymm7, yword [POK07]
+    vmovdqu ymm8, yword [POK08]
+    vmovdqu ymm9, yword [POKFF]
+    mov     ecx, 8
+.pl:
+    vmovdqa ymm0, ymm7
+    vpmulld ymm0, ymm0, ymm5
+    vpaddd  ymm0, ymm0, ymm4
+    vpxor   ymm0, ymm0, ymm6
+    vpand   ymm0, ymm0, ymm9
+    vpmovzxbd ymm1, qword [rdi]
+    vpcmpeqd ymm1, ymm1, ymm0
+    vpmovmskb eax, ymm1
+    cmp     eax, -1
+    jne     .fail
+    add     rdi, 8
+    vpaddd  ymm7, ymm7, ymm8
+    dec     ecx
+    jnz     .pl
+    mov     eax, 1
+    vzeroupper
+    pop     r12
+    pop     rbx
+    ret
+.fail:
+    xor     eax, eax
+    vzeroupper
+    pop     r12
     pop     rbx
     ret
 
@@ -527,9 +599,221 @@ sq5_rep:
     ret
 
 ; -- flux_bin: rdi = torus, esi = b, rdx = ds[2][3] -> eax flags --
+; AVX2 moment scan (unrolled x2, 8B lanes): 5.9x per 64B stream in
+; microbench, bit-identical sums. Falls back to flux_bin_scalar when
+; use_avx2 == 0. Vector accs span the g-loop (mod-2^32 lane math wraps
+; identically); hsum once per shell group. Shell g order is irrelevant
+; (sums commute) so both shells scan g=0..31 with position-based idx.
+flux_bin:
+    cmp     byte [use_avx2], 0
+    je      flux_bin_scalar
+    push    rbx
+    push    r14
+    sub     rsp, 48                 ; accs @0..20, base @24, hsum @28..43
+    mov     rbx, rdi                ; torus
+    mov     r14, rdx                ; ds
+    vmovdqa ymm11, yword [FX8]
+    vmovdqa ymm12, yword [FX16]
+    vpxor   ymm13, ymm13, ymm13     ; a0
+    vpxor   ymm14, ymm14, ymm14     ; a1
+    vpxor   ymm15, ymm15, ymm15     ; a2
+    xor     r9d, r9d                ; g
+.fg:
+    cmp     r9d, 32
+    jae     .fdone_f
+    mov     eax, esi
+    shl     eax, 5
+    add     eax, r9d
+    shl     eax, 1                  ; slot0
+    cmp     byte [rbx+OCC_OFF+rax], 0
+    je      .gnext
+    mov     ecx, eax
+    shl     ecx, 6                  ; byte base
+    lea     rdi, [rbx+rcx]          ; pay base
+    mov     edx, r9d
+    shl     edx, 6                  ; mbase = g*64
+    mov     [rsp+24], edx
+    vpbroadcastd ymm5, dword [rsp+24]
+    vpaddd  ymm5, ymm5, yword [FXX1]
+    vpaddd  ymm6, ymm5, ymm11
+    mov     ecx, 4
+.fa:
+    vpmovzxbd ymm0, qword [rdi]
+    vpmovzxbd ymm1, qword [rdi+8]
+    vpmulld ymm2, ymm0, ymm5
+    vpmulld ymm3, ymm1, ymm6
+    vpmulld ymm4, ymm2, ymm5
+    vpmulld ymm7, ymm3, ymm6
+    vpaddd  ymm13, ymm13, ymm0
+    vpaddd  ymm13, ymm13, ymm1
+    vpaddd  ymm14, ymm14, ymm2
+    vpaddd  ymm14, ymm14, ymm3
+    vpaddd  ymm15, ymm15, ymm4
+    vpaddd  ymm15, ymm15, ymm7
+    vpaddd  ymm5, ymm5, ymm12
+    vpaddd  ymm6, ymm6, ymm12
+    add     rdi, 16
+    dec     ecx
+    jnz     .fa
+.gnext:
+    inc     r9d
+    jmp     .fg
+.fdone_f:
+    lea     rax, [rsp+28]
+    vextracti128 xmm3, ymm13, 1
+    vpaddd  xmm3, xmm3, xmm13
+    vmovdqu [rax], xmm3
+    mov     ecx, [rax]
+    add     ecx, [rax+4]
+    add     ecx, [rax+8]
+    add     ecx, [rax+12]
+    mov     [rsp], ecx
+    vextracti128 xmm3, ymm14, 1
+    vpaddd  xmm3, xmm3, xmm14
+    vmovdqu [rax], xmm3
+    mov     ecx, [rax]
+    add     ecx, [rax+4]
+    add     ecx, [rax+8]
+    add     ecx, [rax+12]
+    mov     [rsp+4], ecx
+    vextracti128 xmm3, ymm15, 1
+    vpaddd  xmm3, xmm3, xmm15
+    vmovdqu [rax], xmm3
+    mov     ecx, [rax]
+    add     ecx, [rax+4]
+    add     ecx, [rax+8]
+    add     ecx, [rax+12]
+    mov     [rsp+8], ecx
+    ; backward shell 1 (same kernel, c-accs)
+    vpxor   ymm13, ymm13, ymm13
+    vpxor   ymm14, ymm14, ymm14
+    vpxor   ymm15, ymm15, ymm15
+    xor     r9d, r9d
+.bg:
+    cmp     r9d, 32
+    jae     .fdone_b
+    mov     eax, esi
+    shl     eax, 5
+    add     eax, r9d
+    shl     eax, 1
+    add     eax, 1                  ; slot1
+    cmp     byte [rbx+OCC_OFF+rax], 0
+    je      .gnext2
+    mov     ecx, eax
+    shl     ecx, 6
+    lea     rdi, [rbx+rcx]
+    mov     edx, r9d
+    shl     edx, 6
+    mov     [rsp+24], edx
+    vpbroadcastd ymm5, dword [rsp+24]
+    vpaddd  ymm5, ymm5, yword [FXX1]
+    vpaddd  ymm6, ymm5, ymm11
+    mov     ecx, 4
+.ba:
+    vpmovzxbd ymm0, qword [rdi]
+    vpmovzxbd ymm1, qword [rdi+8]
+    vpmulld ymm2, ymm0, ymm5
+    vpmulld ymm3, ymm1, ymm6
+    vpmulld ymm4, ymm2, ymm5
+    vpmulld ymm7, ymm3, ymm6
+    vpaddd  ymm13, ymm13, ymm0
+    vpaddd  ymm13, ymm13, ymm1
+    vpaddd  ymm14, ymm14, ymm2
+    vpaddd  ymm14, ymm14, ymm3
+    vpaddd  ymm15, ymm15, ymm4
+    vpaddd  ymm15, ymm15, ymm7
+    vpaddd  ymm5, ymm5, ymm12
+    vpaddd  ymm6, ymm6, ymm12
+    add     rdi, 16
+    dec     ecx
+    jnz     .ba
+.gnext2:
+    inc     r9d
+    jmp     .bg
+.fdone_b:
+    lea     rax, [rsp+28]
+    vextracti128 xmm3, ymm13, 1
+    vpaddd  xmm3, xmm3, xmm13
+    vmovdqu [rax], xmm3
+    mov     ecx, [rax]
+    add     ecx, [rax+4]
+    add     ecx, [rax+8]
+    add     ecx, [rax+12]
+    mov     [rsp+12], ecx
+    vextracti128 xmm3, ymm14, 1
+    vpaddd  xmm3, xmm3, xmm14
+    vmovdqu [rax], xmm3
+    mov     ecx, [rax]
+    add     ecx, [rax+4]
+    add     ecx, [rax+8]
+    add     ecx, [rax+12]
+    mov     [rsp+16], ecx
+    vextracti128 xmm3, ymm15, 1
+    vpaddd  xmm3, xmm3, xmm15
+    vmovdqu [rax], xmm3
+    mov     ecx, [rax]
+    add     ecx, [rax+4]
+    add     ecx, [rax+8]
+    add     ecx, [rax+12]
+    mov     [rsp+20], ecx
+    ; jr0/jr1 bases
+    mov     eax, esi
+    shl     eax, 1
+    imul    eax, eax, 12
+    lea     r8, [rbx+JR_OFF+rax]    ; jr[b][0]
+    mov     ecx, [rsp]
+    sub     ecx, [r8]
+    mov     [r14], ecx
+    mov     ecx, [rsp+4]
+    sub     ecx, [r8+4]
+    mov     [r14+4], ecx
+    mov     ecx, [rsp+8]
+    sub     ecx, [r8+8]
+    mov     [r14+8], ecx
+    mov     ecx, [rsp+12]
+    sub     ecx, [r8+12]
+    mov     [r14+12], ecx
+    mov     ecx, [rsp+16]
+    sub     ecx, [r8+16]
+    mov     [r14+16], ecx
+    mov     ecx, [rsp+20]
+    sub     ecx, [r8+20]
+    mov     [r14+20], ecx
+    xor     eax, eax                ; flags
+    mov     ecx, [r14]
+    or      ecx, [r14+4]
+    or      ecx, [r14+8]
+    jz      .noR0
+    or      eax, 1
+.noR0:
+    mov     ecx, [r14+12]
+    or      ecx, [r14+16]
+    or      ecx, [r14+20]
+    jz      .noR1
+    or      eax, 2
+.noR1:
+    mov     ecx, [rsp]
+    cmp     ecx, [rsp+12]
+    jne     .rx
+    mov     ecx, [rsp+4]
+    cmp     ecx, [rsp+16]
+    jne     .rx
+    mov     ecx, [rsp+8]
+    cmp     ecx, [rsp+20]
+    je      .rxdone
+.rx:
+    or      eax, 4
+.rxdone:
+    vzeroupper
+    add     rsp, 48
+    pop     r14
+    pop     rbx
+    ret
+
+; -- flux_bin_scalar: original byte loops (non-AVX2 fallback) --
 ; Forward shell-0 stream + backward shell-1 stream, residuals vs journals.
 ; Accumulators live at [rsp] (no calls made here).
-flux_bin:
+flux_bin_scalar:
     push    rbx
     push    r12
     sub     rsp, 24                 ; a0 a1 a2 c0 c1 c2
@@ -2286,6 +2570,7 @@ _start:
     mov     rsi, 0xCE27
     call    seed_rng
     call    check_sse41             ; r12d/r13d survive cpuid
+    call    check_avx2
     lea     rdi, [torus]            ; tin
     call    sq5_tin
     xor     ebx, ebx                ; i = 0..255: alloc(i, i)
@@ -2629,6 +2914,16 @@ _start:
 
 segment readable
 
+align 32
+FXX1 dd 1,2,3,4,5,6,7,8
+FX8  dd 8,8,8,8,8,8,8,8
+FX16 dd 16,16,16,16,16,16,16,16
+align 32
+POK91 dd 91,91,91,91,91,91,91,91
+POKA5 dd 0xA5,0xA5,0xA5,0xA5,0xA5,0xA5,0xA5,0xA5
+POK07 dd 0,1,2,3,4,5,6,7
+POK08 dd 8,8,8,8,8,8,8,8
+POKFF dd 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
 DBL_10  dq 0x4024000000000000      ; 10.0
 DBL_1E9 dq 0x41CDCD6500000000      ; 1e9
 DBL_1E_9 dq 0x3E112E0BE826D369     ; 1e-9
@@ -2753,6 +3048,7 @@ accA     rq 17
 accB     rq 17
 rng_main rb 32
 use_sse41 rb 1
+use_avx2 rb 1
 sse_idx  rd 4
 sse_hs   rb 16
 stamp_badmap rq 8
