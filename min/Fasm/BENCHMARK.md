@@ -75,14 +75,14 @@ modulo timing lines) — no strawmen, no diverged workloads.
 | system | FASM | C `-O3 -native` | FASM/C | verdict |
 |---|---|---|---|---|
 | sq2b (1500) | 122 ms | 123 ms | **1.00×** | **parity**: inlined sweep kernels + honest O9 main-cohere line (cost C its DCE) |
-| sqm (1000) | 9.00 ms | 9.90 ms | **1.10×** | **faster** |
-| sqw (1500) | 44.6 ms | 32.4 ms | 0.73× | shared pay_ok was the big one (was 0.26×); recognition remains |
-| sq5 (1500) | 339.4 ms | 55.1 ms | 0.16× | slower (scalar flux_bin) |
-| sqfh (fixed) | 8.72 ms | 7.59 ms | 0.87× | parity |
+| sqm (1000) | 8.96 ms | 9.82 ms | **1.10×** | **faster** |
+| sqw (1500) | 44.1 ms | 32.3 ms | 0.73× | shared pay_ok was the big one (was 0.26×); recognition remains |
+| sq5 (1500) | 341 ms | 54.8 ms | 0.16× | slower (scalar flux_bin) |
+| sqfh (fixed) | 8.67 ms | 7.49 ms | 0.86× | parity |
 | sq4 (fixed) | 1.76 ms | 1.92 ms | **1.09×** | **faster** |
 | v8 fold (kernel) | ~1.5 ns | 2.56 ns | **~1.7×** | **faster** (200k-fold microbench, sinks match) |
 
-Honest read: 3 wins, 1 parity, 3 losses — not uniformly on par.
+Honest read: 3 wins, 2 parity, 2 losses — not uniformly on par.
 The losses share one cause: `gcc -march=native` auto-vectorizes
 the hot sweep loops while our ports run them scalar (sq5's AVX2
 flux attempt measured 2.5× worse and was reverted; cell-level
