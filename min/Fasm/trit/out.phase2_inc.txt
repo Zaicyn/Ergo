@@ -1,0 +1,14 @@
+phase2 rounds: 2000
+raw bytes: 512000
+twobit bytes: 128000
+trit bytes: 104000
+rle bytes: 30578
+roundtrip fails: 0
+enc MB/s raw: 8075
+enc MB/s 2bit: 3381
+enc MB/s trit: 2689
+enc MB/s rle: 1461
+dec MB/s raw: 8513
+dec MB/s 2bit: 3792
+dec MB/s trit: 5453
+dec MB/s rle: 2143

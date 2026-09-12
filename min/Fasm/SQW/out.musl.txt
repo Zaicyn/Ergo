@@ -1,0 +1,12 @@
+SQWOR O1_recognition  256/256 = 1.000000  expect=1.000000 counting (memoization exactness)
+SQWOR O2_refpair_det  214/214 = 1.000000  expect=1.000000 counting [A]
+SQWOR O3_payload_det  644/644 = 1.000000  expect=1.000000 counting [A]
+SQWOR O3_payload_rep  644/644 = 1.000000  expect>=0.990 measurement [A]
+SQWOR O4_syndrome_det 214/214 = 1.000000  expect=1.000000 counting [A]
+SQWOR O4_syndrome_rep 214/214 = 1.000000  expect=1.000000 measurement [A]
+SQWOR O5_closure      0 unresolved [A]  expect=0
+SQWOR O6_apoptosis    0 [A]  expect=0 isolated
+SQWOR O7_idx_failsafe 428/428 = 1.000000  expect=1.000000 (poisoned cache never serves wrong content) [A isolated]
+SQWOR auxB_det        5111/5111 = 1.000000  poisson tail (content classes)
+SQWOR auxB_rep        4942/5111 = 0.966934  poisson tail
+SQWOR auxB_tombs      83  tomb_refs 156 (amplification: 1.88 logical items lost per tombstone)  auxB_coh_fail 161  auxB_unresolved 0

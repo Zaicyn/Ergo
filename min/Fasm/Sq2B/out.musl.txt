@@ -1,0 +1,12 @@
+SQ2BOR O1_payload_det   900/900 = 1.000000  expect=1.000000 counting [A]
+SQ2BOR O2_payload_rep   900/900 = 1.000000  expect>=0.990 measurement [A]
+SQ2BOR O3_syndrome_det  300/300 = 1.000000  expect=1.000000 counting [A]
+SQ2BOR O4_syndrome_rep  300/300 = 1.000000  expect=1.000000 measurement [A]
+SQ2BOR O5_closure       0 unresolved [A]  expect=0
+SQ2BOR O6_apoptosis     0 [A]  expect=0 isolated
+SQ2BOR O7_blind_random  2000/2000 detected+tombstoned (never silent)  expect=1.000000
+SQ2BOR O8_blind_crafted 2000/2000 blind  expect=all-blind documented-exclusion
+SQ2BOR auxB_det         5647/5647 = 1.000000  poisson tail
+SQ2BOR auxB_rep         5551/5647 = 0.983000  poisson tail
+SQ2BOR auxB_tombs       48  auxB_coh_fail 48  auxB_slippage 0  auxB_unresolved 0
+SQ2BOR aux_proofread_retries 0 (GTP bill, should be 0 absent injection)

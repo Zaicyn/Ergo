@@ -1,0 +1,9 @@
+SQMOR O1_skip_exact    256/256 = 1.000000  expect=1.000000 (0 rd 0 wr)
+SQMOR O2_diff_correct  1000/1000 = 1.000000  expect=1.000000 (content+journal closure)
+SQMOR O3_amplification 1-byte: 1.00 rd 1.00 wr | 2-byte: 2.04 rd 1.98 wr (bytes/write)
+SQMOR O4_sweep_det     1000/1000 = 1.000000  expect=1.000000 counting
+SQMOR O4_sweep_rep     1000/1000 = 1.000000  expect>=0.990 measurement
+SQMOR O4_unresolved    0  expect=0
+SQMOR O5_quad_caught   2000/2000 = 1.000000  expect=1.000000 (blind to SQ5, caught by s3)
+SQMOR O5_pent_blind    2000/2000 = 1.000000  expect=1.000000 documented-exclusion
+SQMOR O6_skip_window   200/200 stale-after-skip  expect=all-stale documented-window (sweep closes it)

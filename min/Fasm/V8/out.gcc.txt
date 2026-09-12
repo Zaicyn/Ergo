@@ -1,0 +1,5 @@
+invariant=d08b5405d28e57ff
+normal[0]=00000000 bee4f92e 3f64f92e
+normal[1]=bcbb61d6 bf7f3d99 3d96817b
+normal[2]=3f0d3eea bf3dafc9 bec40197
+normal[3]=3f7e355a bdf101fb bc23396e

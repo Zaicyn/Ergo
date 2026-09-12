@@ -1,0 +1,12 @@
+SQ5OR O1_payload_det  900/900 = 1.000000  expect=1.000000 counting [A]
+SQ5OR O2_stamp_det    300/300 = 1.000000  expect=1.000000 counting [A]
+SQ5OR O3_journal_det  300/300 = 1.000000  expect=1.000000 counting [A]
+SQ5OR O4_payload_rep  900/900 = 1.000000  expect>=0.990000 measurement [A]
+SQ5OR O5_arbitration  300/300 = 1.000000  expect=1.000000 measurement [A isolated]
+SQ5OR O6_coh_fail     0 slots [A]  expect=0
+SQ5OR O7_collision    2000/2000 blind of applied; 31698 realizable quads mapped  expect=all-blind documented-exclusion
+SQ5OR O8_mirror_diff  see sq5_mirror.py verdict  expect=0 construction
+SQ5OR auxB_det        6000/6000 = 1.000000  poisson tail, no expectation
+SQ5OR auxB_rep        5370/6000 = 0.895000  poisson tail (multi-hit DED limit)
+SQ5OR auxB_coh_fail   473 slots  auxB_unresolved 588  auxB_anomalies 0  auxB_stamp_flagged 922
+SQ5T full_A=10344 legacy_A=9137 full_B=17716 legacy_B=16018 ns_per_round roundsA=1500 roundsB=500
