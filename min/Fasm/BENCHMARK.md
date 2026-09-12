@@ -13,7 +13,7 @@ host drift acknowledged — see SQ5_CERTIFICATION.md §3).
 | system | ns/item | det_% | rep_% | coh | L1_hit% | instr/item | notes |
 |---|---|---|---|---|---|---|---|
 | V22 | 79.57 | 100.00 | 100.00 | 0/220 | 93.35 | 473.6 | **14076 silent alloc rejects live** (the deferred bug, on stage) |
-| SQ4 | 2.29 | 100.00 | 100.00 | 0/432 | 99.99 | 30.5 | metadata-only; also rejects (15640) at fill |
+| SQ4 | 2.66 | 100.00 | 100.00 | 0/512 | 99.99 | 36.6 | metadata-only; overflow probe added 2026-09-11 — **0 rejects** (was 15640), full 512-slot coherency |
 | SQ5 | 30.29 | 100.00 | 100.00 | 0/256 | 98.31 | 258.4 | sweep 18.6µs, stamp_flagged=1 |
 | SQ2B | 61.30 | 100.00 | 100.00 | 0/256 | 93.30 | 558.7 | sweep 18.6µs, 0 tombs at 1% |
 | SQW | 59.63 | 100.00 | 100.00 | 0/256 | 91.04 | 509.1 | **49.2% skipped** (dup=500); sweep 10.2µs |
@@ -23,9 +23,15 @@ Notes:
 - SQM's 0.00% det/rep in the raw table means "not measured"
   (`bench_sqm.c` zeroes those fields; it measures amplification).
   Presented as N/A, same convention as the GPU row.
-- V22/SQ4 `alloc_M/s` include fast-fail no-ops (harness WARNINGs);
-  their ns/item flatters the rejects. Coherency for V22 is measured
+- V22 `alloc_M/s` includes fast-fail no-ops (harness WARNING);
+  its ns/item flatters the rejects. Coherency for V22 is measured
   on the repaired shell per the comparison doc.
+- SQ4's silence was fixed, not inherent: SCATLT imbalance is a
+  routing problem (8×32 geometry holds all 256), and a cold-path
+  linear probe recovers every overflowed item. Price: 2.25 → 2.66
+  ns/item (+7 instr, perfectly predicted) — same regime, still 10×
+  clear of the next allocator. V22's identical disease was left
+  alone deliberately (Sq2B supersedes; plan.md).
 - ESF frame rows (context, not the bunch): ESF/v2 ~2.2µs/item at
   99.9–100% rep; batch variants trade rep for speed; CRC detects
   only (rep 0 by design).

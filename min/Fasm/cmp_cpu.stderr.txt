@@ -1,7 +1,6 @@
 V22: 14076/100096 allocations failed (strand overflow)
-SQ4: 15640/100096 allocations failed (strand overflow)
-SQ5T detect_ns=8880 repair_ns=2950 stamp_flagged=1
-SQ2BT sweep_ns=18610 unresolved=0 tombstones=0 slippage=0
+SQ5T detect_ns=9320 repair_ns=2910 stamp_flagged=1
+SQ2BT sweep_ns=18800 unresolved=0 tombstones=0 slippage=0
 SQWT dup=500 skips=126 phys=130 (49.2% skipped)
-SQWT sweep_ns=10190 unresolved=0 tombs=0 ref_bad=2 refsum_ok=0
+SQWT sweep_ns=10150 unresolved=0 tombs=0 ref_bad=2 refsum_ok=0
 SQMT mut=1 skip=0 sec=102400 half=0 full=256 | rd=102400 wr=118784 bytes (1.00 rd 1.16 wr per write)
