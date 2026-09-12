@@ -123,6 +123,28 @@ strand_ok:
     jmp     .cmp
 .dec1:
     lea     rdi, [decbuf]
+    cmp     byte [use_avx2], 0
+    je      .dec_scalar
+    ; AVX2 152B complement (VEX-only; verified 27x over scalar, bitwise
+    ; identical). rbx = codon (address base only), rdi = decbuf.
+    vmovdqa ymm0, yword [C55]       ; 32 x 0x55 (align-32 in rodata)
+    vpxor   ymm1, ymm0, [rbx]
+    vmovdqu [rdi], ymm1
+    vpxor   ymm1, ymm0, [rbx+32]
+    vmovdqu [rdi+32], ymm1
+    vpxor   ymm1, ymm0, [rbx+64]
+    vmovdqu [rdi+64], ymm1
+    vpxor   ymm1, ymm0, [rbx+96]
+    vmovdqu [rdi+96], ymm1
+    vmovdqa xmm2, dqword [C55]      ; low 16 (aligned)
+    vpxor   xmm1, xmm2, [rbx+128]
+    vmovdqu [rdi+128], xmm1
+    mov     rax, [rbx+144]
+    xor     rax, qword [C55]        ; low 8 = 0x5555...
+    mov     [rdi+144], rax
+    vzeroupper
+    jmp     .dec_done
+.dec_scalar:
     xor     ecx, ecx
 .xor_loop:
     mov     al, [rbx+rcx]
@@ -131,6 +153,7 @@ strand_ok:
     inc     rcx
     cmp     ecx, SQB_PAY
     jne     .xor_loop
+.dec_done:
     lea     rsi, [tmp_s0]
     lea     rdx, [tmp_s1]
     call    syn

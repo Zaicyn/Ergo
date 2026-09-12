@@ -198,10 +198,10 @@ timing accumulator held in a register the scoring loop reuses
 |---|---|---|
 | `V8/v8_invariant` (FASM, AVX2 fold + scalar fallback) | ~1240 us (noise; startup-dominated, was 1260/1161 scalar) | 769 B |
 | `V8/v8_driver.gcc` (C) | 1616 us | 16024 B |
-| `Sq2B/sq2b` (FASM) | 903 ms scalar → 601 ms (+mismatch) → **351 ms (+syn, 2.57×)** | 6162 → 6401 → 6593 B |
+| `Sq2B/sq2b` (FASM) | 903 ms scalar → 601 ms (+mismatch) → 351 ms (+syn) → **194 ms (+strand-decode, 1.78×)** | 6162 → 6401 → 6593 → 6891 B |
 | `sq2b.gcc` (C `-O2`) | 212 ms | 28784 B |
 | `SQM/sqm` (FASM) | 23 ms scalar → **8.9 ms AVX2 (2.6×)** | 7938 → 8505 B |
-| `SQW/sqw` (FASM) | 129 ms | 8156 B |
+| `SQW/sqw` (FASM) | 129 ms → **99 ms** (+strand-decode via shared cell) | 8156 → 8252 B |
 | `SQ5/sq5` (FASM, scalar + SSE4.1 journal) | 344 ms | 11379 B |
 | `sq5.gcc` (C `-O2 -mavx2 -msse4.1`) | 61 ms | 29632 B |
 | `sq5` scalar-C (`-O2`, no SIMD flags) | 154 ms | — |
