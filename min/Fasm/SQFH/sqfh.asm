@@ -510,6 +510,8 @@ cpu       rb 208
 probe     rb 208
 slip_rec  rq 2
 th_tmp   rb 32
+rot_cd   rq 1
+rot_sd   rq 1
 numbuf   rb 32
 fdigits  rb 8
 outbuf   rb 4096
@@ -577,6 +579,10 @@ gen_stream:
     push    r15
     xor     r12d, r12d              ; slip_cum bits = +0.0
     xor     r13d, r13d              ; t
+    movsd   xmm0, [TRUE_K]          ; rotation step (once): sincos(δ)
+    call    my_sincos
+    movsd   [rot_sd], xmm0
+    movsd   [rot_cd], xmm1
 .tloop:
     cmp     r13d, 4096
     jae     .done
@@ -622,7 +628,113 @@ gen_stream:
     ; samples
     mov     r10d, r13d
     shl     r10d, 6                 ; t*64 base
+    test    r15d, r15d
+    jnz     .sloop_entry            ; exact path (overflow tiles)
+    test    r14d, r14d
+    jnz     .sloop_entry            ; exact path (shear tiles)
+    ; fast path: reseed rotation at θ0 (C-order), 64-step Chebyshev
+    mov     eax, r10d
+    cvtsi2sd xmm0, eax
+    mulsd   xmm0, [TRUE_K]
+    movq    xmm1, r12
+    addsd   xmm0, xmm1
+    call    my_sincos               ; s->xmm0, c->xmm1
+    movapd  xmm5, xmm0              ; s
+    movapd  xmm4, xmm1              ; c
+    movsd   xmm6, [rot_cd]
+    movsd   xmm7, [rot_sd]
     xor     r11d, r11d              ; i
+.floop:
+    cmp     r11d, 64
+    jae     .snext
+    movapd  xmm0, xmm5              ; v = s
+    cmp     r13d, 3000
+    jne     .fnoise
+    cmp     r11d, 17
+    jne     .fnoise
+    mulsd   xmm0, [FIFTY]           ; transport spike (exact op)
+.fnoise:
+    ; 4 inline xorshift draws, left-assoc (same stream as frnd calls)
+    mov     rax, [rngs]
+    mov     rcx, rax
+    shl     rcx, 13
+    xor     rax, rcx
+    mov     rcx, rax
+    shr     rcx, 7
+    xor     rax, rcx
+    mov     rcx, rax
+    shl     rcx, 17
+    xor     rax, rcx
+    mov     [rngs], rax
+    shr     rax, 11
+    cvtsi2sd xmm1, rax
+    mulsd   xmm1, [INV_2P53]        ; d0
+    mov     rax, [rngs]
+    mov     rcx, rax
+    shl     rcx, 13
+    xor     rax, rcx
+    mov     rcx, rax
+    shr     rcx, 7
+    xor     rax, rcx
+    mov     rcx, rax
+    shl     rcx, 17
+    xor     rax, rcx
+    mov     [rngs], rax
+    shr     rax, 11
+    cvtsi2sd xmm2, rax
+    mulsd   xmm2, [INV_2P53]
+    addsd   xmm1, xmm2              ; d0+d1
+    mov     rax, [rngs]
+    mov     rcx, rax
+    shl     rcx, 13
+    xor     rax, rcx
+    mov     rcx, rax
+    shr     rcx, 7
+    xor     rax, rcx
+    mov     rcx, rax
+    shl     rcx, 17
+    xor     rax, rcx
+    mov     [rngs], rax
+    shr     rax, 11
+    cvtsi2sd xmm2, rax
+    mulsd   xmm2, [INV_2P53]
+    addsd   xmm1, xmm2
+    mov     rax, [rngs]
+    mov     rcx, rax
+    shl     rcx, 13
+    xor     rax, rcx
+    mov     rcx, rax
+    shr     rcx, 7
+    xor     rax, rcx
+    mov     rcx, rax
+    shl     rcx, 17
+    xor     rax, rcx
+    mov     [rngs], rax
+    shr     rax, 11
+    cvtsi2sd xmm2, rax
+    mulsd   xmm2, [INV_2P53]
+    addsd   xmm1, xmm2              ; d0+d1+d2+d3
+    subsd   xmm1, [TWO]
+    mulsd   xmm1, [C_0005]          ; n
+    addsd   xmm0, xmm1              ; v + n
+    cvtsd2ss xmm0, xmm0
+    mov     eax, r10d
+    add     eax, r11d
+    movss   dword [stream+rax*4], xmm0
+    ; rotate state (same shape as lockin recurrence)
+    movapd  xmm1, xmm4
+    mulsd   xmm1, xmm6
+    movapd  xmm2, xmm5
+    mulsd   xmm2, xmm7
+    subsd   xmm1, xmm2
+    mulsd   xmm5, xmm6
+    mulsd   xmm4, xmm7
+    addsd   xmm5, xmm4
+    movapd  xmm4, xmm1
+    inc     r11d
+    jmp     .floop
+.sloop_entry:
+    xor     r11d, r11d              ; i (exact path entry, once)
 .sloop:
     cmp     r11d, 64
     jae     .snext

@@ -6,4 +6,4 @@ SQFHOR O4_raw_fidelity    12/12 episode tiles byte-identical (0 clamped/correcte
 SQFHOR O5_spike           tile 3000 (expect 3000) sample 17 (expect 17) routed=SPIKE (not shear)
 SQFHOR O7_overflow_lane   12/12 routed OVERFLOW (0 episodes expected: ep=0)  raw=12/12 byte-identical
 SQFHOR O8_excess_recovery 0.6053 (true 0.6000, expect |err|<=0.05)
-SQFHOR O6_handoff_cost    423.8 ns/tile (6.62 ns/sample)  lanes: lin=4069 slip=2 shear=12 spike=1
+SQFHOR O6_handoff_cost    425.4 ns/tile (6.64 ns/sample)  lanes: lin=4069 slip=2 shear=12 spike=1

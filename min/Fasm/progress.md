@@ -166,9 +166,21 @@ at runtime in C op order. Unit-gated 3.9e-12 worst-case vs libm
 `cvttsd2si` (excluded from diff, counts included).
 
 Verified: stdout oracle byte-identical (O6 timing excluded), repeat
-runs identical, 16 ms best-of-5 vs 8 ms gcc (2× — owned polynomial
-trig vs libm; sincos pairing applied for the dual-use sites).
-O6 lanes match (4069/2/12/1).
+runs identical, 8 ms best-of-5 vs 8 ms gcc (**parity** — see speed
+work below). O6 lanes match (4069/2/12/1).
+
+Speed work (post-port investigation, measured not guessed):
+whole-program `perf` showed 47.9M cycles at IPC 1.16 with 72% in
+stream gen. Microbenchmarks: owned `my_sin` 16.0 ns/op vs libm
+11.1 ns (1.45×); ~7 ns per `frnd` draw, dominated by call overhead
+(2 nested calls × 1M draws). Fix: per-tile reseeded Chebyshev
+rotation for the main sine (drift ~1e-14, same shape the core
+uses) + inline xorshift draws (identical draw stream, zero calls)
+on clean tiles; exact full-sin path kept for overflow/shear tiles.
+16 → 8 ms with the oracle still byte-identical (1e-14 perturbations
+vs 1e-3 lane margins and 5e-5 print bands). New `emit_f4` (%.4f);
+O6 timing via scaled `cvttsd2si` (excluded from diff, counts
+included).
 
 Bugs caught: `rep stosq` advancing `rdi` past the struct being
 initialized (fields landed in the next BSS object); `wallns`
@@ -192,7 +204,7 @@ timing accumulator held in a register the scoring loop reuses
 | `SQ5/sq5` (FASM, scalar + SSE4.1 journal) | 344 ms | 11379 B |
 | `sq5.gcc` (C `-O2 -mavx2 -msse4.1`) | 61 ms | 29632 B |
 | `sq5` scalar-C (`-O2`, no SIMD flags) | 154 ms | — |
-| `SQFH/sqfh` (FASM, owned f64 trig) | 16 ms | 8221 B |
+| `SQFH/sqfh` (FASM, owned f64 trig + rotation recurrence) | 8 ms | 8700 B |
 | `sqfh.gcc` (C `-O2`) | 8 ms | — |
 | `sqm` CREL (C full flags) | 9.8 ms | 32928 B |
 
@@ -295,6 +307,12 @@ vectorizer still wins. Sizes run 4–26× smaller across the board.
     ints = identical to the C literal, provably). Powers of two and
     small ints as hex are fine; everything else goes through
     `mkconst`.
+15. **Loop heads are entries AND back-edges.** One-shot setup placed
+    AT the loop label (`xor r11d` at `.sloop:`) re-runs every
+    iteration once anything else jumps there — infinite loop that
+    assembles clean and passes a glance review (SQFH fast-path
+    retrofit). Keep setup above the label in an entry stub; the
+    label itself must be pure loop.
 
 ## Pitfalls — methodology (learned the hard way)
 

@@ -28,9 +28,19 @@ trust); TRUE_K etc. computed at runtime in C op order. Verified
 3.9e-12 worst-case vs libm (margins need 5e-5).
 
 Verified: stdout oracle byte-identical (O6 timing excluded),
-repeat runs identical, 16 ms best-of-5 vs 8 ms gcc (2× — owned
-poly trig vs libm; sincos pairing applied). O6 lanes match
-(4069/2/12/1).
+repeat runs identical, 8 ms best-of-5 vs 8 ms gcc (parity — see
+below). O6 lanes match (4069/2/12/1).
+
+Speed work (post-port investigation): whole-program perf showed
+47.9M cycles at IPC 1.16, 72% in stream gen. Microbenchmarks:
+owned `my_sin` 16.0 ns/op vs libm 11.1 ns (1.45×) and ~7ns per
+`frnd` draw with call overhead. Fix, both bit-safe by construction:
+per-tile reseeded Chebyshev rotation for the main sine (drift
+~1e-14 over 64 steps, same shape the core itself uses) + inline
+xorshift draws (identical draw stream, zero calls) on clean tiles;
+exact full-sin path kept for overflow/shear tiles. 16 → 8 ms,
+oracle still byte-identical (recurrence perturbs ~1e-14, lanes
+need 1e-3, %.4f needs 5e-5).
 
 Bugs caught: `rep stosq` advancing `rdi` past the struct init
 (fields landed in the next BSS object); `wallns` killing the tile
