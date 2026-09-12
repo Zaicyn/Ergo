@@ -74,12 +74,12 @@ modulo timing lines) — no strawmen, no diverged workloads.
 
 | system | FASM | C `-O3 -native` | FASM/C | verdict |
 |---|---|---|---|---|
-| sq2b (1500) | 344.9 ms | 116.5 ms | 0.34× | slower (scalar duplex sweeps) |
-| sqm (1000) | 8.85 ms | 9.96 ms | **1.12×** | **faster** |
-| sqw (1500) | 124.3 ms | 32.4 ms | 0.26× | slower (scalar recognition) |
-| sq5 (1500) | 340.2 ms | 55.3 ms | 0.16× | slower (scalar flux_bin) |
-| sqfh (fixed) | 8.62 ms | 7.83 ms | 0.91× | parity |
-| sq4 (fixed) | 1.69 ms | 2.02 ms | **1.20×** | **faster** |
+| sq2b (1500) | 194.7 ms | 118.4 ms | 0.61× | halved by shared decode (was 0.34×); scalar sweeps remain |
+| sqm (1000) | 9.00 ms | 9.90 ms | **1.10×** | **faster** |
+| sqw (1500) | 100.7 ms | 32.8 ms | 0.33× | shared decode helped (was 0.26×); scalar recognition remains |
+| sq5 (1500) | 339.4 ms | 55.1 ms | 0.16× | slower (scalar flux_bin) |
+| sqfh (fixed) | 8.72 ms | 7.59 ms | 0.87× | parity |
+| sq4 (fixed) | 1.76 ms | 1.92 ms | **1.09×** | **faster** |
 | v8 fold (kernel) | ~1.5 ns | 2.56 ns | **~1.7×** | **faster** (200k-fold microbench, sinks match) |
 
 Honest read: 3 wins, 1 parity, 3 losses — not uniformly on par.
