@@ -21,13 +21,18 @@ Flags: `-O3 -march=x86-64-v3 -ffp-contract=fast -fno-math-errno -std=c11`.
   the float kernel is **libm-bound** — bare FASM can't take it until it
   has an owned sin/cos (same lesson as `ergo_math_kernels.h`).
 - `compute_invariant` (both): GCC auto-vectorized to AVX2 (`vpxor ymm`)
-  with scalar head/tail. The FASM port (`v8_invariant.asm`) is scalar —
-  matching SIMD by hand is the open next step (the V22 hand-SSE story
-  all over again).
+  with scalar head/tail. The FASM port (`v8_invariant.asm`) now matches
+  by hand: 8× `vpxor ymm` + 3-instruction vector tail
+  (extract/fold/movhlps) with CPUID+XGETBV dispatch and the scalar
+  loop as fallback — both paths byte-match the oracle line.
+  Measured: no gain (~1.2 ms either way, startup-dominated;
+  the fold is 32 XORs). Closed the open item honestly: matching
+  SIMD by hand works, it just doesn't matter at this size.
 
 ## Sizes
 
-- FASM static, no-libc binary: **621 bytes**.
+- FASM static, no-libc binary: **769 bytes** (was 621 scalar;
+  AVX2 fold + dispatch, both paths verified).
 - gcc/glibc driver: 16024 bytes. musl static driver: 39696 bytes.
 
 ## Files

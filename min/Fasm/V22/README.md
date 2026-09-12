@@ -25,5 +25,18 @@ difference, in CLI parsing only: glibc inlines `atoi(argv[1])` as
 
 ## Notes
 
-- Known V22 bug is **deferred**, not investigated here.
+- Known V22 bug is **characterized** (second pass, 2026-09-11), not
+  fixed here per plan.md ("debug the port against the buggy reference
+  rather than fixing it here"): `sq2_cell_alloc`
+  (`Testing/V22/squaragon_v2_dna.h:270`) maps id→bin via the
+  unbalanced `sq2_viviani_scatter_full` and silently drops the item
+  when that strand is full — no fallback scan, no error return.
+  Measured: scatter histogram at total=256 is
+  [20,44,18,28,56,32,30,28] against ring 32 → bins 1 and 4 overflow
+  by 12+24 → **220/256 allocated, 36 silent rejects (14.1%)**,
+  matching the comparison doc's "~14%" and its "0 (220)" V22 row.
+  Root cause per the doc: the dynamic Viviani loads don't balance;
+  suggested fix (unimplemented): baked SCATLT or overflow fallback.
+  Sq2B supersedes with proofread-and-refuse semantics, so the OG fix
+  is a deliberate open decision, not an oversight.
 - For the fixed-variant comparison, see `../Sq2B/README.md`.

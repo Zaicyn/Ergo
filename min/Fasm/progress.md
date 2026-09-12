@@ -9,7 +9,7 @@ original concept.
 | Variant | Dir | GCC | musl | FASM | Notes |
 |---|---|---|---|---|---|
 | V8 slice (`viviani_normal` + `compute_invariant`) | `V8/` | identical | identical | matches (`v8_invariant`, 621 B) | First blood. Integer kernel fully portable; float kernel is libm-bound (`sincosf@PLT`), stays in C until owned trig exists. GCC AVX2-vectorized the fold; FASM port scalar. |
-| V22 (OG residual) | `V22/` | `r=0 sink=0` | same | — | Baseline only. Algebraic-zero invariant holds cross-libc. Known V22 bug deferred. |
+| V22 (OG residual) | `V22/` | `r=0 sink=0` | same | — | Baseline only. Algebraic-zero invariant holds cross-libc. V22 alloc bug characterized 2026-09-11 (220/256, 14.1% silent rejects, unbalanced Viviani scatter, no fallback) — fix deliberately open, Sq2B supersedes. |
 | Sq2B (fixed V22) | `Sq2B/` | cert passes | byte-identical | matches (`sq2b`, 6795 B, AVX2 mismatch + syn, cell via shared `sqb_cell.inc`) | Full port + driver; cell logic extracted shared (oracle-identical after). Verified at 7/30/1500 rounds. |
 | SQM (moment-Merkle) | `SQM/` | all 9 pass | byte-identical | matches (`sqm`, 8505 B, AVX2 mom integrated) | Full port: dispatched `mom` (AVX2 u32 lanes w/ scalar fallback), `idiv` Vandermonde solve, own `%.6f`/`%.2f`. Verified at 7/30/1000/2000 rounds. |
 | SQ5 | `SQ5/` | O1-O7 + auxB match pre-registered table; audit byte-identical; mirror S1-S4 PASS on FASM audit | GCC+musl filed, cross-identical modulo SQ5T; audits byte-identical (211647 B) | matches (`sq5`, 11379 B, scalar + SSE4.1 journal) | RNG is xoshiro256** here; libm vestigial; newest/least-tested → repeat-determinism + 30/7 gates added. |
@@ -195,7 +195,7 @@ timing accumulator held in a register the scoring loop reuses
 
 | Binary | Time | Size |
 |---|---|---|
-| `V8/v8_invariant` (FASM) | 1161 us | 621 B |
+| `V8/v8_invariant` (FASM, AVX2 fold + scalar fallback) | ~1240 us (noise; startup-dominated, was 1260/1161 scalar) | 769 B |
 | `V8/v8_driver.gcc` (C) | 1616 us | 16024 B |
 | `Sq2B/sq2b` (FASM) | 903 ms scalar → 601 ms (+mismatch) → **351 ms (+syn, 2.57×)** | 6162 → 6401 → 6593 B |
 | `sq2b.gcc` (C `-O2`) | 212 ms | 28784 B |
