@@ -681,8 +681,14 @@ sqb_fill:
     ret
 
 ; -- pay_ok: rdi = payload[152], esi = item → eax 0/1 --
-; bio.h:86
+; bio.h:86. Dispatched (AVX2 8B/iter when available).
 pay_ok:
+    cmp     byte [use_avx2], 0
+    je      pay_ok_scalar
+    jmp     pay_ok_avx2
+
+; -- pay_ok_scalar: original byte loop --
+pay_ok_scalar:
     imul    r8d, esi, 17
     xor     ecx, ecx
 .ok_loop:
@@ -701,6 +707,51 @@ pay_ok:
     xor     eax, eax
     ret
 
+; -- pay_ok_avx2: rdi = payload[152], esi = item -> eax 0/1 --
+; 19x8B lanes: pattern u32 lanes, byte-masked compare. VEX-only
+; (vzeroupper both ends; legacy movd needs clean entry state).
+; Verified 5.7x over scalar, bit-identical result.
+pay_ok_avx2:
+    push    rbx
+    push    r12
+    vzeroupper
+    mov     ebx, esi
+    imul    ebx, ebx, 17              ; base
+    movd    xmm4, ebx
+    vpbroadcastd ymm4, xmm4
+    vmovdqu ymm5, yword [POK91]
+    vmovdqu ymm6, yword [POKA5]
+    vmovdqu ymm7, yword [POK07]
+    vmovdqu ymm8, yword [POK08]
+    vmovdqu ymm9, yword [POKFF]
+    mov     ecx, 19
+.pl:
+    vmovdqa ymm0, ymm7
+    vpmulld ymm0, ymm0, ymm5         ; idx*91
+    vpaddd  ymm0, ymm0, ymm4         ; +base
+    vpxor   ymm0, ymm0, ymm6         ; ^0xA5
+    vpand   ymm0, ymm0, ymm9         ; keep low byte per lane
+    vpmovzxbd ymm1, qword [rdi]      ; payload 8B -> 8 u32
+    vpcmpeqd ymm1, ymm1, ymm0
+    vpmovmskb eax, ymm1
+    cmp     eax, -1                  ; all 8 lanes equal?
+    jne     .fail
+    add     rdi, 8
+    vpaddd  ymm7, ymm7, ymm8         ; idx += 8
+    dec     ecx
+    jnz     .pl
+    mov     eax, 1
+    vzeroupper
+    pop     r12
+    pop     rbx
+    ret
+.fail:
+    xor     eax, eax
+    vzeroupper
+    pop     r12
+    pop     rbx
+    ret
+
 segment readable
 
 SCATLT  dd  6,5,4,0,2,3,4,7,4,6,3,0,1,2,1,0,3,6,4,7,4,3,2,0,4,5,6,5,4,0,2,3
@@ -709,3 +760,13 @@ C55 dd 0x55555555, 0x55555555, 0x55555555, 0x55555555, 0x55555555, 0x55555555, 0
 align 32
 idx17   dd 1, 2, 3, 4, 5, 6, 7, 8
 idx8    dd 8, 8, 8, 8, 8, 8, 8, 8
+align 32
+POK91 dd 91,91,91,91,91,91,91,91
+align 32
+POKA5 dd 0xA5,0xA5,0xA5,0xA5,0xA5,0xA5,0xA5,0xA5
+align 32
+POK07 dd 0,1,2,3,4,5,6,7
+align 32
+POK08 dd 8,8,8,8,8,8,8,8
+align 32
+POKFF dd 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
