@@ -10,7 +10,7 @@ original concept.
 |---|---|---|---|---|---|
 | V8 slice (`viviani_normal` + `compute_invariant`) | `V8/` | identical | identical | matches (`v8_invariant`, 769 B, AVX2 fold + scalar fallback) | First blood. Integer kernel fully portable; float kernel is libm-bound (`sincosf@PLT`), stays in C until owned trig exists. Hand-AVX2 fold closes the open item (no gain at 32 XORs, recorded honestly). |
 | V22 (OG residual) | `V22/` | `r=0 sink=0` | same | — | Baseline only. Algebraic-zero invariant holds cross-libc. V22 alloc bug characterized 2026-09-11 (220/256, 14.1% silent rejects, unbalanced Viviani scatter, no fallback) — fix deliberately open, Sq2B supersedes. |
-| Sq2B (fixed V22) | `Sq2B/` | cert passes | byte-identical | matches (`sq2b`, 6795 B, AVX2 mismatch + syn, cell via shared `sqb_cell.inc`) | Full port + driver; cell logic extracted shared (oracle-identical after). Verified at 7/30/1500 rounds. |
+| Sq2B (fixed V22) | `Sq2B/` | cert passes | byte-identical | matches (`sq2b`, 7842 B, AVX2 mismatch + syn + fused cohere, cell via shared `sqb_cell.inc`) | Full port + driver; cell logic extracted shared (oracle-identical after). Verified at 7/30/1500 rounds. Fused cohere 2026-09-12: 150 → 130 ms. |
 | SQM (moment-Merkle) | `SQM/` | all 9 pass | byte-identical | matches (`sqm`, 8505 B, AVX2 mom integrated) | Full port: dispatched `mom` (AVX2 u32 lanes w/ scalar fallback), `idiv` Vandermonde solve, own `%.6f`/`%.2f`. Verified at 7/30/1000/2000 rounds. |
 | SQ5 | `SQ5/` | O1-O7 + auxB match pre-registered table; audit byte-identical; mirror S1-S4 PASS on FASM audit | GCC+musl filed, cross-identical modulo SQ5T; audits byte-identical (211647 B) | matches (`sq5`, 11379 B, scalar + SSE4.1 journal) | RNG is xoshiro256** here; libm vestigial; newest/least-tested → repeat-determinism + 30/7 gates added. |
 | SQW (memoized duplex) | `SQW/` | all 12 pass incl. 428/428 poison-failsafe | byte-identical | matches (`sqw`, 8156 B, shared `sqb_cell.inc` + recognition layer) | Recognition/cache/refcounts/audit new; cell rides free. Verified at 30/1500 rounds. |
@@ -192,13 +192,27 @@ timing accumulator held in a register the scoring loop reuses
 (see new pitfall #14); octant-vs-turns confusion in the reducer
 (caught by the trig unit gate before it could touch the oracle).
 
+## Sq2B fused cohere (DONE 2026-09-12)
+
+Cohere was the last big scalar block (71 ms of 152): per occupied slot it
+called `codon_ptr` + `transcribe` (152 B copy to `decbuf`) + `pay_ok`.
+A fused single-pass check reads codon bytes directly (no copy, no calls):
+microbench measured copy+check 55 ns/slot vs fused 16 ns/slot (3.4×, all
+1M trials pass). Applied to `sq2b.asm`: inline `codon_ptr` math, tomb
+check, 19-iteration AVX2 check with per-slot base via `vpbroadcastd`
+from an m32 temp (no SSE `movd`, so zero transition penalties in the
+loop). Oracle byte-identical at 7/30/1500 rounds; 150 → 130 ms
+best-of-5 (0.90× of gcc `-O3` at 117 ms). Two traps caught en route:
+pitfall 18 (`vzeroupper` between constant loads and loop) and a hardcoded
+stride 336 vs real `CODON_SZ` 168 (methodology 6).
+
 ## Wall-clock speeds, all working FASM variants (best-of-5)
 
 | Binary | Time | Size |
 |---|---|---|
 | `V8/v8_invariant` (FASM, AVX2 fold + scalar fallback) | ~1240 us (noise; startup-dominated, was 1260/1161 scalar) | 769 B |
 | `V8/v8_driver.gcc` (C) | 1616 us | 16024 B |
-| `Sq2B/sq2b` (FASM) | 903 ms scalar → 601 ms (+mismatch) → 351 ms (+syn) → 194 ms (+decode) → **152 ms (+pay_ok, 2.27× total)** | 6162 → 6401 → 6593 → 6891 → 7446 → 7766 B |
+| `Sq2B/sq2b` (FASM) | 903 ms scalar → 601 ms (+mismatch) → 351 ms (+syn) → 194 ms (+decode) → 152 ms (+pay_ok) → **130 ms (+fused cohere, 2.7× total)** | 6162 → 6401 → 6593 → 6891 → 7446 → 7766 → 7842 B |
 | `sq2b.gcc` (C `-O2`) | 212 ms | 28784 B |
 | `SQM/sqm` (FASM) | 23 ms scalar → **8.9 ms AVX2 (2.6×)** | 7938 → 8505 → 9041 B (shared incs) |
 | `SQW/sqw` (FASM) | 129 ms → 99 ms (+decode) → **44.6 ms (+pay_ok via shared cell)** | 8156 → 8252 → 8786 → 9106 B |
@@ -334,6 +348,15 @@ vectorizer still wins. Sizes run 4–26× smaller across the board.
     measured 30× on a fold kernel (76 ns → ~1.5 ns switching to
     `vpunpckhqdq`). In any 256-bit loop, every instruction must
     be VEX; audit with the microbench, not the eye.
+18. **`vzeroupper` after a 256-bit load destroys the load.** It zeroes
+    the upper halves of all ymm registers — so constants loaded once
+    and used later must be loaded AFTER the last `vzeroupper` before
+    their use, never before it. Cost two debugging sessions on the
+    sq2b fused-cohere work: a scratch bench failed every check at
+    ~1 ns/trial (fail-fast path) with byte-correct code and data,
+    purely from a `vzeroupper` sitting between the constant loads and
+    the loop. Disassembly and data dumps both looked right; only a
+    lane dump of the live registers exposed it.
 
 ## Pitfalls — methodology (learned the hard way)
 
@@ -355,3 +378,10 @@ vectorizer still wins. Sizes run 4–26× smaller across the board.
    sides) separates them in one run.
 5. **File the failing output.** Every `out.{gcc,musl,fasm}.txt` plus the
    `.s` assembly stays in-tree per variant, so regressions are diffable.
+6. **Use the named constant, not the remembered number.** The fused-cohere
+   port hardcoded stride 336 from memory; the real `CODON_SZ` is 168 and
+   every auxB check failed while main-round counts agreed degenerately
+   (all-fail regime counts match regardless of addressing). A hybrid
+   binary running both address computations side by side caught the
+   255×336-byte discrepancy in one run. `grep` the symbol; never trust
+   the number in your head.

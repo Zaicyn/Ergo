@@ -220,6 +220,15 @@ cert_round:
     jmp     .score
 .cohere:
     xor     r14d, r14d              ; b (nev no longer needed)
+    ; cohere: fused single-pass check (no transcribe/decbuf/calls).
+    ; Constants loaded once AFTER vzeroupper (upper halves are live data!
+    ; vzeroupper after a load wipes them -> pitfall #18). Per-slot base via
+    ; m32 broadcast (no SSE movd -> no transition penalty in the loop).
+    vzeroupper
+    vmovdqu ymm5, yword [POK91]
+    vmovdqu ymm6, yword [POKA5]
+    vmovdqu ymm8, yword [POK08]
+    vmovdqu ymm9, yword [POKFF]
 .cb_loop:
     xor     r15d, r15d              ; g
 .cg_loop:
@@ -228,27 +237,32 @@ cert_round:
     add     eax, r15d               ; idx
     cmp     byte [rbx+OCC_OFF+rax], 0
     je      .cnext
-    mov     rdi, rbx
-    mov     esi, r14d
-    mov     edx, r15d
-    xor     ecx, ecx
-    call    codon_ptr
-    mov     rbp, rax                ; c0
-    cmp     dword [rbp+164], TOMB_MAGIC
+    lea     ecx, [eax*2]            ; slot0 = idx*2+0
+    imul    rcx, rcx, CODON_SZ
+    lea     rsi, [rbx+rcx]          ; c0 (codon_ptr inline)
+    cmp     dword [rsi+164], TOMB_MAGIC
     je      .cohfail
-    mov     rdi, rbx
-    mov     esi, r14d
-    mov     edx, r15d
-    lea     rcx, [decbuf]
-    call    transcribe
-    lea     rdi, [decbuf]
-    mov     eax, r14d
-    shl     eax, 5
-    add     eax, r15d
-    mov     esi, [item_at+rax*4]
-    call    pay_ok
-    test    eax, eax
-    jz      .cohfail
+    mov     edi, [item_at+rax*4]
+    imul    edi, edi, 17
+    mov     [cohbase], edi
+    vpbroadcastd ymm4, dword [cohbase]
+    vmovdqu ymm7, yword [POK07]
+    mov     ecx, 19
+.ckloop:
+    vmovdqa ymm0, ymm7
+    vpmulld ymm0, ymm0, ymm5
+    vpaddd  ymm0, ymm0, ymm4
+    vpxor   ymm0, ymm0, ymm6
+    vpand   ymm0, ymm0, ymm9
+    vpmovzxbd ymm1, qword [rsi]
+    vpcmpeqd ymm1, ymm1, ymm0
+    vpmovmskb eax, ymm1
+    cmp     eax, -1
+    jne     .cohfail
+    add     rsi, 8
+    vpaddd  ymm7, ymm7, ymm8
+    dec     ecx
+    jnz     .ckloop
     jmp     .cnext
 .cohfail:
     inc     qword [r13+104]         ; coh_fail
@@ -259,6 +273,7 @@ cert_round:
     inc     r14d
     cmp     r14d, SQB_NB
     jne     .cb_loop
+    vzeroupper                      ; hygiene: cohere leaves upper ymm live
     inc     qword [r13+112]         ; rounds
     add     rsp, 8
     pop     r15
@@ -799,6 +814,7 @@ accB    rq 15
 rng_main rb 32
 rng_blind rb 32
 decbuf  rb SQB_PAY
+cohbase rd 1                        ; fused-cohere per-slot base temp
 hstmp   rb 16
 tmp_s0  rd 1
 tmp_s1  rd 1
