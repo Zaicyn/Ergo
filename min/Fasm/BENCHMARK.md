@@ -74,9 +74,9 @@ modulo timing lines) — no strawmen, no diverged workloads.
 
 | system | FASM | C `-O3 -native` | FASM/C | verdict |
 |---|---|---|---|---|
-| sq2b (1500) | 194.7 ms | 118.4 ms | 0.61× | halved by shared decode (was 0.34×); scalar sweeps remain |
+| sq2b (1500) | 152.3 ms | 117.4 ms | 0.77× | shared decode+pay_ok closed most of it; sweep/call overhead remains |
 | sqm (1000) | 9.00 ms | 9.90 ms | **1.10×** | **faster** |
-| sqw (1500) | 100.7 ms | 32.8 ms | 0.33× | shared decode helped (was 0.26×); scalar recognition remains |
+| sqw (1500) | 44.6 ms | 32.4 ms | 0.73× | shared pay_ok was the big one (was 0.26×); recognition remains |
 | sq5 (1500) | 339.4 ms | 55.1 ms | 0.16× | slower (scalar flux_bin) |
 | sqfh (fixed) | 8.72 ms | 7.59 ms | 0.87× | parity |
 | sq4 (fixed) | 1.76 ms | 1.92 ms | **1.09×** | **faster** |
