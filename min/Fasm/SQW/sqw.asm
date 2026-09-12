@@ -36,247 +36,15 @@ segment readable executable
 include '../sqb_cell.inc'   ; shared duplex cell (code + consts + LUTs)
 
 segment readable executable
-
-; -- xoshiro256++ : rdi = state ptr (4 qwords) -> rax --
-xoshiro:
-    mov     rax, [rdi]
-    add     rax, [rdi+24]
-    mov     rdx, [rdi+8]
-    shl     rdx, 17
-    mov     rcx, [rdi]
-    xor     [rdi+16], rcx
-    mov     rcx, [rdi+8]
-    xor     [rdi+24], rcx
-    mov     rcx, [rdi+16]
-    xor     [rdi+8], rcx
-    mov     rcx, [rdi+24]
-    xor     [rdi], rcx
-    xor     [rdi+16], rdx
-    mov     rcx, [rdi+24]
-    mov     rdx, rcx
-    shl     rcx, 45
-    shr     rdx, 19
-    or      rcx, rdx
-    mov     [rdi+24], rcx
-    mov     rdx, rax
-    shl     rax, 17
-    shr     rdx, 47
-    or      rax, rdx
-    ret
-
-; -- seed: rdi = state, rsi = seed (10 warmups, callee-saved counter) --
-seed_rng:
-    push    rbx
-    push    r12
-    mov     rbx, rdi
-    mov     rax, rsi
-    mov     rcx, 0x9E3779B97F4A7C15
-    add     rax, rcx
-    mov     [rbx], rax
-    mov     rax, rsi
-    mov     rcx, 0xBF58476D1CE4E5B9
-    xor     rax, rcx
-    mov     [rbx+8], rax
-    mov     rax, rsi
-    mov     rcx, 0x94D049BB133111EB
-    add     rax, rcx
-    mov     [rbx+16], rax
-    mov     rax, rsi
-    mov     rcx, 0xF0BA35E12960E9E7
-    xor     rax, rcx
-    mov     [rbx+24], rax
-    mov     r12d, 10
-.seed_loop:
-    mov     rdi, rbx
-    call    xoshiro
-    dec     r12d
-    jnz     .seed_loop
-    pop     r12
-    pop     rbx
-    ret
-
-; -- rand_u32: rdi = state -> eax --
-rand_u32:
-    push    rdi
-    call    xoshiro
-    pop     rdi
-    ret
-
-; -- rand01: rdi = state -> xmm0 double in [0,1) --
-rand01:
-    push    rdi
-    call    xoshiro
-    pop     rdi
-    shr     rax, 11
-    cvtsi2sd xmm0, rax
-    mulsd   xmm0, [M53]
-    ret
-
-; -- emit_str: rsi = ptr, rdx = len --
-emit_str:
-    mov     rax, [ocur]
-    lea     rdi, [outbuf+rax]
-    mov     rcx, rdx
-    rep     movsb
-    mov     rax, rdi
-    sub     rax, outbuf
-    mov     [ocur], rax
-    ret
-
-; -- emit_u64: rax -> decimal --
-emit_u64:
-    lea     rdi, [numbuf+31]
-    mov     rcx, 10
-    test    rax, rax
-    jnz     .dig
-    dec     rdi
-    mov     byte [rdi], '0'
-    jmp     .out
-.dig:
-    xor     edx, edx
-    div     rcx
-    add     dl, '0'
-    dec     rdi
-    mov     [rdi], dl
-    test    rax, rax
-    jnz     .dig
-.out:
-    mov     rsi, rdi
-    lea     rdx, [numbuf+31]
-    sub     rdx, rsi
-    jmp     emit_str
-
-; -- emit_fdec: xmm0 = double >= 0, ecx = decimals (2 or 6) --
-emit_fdec:
-    push    rbx
-    mov     r8d, ecx
-    cvttsd2si r9, xmm0
-    cvtsi2sd xmm1, r9
-    subsd   xmm0, xmm1
-    xor     ecx, ecx
-.dig_loop:
-    mulsd   xmm0, [DBL_10]
-    cvttsd2si eax, xmm0
-    mov     [fdigits+rcx], al
-    cvtsi2sd xmm1, eax
-    subsd   xmm0, xmm1
-    inc     ecx
-    cmp     ecx, r8d
-    jbe     .dig_loop
-    xor     ecx, ecx
-    ucomisd xmm0, [DBL_0]
-    setnz   cl
-    mov     eax, r8d
-    mov     dl, [fdigits+rax]
-    cmp     dl, 5
-    ja      .carry
-    jb      .print
-    test    ecx, ecx
-    jnz     .carry
-    dec     eax
-    test    byte [fdigits+rax], 1
-    jz      .print
-.carry:
-    mov     ecx, r8d
-    dec     ecx
-.carry_loop:
-    inc     byte [fdigits+rcx]
-    cmp     byte [fdigits+rcx], 10
-    jb      .print
-    mov     byte [fdigits+rcx], 0
-    dec     ecx
-    jns     .carry_loop
-    inc     r9
-.print:
-    mov     rax, r9
-    call    emit_u64
-    mov     rax, [ocur]
-    mov     byte [outbuf+rax], '.'
-    inc     qword [ocur]
-    mov     rax, [ocur]
-    lea     rdi, [outbuf+rax]
-    xor     ecx, ecx
-.copy_loop:
-    cmp     ecx, r8d
-    jae     .copied
-    mov     al, [fdigits+rcx]
-    add     al, '0'
-    mov     [rdi+rcx], al
-    inc     ecx
-    jmp     .copy_loop
-.copied:
-    movsxd  rax, r8d
-    add     [ocur], rax
-    pop     rbx
-    ret
-
-emit_f6:
+include '../rng.inc'        ; shared xoshiro** (single source)
+include '../emit.inc'       ; shared emit (single source)
+emit_f6w:
     mov     ecx, 6
     jmp     emit_fdec
 
-emit_f2:
+emit_f2w:
     mov     ecx, 2
     jmp     emit_fdec
-
-; -- ratio_fx: rax = num, rdx = den -> xmm0 = num/den or 0.0 --
-ratio_fx:
-    test    rdx, rdx
-    jz      .zero
-    push    rbx
-    mov     rbx, rdx
-    cvtsi2sd xmm0, rax
-    cvtsi2sd xmm1, rbx
-    divsd   xmm0, xmm1
-    pop     rbx
-    ret
-.zero:
-    xorpd   xmm0, xmm0
-    ret
-
-; -- atoi: rsi = string -> eax --
-atoi:
-    xor     eax, eax
-    xor     ecx, ecx
-.skip:
-    movzx   edx, byte [rsi]
-    cmp     dl, ' '
-    je      .skip_next
-    cmp     dl, 9
-    je      .skip_next
-    jmp     .sign
-.skip_next:
-    inc     rsi
-    jmp     .skip
-.sign:
-    cmp     dl, '-'
-    jne     .plus
-    mov     ecx, 1
-    inc     rsi
-    jmp     .digits
-.plus:
-    cmp     dl, '+'
-    jne     .digits
-    inc     rsi
-.digits:
-    movzx   edx, byte [rsi]
-    sub     dl, '0'
-    cmp     dl, 9
-    ja      .apply
-    imul    eax, eax, 10
-    movzx   edx, dl
-    add     eax, edx
-    inc     rsi
-    jmp     .digits
-.apply:
-    test    ecx, ecx
-    jz      .ret
-    neg     eax
-.ret:
-    ret
-
-; ================= SQW recognition layer (new; proves itself here) =========
-
-; -- sqw_hash: rdi = payload[152] -> rax u64 (FNV-1a 19 words + finalizer) --
 sqw_hash:
     mov     rax, 0x9E3779B97F4A7C15
     xor     ecx, ecx                ; word 0..18
@@ -708,13 +476,13 @@ cert_round:
     mov     r10d, eax               ; cat (r10 free: no calls until apply)
     inc     qword [r13+rax*8]       ; acc.cnt[cat]
     lea     rdi, [rng_main]         ; slot = occ_list[rand % n_occ]
-    call    xoshiro
+    call    xoshiro_ss
     xor     edx, edx
     mov     ecx, [t_nocc]
     div     ecx
     mov     eax, [occ_list+rdx*4]   ; slot
     mov     r10d, eax
-    shr     r10d, 8                 ; b (r10 survives xoshiro calls: untouched)
+    shr     r10d, 8                 ; b (r10 survives xoshiro_ss calls: untouched)
     and     eax, 0xFF
     mov     r11d, eax               ; g (same)
     imul    ecx, r15d, 24
@@ -722,19 +490,19 @@ cert_round:
     mov     [rdi+4], r10d           ; b
     mov     [rdi+8], r11d           ; g
     lea     rdi, [rng_main]         ; strand = rand & 1
-    call    xoshiro
+    call    xoshiro_ss
     and     eax, 1
     imul    ecx, r15d, 24
     mov     [evtbuf+rcx+12], eax
     lea     rdi, [rng_main]         ; i = rand % 152
-    call    xoshiro
+    call    xoshiro_ss
     xor     edx, edx
     mov     ecx, 152
     div     ecx
     imul    ecx, r15d, 24
     mov     [evtbuf+rcx+16], edx
     lea     rdi, [rng_main]         ; m = 1 + rand % 255
-    call    xoshiro
+    call    xoshiro_ss
     xor     edx, edx
     mov     ecx, 255
     div     ecx
@@ -1079,7 +847,7 @@ _start:
     mov     rax, rbx
     mov     rdx, CERT_N
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q1B]
     mov     rdx, Q1B_LEN
     call    emit_str
@@ -1099,7 +867,7 @@ _start:
     mov     rax, [accA+48]
     mov     rdx, [accA+16]
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q2B]
     mov     rdx, Q2B_LEN
     call    emit_str
@@ -1119,7 +887,7 @@ _start:
     mov     rax, [accA+32]
     mov     rdx, [accA+0]
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q3B]
     mov     rdx, Q3B_LEN
     call    emit_str
@@ -1139,7 +907,7 @@ _start:
     mov     rax, [accA+64]
     mov     rdx, [accA+0]
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q4B]
     mov     rdx, Q4B_LEN
     call    emit_str
@@ -1159,7 +927,7 @@ _start:
     mov     rax, [accA+40]
     mov     rdx, [accA+8]
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q5B]
     mov     rdx, Q5B_LEN
     call    emit_str
@@ -1179,7 +947,7 @@ _start:
     mov     rax, [accA+72]
     mov     rdx, [accA+8]
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q6B]
     mov     rdx, Q6B_LEN
     call    emit_str
@@ -1215,7 +983,7 @@ _start:
     mov     rax, [accA+112]
     mov     rdx, [accA+120]
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q9B]
     mov     rdx, Q9B_LEN
     call    emit_str
@@ -1239,7 +1007,7 @@ _start:
     mov     rax, r14
     mov     rdx, r15
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q10B]
     mov     rdx, Q10B_LEN
     call    emit_str
@@ -1261,7 +1029,7 @@ _start:
     mov     rax, r14
     mov     rdx, r15
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q11B]
     mov     rdx, Q11B_LEN
     call    emit_str
@@ -1281,7 +1049,7 @@ _start:
     mov     rax, [accB+136]
     mov     rdx, [accB+128]
     call    ratio_fx
-    call    emit_f2
+    call    emit_f2w
     lea     rsi, [Q12D]
     mov     rdx, Q12D_LEN
     call    emit_str
@@ -1298,7 +1066,7 @@ _start:
     mov     eax, 1                  ; sys_write(1, outbuf, outcur)
     mov     edi, 1
     lea     rsi, [outbuf]
-    mov     rdx, [ocur]
+    mov     rdx, [outcur]
     syscall
     mov     eax, 60                 ; sys_exit(0)
     xor     edi, edi
@@ -1310,7 +1078,7 @@ _start:
     mov     eax, 1
     mov     edi, 1
     lea     rsi, [outbuf]
-    mov     rdx, [ocur]
+    mov     rdx, [outcur]
     syscall
     mov     eax, 60
     mov     edi, 1
@@ -1322,7 +1090,7 @@ _start:
     mov     eax, 1
     mov     edi, 1
     lea     rsi, [outbuf]
-    mov     rdx, [ocur]
+    mov     rdx, [outcur]
     syscall
     mov     eax, 60
     mov     edi, 1
@@ -1330,9 +1098,7 @@ _start:
 
 segment readable
 
-M53 dq 0x3CA0000000000000          ; 2^-53
 DBL_10  dq 10.0
-DBL_0   dq 0.0
 DBL_070 dq 0.70
 DBL_050 dq 0.50
 DBL_067 dq 0.67
@@ -1423,5 +1189,6 @@ t_nocc    rd 1
 t_evt     rd 6                    ; evt copy (6 dwords)
 numbuf    rb 32
 outbuf    rb 8192
-ocur      rq 1
+outcur      rq 1
+tsbuf       rq 2
 fdigits   rb 8

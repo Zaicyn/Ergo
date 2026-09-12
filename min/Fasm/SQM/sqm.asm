@@ -1,5 +1,5 @@
 ; SQM certification driver in flat assembler (FASM 1.73.x, x86-64 Linux).
-; Faithful port of benchmark/sqm_cert.c + sqm_core.h + xoshiro RNG from
+; Faithful port of benchmark/sqm_cert.c + sqm_core.h + xoshiro_ss RNG from
 ; benchmark/common.h. Goal: byte-identical stdout to sqm_cert.
 ;
 ; Deliberate scope: the SCALAR moment path only. The SSE4.1 path in
@@ -46,75 +46,8 @@ CELL_SZ = 41312
 CELL_QW = 5164
 
 segment readable executable
-
-; -- xoshiro256++ : rdi = state ptr (4 qwords) -> rax --
-; common.h cmp_xoshiro256ss
-xoshiro:
-    mov     rax, [rdi]
-    add     rax, [rdi+24]
-    mov     rdx, [rdi+8]
-    shl     rdx, 17
-    mov     rcx, [rdi]
-    xor     [rdi+16], rcx
-    mov     rcx, [rdi+8]
-    xor     [rdi+24], rcx
-    mov     rcx, [rdi+16]
-    xor     [rdi+8], rcx
-    mov     rcx, [rdi+24]
-    xor     [rdi], rcx
-    xor     [rdi+16], rdx
-    mov     rcx, [rdi+24]
-    mov     rdx, rcx
-    shl     rcx, 45
-    shr     rdx, 19
-    or      rcx, rdx
-    mov     [rdi+24], rcx
-    mov     rdx, rax
-    shl     rax, 17
-    shr     rdx, 47
-    or      rax, rdx
-    ret
-
-; -- seed: rdi = state, rsi = seed (10 warmups, callee-saved counter) --
-; common.h cmp_seed. NOTE: counter must NOT live in rcx (xoshiro clobbers it).
-seed_rng:
-    push    rbx
-    push    r12
-    mov     rbx, rdi
-    mov     rax, rsi
-    mov     rcx, 0x9E3779B97F4A7C15
-    add     rax, rcx
-    mov     [rbx], rax
-    mov     rax, rsi
-    mov     rcx, 0xBF58476D1CE4E5B9
-    xor     rax, rcx
-    mov     [rbx+8], rax
-    mov     rax, rsi
-    mov     rcx, 0x94D049BB133111EB
-    add     rax, rcx
-    mov     [rbx+16], rax
-    mov     rax, rsi
-    mov     rcx, 0xF0BA35E12960E9E7
-    xor     rax, rcx
-    mov     [rbx+24], rax
-    mov     r12d, 10
-.seed_loop:
-    mov     rdi, rbx
-    call    xoshiro
-    dec     r12d
-    jnz     .seed_loop
-    pop     r12
-    pop     rbx
-    ret
-
-; -- rand_u32: rdi = state -> eax --
-rand_u32:
-    push    rdi
-    call    xoshiro
-    pop     rdi
-    ret                             ; low 32 bits of rax are the uint32
-
-; -- mom: dispatched (AVX2 when available, else scalar). Args untouched. --
+include '../rng.inc'        ; shared xoshiro** (single source)
+include '../emit.inc'       ; shared emit (single source)
 mom:
     cmp     byte [use_avx], 0
     je      mom_scalar
@@ -549,20 +482,6 @@ pay_ok:
 .fail:
     xor     eax, eax
     ret
-
-; -- mem_eq: rdi, rsi, ecx = len -> eax 0/1 (== memcmp(...)==0) --
-mem_eq:
-    test    ecx, ecx
-    jz      .eq
-    repe    cmpsb
-    sete    al
-    movzx   eax, al
-    ret
-.eq:
-    mov     eax, 1
-    ret
-
-; -- mem_cpy: rdi = dst, rsi = src, ecx = len --
 mem_cpy:
     rep     movsb
     ret
@@ -1166,172 +1085,13 @@ sqm_sweep:
     pop     rbp
     pop     rbx
     ret
-
-; -- emit_str: rsi = ptr, rdx = len -> appends to outbuf --
-emit_str:
-    mov     rax, [outcur]
-    lea     rdi, [outbuf+rax]
-    mov     rcx, rdx
-    rep     movsb
-    mov     rax, rdi
-    sub     rax, outbuf
-    mov     [outcur], rax
-    ret
-
-; -- emit_u64: rax = value -> decimal --
-emit_u64:
-    lea     rdi, [numbuf+31]
-    mov     rcx, 10
-    test    rax, rax
-    jnz     .dig
-    dec     rdi
-    mov     byte [rdi], '0'
-    jmp     .out
-.dig:
-    xor     edx, edx
-    div     rcx
-    add     dl, '0'
-    dec     rdi
-    mov     [rdi], dl
-    test    rax, rax
-    jnz     .dig
-.out:
-    mov     rsi, rdi
-    lea     rdx, [numbuf+31]
-    sub     rdx, rsi
-    jmp     emit_str
-
-; -- emit_fdec: xmm0 = double >= 0, ecx = decimals (2 or 6) --
-; Correctly-rounded decimal output: N+1 guard digits + sticky,
-; round-half-even. Exact for the benign ratios printed here.
-emit_fdec:
-    push    rbx
-    mov     r8d, ecx                ; N
-    cvttsd2si r9, xmm0              ; int part
-    cvtsi2sd xmm1, r9
-    subsd   xmm0, xmm1              ; frac
-    xor     ecx, ecx
-.dig_loop:
-    mulsd   xmm0, [DBL_10]
-    cvttsd2si eax, xmm0
-    mov     [fdigits+rcx], al
-    cvtsi2sd xmm1, eax
-    subsd   xmm0, xmm1
-    inc     ecx
-    cmp     ecx, r8d
-    jbe     .dig_loop               ; digits 0..N
-    xor     ecx, ecx
-    ucomisd xmm0, [DBL_0]
-    setnz   cl                      ; sticky
-    mov     eax, r8d                ; guard = d[N]
-    mov     dl, [fdigits+rax]
-    cmp     dl, 5
-    ja      .carry
-    jb      .print
-    test    ecx, ecx
-    jnz     .carry
-    dec     eax                     ; d[N-1] odd ?
-    test    byte [fdigits+rax], 1
-    jz      .print
-.carry:
-    mov     ecx, r8d
-    dec     ecx                     ; start at d[N-1]
-.carry_loop:
-    inc     byte [fdigits+rcx]
-    cmp     byte [fdigits+rcx], 10
-    jb      .print
-    mov     byte [fdigits+rcx], 0
-    dec     ecx
-    jns     .carry_loop
-    inc     r9                      ; carried past d0
-.print:
-    mov     rax, r9
-    call    emit_u64
-    mov     rax, [outcur]
-    mov     byte [outbuf+rax], '.'
-    inc     qword [outcur]
-    mov     rax, [outcur]
-    lea     rdi, [outbuf+rax]
-    xor     ecx, ecx
-.copy_loop:
-    cmp     ecx, r8d
-    jae     .copied
-    mov     al, [fdigits+rcx]
-    add     al, '0'
-    mov     [rdi+rcx], al
-    inc     ecx
-    jmp     .copy_loop
-.copied:
-    movsxd  rax, r8d
-    add     [outcur], rax
-    pop     rbx
-    ret
-
-emit_f6:
+emit_f6w:
     mov     ecx, 6
     jmp     emit_fdec
 
-emit_f2:
+emit_f2w:
     mov     ecx, 2
     jmp     emit_fdec
-
-; -- ratio_fx: rax = num (signed 64), rdx = den -> xmm0 = num/den or 0.0 --
-ratio_fx:
-    test    rdx, rdx
-    jz      .zero
-    push    rbx
-    mov     rbx, rdx
-    cvtsi2sd xmm0, rax
-    cvtsi2sd xmm1, rbx
-    divsd   xmm0, xmm1
-    pop     rbx
-    ret
-.zero:
-    xorpd   xmm0, xmm0
-    ret
-
-; -- atoi: rsi = string -> eax --
-atoi:
-    xor     eax, eax
-    xor     ecx, ecx
-.skip:
-    movzx   edx, byte [rsi]
-    cmp     dl, ' '
-    je      .skip_next
-    cmp     dl, 9
-    je      .skip_next
-    jmp     .sign
-.skip_next:
-    inc     rsi
-    jmp     .skip
-.sign:
-    cmp     dl, '-'
-    jne     .plus
-    mov     ecx, 1
-    inc     rsi
-    jmp     .digits
-.plus:
-    cmp     dl, '+'
-    jne     .digits
-    inc     rsi
-.digits:
-    movzx   edx, byte [rsi]
-    sub     dl, '0'
-    cmp     dl, 9
-    ja      .apply
-    imul    eax, eax, 10
-    movzx   edx, dl
-    add     eax, edx
-    inc     rsi
-    jmp     .digits
-.apply:
-    test    ecx, ecx
-    jz      .ret
-    neg     eax
-.ret:
-    ret
-
-; -- _start: build, O1..O6, emit, exit. rounds default 1000. --
 _start:
     mov     eax, [rsp]
     cmp     eax, 1
@@ -1443,7 +1203,7 @@ _start:
     mov     [t_b4r], rax
     mov     rax, [cell+C_BWRITTEN]
     mov     [t_b4w], rax
-    xor     r11d, r11d              ; k (xoshiro preserves r11)
+    xor     r11d, r11d              ; k (xoshiro_ss preserves r11)
 .k_loop:
     cmp     r11d, r14d
     jae     .mut_done
@@ -1847,7 +1607,7 @@ _start:
     mov     rax, [ac_o1]
     mov     rdx, 256
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q1B]
     mov     rdx, Q1B_LEN
     call    emit_str
@@ -1867,7 +1627,7 @@ _start:
     mov     rax, [ac_o2ok]
     mov     rdx, [ac_o2n]
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q2B]
     mov     rdx, Q2B_LEN
     call    emit_str
@@ -1877,28 +1637,28 @@ _start:
     mov     rax, [ac_rd1]
     mov     rdx, [ac_n1]
     call    ratio_fx
-    call    emit_f2
+    call    emit_f2w
     lea     rsi, [Q3B]
     mov     rdx, Q3B_LEN
     call    emit_str
     mov     rax, [ac_wr1]
     mov     rdx, [ac_n1]
     call    ratio_fx
-    call    emit_f2
+    call    emit_f2w
     lea     rsi, [Q3C]
     mov     rdx, Q3C_LEN
     call    emit_str
     mov     rax, [ac_rd2]
     mov     rdx, [ac_n2]
     call    ratio_fx
-    call    emit_f2
+    call    emit_f2w
     lea     rsi, [Q3B]
     mov     rdx, Q3B_LEN
     call    emit_str
     mov     rax, [ac_wr2]
     mov     rdx, [ac_n2]
     call    ratio_fx
-    call    emit_f2
+    call    emit_f2w
     lea     rsi, [Q3D]
     mov     rdx, Q3D_LEN
     call    emit_str
@@ -1918,7 +1678,7 @@ _start:
     mov     rax, [ac_d4]
     mov     rdx, [ac_n4]
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q4B]
     mov     rdx, Q4B_LEN
     call    emit_str
@@ -1938,7 +1698,7 @@ _start:
     mov     rax, [ac_r4]
     mov     rdx, [ac_n4]
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q5B]
     mov     rdx, Q5B_LEN
     call    emit_str
@@ -1966,7 +1726,7 @@ _start:
     mov     rax, [ac_qc]
     mov     rdx, [ac_qn]
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q7B]
     mov     rdx, Q7B_LEN
     call    emit_str
@@ -1986,7 +1746,7 @@ _start:
     mov     rax, [ac_pb]
     mov     rdx, [ac_pn]
     call    ratio_fx
-    call    emit_f6
+    call    emit_f6w
     lea     rsi, [Q8B]
     mov     rdx, Q8B_LEN
     call    emit_str
@@ -2019,7 +1779,6 @@ align 32
 idx_off dd 0, 1, 2, 3, 4, 5, 6, 7
 idx8    dd 8, 8, 8, 8, 8, 8, 8, 8
 DBL_10  dq 10.0
-DBL_0   dq 0.0
 
 ; line literals copied verbatim from sqm_cert.c printf formats
 Q1A db 'SQMOR O1_skip_exact    '
@@ -2112,3 +1871,4 @@ numbuf    rb 32
 fdigits   rb 8
 outbuf    rb 8192
 outcur    rq 1
+tsbuf     rq 2

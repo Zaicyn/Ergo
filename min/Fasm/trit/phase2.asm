@@ -27,6 +27,7 @@ include 'trit_codec.inc'   ; pack_groups/unpack_groups/pack5/unpack5 + UTBL
 segment readable executable
 
 include 'rle_pack.inc'   ; pack2/unpack2/rle_enc/rle_dec (no deps)
+include '../emit.inc'      ; shared emit (single source)
 
 ; -- round codecs (src/dst round pointers set by caller) --
 ; raw: plain 256 B copy both directions
@@ -90,74 +91,6 @@ dr_trit:
     pop     r12
     pop     rbx
     ret
-
-; -- mem_eq: rdi, rsi, ecx = len -> eax 1 equal / 0 differ --
-mem_eq:
-    test    ecx, ecx
-    jz      .eq
-    repe    cmpsb
-    sete    al
-    movzx   eax, al
-    ret
-.eq:
-    mov     eax, 1
-    ret
-
-; -- emit_str: rsi = ptr, rdx = len --
-emit_str:
-    mov     rax, [ocur]
-    lea     rdi, [outbuf+rax]
-    mov     rcx, rdx
-    rep     movsb
-    mov     rax, rdi
-    sub     rax, outbuf
-    mov     [ocur], rax
-    ret
-
-; -- emit_u64: rax -> decimal --
-emit_u64:
-    lea     rdi, [numbuf+31]
-    mov     rcx, 10
-    test    rax, rax
-    jnz     .dig
-    dec     rdi
-    mov     byte [rdi], '0'
-    jmp     .out
-.dig:
-    xor     edx, edx
-    div     rcx
-    add     dl, '0'
-    dec     rdi
-    mov     [rdi], dl
-    test    rax, rax
-    jnz     .dig
-.out:
-    mov     rsi, rdi
-    lea     rdx, [numbuf+31]
-    sub     rdx, rsi
-    jmp     emit_str
-
-; -- wallns: -> rax = CLOCK_MONOTONIC ns --
-wallns:
-    mov     eax, 228
-    mov     edi, 1
-    lea     rsi, [tsbuf]
-    syscall
-    mov     rax, [tsbuf]
-    mov     rcx, 1000000000
-    mul     rcx
-    add     rax, [tsbuf+8]
-    ret
-
-; -- cycles: -> rax = serialized rdtsc --
-cycles:
-    xor     eax, eax
-    cpuid
-    rdtsc
-    shl     rdx, 32
-    or      rax, rdx
-    ret
-
 _start:
     push    rbx
     push    r12
@@ -747,7 +680,7 @@ _start:
     mov     eax, 1                  ; sys_write(1, outbuf, outcur)
     mov     edi, 1
     lea     rsi, [outbuf]
-    mov     rdx, [ocur]
+    mov     rdx, [outcur]
     syscall
     mov     eax, 60                 ; sys_exit(0)
     xor     edi, edi
@@ -759,7 +692,7 @@ _start:
     mov     eax, 1
     mov     edi, 1
     lea     rsi, [outbuf]
-    mov     rdx, [ocur]
+    mov     rdx, [outcur]
     syscall
     mov     eax, 60
     mov     edi, 1
@@ -771,7 +704,7 @@ _start:
     mov     eax, 1
     mov     edi, 1
     lea     rsi, [outbuf]
-    mov     rdx, [ocur]
+    mov     rdx, [outcur]
     syscall
     mov     eax, 60
     mov     edi, 1
@@ -831,8 +764,9 @@ t_trit    rq 1
 t_rle     rq 1
 fails     rq 1
 numbuf    rb 32
+fdigits   rb 8
 outbuf    rb 8192
-ocur      rq 1
+outcur      rq 1
 tsbuf     rq 2
 t_sCy     rq 1
 t_sNs     rq 1

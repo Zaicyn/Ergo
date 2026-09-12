@@ -23,6 +23,7 @@ SQFH_N = 64
 NT = 4096
 
 segment readable executable
+include '../emit.inc'       ; shared emit (single source)
 
 ; -- xorshift64: -> rax (state in rngs, nonzero file init) --
 rnd64:
@@ -46,21 +47,6 @@ frnd:
     cvtsi2sd xmm0, rax
     mulsd   xmm0, [INV_2P53]
     ret
-
-; -- wallns: -> rax = CLOCK_MONOTONIC ns (timing only) --
-wallns:
-    mov     eax, 228
-    mov     edi, 1
-    lea     rsi, [tsbuf]
-    syscall
-    mov     rax, [tsbuf]
-    mov     rcx, 1000000000
-    mul     rcx
-    add     rax, [tsbuf+8]
-    ret
-
-; -- mkconst: rdi = dst, esi = num, edx = den -> [dst] = num/den --
-; Single correctly-rounded division = identical to a C decimal literal.
 mkconst:
     cvtsi2sd xmm0, esi
     cvtsi2sd xmm1, edx
@@ -1318,111 +1304,6 @@ sqfh_advance:
     addsd   xmm0, [rdi+96]
     movsd   [rdi+96], xmm0          ; x0 += 64*scale (legacy: unused, kept)
     ret
-
-; -- mem_eq: rdi, rsi, ecx = len -> eax 1 equal / 0 --
-mem_eq:
-    test    ecx, ecx
-    jz      .eq
-    repe    cmpsb
-    sete    al
-    movzx   eax, al
-    ret
-.eq:
-    mov     eax, 1
-    ret
-
-; -- emit_str: rsi = ptr, rdx = len -> appends to outbuf --
-emit_str:
-    mov     rax, [outcur]
-    lea     rdi, [outbuf+rax]
-    mov     rcx, rdx
-    rep     movsb
-    mov     rax, rdi
-    sub     rax, outbuf
-    mov     [outcur], rax
-    ret
-
-; -- emit_u64: rax = value -> decimal --
-emit_u64:
-    lea     rdi, [numbuf+31]
-    mov     rcx, 10
-    test    rax, rax
-    jnz     .dig
-    dec     rdi
-    mov     byte [rdi], '0'
-    jmp     .out
-.dig:
-    xor     edx, edx
-    div     rcx
-    add     dl, '0'
-    dec     rdi
-    mov     [rdi], dl
-    test    rax, rax
-    jnz     .dig
-.out:
-    mov     rsi, rdi
-    lea     rdx, [numbuf+31]
-    sub     rdx, rsi
-    jmp     emit_str
-
-; -- emit_f6: xmm0 = double >= 0 -> "d.dddddd" (correctly rounded) --
-emit_f6:
-    push    rbx
-    cvttsd2si r8, xmm0
-    cvtsi2sd xmm1, r8
-    subsd   xmm0, xmm1
-    xor     ecx, ecx
-.dig_loop:
-    mulsd   xmm0, [TEN]
-    cvttsd2si eax, xmm0
-    mov     [fdigits+rcx], al
-    cvtsi2sd xmm1, eax
-    subsd   xmm0, xmm1
-    inc     ecx
-    cmp     ecx, 7
-    jne     .dig_loop
-    xor     ecx, ecx
-    ucomisd xmm0, [DBL_0]
-    setnz   cl
-    mov     al, [fdigits+6]
-    cmp     al, 5
-    ja      .carry
-    jb      .print
-    test    ecx, ecx
-    jnz     .carry
-    test    byte [fdigits+5], 1
-    jz      .print
-.carry:
-    mov     ecx, 5
-.carry_loop:
-    inc     byte [fdigits+rcx]
-    cmp     byte [fdigits+rcx], 10
-    jb      .print
-    mov     byte [fdigits+rcx], 0
-    dec     ecx
-    jns     .carry_loop
-    inc     r8
-.print:
-    mov     rax, r8
-    call    emit_u64
-    mov     rax, [outcur]
-    mov     byte [outbuf+rax], '.'
-    inc     qword [outcur]
-    mov     rax, [outcur]
-    lea     rdi, [outbuf+rax]
-    xor     ecx, ecx
-.copy_loop:
-    mov     al, [fdigits+rcx]
-    add     al, '0'
-    mov     [rdi+rcx], al
-    inc     ecx
-    cmp     ecx, 6
-    jne     .copy_loop
-    add     qword [outcur], 6
-    pop     rbx
-    ret
-
-; -- emit_f4: xmm0 = double (any sign) -> "[-]d.dddd" (correctly rounded) --
 emit_f4:
     push    rbx
     movq    rax, xmm0
@@ -1449,7 +1330,7 @@ emit_f4:
     cmp     ecx, 5
     jne     .dig_loop
     xor     ecx, ecx
-    ucomisd xmm0, [DBL_0]
+    ucomisd xmm0, [DBL_0F]
     setnz   cl
     mov     al, [fdigits+4]
     cmp     al, 5
@@ -1532,23 +1413,6 @@ emit_f2:
     call    emit_u64
     pop     rbx
     ret
-
-; -- ratio_f6: rax = num (signed 64), rdx = den -> xmm0 = num/den or 0.0 --
-ratio_f6:
-    test    rdx, rdx
-    jz      .zero
-    push    rbx
-    mov     rbx, rdx
-    cvtsi2sd xmm0, rax
-    cvtsi2sd xmm1, rbx
-    divsd   xmm0, xmm1
-    pop     rbx
-    ret
-.zero:
-    xorpd   xmm0, xmm0
-    ret
-
-; -- _start --
 _start:
     push    rbx
     push    r12
@@ -1919,7 +1783,7 @@ _start:
 
 segment readable
 
-DBL_0 dq 0
+DBL_0F dq 0
 C_4096 dq 0x40B0000000000000        ; 4096.0
 
 P1A db 'SQFHOR O1_linear_purity   '

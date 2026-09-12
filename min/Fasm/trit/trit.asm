@@ -25,75 +25,13 @@ NPACK = NTRITS / 5
 segment readable executable
 
 include 'trit_codec.inc'   ; shared codec (code + UTBL)
+include '../rng.inc'        ; shared xoshiro** (single source)
+include '../emit.inc'       ; shared emit (single source)
 
 segment readable executable
-
-
-; -- xoshiro256++ : rdi = state -> rax --
-xoshiro:
-    mov     rax, [rdi]
-    add     rax, [rdi+24]
-    mov     rdx, [rdi+8]
-    shl     rdx, 17
-    mov     rcx, [rdi]
-    xor     [rdi+16], rcx
-    mov     rcx, [rdi+8]
-    xor     [rdi+24], rcx
-    mov     rcx, [rdi+16]
-    xor     [rdi+8], rcx
-    mov     rcx, [rdi+24]
-    xor     [rdi], rcx
-    xor     [rdi+16], rdx
-    mov     rcx, [rdi+24]
-    mov     rdx, rcx
-    shl     rcx, 45
-    shr     rdx, 19
-    or      rcx, rdx
-    mov     [rdi+24], rcx
-    mov     rdx, rax
-    shl     rax, 17
-    shr     rdx, 47
-    or      rax, rdx
-    ret
-
-; -- emit_str: rsi = ptr, rdx = len --
-emit_str:
-    mov     rax, [ocur]
-    lea     rdi, [obuf+rax]
-    mov     rcx, rdx
-    rep     movsb
-    mov     rax, rdi
-    sub     rax, obuf
-    mov     [ocur], rax
-    ret
-
-; -- emit_u64: rax -> decimal --
-emit_u64:
-    lea     rdi, [numbuf+31]
-    mov     rcx, 10
-    test    rax, rax
-    jnz     .dig
-    dec     rdi
-    mov     byte [rdi], '0'
-    jmp     .out
-.dig:
-    xor     edx, edx
-    div     rcx
-    add     dl, '0'
-    dec     rdi
-    mov     [rdi], dl
-    test    rax, rax
-    jnz     .dig
-.out:
-    mov     rsi, rdi
-    lea     rdx, [numbuf+31]
-    sub     rdx, rsi
-    jmp     emit_str
-
-; -- emit_hex16: rbx -> 16 hex chars --
 emit_hex16:
-    mov     rax, [ocur]
-    lea     rdi, [obuf+rax]
+    mov     rax, [outcur]
+    lea     rdi, [outbuf+rax]
     mov     rcx, 16
 .hh:
     rol     rbx, 4
@@ -109,31 +47,9 @@ emit_hex16:
     dec     ecx
     jnz     .hh
     mov     rax, rdi
-    sub     rax, obuf
-    mov     [ocur], rax
+    sub     rax, outbuf
+    mov     [outcur], rax
     ret
-
-; -- wallns: -> rax = CLOCK_MONOTONIC ns (clobbers rcx,rdx,rsi,rdi,r11) --
-wallns:
-    mov     eax, 228                ; sys_clock_gettime
-    mov     edi, 1                  ; MONOTONIC
-    lea     rsi, [tsbuf]
-    syscall
-    mov     rax, [tsbuf]            ; sec
-    mov     rcx, 1000000000
-    mul     rcx                     ; rdx:rax = sec*1e9 (sec small, rdx=0)
-    add     rax, [tsbuf+8]          ; + nsec
-    ret
-
-; -- cycles: -> rax = serialized rdtsc (clobbers rax,rbx,rcx,rdx) --
-cycles:
-    xor     eax, eax
-    cpuid
-    rdtsc
-    shl     rdx, 32
-    or      rax, rdx
-    ret
-
 _start:
     push    rbx
     push    r12
@@ -218,7 +134,7 @@ _start:
     call    emit_str
     test    r12d, r12d
     jnz     .fail_exit
-    ; ---- fill 1M trits via xoshiro(seed 0x2026) % 3 ----
+    ; ---- fill 1M trits via xoshiro_ss(seed 0x2026) % 3 ----
     lea     rdi, [rngst]
     mov     rsi, 0x2026
     mov     rax, rsi
@@ -241,7 +157,7 @@ _start:
 .seed_warm:
     push    r12
     lea     rdi, [rngst]
-    call    xoshiro
+    call    xoshiro_ss
     pop     r12
     dec     r12d
     jnz     .seed_warm
@@ -251,7 +167,7 @@ _start:
     push    rbx
     push    r15
     lea     rdi, [rngst]
-    call    xoshiro
+    call    xoshiro_ss
     pop     r15
     pop     rbx
     xor     edx, edx
@@ -418,8 +334,8 @@ _start:
     call    emit_str
     mov     eax, 1
     mov     edi, 1
-    lea     rsi, [obuf]
-    mov     rdx, [ocur]
+    lea     rsi, [outbuf]
+    mov     rdx, [outcur]
     syscall
     mov     eax, 60
     xor     edi, edi
@@ -427,8 +343,8 @@ _start:
 .fail_exit:
     mov     eax, 1
     mov     edi, 1
-    lea     rsi, [obuf]
-    mov     rdx, [ocur]
+    lea     rsi, [outbuf]
+    mov     rdx, [outcur]
     syscall
     mov     eax, 60
     mov     edi, 1
@@ -469,5 +385,6 @@ mUnpCy    rq 1
 mPackMB   rq 1
 mUnpMB    rq 1
 numbuf    rb 32
-obuf      rb 2048
-ocur      rq 1
+fdigits   rb 8
+outbuf      rb 2048
+outcur      rq 1

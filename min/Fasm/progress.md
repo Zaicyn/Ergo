@@ -198,16 +198,16 @@ timing accumulator held in a register the scoring loop reuses
 |---|---|---|
 | `V8/v8_invariant` (FASM, AVX2 fold + scalar fallback) | ~1240 us (noise; startup-dominated, was 1260/1161 scalar) | 769 B |
 | `V8/v8_driver.gcc` (C) | 1616 us | 16024 B |
-| `Sq2B/sq2b` (FASM) | 903 ms scalar → 601 ms (+mismatch) → 351 ms (+syn) → **194 ms (+strand-decode, 1.78×)** | 6162 → 6401 → 6593 → 6891 B |
+| `Sq2B/sq2b` (FASM) | 903 ms scalar → 601 ms (+mismatch) → 351 ms (+syn) → **194 ms (+strand-decode, 1.78×)** | 6162 → 6401 → 6593 → 6891 → 7446 B (shared incs) |
 | `sq2b.gcc` (C `-O2`) | 212 ms | 28784 B |
-| `SQM/sqm` (FASM) | 23 ms scalar → **8.9 ms AVX2 (2.6×)** | 7938 → 8505 B |
-| `SQW/sqw` (FASM) | 129 ms → **99 ms** (+strand-decode via shared cell) | 8156 → 8252 B |
-| `SQ5/sq5` (FASM, scalar + SSE4.1 journal) | 344 ms | 11379 B |
+| `SQM/sqm` (FASM) | 23 ms scalar → **8.9 ms AVX2 (2.6×)** | 7938 → 8505 → 9041 B (shared incs) |
+| `SQW/sqw` (FASM) | 129 ms → **99 ms** (+strand-decode via shared cell) | 8156 → 8252 → 8786 B (shared incs) |
+| `SQ5/sq5` (FASM, scalar + SSE4.1 journal) | 344 ms | 11379 → 11926 B (shared incs) |
 | `sq5.gcc` (C `-O2 -mavx2 -msse4.1`) | 61 ms | 29632 B |
 | `sq5` scalar-C (`-O2`, no SIMD flags) | 154 ms | — |
-| `SQFH/sqfh` (FASM, owned f64 trig + rotation recurrence) | 8 ms | 8700 B |
+| `SQFH/sqfh` (FASM, owned f64 trig + rotation recurrence) | 8 ms | 8700 → 9158 B (shared incs) |
 | `sqfh.gcc` (C `-O2`) | 8 ms | — |
-| `SQ4/sq4` (FASM, fixed-probe port) | 1.8 ms | 3248 B |
+| `SQ4/sq4` (FASM, fixed-probe port) | 1.8 ms | 3248 → 3821 B (shared incs) |
 | `sqm` CREL (C full flags) | 9.8 ms | 32928 B |
 
 Read honestly: the V8 pair is startup-dominated (µs of real work; the gap
@@ -225,7 +225,14 @@ vectorizer still wins. Sizes run 4–26× smaller across the board.
 ## Shared playbook (reuse for each port)
 
 - Static BSS arena (`rb`/`rd`/`rq`), `write(2)`/`exit(2)` only, own entry.
-- xoshiro256++ + splitmix-style seed, copied from `benchmark/common.h`.
+- Shared includes (single source, all consumers byte-verified):
+  `sqb_cell.inc` (cell/sweep/syndrome, sq2b+sqw),
+  `rng.inc` (xoshiro256** + seed/rand helpers),
+  `emit.inc` (emit_str/u64/f6/fdec, ratio, atoi, wallns, cycles,
+  mem_eq — BSS contract: outbuf/outcur/numbuf/fdigits/tsbuf),
+  `trit_codec.inc`, `rle_pack.inc`, `int_codec.inc`.
+  ~1350 duplicated lines consolidated to ~410 (binaries gain
+  ~0.5–0.9 KB of dead shared functions — documented tax, not a bug).
 - C appels: args rdi,rsi,rdx,rcx,r8,r9; only rbx,rbp,r12-r15 survive calls.
 - `emit_str` / `emit_u64` / `emit_fdec(N)` (exact-double digit extraction,
   guard digit + sticky, round-half-even) -> `emit_f6`, `emit_f2`.
