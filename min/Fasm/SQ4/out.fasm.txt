@@ -1,0 +1,5 @@
+SQ4OR O1_alloc       100096/100096 = 1.000000  expect=1.000000 counting
+SQ4OR O2_detect      3/3 = 1.000000  expect=1.000000 counting
+SQ4OR O3_repair      3/3 = 1.000000  expect=1.000000 measurement
+SQ4OR O4_coherency   0 slots  expect=0
+SQ4T alloc_ns=563360 rounds=391

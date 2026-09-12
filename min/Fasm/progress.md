@@ -8,13 +8,14 @@ original concept.
 
 | Variant | Dir | GCC | musl | FASM | Notes |
 |---|---|---|---|---|---|
-| V8 slice (`viviani_normal` + `compute_invariant`) | `V8/` | identical | identical | matches (`v8_invariant`, 621 B) | First blood. Integer kernel fully portable; float kernel is libm-bound (`sincosf@PLT`), stays in C until owned trig exists. GCC AVX2-vectorized the fold; FASM port scalar. |
+| V8 slice (`viviani_normal` + `compute_invariant`) | `V8/` | identical | identical | matches (`v8_invariant`, 769 B, AVX2 fold + scalar fallback) | First blood. Integer kernel fully portable; float kernel is libm-bound (`sincosf@PLT`), stays in C until owned trig exists. Hand-AVX2 fold closes the open item (no gain at 32 XORs, recorded honestly). |
 | V22 (OG residual) | `V22/` | `r=0 sink=0` | same | — | Baseline only. Algebraic-zero invariant holds cross-libc. V22 alloc bug characterized 2026-09-11 (220/256, 14.1% silent rejects, unbalanced Viviani scatter, no fallback) — fix deliberately open, Sq2B supersedes. |
 | Sq2B (fixed V22) | `Sq2B/` | cert passes | byte-identical | matches (`sq2b`, 6795 B, AVX2 mismatch + syn, cell via shared `sqb_cell.inc`) | Full port + driver; cell logic extracted shared (oracle-identical after). Verified at 7/30/1500 rounds. |
 | SQM (moment-Merkle) | `SQM/` | all 9 pass | byte-identical | matches (`sqm`, 8505 B, AVX2 mom integrated) | Full port: dispatched `mom` (AVX2 u32 lanes w/ scalar fallback), `idiv` Vandermonde solve, own `%.6f`/`%.2f`. Verified at 7/30/1000/2000 rounds. |
 | SQ5 | `SQ5/` | O1-O7 + auxB match pre-registered table; audit byte-identical; mirror S1-S4 PASS on FASM audit | GCC+musl filed, cross-identical modulo SQ5T; audits byte-identical (211647 B) | matches (`sq5`, 11379 B, scalar + SSE4.1 journal) | RNG is xoshiro256** here; libm vestigial; newest/least-tested → repeat-determinism + 30/7 gates added. |
 | SQW (memoized duplex) | `SQW/` | all 12 pass incl. 428/428 poison-failsafe | byte-identical | matches (`sqw`, 8156 B, shared `sqb_cell.inc` + recognition layer) | Recognition/cache/refcounts/audit new; cell rides free. Verified at 30/1500 rounds. |
 | SQFH (+SQF) | `SQFH/` | O1-O5 + O7/O8 match; O6 lanes match (timing varies) | GCC+musl filed, identical modulo O6; **zero FMA** | matches (`sqfh`, 8221 B, owned f64 trig) | Fast pass done; cert is legacy-only (no exp/model-M); repeat-deterministic. |
+| SQ4 (metadata torus) | `SQ4/` | O1-O4 counts match fixed C bench; victims byte-identical | C bench is the spec (no cert.c) | matches (`sq4`, 3248 B) | Completes the set. Ports the overflow-probe fix; fixed protocol (256/391/0.01). |
 | Trit codec (Phase 1) | `trit/` (`trit.asm` + `trit_ref.c`) | mirror passes, digest matches | n/a (no libc to compare) | self-test 0/261, digest matches C | Full toolset below. |
 
 Reference data: `V22/` and `Sq2B/` READMEs hold the OG-vs-fixed comparison
@@ -206,6 +207,7 @@ timing accumulator held in a register the scoring loop reuses
 | `sq5` scalar-C (`-O2`, no SIMD flags) | 154 ms | — |
 | `SQFH/sqfh` (FASM, owned f64 trig + rotation recurrence) | 8 ms | 8700 B |
 | `sqfh.gcc` (C `-O2`) | 8 ms | — |
+| `SQ4/sq4` (FASM, fixed-probe port) | 1.8 ms | 3248 B |
 | `sqm` CREL (C full flags) | 9.8 ms | 32928 B |
 
 Read honestly: the V8 pair is startup-dominated (µs of real work; the gap
@@ -313,6 +315,12 @@ vectorizer still wins. Sizes run 4–26× smaller across the board.
     assembles clean and passes a glance review (SQFH fast-path
     retrofit). Keep setup above the label in an entry stub; the
     label itself must be pure loop.
+16. **Code assembled into a non-executable segment faults on fetch,
+    and the RIP points at data.** Appending a function after the
+    rodata directive (SQ4's `rep` landed past `segment readable`)
+    builds clean and dies calling into literals. After any append
+    or move, grep `^segment` and confirm every global label sits
+    in the segment you think it does.
 
 ## Pitfalls — methodology (learned the hard way)
 
