@@ -1,0 +1,26 @@
+Allocator/streaming comparison (n=100000 error_rate=0.0100 churn_every=0)
+system             items     alloc_M/s       ns/item     det_%     rep_%    coh_fail_%
+V22           items=    100096  alloc=  12.567 M/s     79.57 ns/item  det=100.00%  rep=100.00%  coh_fail=0.0000% (0/220)
+              WARNING: 14076 allocation attempts silently rejected (throughput includes fast-fail no-ops)
+V22           cache: L1_hit=93.35%  LLC_hit=99.89%  L1_miss/item=12.1648  LLC_miss/item=0.0172  instr/item=473.6
+SQ4           items=    100096  alloc= 436.186 M/s      2.29 ns/item  det=100.00%  rep=100.00%  coh_fail=0.0000% (0/432)
+              WARNING: 15640 allocation attempts silently rejected (throughput includes fast-fail no-ops)
+SQ4           cache: L1_hit=99.99%  LLC_hit=71.68%  L1_miss/item=0.0012  LLC_miss/item=0.0016  instr/item=30.5
+SQ5           items=    100096  alloc=  33.010 M/s     30.29 ns/item  det=100.00%  rep=100.00%  coh_fail=0.0000% (0/256)
+SQ5           cache: L1_hit=98.31%  LLC_hit=99.91%  L1_miss/item=1.9134  LLC_miss/item=0.0027  instr/item=258.4
+SQ2B          items=    100096  alloc=  16.312 M/s     61.30 ns/item  det=100.00%  rep=100.00%  coh_fail=0.0000% (0/256)
+SQ2B          cache: L1_hit=93.30%  LLC_hit=99.83%  L1_miss/item=10.1361  LLC_miss/item=0.0224  instr/item=558.7
+SQW           items=    100096  alloc=  16.770 M/s     59.63 ns/item  det=100.00%  rep=100.00%  coh_fail=0.0000% (0/256)
+SQW           cache: L1_hit=91.04%  LLC_hit=99.87%  L1_miss/item=15.2046  LLC_miss/item=0.0219  instr/item=509.1
+SQM           items=    102400  alloc=  21.033 M/s     47.54 ns/item  det=  0.00%  rep=  0.00%  coh_fail=0.0000% (0/256)
+SQM           cache: L1_hit=96.45%  LLC_hit=99.48%  L1_miss/item=3.7613  LLC_miss/item=0.0224  instr/item=349.0
+ESF           items=    100000  alloc=   0.448 M/s   2234.57 ns/item  det=100.00%  rep= 99.90%  coh_fail=0.0000% (0/100000)
+ESF           cache: L1_hit=89.87%  LLC_hit=99.61%  L1_miss/item=69.7129  LLC_miss/item=0.3636  instr/item=5237.0
+ESF_v2        items=    100000  alloc=   0.456 M/s   2191.27 ns/item  det=100.00%  rep= 99.90%  coh_fail=0.0000% (0/100000)
+ESF_v2        cache: L1_hit=58.07%  LLC_hit=99.91%  L1_miss/item=608.0141  LLC_miss/item=0.5644  instr/item=5107.0
+ESF_v2_crc    items=    100000  alloc=   0.414 M/s   2418.37 ns/item  det= 99.90%  rep=  0.00%  coh_fail=0.0210% (21/100000)
+ESF_v2_crc    cache: L1_hit=94.41%  LLC_hit=99.61%  L1_miss/item=70.1252  LLC_miss/item=0.3341  instr/item=2343.0
+ESF_v2_batch_crc  items=    100000  alloc=  19.316 M/s     51.77 ns/item  det=100.00%  rep=  0.00%  coh_fail=1.0080% (1008/100000)
+ESF_v2_batch_crc  cache: L1_hit=96.07%  LLC_hit=98.65%  L1_miss/item=1.0915  LLC_miss/item=0.0187  instr/item=53.1
+ESF_v2_batch_repair  items=    100000  alloc=  23.153 M/s     43.19 ns/item  det=100.00%  rep=100.00%  coh_fail=0.0000% (0/100000)
+ESF_v2_batch_repair  cache: L1_hit=67.62%  LLC_hit=99.75%  L1_miss/item=10.5358  LLC_miss/item=0.0287  instr/item=98.1
