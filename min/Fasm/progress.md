@@ -236,6 +236,19 @@ of the size. Lesson recorded, not exception claimed: hand-vectorizing the
 single hottest kernel beat the compiler there; everywhere else the
 vectorizer still wins. Sizes run 4–26× smaller across the board.
 
+## HashKit deterministic harness (DONE 2026-09-12)
+
+Second test harness for analysis, alongside (not replacing) the xoshiro
+streams: `hash_rng.inc` (shared splitmix64-Stafford pure functions with
+Ergo HASH/RAND top-31/top-53 semantics) + `HashKit/det_harness.asm` with
+C mirror `det_harness.c`. Prints matching FNV-1a digests
+(`87910d869df5d644` stream / `ad2081bf93117d9b` events) and a 5/5
+random-access spot check — event k recomputed from `(seed, k)` with no
+replay, the property sequential streams cannot give. Intended use:
+deterministic event streams for second-pass/failure analysis where
+independent recompute of a single failing index matters. Deterministic
+across runs; ports untouched (their streams are the oracles).
+
 ## Shared playbook (reuse for each port)
 
 - Static BSS arena (`rb`/`rd`/`rq`), `write(2)`/`exit(2)` only, own entry.
