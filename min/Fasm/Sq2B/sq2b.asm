@@ -728,6 +728,14 @@ _start:
     lea     rsi, [P12B]
     mov     rdx, P12B_LEN
     call    emit_str
+    lea     rsi, [P13A]
+    mov     rdx, P13A_LEN
+    call    emit_str
+    mov     rax, [accA+104]
+    call    emit_u64
+    lea     rsi, [P13B]
+    mov     rdx, P13B_LEN
+    call    emit_str
     mov     eax, 1                  ; sys_write(1, outbuf, outcur)
     mov     edi, 1
     lea     rsi, [outbuf]
@@ -798,6 +806,10 @@ P12A db 'SQ2BOR aux_proofread_retries '
 P12A_LEN = $ - P12A
 P12B db ' (GTP bill, should be 0 absent injection)', 0x0A
 P12B_LEN = $ - P12B
+P13A db 'SQ2BOR O9_main_cohere  '
+P13A_LEN = $ - P13A
+P13B db '  expect=0 audit [A]', 0x0A
+P13B_LEN = $ - P13B
 SLASH db '/'
 EQSTR db ' = '
 

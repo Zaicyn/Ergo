@@ -10,3 +10,4 @@ SQ2BOR auxB_det         5647/5647 = 1.000000  poisson tail
 SQ2BOR auxB_rep         5551/5647 = 0.983000  poisson tail
 SQ2BOR auxB_tombs       48  auxB_coh_fail 48  auxB_slippage 0  auxB_unresolved 0
 SQ2BOR aux_proofread_retries 0 (GTP bill, should be 0 absent injection)
+SQ2BOR O9_main_cohere  0  expect=0 audit [A]

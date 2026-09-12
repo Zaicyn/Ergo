@@ -181,5 +181,7 @@ int main(int argc, char **argv) {
            B.tombs, B.coh_fail, B.slippage, B.unresolved);
     printf("SQ2BOR aux_proofread_retries %lld (GTP bill, should be 0 absent injection)\n",
            A.retries + B.retries);
+    printf("SQ2BOR O9_main_cohere  %lld  expect=0 audit [A]\n",
+           A.coh_fail);
     return 0;
 }

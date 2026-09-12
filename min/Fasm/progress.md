@@ -10,7 +10,7 @@ original concept.
 |---|---|---|---|---|---|
 | V8 slice (`viviani_normal` + `compute_invariant`) | `V8/` | identical | identical | matches (`v8_invariant`, 769 B, AVX2 fold + scalar fallback) | First blood. Integer kernel fully portable; float kernel is libm-bound (`sincosf@PLT`), stays in C until owned trig exists. Hand-AVX2 fold closes the open item (no gain at 32 XORs, recorded honestly). |
 | V22 (OG residual) | `V22/` | `r=0 sink=0` | same | — | Baseline only. Algebraic-zero invariant holds cross-libc. V22 alloc bug characterized 2026-09-11 (220/256, 14.1% silent rejects, unbalanced Viviani scatter, no fallback) — fix deliberately open, Sq2B supersedes. |
-| Sq2B (fixed V22) | `Sq2B/` | cert passes | byte-identical | matches (`sq2b`, 7842 B, AVX2 mismatch + syn + fused cohere, cell via shared `sqb_cell.inc`) | Full port + driver; cell logic extracted shared (oracle-identical after). Verified at 7/30/1500 rounds. Fused cohere 2026-09-12: 150 → 130 ms. |
+| Sq2B (fixed V22) | `Sq2B/` | cert passes | byte-identical | matches (`sq2b`, 9120 B, AVX2 mismatch + syn + fused cohere + inlined sweep, cell via shared `sqb_cell.inc`) | Full port + driver; cell logic extracted shared (oracle-identical after). Verified at 7/30/1500 rounds. Fused cohere 2026-09-12: 150 → 130 ms. Inlined sweep + O9 line: 130 → 122 ms, parity with gcc. |
 | SQM (moment-Merkle) | `SQM/` | all 9 pass | byte-identical | matches (`sqm`, 8505 B, AVX2 mom integrated) | Full port: dispatched `mom` (AVX2 u32 lanes w/ scalar fallback), `idiv` Vandermonde solve, own `%.6f`/`%.2f`. Verified at 7/30/1000/2000 rounds. |
 | SQ5 | `SQ5/` | O1-O7 + auxB match pre-registered table; audit byte-identical; mirror S1-S4 PASS on FASM audit | GCC+musl filed, cross-identical modulo SQ5T; audits byte-identical (211647 B) | matches (`sq5`, 11379 B, scalar + SSE4.1 journal) | RNG is xoshiro256** here; libm vestigial; newest/least-tested → repeat-determinism + 30/7 gates added. |
 | SQW (memoized duplex) | `SQW/` | all 12 pass incl. 428/428 poison-failsafe | byte-identical | matches (`sqw`, 8156 B, shared `sqb_cell.inc` + recognition layer) | Recognition/cache/refcounts/audit new; cell rides free. Verified at 30/1500 rounds. |
@@ -206,13 +206,37 @@ best-of-5 (0.90× of gcc `-O3` at 117 ms). Two traps caught en route:
 pitfall 18 (`vzeroupper` between constant loads and loop) and a hardcoded
 stride 336 vs real `CODON_SZ` 168 (methodology 6).
 
+## Sq2B parity: inlined sweep + honest O9 (DONE 2026-09-12)
+
+Cycle-exact attribution (rdtsc both sides, TSC-calibrated) closed the
+13 ms gap completely before fixing anything: cohere-main +6.1 ms (gcc
+DCEs the scan — main `coh_fail` was never read), blind +5.2 ms (mostly
+sweep-driven: 4000 sweep calls), sweep +3.3 ms (6 calls per healthy
+slot vs gcc's fully-inlined zero-call `sqb_sweep`), copy/ev/score +1 ms.
+
+A. Inlined `duplex_mismatch`/`strand_ok`/`syn` into sweep's hot path in
+shared `sqb_cell.inc` (new `sweep`, old body kept as `sweep_calls`
+fallback for `use_avx2 == 0`; `excise` stays a call: cold). Microbench
+on synthetic 50%-occupied cells first: bit-identical (same unresolved
++ cell digest), 1.05× per call. During validation the entry-hoisted
+`ymm7` was wiped by `excise→strand_write→syn`'s exit-`vzeroupper`
+(pitfall 18, confirmed by fix: per-duplex reload restored identity).
+Ported with per-duplex reloads by construction. sq2b 130 → 122 ms;
+sqw unchanged (recognition-bound). Oracles clean at 7/30/1500 both.
+
+B. Wired main `coh_fail` into the oracle as `O9_main_cohere` (was 0,
+deterministic) in C + FASM instead of deleting our scan to match gcc's
+DCE. All three filed outputs (gcc/musl/fasm) regenerated at 13 lines,
+mutually identical. Honest cost: C rose 117 → 123 ms (keeps its scan);
+FASM 122 vs C 123 ms best-of-5 — parity at 1.00×.
+
 ## Wall-clock speeds, all working FASM variants (best-of-5)
 
 | Binary | Time | Size |
 |---|---|---|
 | `V8/v8_invariant` (FASM, AVX2 fold + scalar fallback) | ~1240 us (noise; startup-dominated, was 1260/1161 scalar) | 769 B |
 | `V8/v8_driver.gcc` (C) | 1616 us | 16024 B |
-| `Sq2B/sq2b` (FASM) | 903 ms scalar → 601 ms (+mismatch) → 351 ms (+syn) → 194 ms (+decode) → 152 ms (+pay_ok) → **130 ms (+fused cohere, 2.7× total)** | 6162 → 6401 → 6593 → 6891 → 7446 → 7766 → 7842 B |
+| `Sq2B/sq2b` (FASM) | 903 ms scalar → 601 ms (+mismatch) → 351 ms (+syn) → 194 ms (+decode) → 152 ms (+pay_ok) → 130 ms (+fused cohere) → **122 ms (+inlined sweep, 2.9× total)** | 6162 → 6401 → 6593 → 6891 → 7446 → 7766 → 7842 → 9026 → 9120 B |
 | `sq2b.gcc` (C `-O2`) | 212 ms | 28784 B |
 | `SQM/sqm` (FASM) | 23 ms scalar → **8.9 ms AVX2 (2.6×)** | 7938 → 8505 → 9041 B (shared incs) |
 | `SQW/sqw` (FASM) | 129 ms → 99 ms (+decode) → **44.6 ms (+pay_ok via shared cell)** | 8156 → 8252 → 8786 → 9106 B |
@@ -368,8 +392,12 @@ across runs; ports untouched (their streams are the oracles).
     sq2b fused-cohere work: a scratch bench failed every check at
     ~1 ns/trial (fail-fast path) with byte-correct code and data,
     purely from a `vzeroupper` sitting between the constant loads and
-    the loop. Disassembly and data dumps both looked right; only a
-    lane dump of the live registers exposed it.
+    the     loop. Disassembly and data dumps both looked right; only a
+    lane dump of the live registers exposed it. Corollary: never hoist
+    a 256-bit constant across calls — `excise→strand_write→syn`'s exit
+    `vzeroupper` wiped an entry-loaded `ymm7` three sessions later and
+    broke 43 healthy slots while isolated probes passed. Reload per use;
+    the loads are ~1cy, the debugging is hours.
 
 ## Pitfalls — methodology (learned the hard way)
 

@@ -526,9 +526,315 @@ transcribe:
     ret
 
 ; -- sweep: rdi = cell, rsi = action or 0 → rax unresolved --
+; Fast path (AVX2): duplex/strand/syn kernels inlined, zero calls on
+; healthy slots (excise stays a call: cold repair path). Falls back to
+; sweep_calls when use_avx2 == 0. Verified bit-identical vs sweep_calls
+; (same unresolved + cell digest @50% occ with damage + tombs).
+; ymm7 reloaded per duplex, NOT hoisted: excise→strand_write→syn ends
+; with vzeroupper, which wipes hoisted upper halves (pitfall 18).
+sweep:
+    cmp     byte [use_avx2], 0
+    je      sweep_calls
+    push    rbx
+    push    rbp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 8
+    mov     r13, rdi                ; cell
+    mov     r14, rsi                ; action
+    xor     r15, r15                ; unresolved
+    xor     ebx, ebx                ; b
+.b_loop:
+    xor     r12d, r12d              ; g
+.g_loop:
+    mov     eax, ebx
+    shl     eax, 5
+    add     eax, r12d               ; idx = b*32+g
+    cmp     byte [r13+OCC_OFF+rax], 0
+    je      .next
+    imul    rax, rax, 336           ; idx * (2 codons * 168 B)
+    lea     rbp, [r13+rax]          ; c0 (c1 = c0+168)
+    test    r14, r14
+    jz      .no_zero
+    mov     eax, ebx
+    shl     eax, 5
+    add     eax, r12d
+    mov     byte [r14+rax], 0
+.no_zero:
+    cmp     dword [rbp+164], TOMB_MAGIC
+    je      .next                   ; already dead
+    ; mm = duplex(c0, c1) -> r10d (inlined duplex_mismatch_avx2)
+    lea     rsi, [rbp+CODON_SZ]
+    vmovdqa ymm7, yword [C55]
+    xor     r10d, r10d
+    xor     ecx, ecx
+    mov     rdi, rbp
+.vlp1:
+    vmovdqu ymm8, [rdi+rcx]
+    vmovdqu ymm9, [rsi+rcx]
+    vpxor   ymm8, ymm8, ymm9
+    vpcmpeqb ymm8, ymm8, ymm7
+    vpmovmskb edx, ymm8
+    not     edx
+    popcnt  edx, edx
+    add     r10d, edx
+    add     ecx, 32
+    cmp     ecx, 128
+    jb      .vlp1
+    mov     ecx, 128
+.tlp1:
+    cmp     ecx, 152
+    jae     .mm_done
+    mov     dl, [rdi+rcx]
+    xor     dl, [rsi+rcx]
+    xor     dl, 0x55
+    test    dl, dl
+    setnz   dl
+    movzx   edx, dl
+    add     r10d, edx
+    inc     ecx
+    jmp     .tlp1
+.mm_done:
+    ; ok0 = strand0(c0): syn(c0) vs syn0/syn1 -> r11d
+    mov     rdi, rbp
+    lea     r8, [tmp_s0]
+    lea     r9, [tmp_s1]
+    call    syn_inline
+    mov     ecx, [tmp_s0]
+    cmp     ecx, [rbp+152]
+    jne     .ok0_no
+    mov     ecx, [tmp_s1]
+    cmp     ecx, [rbp+156]
+    jne     .ok0_no
+    mov     r11d, 1
+    jmp     .ok0_done
+.ok0_no:
+    xor     r11d, r11d
+.ok0_done:
+    ; ok1 = strand1(c1): decode c1^0x55 -> decbuf, syn vs c1 syndromes
+    lea     rsi, [rbp+CODON_SZ]
+    vmovdqa ymm0, yword [C55]
+    vpxor   ymm1, ymm0, [rsi]
+    vmovdqu yword [decbuf], ymm1
+    vpxor   ymm1, ymm0, [rsi+32]
+    vmovdqu yword [decbuf+32], ymm1
+    vpxor   ymm1, ymm0, [rsi+64]
+    vmovdqu yword [decbuf+64], ymm1
+    vpxor   ymm1, ymm0, [rsi+96]
+    vmovdqu yword [decbuf+96], ymm1
+    vmovdqa xmm2, dqword [C55]
+    vpxor   xmm1, xmm2, [rsi+128]
+    vmovdqu dqword [decbuf+128], xmm1
+    mov     rax, [rsi+144]
+    xor     rax, qword [C55]
+    mov     qword [decbuf+144], rax
+    lea     rdi, [decbuf]
+    lea     r8, [tmp_s0]
+    lea     r9, [tmp_s1]
+    call    syn_inline
+    mov     ecx, [tmp_s0]
+    cmp     ecx, [rsi+152]
+    jne     .ok1_no
+    mov     ecx, [tmp_s1]
+    cmp     ecx, [rsi+156]
+    jne     .ok1_no
+    mov     r8d, 1
+    jmp     .ok1_done
+.ok1_no:
+    xor     r8d, r8d
+.ok1_done:
+    test    r10d, r10d
+    jnz     .damaged
+    test    r11d, r11d
+    jz      .damaged
+    test    r8d, r8d
+    jz      .damaged
+    inc     dword [rbp+160]         ; methylation clock
+    lea     rax, [rbp+CODON_SZ]
+    inc     dword [rax+160]
+    jmp     .next
+.damaged:
+    test    r14, r14
+    jz      .branch
+    mov     ecx, ebx
+    shl     ecx, 5
+    add     ecx, r12d
+    mov     byte [r14+rcx], 1
+.branch:
+    test    r11d, r11d
+    jz      .q0
+    test    r8d, r8d
+    jz      .fix1                   ; ok0 && !ok1
+    inc     qword [r13+SLIP_OFF]    ; ok0 && ok1, duplex disagrees
+    lea     rdi, [rbp+CODON_SZ]     ; excise(c1, c0, 1)
+    mov     rsi, rbp
+    mov     edx, 1
+    call    excise
+    jmp     .closure
+.q0:
+    test    r8d, r8d
+    jz      .both_dead              ; !ok0 && !ok1
+    mov     rdi, rbp                ; !ok0 && ok1: excise(c0, c1, 0)
+    lea     rsi, [rbp+CODON_SZ]
+    xor     edx, edx
+    call    excise
+    jmp     .closure
+.fix1:                              ; ok0 && !ok1: excise(c1, c0, 1)
+    lea     rdi, [rbp+CODON_SZ]
+    mov     rsi, rbp
+    mov     edx, 1
+    call    excise
+    jmp     .closure
+.both_dead:
+    mov     dword [rbp+164], TOMB_MAGIC
+    lea     rax, [rbp+CODON_SZ]
+    mov     dword [rax+164], TOMB_MAGIC
+    inc     qword [r13+TOMB_OFF]
+    test    r14, r14
+    jz      .closure
+    mov     ecx, ebx
+    shl     ecx, 5
+    add     ecx, r12d
+    mov     byte [r14+rcx], 2
+.closure:
+    cmp     dword [rbp+164], TOMB_MAGIC
+    je      .next
+    ; re-check duplex -> r10d
+    lea     rsi, [rbp+CODON_SZ]
+    vmovdqa ymm7, yword [C55]
+    xor     r10d, r10d
+    xor     ecx, ecx
+    mov     rdi, rbp
+.vlp2:
+    vmovdqu ymm8, [rdi+rcx]
+    vmovdqu ymm9, [rsi+rcx]
+    vpxor   ymm8, ymm8, ymm9
+    vpcmpeqb ymm8, ymm8, ymm7
+    vpmovmskb edx, ymm8
+    not     edx
+    popcnt  edx, edx
+    add     r10d, edx
+    add     ecx, 32
+    cmp     ecx, 128
+    jb      .vlp2
+    mov     ecx, 128
+.tlp2:
+    cmp     ecx, 152
+    jae     .mm2_done
+    mov     dl, [rdi+rcx]
+    xor     dl, [rsi+rcx]
+    xor     dl, 0x55
+    test    dl, dl
+    setnz   dl
+    movzx   edx, dl
+    add     r10d, edx
+    inc     ecx
+    jmp     .tlp2
+.mm2_done:
+    test    r10d, r10d
+    jnz     .unres
+    mov     rdi, rbp
+    lea     r8, [tmp_s0]
+    lea     r9, [tmp_s1]
+    call    syn_inline
+    mov     ecx, [tmp_s0]
+    cmp     ecx, [rbp+152]
+    jne     .unres
+    mov     ecx, [tmp_s1]
+    cmp     ecx, [rbp+156]
+    jne     .unres
+    lea     rsi, [rbp+CODON_SZ]
+    vmovdqa ymm0, yword [C55]
+    vpxor   ymm1, ymm0, [rsi]
+    vmovdqu yword [decbuf], ymm1
+    vpxor   ymm1, ymm0, [rsi+32]
+    vmovdqu yword [decbuf+32], ymm1
+    vpxor   ymm1, ymm0, [rsi+64]
+    vmovdqu yword [decbuf+64], ymm1
+    vpxor   ymm1, ymm0, [rsi+96]
+    vmovdqu yword [decbuf+96], ymm1
+    vmovdqa xmm2, dqword [C55]
+    vpxor   xmm1, xmm2, [rsi+128]
+    vmovdqu dqword [decbuf+128], xmm1
+    mov     rax, [rsi+144]
+    xor     rax, qword [C55]
+    mov     qword [decbuf+144], rax
+    lea     rdi, [decbuf]
+    lea     r8, [tmp_s0]
+    lea     r9, [tmp_s1]
+    call    syn_inline
+    mov     ecx, [tmp_s0]
+    cmp     ecx, [rsi+152]
+    jne     .unres
+    mov     ecx, [tmp_s1]
+    cmp     ecx, [rsi+156]
+    jne     .unres
+    jmp     .next
+.unres:
+    inc     r15
+.next:
+    inc     r12d
+    cmp     r12d, SQB_NR
+    jne     .g_loop
+    inc     ebx
+    cmp     ebx, SQB_NB
+    jne     .b_loop
+    mov     rax, r15
+    vzeroupper                      ; hygiene: inline kernels leave upper live
+    add     rsp, 8
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
+    pop     rbx
+    ret
+
+; -- syn_inline: rdi = input[152], r8 = &s0, r9 = &s1 (AVX2, VEX-only) --
+; Same math as syn_avx2 (fused for sweep; no dispatch, no vzeroupper --
+; caller guarantees AVX2 and owns upper-state hygiene).
+; Clobbers rax/rcx/rdx/rdi/ymm0/1/4/5/6.
+syn_inline:
+    vpxor   ymm0, ymm0, ymm0
+    vpxor   ymm1, ymm1, ymm1
+    lea     rax, [idx17]
+    vmovdqa ymm5, [rax]
+    lea     rax, [idx8]
+    mov     ecx, 19
+.si_lp:
+    vpmovzxbd ymm4, qword [rdi]
+    vpaddd  ymm0, ymm0, ymm4
+    vpmulld ymm6, ymm4, ymm5
+    vpaddd  ymm1, ymm1, ymm6
+    vpaddd  ymm5, ymm5, [rax]
+    add     rdi, 8
+    dec     ecx
+    jnz     .si_lp
+    lea     rax, [hstmp]
+    vextracti128 xmm6, ymm0, 1
+    vpaddd  xmm6, xmm6, xmm0
+    vmovdqu [rax], xmm6
+    mov     ecx, [rax]
+    add     ecx, [rax+4]
+    add     ecx, [rax+8]
+    add     ecx, [rax+12]
+    mov     [r8], ecx
+    vextracti128 xmm6, ymm1, 1
+    vpaddd  xmm6, xmm6, xmm1
+    vmovdqu [rax], xmm6
+    mov     ecx, [rax]
+    add     ecx, [rax+4]
+    add     ecx, [rax+8]
+    add     ecx, [rax+12]
+    mov     [r9], ecx
+    ret
+
+; -- sweep_calls: original call-based sweep (scalar-safe fallback) --
 ; bio.h:231. rbx = b, r12d = g, rbp = c0, r13 = cell, r14 = action,
 ; r15 = unresolved. mm/ok0 spilled to frame (must survive calls).
-sweep:
+sweep_calls:
     push    rbx
     push    rbp
     push    r12

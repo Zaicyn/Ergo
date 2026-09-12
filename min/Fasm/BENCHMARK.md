@@ -74,7 +74,7 @@ modulo timing lines) — no strawmen, no diverged workloads.
 
 | system | FASM | C `-O3 -native` | FASM/C | verdict |
 |---|---|---|---|---|
-| sq2b (1500) | 130.0 ms | 117.4 ms | 0.90× | fused cohere closed it further (was 0.77×); blind/sweep overhead remains |
+| sq2b (1500) | 122 ms | 123 ms | **1.00×** | **parity**: inlined sweep kernels + honest O9 main-cohere line (cost C its DCE) |
 | sqm (1000) | 9.00 ms | 9.90 ms | **1.10×** | **faster** |
 | sqw (1500) | 44.6 ms | 32.4 ms | 0.73× | shared pay_ok was the big one (was 0.26×); recognition remains |
 | sq5 (1500) | 339.4 ms | 55.1 ms | 0.16× | slower (scalar flux_bin) |
