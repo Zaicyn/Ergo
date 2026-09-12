@@ -73,8 +73,8 @@ _start:
     vpxor   ymm0, ymm0, [rsi+224]   ; 4 partials (each = 8 qwords)
     vextracti128 xmm1, ymm0, 1     ; high 2
     vpxor   xmm1, xmm1, xmm0       ; low ^ high (low128 of ymm0)
-    movhlps xmm2, xmm1             ; xmm2.lo = high 64
-    vpxor   xmm1, xmm1, xmm2
+    vpunpckhqdq xmm2, xmm1, xmm1   ; VEX-only (movhlps is legacy SSE:
+    vpxor   xmm1, xmm1, xmm2       ;  ~70cy transition penalty per mix)
     movq    rax, xmm1              ; rax = all 32 folded
 .folded:
 

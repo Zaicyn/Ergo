@@ -321,6 +321,12 @@ vectorizer still wins. Sizes run 4–26× smaller across the board.
     builds clean and dies calling into literals. After any append
     or move, grep `^segment` and confirm every global label sits
     in the segment you think it does.
+17. **Legacy SSE inside hot AVX-256 loops pays transition
+    penalties.** `movhlps` has no VEX encoding; executing it with
+    dirty upper ymm state costs ~70 cycles per transition —
+    measured 30× on a fold kernel (76 ns → ~1.5 ns switching to
+    `vpunpckhqdq`). In any 256-bit loop, every instruction must
+    be VEX; audit with the microbench, not the eye.
 
 ## Pitfalls — methodology (learned the hard way)
 

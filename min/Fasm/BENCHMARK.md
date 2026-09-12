@@ -62,3 +62,32 @@ Notes:
 - Integrity at 1%: 100/100 across every detection-capable
   allocator; the differentiators are elsewhere (poisson tails in
   the cert oracles, blind-class maps, amplification, blast radius).
+
+## FASM vs C head-to-head (same session, same box)
+
+Strongest-fair-C (`gcc -O3 -march=native`, fresh builds) vs fresh
+FASM builds, identical workloads (defaults match: 1500/1000/1500/
+1500 rounds, fixed tile/stream/protocol drivers), best-of-5 wall.
+Every pair's outputs verified identical first (full diff, or
+modulo timing lines) — no strawmen, no diverged workloads.
+(V22 excluded: baseline only, no FASM port.)
+
+| system | FASM | C `-O3 -native` | FASM/C | verdict |
+|---|---|---|---|---|
+| sq2b (1500) | 344.9 ms | 116.5 ms | 0.34× | slower (scalar duplex sweeps) |
+| sqm (1000) | 8.85 ms | 9.96 ms | **1.12×** | **faster** |
+| sqw (1500) | 124.3 ms | 32.4 ms | 0.26× | slower (scalar recognition) |
+| sq5 (1500) | 340.2 ms | 55.3 ms | 0.16× | slower (scalar flux_bin) |
+| sqfh (fixed) | 8.62 ms | 7.83 ms | 0.91× | parity |
+| sq4 (fixed) | 1.69 ms | 2.02 ms | **1.20×** | **faster** |
+| v8 fold (kernel) | ~1.5 ns | 2.56 ns | **~1.7×** | **faster** (200k-fold microbench, sinks match) |
+
+Honest read: 3 wins, 1 parity, 3 losses — not uniformly on par.
+The losses share one cause: `gcc -march=native` auto-vectorizes
+the hot sweep loops while our ports run them scalar (sq5's AVX2
+flux attempt measured 2.5× worse and was reverted; cell-level
+AVX2 is queued follow-up, not forced). The wins come from
+dispatch + hand-scheduled integer code beating the compiler's
+general shapes. V8 footnote: the fixed `movhlps`→`vpunpckhqdq`
+(VEX-only, no transition penalty) is what the kernel number
+reflects; the shipped driver is startup-dominated either way.
