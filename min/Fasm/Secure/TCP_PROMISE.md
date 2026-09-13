@@ -1,0 +1,99 @@
+# TCP Promise — parity-on-demand stream recovery without resend
+
+Status: prototyped + measured (C sims). No FASM mirror yet.
+
+## Problem
+
+Data streams (unlike auth) can take partial credit: recover as much as
+possible in place instead of paying a full round trip to resend. Goal:
+0-RTT repair of everything below a measured boundary, resend only
+above it.
+
+## Packing: the 1460 B segment
+
+- Unit = 512 B. 1460/512 = **2.85 units/segment**: 2 full units
+  (1024 B) + 436 B spare.
+- One 4096 B frame = 8 units rides in **4 segments** (always-send) or
+  **3 segments** (on-demand routine: 4096 + 256 metadata = 4352 ≤ 4380).
+- 4×436 = 1744 B of spare funds P+Q parities (2×512) + 8×16 B
+  syndromes = 1152 B overhead, 592 B left (deliberately unsent).
+
+## Wire format
+
+- **Depth-8 byte interleave.** Unit u holds frame bytes {u+8k}. A
+  channel burst contiguous on the wire of length L≤8 lands 1 byte each
+  in L distinct units → per-unit SEC fixes all of them.
+- **Per-unit S0..S3** (idx 1..512) + gated single-byte SEC per packet.
+- **P = row XOR, Q = GF(256) weighted sum** (coeffs 3^u — note: 2 has
+  order 51 in the AES field and silently aliases log/exp tables; 3 is
+  primitive, order 255, verified). Any 1–2 whole-unit losses solve
+  exactly. No search, no gates, no refuse cases.
+- **Order (measured, not assumed): SEC survivors → rebuild from clean
+  data → reverify.** Rebuilding from dirty survivors transplants their
+  errors into the fresh packet (mixed cell went 0/200 → 162/200 on
+  flipping the order; v2: 176/200).
+
+## On-demand protocol ("256 + a promise")
+
+- Routine: 3 segments carrying frame + 256 B metadata = 128 B
+  syndromes + 64 B parity commitment (keyed tag over P+Q) + 64 B
+  stream authenticator (bond tag).
+- Sender retains P+Q per unacked frame (1 KB × window; 64 KB nominal).
+- Receiver: SEC from syndromes → clean = done, 0 RTT. Hurt beyond
+  SEC → fetch parity (+1088 B, +1 RTT), rebuild, check commitment.
+  Commitment mismatch (liar/broken sender) or still dirty → resend
+  fallback (+4096 B, +1 RTT).
+
+## Measured (NTR=200/cell, deterministic; NSIM=2000/point)
+
+packetbench v2 (full recovery / mean bytes-correct of 4096):
+
+| cell | full | mean | note |
+|---|---|---|---|
+| spread n=1 | 200 | 4096.0 | always |
+| spread n=2/4/8 | 173/86/0 | 4095.7/4094.7/4091.2 | graceful, partial credit high |
+| burst L=4,8 (interleaved) | 200/200 | 4096.0 | wall moved 1→8 |
+| burst L=16/64/256 | 0 | 4080/4032/3840 | cliff at depth+1, resend |
+| burst L=64, non-interleaved control | 0 | 4032.0 | interleave is the whole gain |
+| loss d=1 / d=2 | 200/200 | 4096.0 | exact algebra |
+| mixed 1loss+2err / 2loss+2err | 176/177 | 4095.5/4095.3 | |
+| 1460 B wire-interval erasure | 0 | 2641.4 | **the boundary**: ~182 B gone from every unit at once; 2 equations can't cover 8 simultaneous erasures per offset |
+
+demandbench (bytes/frame, RTT/frame vs damaged-frame fraction f):
+
+| f | on-demand B | on-demand RTT | always-send B | always-send RTT | TCP B | TCP RTT |
+|---|---|---|---|---|---|---|
+| 0.00 | 4352 | 0.000 | 5248 | 0.000 | 4352 | 0.000 |
+| 0.01 | 4361 | 0.004 | 5256 | 0.002 | 4385 | 0.008 |
+| 0.10 | 4498 | 0.072 | 5332 | 0.021 | 4725 | 0.091 |
+| 0.50 | 5067 | 0.368 | 5676 | 0.104 | 6380 | 0.495 |
+| 0.80 | 5571 | 0.619 | 6014 | 0.187 | 7649 | 0.805 |
+
+Readings: on-demand wins bytes at every f (fetch fires only when
+SEC-alone fails — a fraction of damaged frames, hence better than the
+f<0.8 analytic breakeven). Real trade is RTT-vs-bytes against
+always-send (negligible below f≈0.1). TCP frame-resend loses on both
+axes everywhere (frame-level accounting = TCP's upper bound; SACK
+narrows the byte gap but not the 0-RTT repair advantage).
+
+## Bugs caught
+
+- Rebuild-before-repair transplants errors (0/200 → 176/200).
+- GF(256) generator 2 has order 51, not 255 — log/exp division
+  silently garbage (LO d=2: 0/200 → 200/200 on switching to 3).
+- Finite-field code fails silently and exactly: verify exhaustively.
+
+## Boundaries (resend above these, same as TCP would)
+
+- Bursts longer than interleave depth (L>8 at depth 8).
+- Whole-segment (1460 B) wire erasure.
+- 3+ whole-unit losses (Q covers 2).
+
+## Files / reproduce
+
+- `min/Fasm/Secure/packetbench.c` — wire format + recovery cells.
+- `min/Fasm/Secure/demandbench.c` — on-demand protocol sim.
+- `gcc -O2 -march=native -std=c11 -D_GNU_SOURCE -o /tmp/opencode/pb
+  min/Fasm/Secure/packetbench.c && /tmp/opencode/pb`
+- Same shape for `demandbench.c`.
+- Next: FASM bare-metal mirror (pattern: `rgba_hs.asm`/`rgba_hs.c`).
