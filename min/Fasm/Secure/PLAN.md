@@ -137,6 +137,29 @@ Bugs caught along the way (all fixed, all in PLAN pitfalls):
   S3 slot) instead of +16/+20/+24 — found by disassembling the
   built binary after a debug print showed impossible e3=0.
 
+## Derived variant (`torusecc_d`, DONE 2026-09-14)
+
+Single 4096 B shell (no stored duplex): 8 sub-bins × S0–S3 +
+global, same ladder (SEC → unique-2 search → refuse), S3 gates
+included. Mirror-clean vs its C mirror, misc 0 everywhere:
+
+| k | spread | clust |
+|---|---|---|
+| 1 | 500 / 0 / 0 | 500 / 0 / 0 |
+| 2 | 500 / 0 / 0 | 500 / 0 / 0 |
+| 3 | 493 / 7 / 0 | 4 / 496 / 0 |
+| 4 | 467 / 33 / 0 | 0 / 500 / 0 |
+| 6 | 392 / 108 / 0 | 0 / 500 / 0 |
+| 8 | 257 / 243 / 0 | 0 / 500 / 0 |
+
+Stored-vs-derived comparison (same draws family, same ladder):
+spread is close (derived loses a little: no shell-split luck);
+clustered multi-byte collapses without the second shell
+(k=3clust 370 → 4, k=6clust 285 → 0). That delta — 366 extra
+fixes on clustered k=3..6 — is the measured value of the duplex
+overlap. Syndrome cost: derived 8×4+4 = 36 words = 144 B (3.5%)
+vs stored 272 B (6.6%).
+
 ## Resume checklist (for a fresh context)
 
 - Repo: `/home/zaiken/Ergo`, branch state per `git log --oneline -3`
