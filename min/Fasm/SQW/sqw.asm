@@ -237,10 +237,13 @@ ref_audit:
     cmp     byte [rbx+OCC_OFF+rax], 0
     je      .next
     lea     rdx, [rbx+SQW_RFB]
-    mov     edi, [rdx+rax*4]        ; ref[b][g]
-    call    ref_ok                  ; eax (clobbers rax,rcx,rdi only)
-    test    eax, eax
-    jz      .badslot
+    mov     eax, [rdx+rax*4]        ; ref[b][g] (inlined ref_ok)
+    mov     ecx, eax
+    and     eax, 0xFFFF
+    shr     ecx, 16
+    add     eax, ecx
+    cmp     eax, 0xFFFF
+    jne     .badslot
     mov     eax, r13d               ; recompute (regs above are Call-dead)
     shl     eax, 5
     add     eax, r15d
@@ -274,7 +277,81 @@ ref_audit:
     ret
 
 ; -- verify_all_items: rdi = w, rsi = stream, edx = n -> rax = ok count --
+; Fast path (AVX2): item loop with inline 19x8B pay check, zero calls.
+; Falls back to verify_calls when use_avx2 == 0. Per-item base via m32
+; broadcast (no SSE movd -> no transition penalty); constants loaded
+; once after vzeroupper (pitfall 18).
 verify_all_items:
+    cmp     byte [use_avx2], 0
+    je      verify_calls
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+    vzeroupper
+    vmovdqu ymm5, yword [POK91]
+    vmovdqu ymm6, yword [POKA5]
+    vmovdqu ymm8, yword [POK08]
+    vmovdqu ymm9, yword [POKFF]
+    mov     rbx, rdi                ; w
+    mov     r12, rsi                ; stream
+    mov     r13d, edx               ; n
+    xor     r14d, r14d              ; i
+    xor     ebp, ebp                ; ok
+.vi:
+    cmp     r14d, r13d
+    jae     .vdone
+    mov     eax, [r12+r14*4]        ; item
+    lea     rdx, [sqw_item_slot_b]
+    mov     esi, [rdx+rax*4]        ; b
+    lea     rdx, [sqw_item_slot_g]
+    mov     edx, [rdx+rax*4]        ; g
+    shl     esi, 5
+    add     esi, edx
+    shl     esi, 1                  ; slot0
+    imul    rsi, rsi, 168
+    lea     rsi, [rbx+rsi]          ; c0
+    cmp     dword [rsi+164], TOMB_MAGIC
+    je      .vnext
+    imul    eax, eax, 17
+    mov     [vfybase], eax
+    vpbroadcastd ymm4, dword [vfybase]
+    vmovdqu ymm7, yword [POK07]
+    mov     ecx, 19
+.ck:
+    vmovdqa ymm0, ymm7
+    vpmulld ymm0, ymm0, ymm5
+    vpaddd  ymm0, ymm0, ymm4
+    vpxor   ymm0, ymm0, ymm6
+    vpand   ymm0, ymm0, ymm9
+    vpmovzxbd ymm1, qword [rsi]
+    vpcmpeqd ymm1, ymm1, ymm0
+    vpmovmskb eax, ymm1
+    cmp     eax, -1
+    jne     .vnext
+    add     rsi, 8
+    vpaddd  ymm7, ymm7, ymm8
+    dec     ecx
+    jnz     .ck
+    inc     ebp
+.vnext:
+    inc     r14d
+    jmp     .vi
+.vdone:
+    mov     eax, ebp
+    vzeroupper
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; -- verify_calls: original call-based verify (non-AVX2 fallback) --
+verify_calls:
     push    rbx
     push    rbp
     push    r12
@@ -414,8 +491,8 @@ cert_round:
     mov     r14d, ecx               ; nev
     mov     r13, r9                 ; acc
     mov     ebp, r8d                ; forced (rsi=clean intact for copy below)
-    mov     ecx, SQW_QW
-    rep     movsq                   ; *w = *clean (rdi=w, rsi=clean)
+    mov     ecx, SQW_SZ
+    rep     movsb                   ; *w = *clean (rdi=w, rsi=clean; movsb > movsq per cpbench 1.23x)
     ; occ_list of occupied codons
     xor     r10d, r10d              ; n_occ (no calls in build loop)
     xor     r11d, r11d              ; b
@@ -1063,6 +1140,14 @@ _start:
     lea     rsi, [Q12F]
     mov     rdx, Q12F_LEN
     call    emit_str
+    lea     rsi, [Q13A]
+    mov     rdx, Q13A_LEN
+    call    emit_str
+    mov     rax, [accA+152]
+    call    emit_u64
+    lea     rsi, [Q13B]
+    mov     rdx, Q13B_LEN
+    call    emit_str
     mov     eax, 1                  ; sys_write(1, outbuf, outcur)
     mov     edi, 1
     lea     rsi, [outbuf]
@@ -1158,6 +1243,10 @@ Q12E db '  auxB_unresolved '
 Q12E_LEN = $ - Q12E
 Q12F db 0x0A
 Q12F_LEN = $ - Q12F
+Q13A db 'SQWOR O8_main_cohere  '
+Q13A_LEN = $ - Q13A
+Q13B db '  expect=0 audit [A]', 0x0A
+Q13B_LEN = $ - Q13B
 QSL db '/'
 QEQ db ' = '
 LEF db 'sqw encoder refused', 0x0A
@@ -1187,6 +1276,7 @@ use_avx2  rb 1
 t_sumok   rd 1
 t_nocc    rd 1
 t_evt     rd 6                    ; evt copy (6 dwords)
+vfybase   rd 1                    ; fused-verify broadcast temp
 numbuf    rb 32
 outbuf    rb 8192
 outcur      rq 1

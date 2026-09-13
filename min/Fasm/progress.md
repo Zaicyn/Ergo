@@ -13,7 +13,7 @@ original concept.
 | Sq2B (fixed V22) | `Sq2B/` | cert passes | byte-identical | matches (`sq2b`, 9120 B, AVX2 mismatch + syn + fused cohere + inlined sweep, cell via shared `sqb_cell.inc`) | Full port + driver; cell logic extracted shared (oracle-identical after). Verified at 7/30/1500 rounds. Fused cohere 2026-09-12: 150 → 130 ms. Inlined sweep + O9 line: 130 → 122 ms, parity with gcc. |
 | SQM (moment-Merkle) | `SQM/` | all 9 pass | byte-identical | matches (`sqm`, 8505 B, AVX2 mom integrated) | Full port: dispatched `mom` (AVX2 u32 lanes w/ scalar fallback), `idiv` Vandermonde solve, own `%.6f`/`%.2f`. Verified at 7/30/1000/2000 rounds. |
 | SQ5 | `SQ5/` | O1-O7 + auxB match pre-registered table; audit byte-identical; mirror S1-S4 PASS on FASM audit | GCC+musl filed, cross-identical modulo SQ5T; audits byte-identical (211647 B) | matches (`sq5`, 13153 B, AVX2 flux + AVX2 pay_ok + SSE4.1 journal) | RNG is xoshiro256** here; libm vestigial; newest/least-tested → repeat-determinism + 30/7 gates added. AVX2 flux + pay_ok 2026-09-12: 341 → 61 ms (0.90× of gcc). |
-| SQW (memoized duplex) | `SQW/` | all 12 pass incl. 428/428 poison-failsafe | byte-identical | matches (`sqw`, 8156 B, shared `sqb_cell.inc` + recognition layer) | Recognition/cache/refcounts/audit new; cell rides free. Verified at 30/1500 rounds. |
+| SQW (memoized duplex) | `SQW/` | all 12 pass incl. 428/428 poison-failsafe | byte-identical | matches (`sqw`, 10637 B, shared `sqb_cell.inc` + recognition layer + fused verify) | Recognition/cache/refcounts/audit new; cell rides free. Verified at 30/1500 rounds. movsb copy + fused verify + O8 line 2026-09-12: 44.1 → 40.1 ms, 1.08× of gcc. |
 | SQFH (+SQF) | `SQFH/` | O1-O5 + O7/O8 match; O6 lanes match (timing varies) | GCC+musl filed, identical modulo O6; **zero FMA** | matches (`sqfh`, 8221 B, owned f64 trig) | Fast pass done; cert is legacy-only (no exp/model-M); repeat-deterministic. |
 | SQ4 (metadata torus) | `SQ4/` | O1-O4 counts match fixed C bench; victims byte-identical | C bench is the spec (no cert.c) | matches (`sq4`, 3248 B) | Completes the set. Ports the overflow-probe fix; fixed protocol (256/391/0.01). |
 | Trit codec (Phase 1) | `trit/` (`trit.asm` + `trit_ref.c`) | mirror passes, digest matches | n/a (no libc to compare) | self-test 0/261, digest matches C | Full toolset below. |
@@ -239,7 +239,7 @@ FASM 122 vs C 123 ms best-of-5 — parity at 1.00×.
 | `Sq2B/sq2b` (FASM) | 903 ms scalar → 601 ms (+mismatch) → 351 ms (+syn) → 194 ms (+decode) → 152 ms (+pay_ok) → 130 ms (+fused cohere) → **122 ms (+inlined sweep, 2.9× total)** | 6162 → 6401 → 6593 → 6891 → 7446 → 7766 → 7842 → 9026 → 9120 B |
 | `sq2b.gcc` (C `-O2`) | 212 ms | 28784 B |
 | `SQM/sqm` (FASM) | 23 ms scalar → **8.9 ms AVX2 (2.6×)** | 7938 → 8505 → 9041 B (shared incs) |
-| `SQW/sqw` (FASM) | 129 ms → 99 ms (+decode) → **44.6 ms (+pay_ok via shared cell)** | 8156 → 8252 → 8786 → 9106 B |
+| `SQW/sqw` (FASM) | 129 ms → 99 ms (+decode) → 44.6 ms (+pay_ok) → 42.6 ms (+movsb copy) → **40.1 ms (+fused verify +O8, 3.2× total)** | 8156 → 8252 → 8786 → 9106 → 10289 → 10637 B |
 | `SQ5/sq5` (FASM, scalar + SSE4.1 journal) | 344 ms → **61 ms (+AVX2 flux +AVX2 pay_ok, 5.6×)** | 11379 → 11926 → 13153 B (shared incs + flux/pay_ok AVX2) |
 | `sq5.gcc` (C `-O2 -mavx2 -msse4.1`) | 61 ms | 29632 B |
 | `sq5` scalar-C (`-O2`, no SIMD flags) | 154 ms | — |
@@ -291,6 +291,24 @@ microbench 3.8×, dispatched. 90 → 61 ms (0.90× of gcc 54.8 ms).
 0.98× on synthetic fixture — REJECTED, not applied. The call tax is
 smaller than the fused setup cost at this shape; recorded so nobody
 re-tries it blind.
+
+## SQW win: copy + fused verify + honest O8 (DONE 2026-09-12)
+
+Cycle-exact attribution ranked copy (+6.4ms, half of it freq drift —
+wall truth 1.5ms) and cohere-verify (+7.3ms) first, then sweep/audit/
+score (~1ms each).
+
+1. `rep movsq` → `rep movsb` for the 153KB per-round copy (microbench
+1.23×): 44.1 → 42.6 ms, oracle-clean.
+2. Fused `verify_all_items` (item loop with inline 19x8B pay check,
+zero calls, m32 broadcast base, `use_avx2` dispatch with old body as
+`verify_calls` fallback) following the sq2b-cohere pattern, plus
+inlined `ref_ok` in `ref_audit`: 42.6 → 39.3 ms, oracle-clean 30/1500.
+3. Same DCE pattern as sq2b: main `coh_fail` (`accA+152`) was never
+read, so gcc deleted C's 1500 main verifies. Wired it as
+`O8_main_cohere` (= 0) in C + FASM instead of deleting our scan.
+Honest cost: C rose 32.3 → 43.3 ms. FASM 40.1 vs C 43.3 ms — 1.08×.
+Filed gcc/musl/fasm outputs regenerated at 13 lines, identical.
 
 ## Shared playbook (reuse for each port)
 

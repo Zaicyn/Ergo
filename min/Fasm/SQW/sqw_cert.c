@@ -181,5 +181,7 @@ int main(int argc, char **argv) {
            B.tombs, B.tomb_refs,
            B.tombs ? (double)B.tomb_refs / B.tombs : 0.0,
            B.coh_fail, B.unresolved);
+    printf("SQWOR O8_main_cohere  %lld  expect=0 audit [A]\n",
+           A.coh_fail);
     return 0;
 }

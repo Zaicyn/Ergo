@@ -10,3 +10,4 @@ SQWOR O7_idx_failsafe 428/428 = 1.000000  expect=1.000000 (poisoned cache never 
 SQWOR auxB_det        5111/5111 = 1.000000  poisson tail (content classes)
 SQWOR auxB_rep        4942/5111 = 0.966934  poisson tail
 SQWOR auxB_tombs      83  tomb_refs 156 (amplification: 1.88 logical items lost per tombstone)  auxB_coh_fail 161  auxB_unresolved 0
+SQWOR O8_main_cohere  0  expect=0 audit [A]
