@@ -36,8 +36,11 @@ adds independent equation sets:
 
 Capacity summary: 1-byte anywhere (proven); up to 8-byte spread
 (1/bin); 2-byte same-bin via duplex; beyond that detection-only.
-Every repair stays gated + re-verified, so the miscorrection floor
-≈ 2^−32 per attempt is preserved (same argument as ESF §3).
+Every repair stays gated; a 4th moment S3 = Σb·idx³ closes the
+soundness hole the prototype found (post-fix re-verify is vacuous
+by linearity — S3 makes spurious solutions fail a fresh 2^−32
+gate). Syndrome cost with S3: 272 B per 4 KB frame (6.6%).
+See PLAN.md Results for the measured table (misc 0/6000×2).
 
 Geometry note (exact, no padding): one SQ5 bin = 32 gens × 2 shells
 × 64 B = 4096 B = one ESF frame. So frame `k` ↔ bin `k mod 8`,

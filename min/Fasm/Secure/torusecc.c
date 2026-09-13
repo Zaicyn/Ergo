@@ -10,7 +10,8 @@
 #define NTR 500
 
 static uint8_t s0[4096], s1[4096], bk[8192];
-static uint32_t refB[48], refG[3];
+static uint32_t refB[48], refC[16], refG[3], refG3;
+static uint32_t se3b;
 static uint64_t xsst;
 static int ck, cpat, ccorr, cref, cmisc;
 
@@ -23,21 +24,23 @@ static uint64_t xs64(void) {
     return x;
 }
 static void triple(const uint8_t *p, int n, uint32_t *a, uint32_t *b,
-                   uint32_t *c) {
-    uint32_t s0 = 0, s1 = 0, s2 = 0;
+                   uint32_t *c, uint32_t *d) {
+    uint32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
     for (int i = 0; i < n; i++) {
         uint32_t v = p[i], idx = (uint32_t)i + 1;
         s0 += v;
         s1 += v * idx;
         s2 += v * idx * idx;
+        s3 += v * idx * idx * idx;
     }
     *a = s0;
     *b = s1;
     *c = s2;
+    *d = s3;
 }
 /* returns 1 fixed (applied) / 0 refused. e* are mod-2^32 residuals. */
 static int sec_fix(uint8_t *p, int n, uint32_t e0, uint32_t e1,
-                   uint32_t e2) {
+                   uint32_t e2, uint32_t e3) {
     int32_t d = (int32_t)e0;
     if (!((d >= 1 && d <= 255) || (d >= -255 && d <= -1)))
         return 0;
@@ -49,6 +52,8 @@ static int sec_fix(uint8_t *p, int n, uint32_t e0, uint32_t e1,
         return 0;
     int32_t e2s = (int32_t)e2;
     if ((int64_t)d * q * q != e2s)
+        return 0;
+    if ((uint32_t)((int64_t)d * q * q * q) != e3)
         return 0;
     p[q - 1] = (uint8_t)(p[q - 1] - (uint8_t)d);
     return 1;
@@ -73,6 +78,9 @@ static int search2(const uint8_t *p, int n, int64_t e1, int64_t e2,
                 continue;
             if (d1 * p1 * p1 + d2 * p2 * p2 != e3)
                 continue;
+            if ((uint32_t)(d1 * p1 * p1 * p1 + d2 * p2 * p2 * p2) !=
+                se3b)
+                continue;
             nsol++;
             if (nsol == 1) {
                 sd1 = (int)d1;
@@ -87,13 +95,14 @@ static int search2(const uint8_t *p, int n, int64_t e1, int64_t e2,
 static void build_refs(void) {
     for (int s = 0; s < NBIN; s++)
         for (int sh = 0; sh < 2; sh++) {
-            uint32_t a, b, c;
-            triple((sh ? s1 : s0) + s * SBIN, SBIN, &a, &b, &c);
+            uint32_t a, b, c, d;
+            triple((sh ? s1 : s0) + s * SBIN, SBIN, &a, &b, &c, &d);
             refB[(s * 2 + sh) * 3 + 0] = a;
             refB[(s * 2 + sh) * 3 + 1] = b;
             refB[(s * 2 + sh) * 3 + 2] = c;
+            refC[(s * 2 + sh)] = d;
         }
-    triple(s0, 4096, &refG[0], &refG[1], &refG[2]);
+    triple(s0, 4096, &refG[0], &refG[1], &refG[2], &refG3);
 }
 static void inject(int k, int clustered) {
     if (!clustered) {
@@ -121,35 +130,38 @@ static void inject(int k, int clustered) {
     }
 }
 /* residuals of sub-bin s into r[6]; returns nonzero-OR. */
-static int resbin(int s, uint32_t r[6]) {
-    uint32_t a, b, c;
-    triple(s0 + s * SBIN, SBIN, &a, &b, &c);
+static int resbin(int s, uint32_t r[8]) {
+    uint32_t a, b, c, d;
+    triple(s0 + s * SBIN, SBIN, &a, &b, &c, &d);
     r[0] = a - refB[(s * 2 + 0) * 3 + 0];
     r[1] = b - refB[(s * 2 + 0) * 3 + 1];
     r[2] = c - refB[(s * 2 + 0) * 3 + 2];
-    triple(s1 + s * SBIN, SBIN, &a, &b, &c);
-    r[3] = a - refB[(s * 2 + 1) * 3 + 0];
-    r[4] = b - refB[(s * 2 + 1) * 3 + 1];
-    r[5] = c - refB[(s * 2 + 1) * 3 + 2];
-    return (r[0] | r[1] | r[2] | r[3] | r[4] | r[5]) != 0;
+    r[3] = d - refC[(s * 2 + 0)];
+    triple(s1 + s * SBIN, SBIN, &a, &b, &c, &d);
+    r[4] = a - refB[(s * 2 + 1) * 3 + 0];
+    r[5] = b - refB[(s * 2 + 1) * 3 + 1];
+    r[6] = c - refB[(s * 2 + 1) * 3 + 2];
+    r[7] = d - refC[(s * 2 + 1)];
+    return (r[0] | r[1] | r[2] | r[3] | r[4] | r[5] | r[6] | r[7]) != 0;
 }
 /* returns 0 ok-so-far / 1 refused. */
 static int repair_frame(void) {
     int refused = 0;
     for (int s = 0; s < NBIN; s++) {
-        uint32_t r[6];
+        uint32_t r[8];
         if (!resbin(s, r))
             continue;
         for (int sh = 0; sh < 2; sh++) {
-            if (!(r[sh * 3] | r[sh * 3 + 1] | r[sh * 3 + 2]))
+            if (!(r[sh * 4] | r[sh * 4 + 1] | r[sh * 4 + 2] |
+                  r[sh * 4 + 3]))
                 continue;
-            sec_fix((sh ? s1 : s0) + s * SBIN, SBIN, r[sh * 3],
-                    r[sh * 3 + 1], r[sh * 3 + 2]);
+            sec_fix((sh ? s1 : s0) + s * SBIN, SBIN, r[sh * 4],
+                    r[sh * 4 + 1], r[sh * 4 + 2], r[sh * 4 + 3]);
         }
         if (!resbin(s, r))
             continue;
-        int d0 = (r[0] | r[1] | r[2]) != 0;
-        int d1 = (r[3] | r[4] | r[5]) != 0;
+        int d0 = (r[0] | r[1] | r[2] | r[3]) != 0;
+        int d1 = (r[4] | r[5] | r[6] | r[7]) != 0;
         if (d0 && d1) {
             refused = 1;
             continue;
@@ -157,8 +169,9 @@ static int repair_frame(void) {
         if (!d0 && !d1)
             continue;
         int sh = d0 ? 0 : 1;
-        int64_t e1 = (int32_t)r[sh * 3], e2 = (int32_t)r[sh * 3 + 1],
-                e3 = (int32_t)r[sh * 3 + 2];
+        int64_t e1 = (int32_t)r[sh * 4], e2 = (int32_t)r[sh * 4 + 1],
+                e3 = (int32_t)r[sh * 4 + 2];
+        se3b = r[sh * 4 + 3];
         if (search2(NULL, SBIN, e1, e2, e3) != 1) {
             refused = 1;
             continue;
@@ -173,9 +186,10 @@ static int repair_frame(void) {
     }
     if (refused)
         return 1;
-    uint32_t a, b, c;
-    triple(s0, 4096, &a, &b, &c);
-    return (a != refG[0] || b != refG[1] || c != refG[2]);
+    uint32_t a, b, c, d;
+    triple(s0, 4096, &a, &b, &c, &d);
+    return (a != refG[0] || b != refG[1] || c != refG[2] ||
+            d != refG3);
 }
 static void trial_cell(int k, int pat) {
     int corr = 0, ref = 0, misc = 0;

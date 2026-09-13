@@ -29,10 +29,14 @@ xs64:
     ret
 ; -- triple: rdi = ptr, esi = n -> eax=s0, ebx=s1, ecx=s2 (mod 2^32) --
 ; Clobbers rax,rbx,rcx,rdx,rsi,rdi,r8,r9.
+; -- triple: rdi = ptr, esi = n -> eax=s0, ebx=s1, ecx=s2, r10d=s3 --
+; All mod 2^32 (32-bit lanes wrap naturally; s3 needs 3 imuls/byte).
+; Clobbers rax,rbx,rcx,rdx,rsi,rdi,r8-r10. Preserves r12-r15,rbp.
 triple:
     xor     eax, eax
     xor     ebx, ebx
     xor     ecx, ecx
+    xor     r10d, r10d
     xor     edx, edx
 .tl:
     cmp     edx, esi
@@ -44,46 +48,50 @@ triple:
     add     ebx, r8d
     imul    r8d, r9d
     add     ecx, r8d
+    imul    r8d, r9d
+    add     r10d, r8d
     inc     edx
     jmp     .tl
 .tdone:
     ret
-; -- sec_fix: rdi = ptr, esi = n, edx=e0, ecx=e1, r8d=e2 (mod-2^32 words)
-; -> eax 1 fixed (applied) / 0 refused. True values all < 2^31 so
-; movsxd recovers them exactly. Clobbers rax,rbx,rcx,rdx,rsi,rdi,r8-r11.
+; -- sec_fix: rdi = ptr, esi = n, edx=e0, ecx=e1, r8d=e2, r9d=e3 words --
+; -> eax 1 fixed (applied) / 0 refused. S0/S1 solve, S2+S3 gate.
+; True values of e0/e1/e2 all < 2^31 (movsxd exact); e3 compared raw
+; mod-2^32. Clobbers rax,rbx,rcx,rdx,rsi,rdi,r8-r11. Preserves r12-r15.
 sec_fix:
     push    rbx
-    movsxd  r9, edx                 ; e0 signed (d candidate range)
-    cmp     r9d, 1
+    movsxd  r10, edx                ; d
+    cmp     r10d, 1
     jl      .neg
-    cmp     r9d, 255
+    cmp     r10d, 255
     jg      .fail
     jmp     .have_d
 .neg:
-    cmp     r9d, -1
+    cmp     r10d, -1
     jg      .fail
-    cmp     r9d, -255
+    cmp     r10d, -255
     jl      .fail
 .have_d:
-    movsxd  r10, ecx                ; e1 signed
-    mov     eax, r10d
+    movsxd  r11, ecx                ; e1s
+    mov     eax, r11d
     cdq
-    mov     r11d, r9d               ; divisor d (!=0, |d|<=255)
-    idiv    r11d                    ; p = e1/d
+    idiv    r10d                    ; p = e1/d
     test    edx, edx
     jnz     .fail
     cmp     eax, 1
     jl      .fail
     cmp     eax, esi
     jg      .fail
-    movsxd  r11, r8d                ; e2 signed (use r11, divisor dead)
-    movsxd  rbx, r9d                ; d full 32-bit (NOT r9b: |d|>127 breaks the gate)
-    mov     rsi, rbx
-    imul    rsi, rax                ; d*p
-    imul    rsi, rax                ; d*p*p
-    cmp     rsi, r11
+    movsxd  r11, r8d                ; e2s
+    mov     rbx, r10                ; d
+    imul    rbx, rax                ; d*p
+    imul    rbx, rax                ; d*p*p
+    cmp     rbx, r11
     jne     .fail
-    sub     byte [rdi+rax-1], r9b   ; apply (mod 256)
+    imul    rbx, rax                ; d*p*p*p
+    cmp     ebx, r9d                ; S3 gate, mod-2^32
+    jne     .fail
+    sub     byte [rdi+rax-1], r10b  ; apply (mod 256)
     mov     eax, 1
     pop     rbx
     ret
@@ -92,8 +100,9 @@ sec_fix:
     pop     rbx
     ret
 ; -- search2: rdi = ptr, esi = n; se1/se2/se3 (BSS, signed64) residuals.
-; Bounded p1<p2 search for 2-in-one-shell solve. Returns eax = number
-; of solutions capped at 2; unique solution in sd1/sp1/sd2/sp2 (BSS).
+; Bounded p1<p2 search for 2-in-one-shell solve. Counts FULL solutions
+; (S0/S1/S2 + S3 gate vs se3b): returns eax = number capped at 2;
+; unique solution in sd1/sp1/sd2/sp2 (BSS).
 ; Clobbers rax,rbx,rcx,rdx,rsi,rdi,r8-r15 (saves rbx,r12-r15).
 search2:
     push    rbx
@@ -154,6 +163,17 @@ search2:
     add     r9, r10
     cmp     r9, [se3]
     jne     .next2
+    mov     r11, rax                ; d1
+    imul    r11, rbx
+    imul    r11, rbx
+    imul    r11, rbx                ; d1*p1^3
+    mov     r10, r14                ; d2
+    imul    r10, r12
+    imul    r10, r12
+    imul    r10, r12                ; d2*p2^3
+    add     r11, r10
+    cmp     r11d, [se3b]            ; S3 gate, mod-2^32
+    jne     .next2
     inc     r8d                     ; solution!
     cmp     r8d, 1
     jg      .sdone                  ; 2nd solution: stop, ambiguous
@@ -212,6 +232,11 @@ build_refs:
     mov     dword [r9], edx
     mov     dword [r9+4], eax
     mov     dword [r9+8], ecx
+    mov     edx, ebx
+    shl     edx, 1
+    add     edx, r12d               ; s*2+sh
+    lea     r8, [refC+rdx*4]
+    mov     dword [r8], r10d        ; s3 journal
     jmp     .shnext
     ; (old .shfix recompute block removed: single exact store above)
 .shnext:
@@ -227,6 +252,7 @@ build_refs:
     mov     [refG], eax
     mov     [refG+4], ebx
     mov     [refG+8], ecx
+    mov     dword [refG3], r10d
     pop     r13
     pop     r12
     pop     rbx
@@ -334,8 +360,8 @@ inject:
     pop     r12
     pop     rbx
     ret
-; -- resbin: rdi = resbuf[24B], esi = s -> eax OR of 6 residuals --
-; Recomputes both shells vs refs. Preserves rbx,r12-r15,rbp.
+; -- resbin: rdi = resbuf[32B], esi = s -> eax OR of 8 residuals --
+; Recomputes both shells vs refs (incl. S3 from refC). Preserves rbx,r12-r15,rbp.
 resbin:
     push    rbx
     push    r12
@@ -362,6 +388,12 @@ resbin:
     mov     r9d, ecx
     sub     r9d, [r8+8]
     mov     [r15+8], r9d
+    mov     edx, r12d
+    shl     edx, 1
+    lea     r8, [refC+rdx*4]
+    mov     r9d, r10d
+    sub     r9d, [r8]
+    mov     [r15+12], r9d
     lea     rdi, [s1+r13]
     mov     esi, SBIN
     call    triple
@@ -372,26 +404,35 @@ resbin:
     lea     r8, [refB+rdx]
     mov     r9d, eax
     sub     r9d, [r8]
-    mov     [r15+12], r9d
+    mov     [r15+16], r9d
     mov     r9d, ebx
     sub     r9d, [r8+4]
-    mov     [r15+16], r9d
+    mov     [r15+20], r9d
     mov     r9d, ecx
     sub     r9d, [r8+8]
-    mov     [r15+20], r9d
+    mov     [r15+24], r9d
+    mov     edx, r12d
+    shl     edx, 1
+    add     edx, 1
+    lea     r8, [refC+rdx*4]
+    mov     r9d, r10d
+    sub     r9d, [r8]
+    mov     [r15+28], r9d
     mov     eax, [r15]
     or      eax, [r15+4]
     or      eax, [r15+8]
     or      eax, [r15+12]
     or      eax, [r15+16]
     or      eax, [r15+20]
+    or      eax, [r15+24]
+    or      eax, [r15+28]
     pop     r15
     pop     r13
     pop     r12
     pop     rbx
     ret
 ; -- repair_frame -> eax 0 ok-so-far / 1 refused. Mutates shells. --
-; Preserves rbx,r12-r15,rbp. Frame [rsp]: resbuf @0..20, refused @28.
+; Preserves rbx,r12-r15,rbp. Frame [rsp]: resbuf @0..28, refused @32.
 repair_frame:
     push    rbx
     push    r12
@@ -399,8 +440,8 @@ repair_frame:
     push    r14
     push    r15
     push    rbp
-    sub     rsp, 32
-    mov     dword [rsp+28], 0
+    sub     rsp, 40
+    mov     dword [rsp+32], 0
     lea     rbp, [rsp]              ; resbuf (survives calls)
     xor     r12d, r12d              ; s
 .sloop:
@@ -416,11 +457,12 @@ repair_frame:
     cmp     r14d, 2
     jae     .secver
     mov     eax, r14d
-    imul    eax, eax, 12
+    imul    eax, eax, 16
     lea     rcx, [rbp+rax]
     mov     edx, [rcx]
     or      edx, [rcx+4]
     or      edx, [rcx+8]
+    or      edx, [rcx+12]
     jz      .secnext                ; shell clean
     mov     eax, r12d
     shl     eax, 9
@@ -432,6 +474,7 @@ repair_frame:
     mov     esi, SBIN
     mov     edx, [rcx]
     mov     r8d, [rcx+8]
+    mov     r9d, [rcx+12]
     mov     ecx, [rcx+4]
     call    sec_fix                 ; result ignored; reverify decides
 .secnext:
@@ -447,9 +490,12 @@ repair_frame:
     mov     eax, [rbp]
     or      eax, [rbp+4]
     or      eax, [rbp+8]
-    mov     ecx, [rbp+12]
-    or      ecx, [rbp+16]
+    or      eax, [rbp+12]
+    mov     ecx, [rbp+16]
     or      ecx, [rbp+20]
+    or      ecx, [rbp+24]
+    or      ecx, [rbp+28]
+    or      ecx, [rbp+28]
     test    eax, eax
     jz      .only1
     test    ecx, ecx
@@ -462,7 +508,7 @@ repair_frame:
     mov     r14d, 1                 ; only shell1 dirty
 .dosearch:
     mov     eax, r14d
-    imul    eax, eax, 12
+    imul    eax, eax, 16
     lea     rcx, [rbp+rax]
     mov     eax, [rcx]
     movsxd  r8, eax
@@ -473,6 +519,8 @@ repair_frame:
     mov     eax, [rcx+8]
     movsxd  r8, eax
     mov     [se3], r8
+    mov     eax, [rcx+12]
+    mov     [se3b], eax
     mov     eax, r12d
     shl     eax, 9
     lea     rdi, [s0+rax]
@@ -504,13 +552,13 @@ repair_frame:
     jnz     .dorefuse
     jmp     .snext
 .dorefuse:
-    mov     dword [rsp+28], 1
+    mov     dword [rsp+32], 1
     jmp     .snext
 .snext:
     inc     r12d
     jmp     .sloop
 .glob:
-    cmp     dword [rsp+28], 0
+    cmp     dword [rsp+32], 0
     jne     .rfail
     lea     rdi, [s0]
     mov     esi, 4096
@@ -526,12 +574,14 @@ repair_frame:
     sub     eax, [refG+8]
     or      eax, eax
     jnz     .rfail
+    sub     r10d, [refG3]
+    jnz     .rfail
     xor     eax, eax
     jmp     .retdone
 .rfail:
     mov     eax, 1
 .retdone:
-    add     rsp, 32
+    add     rsp, 40
     pop     rbp
     pop     r15
     pop     r14
@@ -749,10 +799,13 @@ s0 rb 4096
 s1 rb 4096
 bk rb 8192
 refB rd 48
+refC rd 16
 refG rd 3
+refG3 rd 1
 se1 rq 1
 se2 rq 1
 se3 rq 1
+se3b rd 1
 sd1 rd 1
 sp1 rd 1
 sd2 rd 1

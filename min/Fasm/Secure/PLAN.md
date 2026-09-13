@@ -94,7 +94,7 @@ nonzero deltas.
 - Verify-before-commit: oracle/audit diff + C mirror + best-of-5,
   same as every prior stage.
 
-## Results (DONE 2026-09-13)
+## Results (DONE 2026-09-13, hardened 2026-09-14)
 
 `torusecc.asm` (+ `.c` mirror): 8 sub-bins × 512 B × duplex shells,
 per-sub-bin triples + global, SEC + duplex-2-byte (1+1 algebraic,
@@ -105,26 +105,37 @@ deterministic across runs.
 | k | spread (corr/ref/misc) | clust (corr/ref/misc) |
 |---|---|---|
 | 1 | 500 / 0 / 0 | 500 / 0 / 0 |
-| 2 | 499 / 1 / 0 | 487 / 13 / 0 |
-| 3 | 496 / 4 / 0 | 354 / 146 / 0 |
-| 4 | 484 / 16 / 0 | 4 / 496 / 0 |
-| 6 | 452 / 48 / 0 | 264 / 236 / 0 |
-| 8 | 389 / 111 / 0 | 0 / 500 / 0 |
+| 2 | 500 / 0 / 0 | 500 / 0 / 0 |
+| 3 | 499 / 1 / 0 | 370 / 130 / 0 |
+| 4 | 490 / 10 / 0 | 4 / 496 / 0 |
+| 6 | 467 / 33 / 0 | 285 / 215 / 0 |
+| 8 | 411 / 89 / 0 | 0 / 500 / 0 |
 
-misc = 0 over 6000 trials × 2 implementations: no unsound repair.
-k=1 at 100% (SEC proven); spread degrades gracefully (birthday
-collisions fall into the 2-byte path); clustered k≥4 correctly
-refused (beyond 2-per-bin capacity); k=6 clust 3+3 resolves when
-both sub-bins hit solvable 2+1 splits.
+misc = 0 over 6000 trials × 2 implementations.
 
-Bugs caught by the mirror rule (both fixed):
-- `movsx rbx, r9b` in `sec_fix` broke the S2 gate for |d| > 127
-  (k=1 at 73%); `movsxd rbx, r9d` fixed → 100%.
+### Soundness hole found by the mirror rule, closed with S3
+
+The first matrix showed 2 miscorrections (k=3 clustered). Autopsy
+(python replica of the draw stream + candidate enumeration) proved
+the cause: **post-fix re-verification is vacuous by linearity** —
+a search solution satisfying all three equations zeroes the
+residuals by construction, so reverify (sub-bin AND global) passes
+provably, and memcmp is the only thing that ever catches it.
+Fix: **4th moment S3 = Σb·idx³** as an independent gate (SEC and
+search both). A spurious pair satisfying S0/S1/S2 fails S3 except
+by fresh 2^−32 coincidence. Syndrome cost rises 204 B → 272 B per
+4 KB frame (5.0% → 6.6%). Bonus: S3 *disambiguates* (cases with two
+S0–S2 solutions where only one passes S3 now fix instead of
+refusing — k=2 went 499/487 → 500/500, k=6 clust 264 → 285).
+
+Bugs caught along the way (all fixed, all in PLAN pitfalls):
+- `movsx rbx, r9b` in `sec_fix` broke the S2 gate for |d| > 127.
 - Clustered-split register reuse (`r10d` = split point clobbered
-  by per-iteration shell assignment → 1+5 distribution instead of
-  3+3); C mirror was right, asm caught up → mirror-clean. Lesson:
-  loop-invariants belong in call-preserved regs (same family as the
-  cohsw r15 hang).
+  by per-iteration shell assignment → 1+5 instead of 3+3);
+  C mirror was right.
+- resbin shell1 stores landed at +12/+16/+20 (clobbering shell0's
+  S3 slot) instead of +16/+20/+24 — found by disassembling the
+  built binary after a debug print showed impossible e3=0.
 
 ## Resume checklist (for a fresh context)
 
