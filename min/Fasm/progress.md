@@ -310,6 +310,18 @@ read, so gcc deleted C's 1500 main verifies. Wired it as
 Honest cost: C rose 32.3 → 43.3 ms. FASM 40.1 vs C 43.3 ms — 1.08×.
 Filed gcc/musl/fasm outputs regenerated at 13 lines, identical.
 
+## Secure campaign: hashshoot (DONE 2026-09-13)
+
+Hash shootout for file-integrity use (`Secure/hashshoot.asm` + `.c`
+mirror): FNV-1a 64 vs splitmix64-block-stream vs ad-hoc control on
+4 KB frames — full 32768-bit avalanche, best-of-5 ns/frame, 2000-trial
+detection. C mirror-clean, deterministic. Splitmix-stream wins both
+axes (1680 ns/frame at 0.41 ns/B, avalanche 32.02 tight; FNV-1a 4162 ns
+with real 30.71 bias; ad-hoc blind at 1.68). Decision recorded in
+`HashKit/README.md`: splitmix-stream is the house integrity hash,
+FNV-1a stays the cross-context fallback. No allocator changes needed
+(fleet's only hash is SQW's per-alloc `sqw_hash`; rest is RNG/syndromes).
+
 ## Shared playbook (reuse for each port)
 
 - Static BSS arena (`rb`/`rd`/`rq`), `write(2)`/`exit(2)` only, own entry.
