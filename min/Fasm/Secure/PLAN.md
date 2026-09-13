@@ -94,6 +94,38 @@ nonzero deltas.
 - Verify-before-commit: oracle/audit diff + C mirror + best-of-5,
   same as every prior stage.
 
+## Results (DONE 2026-09-13)
+
+`torusecc.asm` (+ `.c` mirror): 8 sub-bins × 512 B × duplex shells,
+per-sub-bin triples + global, SEC + duplex-2-byte (1+1 algebraic,
+2-in-one bounded search) + refuse ladder, N=500 per cell, verdicts
+via pristine-backup memcmp. Asm/C mirror-clean on all 12 cells,
+deterministic across runs.
+
+| k | spread (corr/ref/misc) | clust (corr/ref/misc) |
+|---|---|---|
+| 1 | 500 / 0 / 0 | 500 / 0 / 0 |
+| 2 | 499 / 1 / 0 | 487 / 13 / 0 |
+| 3 | 496 / 4 / 0 | 354 / 146 / 0 |
+| 4 | 484 / 16 / 0 | 4 / 496 / 0 |
+| 6 | 452 / 48 / 0 | 264 / 236 / 0 |
+| 8 | 389 / 111 / 0 | 0 / 500 / 0 |
+
+misc = 0 over 6000 trials × 2 implementations: no unsound repair.
+k=1 at 100% (SEC proven); spread degrades gracefully (birthday
+collisions fall into the 2-byte path); clustered k≥4 correctly
+refused (beyond 2-per-bin capacity); k=6 clust 3+3 resolves when
+both sub-bins hit solvable 2+1 splits.
+
+Bugs caught by the mirror rule (both fixed):
+- `movsx rbx, r9b` in `sec_fix` broke the S2 gate for |d| > 127
+  (k=1 at 73%); `movsxd rbx, r9d` fixed → 100%.
+- Clustered-split register reuse (`r10d` = split point clobbered
+  by per-iteration shell assignment → 1+5 distribution instead of
+  3+3); C mirror was right, asm caught up → mirror-clean. Lesson:
+  loop-invariants belong in call-preserved regs (same family as the
+  cohsw r15 hang).
+
 ## Resume checklist (for a fresh context)
 
 - Repo: `/home/zaiken/Ergo`, branch state per `git log --oneline -3`
