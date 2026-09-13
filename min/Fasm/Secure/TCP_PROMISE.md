@@ -76,7 +76,37 @@ always-send (negligible below f≈0.1). TCP frame-resend loses on both
 axes everywhere (frame-level accounting = TCP's upper bound; SACK
 narrows the byte gap but not the 0-RTT repair advantage).
 
-## Bugs caught
+## Structural result: losses are inert (grid test)
+
+Claim: full-recovery rate is a function of error count alone for
+losses ≤ 2. Tested with forced exact-error placement (errors only in
+surviving units, distinct positions — no skip-mixture confound),
+4×3 grid (loss D=0..2 × errors E=0..3, NTR=200), plus per-trial
+effective-error-count collapse buckets across all spread cells.
+RNG stream is continuous (never reseeded) → trials independent.
+
+GRID full/200:
+
+| D\E | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| 0 | 200 | 200 | 181 | 133 |
+| 1 | 200 | 200 | 167 | 128 |
+| 2 | 200 | 200 | 165 | 113 |
+
+COLLAPSE rate(full | effective errors): 0→1.000, 1→1.000,
+2→0.864, 3→0.623, 4→0.430. Single curve to first order.
+
+Verdict: refined, not dead. The erasure algebra contributes zero
+failures (LO d=1,2 = 200/200; grid E=0 column 200/200 at every D).
+But loss is not *perfectly* inert: D=0→D=2 costs 16–20 counts at
+fixed E (~2–2.5σ, same sign in both rows). Mechanism, quantitative:
+losses shrink the surviving-unit pool (8→6), concentrating errors
+into fewer units and raising same-unit collisions (which SEC
+refuses). Predicted collision delta at E=3 is 10% ≈ 20 counts;
+observed 133→113 = 20. Exact match. So: rate = f(error count,
+pool size) via collision probability + SEC gate rate; the algebra
+itself never fails. SP n=2 (173) sits in the same bucket as MX/MX2
+(184/167) as predicted.
 
 - Rebuild-before-repair transplants errors (0/200 → 176/200).
 - GF(256) generator 2 has order 51, not 255 — log/exp division

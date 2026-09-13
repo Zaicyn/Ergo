@@ -30,6 +30,13 @@
 static uint8_t bku[NP][PL], fru[NP][PL], parP[PL], parQ[PL];
 static uint32_t refs[NP][4];
 static uint8_t gexp[512], glog[256];
+static long cbn[8], cbf[8]; /* collapse buckets by effective error count */
+static void bucket(int e, int full) {
+    if (e < 0) e = 0;
+    if (e > 7) e = 7;
+    cbn[e]++;
+    cbf[e] += full;
+}
 
 static uint64_t trng = 0x123456789ABCDEF1ull;
 static uint64_t trand(void) {
@@ -153,6 +160,29 @@ static void dmg_burst(int len) {
         fru[u][o] ^= (uint8_t)dv;
     }
 }
+/* forced errors: exactly e distinct byte-flips in non-lost units.
+ * Returns effective count (= e; positions distinct by construction). */
+static int force_err(const int *lost, int e) {
+    int used[FR], nu = 0;
+    memset(used, 0, sizeof used);
+    for (int j = 0; j < e; j++) {
+        int pos, u, tries = 0;
+        do {
+            pos = (int)(trand() % FR);
+            u = pos % 8;
+            tries++;
+        } while ((lost && lost[u]) || used[pos]);
+        (void)tries;
+        used[pos] = 1;
+        int dv;
+        do {
+            dv = (int)((trand() & 255) + 1) & 255;
+        } while (!dv);
+        fru[u][pos / 8] ^= (uint8_t)dv;
+        nu++;
+    }
+    return nu;
+}
 /* burst confined to one unit (non-interleaved control) */
 static void dmg_burst1(int len) {
     int u = (int)(trand() % NP), st = (int)(trand() % (PL - len));
@@ -256,10 +286,17 @@ int main(void) {
     printf("PACK units/seg=2.85 (2x512+436spare) segs/frame=4 "
            "overhead=%dB spare-left=%dB\n",
            2 * PL + NP * 16, 4 * (SEG - 2 * PL) - (2 * PL + NP * 16));
-    CELL("SP", "n=1", restore(); dmg_spread(1); run_ecc(NULL, 0); FINISH());
-    CELL("SP", "n=2", restore(); dmg_spread(2); run_ecc(NULL, 0); FINISH());
-    CELL("SP", "n=4", restore(); dmg_spread(4); run_ecc(NULL, 0); FINISH());
-    CELL("SP", "n=8", restore(); dmg_spread(8); run_ecc(NULL, 0); FINISH());
+    { const int ns[] = { 1, 2, 4, 8 };
+      for (int ni = 0; ni < 4; ni++) {
+          int full = 0; long be = 0;
+          for (int tt = 0; tt < NTR; tt++) {
+              restore(); dmg_spread(ns[ni]); run_ecc(NULL, 0);
+              int bo = bytes_ok(); be += bo; full += (bo == FR);
+              bucket(ns[ni], bo == FR);
+          }
+          printf("SP n=%d ecc=%.1f full=%d/200\n", ns[ni], be / 200.0,
+                 full);
+      } }
     CELL("BUI", "L=4", restore(); dmg_burst(4); run_ecc(NULL, 0); FINISH());
     CELL("BUI", "L=8", restore(); dmg_burst(8); run_ecc(NULL, 0); FINISH());
     CELL("BUI", "L=16", restore(); dmg_burst(16); run_ecc(NULL, 0); FINISH());
@@ -277,32 +314,46 @@ int main(void) {
     { int full = 0; long be = 0; int lost[NP];
       for (int t = 0; t < NTR; t++) {
           restore(); int nl = dmg_loss(1, lost);
-          for (int j = 0; j < 2; j++) {
-              int p, pos, dv;
-              do { p = (int)(trand() % NP); } while (lost[p]);
-              pos = (int)(trand() % FR);
-              int u = pos % 8, o = pos / 8;
-              if (lost[u]) continue;
-              do { dv = (int)((trand() & 255) + 1) & 255; } while (!dv);
-              fru[u][o] ^= (uint8_t)dv;
-          }
-          run_ecc(lost, nl); FINISH(); }
+          int ne = force_err(lost, 2);
+          run_ecc(lost, nl);
+          int bo0 = bytes_ok(); be += bo0; full += (bo0 == FR);
+          bucket(ne, bo0 == FR); }
       printf("MX 1loss+2err ecc=%.1f full=%d/200\n", be / 200.0, full); }
     { int full = 0; long be = 0; int lost[NP];
       for (int t = 0; t < NTR; t++) {
           restore(); int nl = dmg_loss(2, lost);
-          for (int j = 0; j < 2; j++) {
-              int pos = (int)(trand() % FR);
-              int u = pos % 8, o = pos / 8, dv;
-              if (lost[u]) continue;
-              do { dv = (int)((trand() & 255) + 1) & 255; } while (!dv);
-              fru[u][o] ^= (uint8_t)dv;
-          }
-          run_ecc(lost, nl); FINISH(); }
+          int ne = force_err(lost, 2);
+          run_ecc(lost, nl);
+          int bo0 = bytes_ok(); be += bo0; full += (bo0 == FR);
+          bucket(ne, bo0 == FR); }
       printf("MX2 2loss+2err ecc=%.1f full=%d/200\n", be / 200.0, full); }
     { int full = 0; long be = 0;
       for (int t = 0; t < NTR; t++) {
           restore(); dmg_seg(SEG); run_ecc(NULL, 0); FINISH(); }
       printf("SEG 1460B-erasure ecc=%.1f full=%d/200\n", be / 200.0, full); }
+    /* GRID: loss D=0..2 x forced errors E=0..3, exact effective counts */
+    printf("GRID loss x errors (full/200):\n");
+    for (int D = 0; D <= 2; D++) {
+        printf("D=%d:", D);
+        for (int E = 0; E <= 3; E++) {
+            int full = 0; long be = 0; int lost[NP];
+            for (int tt = 0; tt < NTR; tt++) {
+                restore();
+                int nl = 0;
+                if (D) nl = dmg_loss(D, lost);
+                else memset(lost, 0, sizeof lost);
+                int ne = force_err(D ? lost : NULL, E);
+                run_ecc(D ? lost : NULL, nl);
+                int bo = bytes_ok(); be += bo; full += (bo == FR);
+                bucket(ne, bo == FR);
+            }
+            printf(" E=%d:%d/%.0f", E, full, be / 200.0);
+        }
+        printf("\n");
+    }
+    printf("COLLAPSE by effective-error-count (all spread cells):\n");
+    for (int e = 0; e <= 4; e++)
+        printf("eff=%d n=%ld full=%ld rate=%.3f\n", e, cbn[e], cbf[e],
+               cbn[e] ? (double)cbf[e] / (double)cbn[e] : 0.0);
     return 0;
 }
