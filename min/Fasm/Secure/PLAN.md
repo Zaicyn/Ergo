@@ -193,6 +193,39 @@ Bugs caught (same families as ever):
 - 3-char label loaded as dword printed a stolen 4th byte
   (cosmetic; fixed with exact-size moves).
 
+## Overlap shift-recovery W-sizing (`alignchk`, DONE 2026-09-14)
+
+`alignchk.asm` (+ `.c` mirror): two 4096 B units + W overlap
+(W ∈ {64,256,512}), trials corrupt (k=1,2, in-window only) /
+shift (s) / shift+1-flip (shco), ESF-only control vs overlap
+pipeline, NTR=200, SMAX=512. Mirror-clean (byte-identical TSV),
+deterministic. Columns: fullok / fail|part / misc|fail.
+
+- Shift-only: overlap re-aligns every s with s ≤ W-4 at 200/200
+  exact-offset (W=64 to s=32, W=256 to s=200, W=512 to s=400);
+  s ≥ W always fails (overlap gone). s=500/W=512 fails 200/200
+  on resolution, not alignment: the 12 B TRUE window (score 12)
+  is outscored by a wrong offset (e.g. t=3 scores 16 off
+  fill-structure agreement runs), so no full-agreement t* is
+  ever selected. Probed directly: TRUE t=500 is the unique full
+  agreement (nfull=1) but best=(3,16). ESF-only never
+  unshifts (0/200 everywhere, as designed).
+- Shift+flip: fullok rate tracks s/W (flip must fall outside the
+  TRUE window to leave a unique full-agreement t*: W64/s16 48,
+  W256/s16 10, W512/s16 6, W64/s4 6, W256/s4 4, W512/s4 0;
+  fail ≈ 1-s/W split, misc=0). Out-of-window single residuals
+  are SEC-repaired (same gated SEC as ESF), never miscorrected.
+
+Bugs caught (same families as ever):
+- C mirror `v_ovl_corr` short-circuited SEC when the overlap
+  agreed, while asm `corr_core` always SECs dirty units: 5 M-row
+  splits (asm fullok 6/48/4/10/6 vs C 0). Fixed C to mirror asm
+  (always-SEC + recheck); pure-corrupt rows unchanged (in-window
+  flips always disagree, so they took the SEC path either way).
+- Print spacing: missing `' '` after the param `pdec` glued
+  `s=256200 0 0`; `div`-clobbered rdx strikes again (reload ptr
+  per counter).
+
 ## Resume checklist (for a fresh context)
 
 - Repo: `/home/zaiken/Ergo`, branch state per `git log --oneline -3`

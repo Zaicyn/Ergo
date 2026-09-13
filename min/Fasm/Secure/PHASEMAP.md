@@ -84,8 +84,10 @@ Reflex misc total = 14 (cells k=2c,3s,3c,4c,6s,8s).
   everything).
 - Open edges (N=200 leaves these unmeasured): reflex misc=0 cells
   may misc at higher N (rate bounds, not zeros); exact k=2..3
-  spread boundary for apop-intolerance; W-sizing for the overlap
-  handler (alignchk stage, planned).
+  spread boundary for apop-intolerance; W-sizing measured
+  (alignchk DONE 2026-09-14: re-align iff s <= W-4 at 200/200;
+  shco fullok tracks s/W; s=500/W=512 unresolvable — 12 B TRUE
+  window outscored by wrong offset).
 
 ## Reproduce
 
