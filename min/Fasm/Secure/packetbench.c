@@ -1,20 +1,21 @@
-/* packetbench.c -- stream/packet recovery without resend.
+/* packetbench.c v2 -- stream recovery without resend, wire format.
  *
- * Frame = 4096 B = 8 packets x 512 B + 1 XOR parity packet (512 B).
- * Per-packet S0..S3 syndromes (idx 1..512) + gated single-byte SEC per
- * packet; single whole-packet loss rebuilt from parity (known position
- * = erasure, no search). Damage is injected per trial (NTR=200,
- * deterministic xorshift draws), then each policy runs on a snapshot:
+ * PACKING (the 1460 B question): unit = 512 B. 1460/512 = 2.85 units
+ * per TCP segment: 2 full units (1024 B) + 436 B spare. One 4096 B
+ * frame = 8 units rides in 4 segments; the 4x436 = 1744 B of spare
+ * funds P+Q parities (2x512) + 8x16 B syndromes = 1152 B, 592 B left.
  *
- *   UDP    accept damage (bytes_correct = 4096 - damaged, 0 RTT)
- *   ECC    per-packet SEC + parity rebuild (0 RTT, overhead bytes only)
- *   RESEND ground truth: always 4096/4096 at 1 RTT + 4096 resend bytes
+ * WIRE FORMAT: depth-8 byte interleave. Unit u holds frame bytes
+ * {u+8k}. A channel burst contiguous on the wire of length L<=8 lands
+ * 1 byte each in L distinct units -> per-unit SEC fixes all of them.
+ * Erasures are solved, not searched: P = row XOR, Q = GF(256) weighted
+ * sum (coeffs 2^p) -> any 1-2 whole-unit losses rebuild exactly.
+ * Order: SEC survivors -> rebuild from clean data -> reverify.
  *
- * Cells: spread n-byte errors (n=1..8), burst runs (L=4,16,64,256),
- * whole-packet loss (d=1,2), mixed (1 loss + 2 errors).
- * Report per cell: fullok/200, mean bytes_correct/4096, and the cost
- * model: ECC overhead = 512 B parity + 8x16 B syndromes = 640 B/frame
- * (15.6%) once, vs 4096 B + 1 RTT per resend.
+ * Cells (NTR=200, deterministic draws): SP spread n=1,2,4,8;
+ * BU-I interleaved bursts L=4,8,16,64,256; BU64 non-interleaved burst
+ * control; LO d=1,2 whole-unit loss; MX 1loss+2err; MX2 2loss+2err;
+ * SEG 1460 B wire-interval erasure (the measured limit).
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -24,9 +25,11 @@
 #define PL 512
 #define FR (NP * PL)
 #define NTR 200
+#define SEG 1460
 
-static uint8_t bk[FR], fr[FR], par[PL];
+static uint8_t bku[NP][PL], fru[NP][PL], parP[PL], parQ[PL];
 static uint32_t refs[NP][4];
+static uint8_t gexp[512], glog[256];
 
 static uint64_t trng = 0x123456789ABCDEF1ull;
 static uint64_t trand(void) {
@@ -35,7 +38,38 @@ static uint64_t trand(void) {
     trng ^= trng << 17;
     return trng;
 }
-
+/* GF(256), poly 0x11B */
+static uint8_t gfm(uint8_t a, uint8_t b) {
+    uint8_t r = 0;
+    while (b) {
+        if (b & 1)
+            r ^= a;
+        uint8_t hi = a & 0x80;
+        a <<= 1;
+        if (hi)
+            a ^= 0x1B;
+        b >>= 1;
+    }
+    return r;
+}
+static void gf_init(void) {
+    uint8_t v = 1;
+    for (int i = 0; i < 511; i++) {
+        gexp[i] = v;
+        if (i < 255)
+            glog[v] = (uint8_t)i;
+        v = gfm(v, 3); /* 3 is primitive (ord 255); 2 is not (ord 51) */
+    }
+    gexp[511] = 1;
+}
+static uint8_t gf_div(uint8_t a, uint8_t b) {
+    if (!a)
+        return 0;
+    int l = (int)glog[a] - (int)glog[b];
+    if (l < 0)
+        l += 255;
+    return gexp[l];
+}
 static void triple4(const uint8_t *p, uint32_t *s) {
     uint32_t a = 0, b = 0, c = 0, d = 0;
     for (int i = 0; i < PL; i++) {
@@ -50,7 +84,6 @@ static void triple4(const uint8_t *p, uint32_t *s) {
     s[2] = c;
     s[3] = d;
 }
-/* gated single-byte SEC on one packet; returns 1 if repaired-or-clean */
 static int sec_pkt(uint8_t *p, const uint32_t *ref) {
     uint32_t s[4];
     triple4(p, s);
@@ -77,40 +110,60 @@ static int sec_pkt(uint8_t *p, const uint32_t *ref) {
              (s[3] - ref[3]));
 }
 static void build(void) {
-    for (int i = 0; i < FR; i++)
-        bk[i] = (uint8_t)(((i * 67 + 41) ^ 0x3C ^ (i >> 3)) & 0xFF);
-    bk[0] = 0x45;
-    bk[1] = 0x53;
-    bk[2] = 0x46;
-    bk[3] = 0x32;
-    for (int p = 0; p < NP; p++)
-        triple4(bk + p * PL, refs[p]);
-    memset(par, 0, PL);
-    for (int p = 0; p < NP; p++)
-        for (int i = 0; i < PL; i++)
-            par[i] ^= bk[p * PL + i];
+    gf_init();
+    for (int u = 0; u < NP; u++)
+        for (int k = 0; k < PL; k++) {
+            int j = 8 * k + u; /* frame byte -> unit u, offset k */
+            bku[u][k] =
+                (uint8_t)(((j * 67 + 41) ^ 0x3C ^ (j >> 3)) & 0xFF);
+        }
+    bku[0][0] = 0x45;
+    bku[1][0] = 0x53;
+    bku[2][0] = 0x46;
+    bku[3][0] = 0x32;
+    for (int u = 0; u < NP; u++)
+        triple4(bku[u], refs[u]);
+    memset(parP, 0, PL);
+    memset(parQ, 0, PL);
+    for (int u = 0; u < NP; u++) {
+        uint8_t c = gexp[u]; /* 3^u, distinct nonzero */
+        for (int i = 0; i < PL; i++) {
+            parP[i] ^= bku[u][i];
+            parQ[i] ^= gfm(c, bku[u][i]);
+        }
+    }
 }
-/* damage kinds; lost[] marks erased packets (content zeroed) */
+/* damage in wire (= frame) coords: pos -> unit pos%8, off pos/8 */
 static void dmg_spread(int n) {
     for (int j = 0; j < n; j++) {
-        int pos = (int)(trand() % FR), dv;
+        int pos = (int)(trand() % FR), dv, u = pos % 8, o = pos / 8;
         do {
             dv = (int)((trand() & 255) + 1) & 255;
         } while (!dv);
-        fr[pos] ^= (uint8_t)dv;
+        fru[u][o] ^= (uint8_t)dv;
     }
 }
 static void dmg_burst(int len) {
     int st = (int)(trand() % (FR - len));
     for (int j = 0; j < len; j++) {
+        int pos = st + j, dv, u = pos % 8, o = pos / 8;
+        do {
+            dv = (int)((trand() & 255) + 1) & 255;
+        } while (!dv);
+        fru[u][o] ^= (uint8_t)dv;
+    }
+}
+/* burst confined to one unit (non-interleaved control) */
+static void dmg_burst1(int len) {
+    int u = (int)(trand() % NP), st = (int)(trand() % (PL - len));
+    for (int j = 0; j < len; j++) {
         int dv;
         do {
             dv = (int)((trand() & 255) + 1) & 255;
         } while (!dv);
-        fr[st + j] ^= (uint8_t)dv;
+        fru[u][st + j] ^= (uint8_t)dv;
     }
 }
-/* returns # lost; lost[] flags */
 static int dmg_loss(int d, int *lost) {
     int n = 0;
     memset(lost, 0, NP * sizeof(int));
@@ -118,130 +171,138 @@ static int dmg_loss(int d, int *lost) {
         int p = (int)(trand() % NP);
         if (!lost[p]) {
             lost[p] = 1;
-            memset(fr + p * PL, 0, PL);
+            memset(fru[p], 0, PL);
             n++;
         }
     }
     return n;
 }
-static int bytes_ok(void) {
-    int n = 0;
-    for (int i = 0; i < FR; i++)
-        n += (fr[i] == bk[i]);
+/* wire-interval erasure (segment damage): zero all unit bytes whose
+ * frame position falls in [st, st+len). Returns bytes erased. */
+static int dmg_seg(int len) {
+    int st = (int)(trand() % (FR - len)), n = 0;
+    for (int j = 0; j < len; j++) {
+        int pos = st + j;
+        fru[pos % 8][pos / 8] = 0;
+        n++;
+    }
     return n;
 }
-/* ECC: parity rebuild for single loss, then per-packet SEC.
- * NOTE: parity rebuild needs the parity packet intact; loss cell with
- * d>=1 never damages par (loss = dropped data packets only). */
+static int bytes_ok(void) {
+    int n = 0;
+    for (int u = 0; u < NP; u++)
+        for (int i = 0; i < PL; i++)
+            n += (fru[u][i] == bku[u][i]);
+    return n;
+}
+/* exact 1-2 erasure solve from P+Q (data already SEC-cleaned) */
+static void solve_erase(const int *lost, int nloss) {
+    int L[2], nl = 0;
+    for (int p = 0; p < NP && nl < 2; p++)
+        if (lost[p])
+            L[nl++] = p;
+    if (nl == 1) {
+        int a = L[0];
+        for (int i = 0; i < PL; i++) {
+            uint8_t v = parP[i];
+            for (int p = 0; p < NP; p++)
+                if (p != a)
+                    v ^= fru[p][i];
+            fru[a][i] = v;
+        }
+    } else if (nl == 2) {
+        int a = L[0], b = L[1];
+        uint8_t ca = gexp[a], cb = gexp[b], den = ca ^ cb;
+        for (int i = 0; i < PL; i++) {
+            uint8_t pp = parP[i], qq = parQ[i];
+            for (int p = 0; p < NP; p++)
+                if (p != a && p != b) {
+                    pp ^= fru[p][i];
+                    qq ^= gfm(gexp[p], fru[p][i]);
+                }
+            /* pp=Ua^Ub; qq=ca.Ua^cb.Ub -> Ua=(qq^cb.pp)/(ca^cb) */
+            uint8_t ua = gf_div(qq ^ gfm(cb, pp), den);
+            fru[a][i] = ua;
+            fru[b][i] = pp ^ ua;
+        }
+    }
+    (void)nloss;
+}
 static void run_ecc(const int *lost, int nloss) {
-    /* 1. SEC survivors FIRST: rebuilding from dirty survivors
-     * transplants their errors into the rebuilt packet. */
     for (int p = 0; p < NP; p++) {
         if (lost && lost[p])
             continue;
-        sec_pkt(fr + p * PL, refs[p]);
+        sec_pkt(fru[p], refs[p]);
     }
-    /* 2. parity rebuild from cleaned survivors, then reverify. */
-    if (nloss == 1) {
-        int lp = 0;
-        while (!lost[lp])
-            lp++;
-        for (int i = 0; i < PL; i++) {
-            uint8_t v = par[i];
-            for (int p = 0; p < NP; p++)
-                if (p != lp)
-                    v ^= fr[p * PL + i];
-            fr[lp * PL + i] = v;
-        }
-        sec_pkt(fr + lp * PL, refs[lp]);
+    if (lost && nloss >= 1 && nloss <= 2) {
+        solve_erase(lost, nloss);
+        for (int p = 0; p < NP; p++)
+            if (lost[p])
+                sec_pkt(fru[p], refs[p]); /* reverify, no-op if exact */
     }
 }
-static void cell_spread(int n) {
-    int full = 0;
-    long budp = 0, becc = 0;
-    for (int t = 0; t < NTR; t++) {
-        memcpy(fr, bk, FR);
-        dmg_spread(n);
-        budp += bytes_ok();
-        run_ecc(NULL, 0);
-        int bo = bytes_ok();
-        becc += bo;
-        full += (bo == FR);
-    }
-    printf("SP n=%d udp=%.1f ecc=%.1f full=%d/200\n", n, budp / 200.0,
-           becc / 200.0, full);
+static void restore(void) {
+    memcpy(fru, bku, sizeof fru);
 }
-static void cell_burst(int len) {
-    int full = 0;
-    long budp = 0, becc = 0;
-    for (int t = 0; t < NTR; t++) {
-        memcpy(fr, bk, FR);
-        dmg_burst(len);
-        budp += bytes_ok();
-        run_ecc(NULL, 0);
-        int bo = bytes_ok();
-        becc += bo;
-        full += (bo == FR);
-    }
-    printf("BU L=%d udp=%.1f ecc=%.1f full=%d/200\n", len, budp / 200.0,
-           becc / 200.0, full);
-}
-static void cell_loss(int d) {
-    int full = 0;
-    long budp = 0, becc = 0;
-    int lost[NP];
-    for (int t = 0; t < NTR; t++) {
-        memcpy(fr, bk, FR);
-        int nl = dmg_loss(d, lost);
-        budp += bytes_ok();
-        run_ecc(lost, nl);
-        int bo = bytes_ok();
-        becc += bo;
-        full += (bo == FR);
-    }
-    printf("LO d=%d udp=%.1f ecc=%.1f full=%d/200\n", d, budp / 200.0,
-           becc / 200.0, full);
-}
-static void cell_mixed(void) {
-    int full = 0;
-    long budp = 0, becc = 0;
-    int lost[NP];
-    for (int t = 0; t < NTR; t++) {
-        memcpy(fr, bk, FR);
-        int nl = dmg_loss(1, lost);
-        /* errors only in surviving packets */
-        for (int j = 0; j < 2; j++) {
-            int p, pos, dv;
-            do {
-                p = (int)(trand() % NP);
-            } while (lost[p]);
-            pos = p * PL + (int)(trand() % PL);
-            do {
-                dv = (int)((trand() & 255) + 1) & 255;
-            } while (!dv);
-            fr[pos] ^= (uint8_t)dv;
-        }
-        budp += bytes_ok();
-        run_ecc(lost, nl);
-        int bo = bytes_ok();
-        becc += bo;
-        full += (bo == FR);
-    }
-    printf("MX 1loss+2err udp=%.1f ecc=%.1f full=%d/200\n", budp / 200.0,
-           becc / 200.0, full);
-}
+#define CELL(name, fmt, ...) \
+    { int full = 0; long be = 0; \
+      for (int t = 0; t < NTR; t++) { __VA_ARGS__; } \
+      printf(name " " fmt " ecc=%.1f full=%d/200\n", be / 200.0, full); }
+#define FINISH() \
+    { int bo = bytes_ok(); be += bo; full += (bo == FR); }
+
 int main(void) {
     build();
-    for (int n = 1; n <= 8; n++)
-        cell_spread(n);
-    cell_burst(4);
-    cell_burst(16);
-    cell_burst(64);
-    cell_burst(256);
-    cell_loss(1);
-    cell_loss(2);
-    cell_mixed();
-    printf("COST ecc-overhead=%dB/frame resend=4096B+1RTT\n",
-           PL + NP * 16);
+    printf("PACK units/seg=2.85 (2x512+436spare) segs/frame=4 "
+           "overhead=%dB spare-left=%dB\n",
+           2 * PL + NP * 16, 4 * (SEG - 2 * PL) - (2 * PL + NP * 16));
+    CELL("SP", "n=1", restore(); dmg_spread(1); run_ecc(NULL, 0); FINISH());
+    CELL("SP", "n=2", restore(); dmg_spread(2); run_ecc(NULL, 0); FINISH());
+    CELL("SP", "n=4", restore(); dmg_spread(4); run_ecc(NULL, 0); FINISH());
+    CELL("SP", "n=8", restore(); dmg_spread(8); run_ecc(NULL, 0); FINISH());
+    CELL("BUI", "L=4", restore(); dmg_burst(4); run_ecc(NULL, 0); FINISH());
+    CELL("BUI", "L=8", restore(); dmg_burst(8); run_ecc(NULL, 0); FINISH());
+    CELL("BUI", "L=16", restore(); dmg_burst(16); run_ecc(NULL, 0); FINISH());
+    CELL("BUI", "L=64", restore(); dmg_burst(64); run_ecc(NULL, 0); FINISH());
+    CELL("BUI", "L=256", restore(); dmg_burst(256); run_ecc(NULL, 0); FINISH());
+    CELL("BU1", "L=64", restore(); dmg_burst1(64); run_ecc(NULL, 0); FINISH());
+    { int full = 0; long be = 0; int lost[NP];
+      for (int t = 0; t < NTR; t++) {
+          restore(); int nl = dmg_loss(1, lost); run_ecc(lost, nl);
+          FINISH(); } printf("LO d=1 ecc=%.1f full=%d/200\n", be / 200.0, full); }
+    { int full = 0; long be = 0; int lost[NP];
+      for (int t = 0; t < NTR; t++) {
+          restore(); int nl = dmg_loss(2, lost); run_ecc(lost, nl);
+          FINISH(); } printf("LO d=2 ecc=%.1f full=%d/200\n", be / 200.0, full); }
+    { int full = 0; long be = 0; int lost[NP];
+      for (int t = 0; t < NTR; t++) {
+          restore(); int nl = dmg_loss(1, lost);
+          for (int j = 0; j < 2; j++) {
+              int p, pos, dv;
+              do { p = (int)(trand() % NP); } while (lost[p]);
+              pos = (int)(trand() % FR);
+              int u = pos % 8, o = pos / 8;
+              if (lost[u]) continue;
+              do { dv = (int)((trand() & 255) + 1) & 255; } while (!dv);
+              fru[u][o] ^= (uint8_t)dv;
+          }
+          run_ecc(lost, nl); FINISH(); }
+      printf("MX 1loss+2err ecc=%.1f full=%d/200\n", be / 200.0, full); }
+    { int full = 0; long be = 0; int lost[NP];
+      for (int t = 0; t < NTR; t++) {
+          restore(); int nl = dmg_loss(2, lost);
+          for (int j = 0; j < 2; j++) {
+              int pos = (int)(trand() % FR);
+              int u = pos % 8, o = pos / 8, dv;
+              if (lost[u]) continue;
+              do { dv = (int)((trand() & 255) + 1) & 255; } while (!dv);
+              fru[u][o] ^= (uint8_t)dv;
+          }
+          run_ecc(lost, nl); FINISH(); }
+      printf("MX2 2loss+2err ecc=%.1f full=%d/200\n", be / 200.0, full); }
+    { int full = 0; long be = 0;
+      for (int t = 0; t < NTR; t++) {
+          restore(); dmg_seg(SEG); run_ecc(NULL, 0); FINISH(); }
+      printf("SEG 1460B-erasure ecc=%.1f full=%d/200\n", be / 200.0, full); }
     return 0;
 }
