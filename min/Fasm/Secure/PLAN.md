@@ -160,6 +160,39 @@ fixes on clustered k=3..6 — is the measured value of the duplex
 overlap. Syndrome cost: derived 8×4+4 = 36 words = 144 B (3.5%)
 vs stored 272 B (6.6%).
 
+## Reflex tiers: sense vs reflex vs full (DONE 2026-09-14)
+
+`reflex.asm` (+ `.c` mirror): 9 doublets × 2 tubules × 512 B,
+same error draws through all three policies per trial (snapshot /
+restore), N=200 per cell. Mirror-clean (byte-identical TSV),
+deterministic. Columns: corr / apop / det / misc.
+
+- sense (9+0, S0 only, detect-only): det=200 in all 24 cells,
+  misc=0. Perfect antenna; repairs nothing.
+- reflex (9+0 + dynein, S0/S1, ungated SEC, tombstone on failure):
+  k=1 at 200 corr; degrades via apoptosis (k=6/8clust: 0 corr +
+  200 apop, contained); **misc = 14 total** (k=2clust 2, k=3s 1,
+  k=3c 2, k=4s 0... peak k=8s 5). Ungated repair miscorrects
+  where gated repair does not.
+- full (9+2 + central pair, S0–S3 + ladder): k=1,2 at 200 corr;
+  k=3c 151, k=4c 3, k=6c 115, k=8c refused; **misc = 0**.
+
+The central pair's measured job: making repair safe (14 → 0
+miscorrections) while lifting correction (e.g. k=6clust 0 → 115).
+Syndrome cost ladder: 18 → 36 → 80 words/frame. Apoptosis
+(tombstone + flag) works as containment: reflex never silently
+loses data beyond its 14 miscs; everything else is corr or apop.
+
+Bugs caught (same families as ever):
+- `div r/m32` uses only the low 32 bits of the dividend — asm
+  `xs % 9216` / `% 9` diverged from C's full-64-bit `%`; `div r64`
+  fixed it. (Power-of-2 masks were always safe; torusecc tables
+  stand.)
+- Print buffer reused a pointer across `pdec` (which clobbers
+  rdx via `div`): reload per counter.
+- 3-char label loaded as dword printed a stolen 4th byte
+  (cosmetic; fixed with exact-size moves).
+
 ## Resume checklist (for a fresh context)
 
 - Repo: `/home/zaiken/Ergo`, branch state per `git log --oneline -3`
