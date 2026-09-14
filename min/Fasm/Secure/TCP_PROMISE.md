@@ -148,6 +148,27 @@ stale length header on hand-rolled fetch replies (shipped 1-byte
 not poll (drain via select() instead); missing SO_REUSEADDR hung
 setup on reruns (TIME_WAIT); missing TCP_NODELAY stalled fetches.
 
+## Euler runs (`eulerbench.c`)
+
+Q: is units/packet ~= e (1460/512 = 2.85) a feature? A: coincidence —
+but three optimizations were run to check where e really governs.
+- Unit size (calculus): wire(u) = F+16F/u+2u -> u* = sqrt(8F) = 181;
+  realizable 128/256 tie at wire 4864 (vs 512 now at 5248, rating
+  8 vs 16/32, same 4 segments). e-tuned u=537 (1460/e) is worse on
+  every axis (wire 5292, rating 7.6). Inherited 512 is 384 B
+  overweight at half-or-quarter the burst rating; counterweight is
+  loss-exposure (more units = more loss targets; Q covers any 2).
+  Balanced pick pending loss-rate data: u=256 (16 units).
+- Geometric bursts (e VERIFIED): L ~ Geometric(mean mu) ->
+  recovery = P(L<=depth) = 1-(mu/(mu+1))^8 ~= 1-e^(-8/mu). Measured
+  7 points track prediction within noise (mu=2: 0.960/0.961;
+  mu=8: 0.620/0.610; mu=32: 0.195/0.218). Euler's number governs
+  the burst-rating curve, by derivation and measurement.
+- Fetch-retry backoff (e loses honestly): q=0.25/attempt, K=4,
+  RTT=10ft: b=1.5 wins (0.927ft), then 2.0, e (1.185), 3.0, 4.0.
+  Cheap retries -> aggressive (small) base; e carries pedigree,
+  not victory, under these constants.
+
 ## Files / reproduce
 
 - `min/Fasm/Secure/packetbench.c` — wire format + recovery cells.
