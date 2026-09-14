@@ -49,6 +49,44 @@ TCMalloc +0 B (exact size classes); SQ4 ~6–8 B/slot (4 B invariant
   tombstone states. The comparison shows those features cost
   nothing measurable on the claim path.
 
+## Multithreaded scaling (1–12 threads, 6C/12T)
+
+Harness `benchmark/mtbench.c` (built both ways), 2M ops/thread of
+64 B, barrier start, best-of-3. Modes: churn (per-thread
+malloc/free), shard (per-thread PRIVATE pool: ring claim + invariant
+stamp, the SQ4-style path as a C model), shared (one pool +
+`pthread_mutex`, the lock-cost control). Mops/s:
+
+| mode | 1T | 2T | 4T | 6T | 8T | 12T |
+|---|---|---|---|---|---|---|
+| glibc churn | 152 | 304 | 582 | 833 | 981 | 1139 |
+| tcmalloc churn | 158 | 317 | 625 | 907 | 905 | 1098 |
+| shard (private) | 1231 | 2432 | 4633 | ~4400 | ~5200 | ~6000–12400* |
+| shared (mutex) | 91 | 21 | 20 | 10 | 8 | 7 |
+
+*Shard at ≥6T varies run to run (SMT contention on 6 physical
+cores; two runs gave 5990 and 12444 at 12T). Churn numbers are
+stable across runs (±5%).
+
+Reading it straight:
+
+- **No defeat anywhere.** Churn throughput is a dead heat at every
+  thread count (glibc marginally ahead at 12T, 1139 vs 1098;
+  efficiency ~0.6 both). TCMalloc's thread cache does not separate
+  from glibc arenas on this pattern.
+- **Sharding wins big.** Private-pool claim (with invariant stamp,
+  no locks) runs 5–10× hotter than malloc churn at every thread
+  count, single-thread included (1231 vs ~155 Mops/s). Same
+  scaling shape as churn, higher floor. This is the SQ4 design
+  (one pool per worker, never share) and the numbers say the
+  design, not just the code, is fast.
+- **Sharing loses catastrophically.** One pool + mutex collapses
+  past 1T (91 → 7 Mops/s) — the control that proves the sharded
+  result is about avoiding the lock, not about doing less work.
+- Caveats: C model of the claim path (not the FASM port; same
+  operations: head advance + stamp + occupy); fixed 64 B; no NUMA
+  (single socket); best-of-3 understates SMT noise (see *).
+
 ## Reproduce
 
 ```
