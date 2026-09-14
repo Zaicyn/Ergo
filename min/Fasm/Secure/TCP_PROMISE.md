@@ -185,6 +185,29 @@ anti-jam heritage); storage partial-sector defects (sub-sector run
 (audio/video concealment analog: even L=64 keeps 4032/4096 bytes);
 narrow jammer (absorbed; wide jam = SEG = resend, honestly kept).
 
+## Transport interop (`pktcore.inc` + `udp_node.asm`)
+
+Modular split: `pktcore.inc` holds the whole codec core (both
+protocols include it; neither carries the other), `udp_node.asm` is
+the UDP shell (role via argv: send|recv), `udp_cpeer.c` the C peer,
+`udp_proxy.c` the fixed-plan fault proxy. Fixed vectors, so verdicts
+must be byte-identical across languages and directions:
+
+| direction | clean | drop=3 | drop=1,5 | flip=2:100 |
+|---|---|---|---|---|
+| asm->C | 9/0/0/1 | 8/1/1/1 | 7/2/1/1 | - |
+| C->asm | 9/0/0/1 | 8/1/1/1 | - | 9/0/0/1 |
+| asm->asm | 9/0/0/1 | - | 7/2/1/1 | - |
+
+(columns: got/lost/fetch/full). All green, incl. Q-solve over the
+wire (drop=1,5) and the fetch handshake both ways.
+Bugs the matrix caught: asm sender stamped idx=0 on all units
+(`al` held low(u*512), always 0 — receivers deduped 7 units);
+receiver scored against a zero oracle (bku never built — full=1 on
+empty air); startup races (ready-probe ports before sending);
+`restore`/`used`/`LDS` reserved words; post-include segment reset
+(pitfall #16, entry landed in readable).
+
 ## Files / reproduce
 
 - `min/Fasm/Secure/packetbench.c` — wire format + recovery cells.
