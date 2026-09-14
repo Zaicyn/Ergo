@@ -14,6 +14,21 @@ operating points for direct mapping onto packetbench cells; .npz
 byte-error traces for future replay.
 """
 import numpy as np
+import subprocess
+
+# Trace format version: bump on ANY generator change (modem, mapping,
+# channel model, framing). Old traces are incomparable across versions
+# by construction — the version rides inside every .npz.
+TRACE_VERSION = 2
+import os
+try:
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _g = subprocess.run(["git", "-C", _here, "rev-parse", "--short",
+                         "HEAD"], capture_output=True, text=True,
+                        timeout=10)
+    GEN_HASH = _g.stdout.strip() or "nogit"
+except Exception:
+    GEN_HASH = "nogit"
 
 N = 64          # carriers / bands
 M = 8           # symbols per band per frame
@@ -166,6 +181,7 @@ for modem in MODEMS:
     print(f"selftest noiseless {modem}: BER={ber:.2e}", flush=True)
     assert ber == 0.0, f"{modem} broken at 60dB!"
 print("gates pass: PR exact, noiseless BER=0 all modems.", flush=True)
+print(f"trace format v{TRACE_VERSION}, generator {GEN_HASH}", flush=True)
 
 CHANNELS = [
     ("awgn", {}),
@@ -216,9 +232,10 @@ def byte_stats(modem, snr_db, kind, nframes=200, save=None, **kw):
     print(f"BYTE {modem} {kind} snr={snr_db}: mean-bad/4096={mean_bad:.1f} "
           f"maxrun={maxrun}", flush=True)
     if save:
-        np.savez_compressed(save, bad=bad,
-                            meta=np.array([modem, kind, str(snr_db)]))
-        print(f"  trace saved: {save}.npz", flush=True)
+        np.savez_compressed(save, bad=bad, version=TRACE_VERSION,
+                            gen_hash=np.array(GEN_HASH),
+                            meta=np.array([modem, kind, str(snr_db),
+                                           f"N={N} M={M} CP={CP} QPSK"]))
 
 
 print("byte-mapped operating points (for packetbench cells):", flush=True)
