@@ -59,11 +59,26 @@ the full PHY→link goodput number; not yet wired, traces are ready.
 
 ## Hardware notes
 
-- **LoRa ESP32 devkits: no.** The SX127x is a fixed-function chirp
-  modem and the ESP32 WiFi PHY is closed firmware — neither can
-  transmit a different modulation. The boards *are* useful for
-  running our transport over real RF (ESP-NOW/WiFi field tests of
-  the codec layer), which tests us but not the PHY question.
+- **Heltec WiFi LoRa 32 (V3) + open firmware: yes, for OUR layer.**
+  Correction to an earlier version of this note: the firmware
+  ecosystem is fully open (Meshtastic GPL, Arduino/PlatformIO/
+  ESP-IDF/CircuitPython, Heltec libs, RadioLib for the SX1262) —
+  only the *modulation* is fixed-function (LoRa CSS + (G)FSK in
+  SX1262 silicon; no driver can make it emit OFDM). That boundary
+  still rules out DWT-vs-FFT over these radios, but the openness
+  buys four real experiments, cheapest first:
+  1. **Link-characterization sweep** (two boards, PlatformIO +
+     RadioLib): sweep spreading factor (SF7–12), bandwidth, coding
+     rate; log PER/RSSI/SNR per setting. Maps straight onto our
+     SP/BU/LO cells with real RF numbers.
+  2. **CSS vs FSK on the same link.** The SX1262 does both —
+     an honest modem comparison this hardware *can* run.
+  3. **Meshtastic as carrier.** Open mesh + telemetry + Python/MQTT
+     API: plug our parity/commitment in as a module and test
+     multi-hop repair with real interference.
+  4. **Embedded pktcore port.** Our C codec is plain C99 — port to
+     ESP-IDF/Arduino (swap sockets for RadioLib send/recv +
+     timers) for a true field test of handshake/tiers/codec.
 - **Real comparison needs SDR:** one ADALM-Pluto (~$150–200,
   full-duplex loopback) for BER-vs-SNR, two units or Pluto+HackRF
   for two-node over-the-air with our stack on top. Sim first (done),
