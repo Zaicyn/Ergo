@@ -87,6 +87,30 @@ Reading it straight:
   operations: head advance + stamp + occupy); fixed 64 B; no NUMA
   (single socket); best-of-3 understates SMT noise (see *).
 
+## Embedded: Heltec WiFi LoRa 32 V3 (ESP32-S3 @ 240 MHz)
+
+Port of `benchmark/bench_sq4.c` (same seed, same draws) to Arduino,
+run on-device over USB serial. x86 FASM cannot run here (Xtensa
+LX7), so the C mirror — which *is* the spec — is what ports.
+
+| check | x86 oracle | ESP32-S3 | match |
+|---|---|---|---|
+| O1_alloc | 100096/100096 | 100096/100096 | yes |
+| victims | (4,23,31) (2,6,25) (0,27,19) | identical | yes, bit-exact |
+| det/rep/remain | 3/3/0 | 3/3/0 | yes |
+| coherency fail | 0 | 0/512 | yes |
+| ns/claim | 5.4 | **530.9** (1.88 Mips) | ~100x (portable C++, flash exec) |
+| torus | 3268 B | 3268 B | yes |
+| heap free | — | 369616 B | plenty |
+
+Two consecutive runs printed identical numbers (deterministic).
+Bring-up notes: `ARDUINO_USB_CDC_ON_BOOT=1` is mandatory (else
+`Serial` goes to unconnected UART0 — silence); sketch prints once
+at boot, so capture across a DTR reset. Firmware (PlatformIO
+project) lives outside the tree for now; results above are the
+record. The Meshtastic firmware it replaced can be re-flashed
+anytime via their web flasher.
+
 ## Reproduce
 
 ```
