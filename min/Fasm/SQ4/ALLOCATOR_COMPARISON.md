@@ -140,3 +140,27 @@ min/Fasm/SQ4/sq4 2>/dev/null | grep SQ4T   # claim ns / 100096
 Harness: `benchmark/allocbench.c`. Follow-ups, not done:
 multithreaded scaling (expected to favor TCMalloc), fragmentation
 under adversarial patterns, SQ4 claim path under pool pressure.
+
+## ESP32-S3 suitability (static BSS measured from sources)
+
+Device: 320 KB SRAM (+PSRAM), single-precision FPU only (doubles
+are soft-float), no FASM (C mirrors only), 8 KB task stack, watchdog
+on long loops. Our BSS-arena style ports directly (static, no
+malloc); audit/journal trails belong on LittleFS (see espfs layer).
+
+| allocator | static state | verdict |
+|---|---|---|
+| SQ4 | ~5 KB | proven on-device, oracle-exact |
+| trit / RLE / int codecs | <2 KB | ideal; built for 250 B radio packets |
+| V8 | 257 B | trivially fits |
+| SQ5 | ~10 KB | fits; integer moments + SEC |
+| SQW | ~21 KB | fits; audit trail -> LittleFS |
+| SQM | ~41 KB | fits; integer moments |
+| Sq2B | ~90 KB working | fits SRAM; needs static arena, no heap reliance |
+| Secure pktcore | ~6 KB + tables | fits; transport needs RadioLib swap |
+| SQFH | **2.1 MB tables + f64 trig** | poor fit: PSRAM + fixed-point rework first |
+| V22 | — | skip (superseded) |
+
+Rules: yield() in any loop past ~1 s (watchdog); keep doubles out
+of hot paths (SQFH trig is the casualty); large locals to static;
+FASM ports stay on x86, C mirrors travel.
