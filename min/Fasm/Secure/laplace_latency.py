@@ -177,3 +177,51 @@ mstar, bstar, Kstar = best
 p99 = p99_bisect(qh, bstar, exact_tail)
 print(f"q_hat={qh:.2f} b*={bstar:.2f} K*={Kstar} "
       f"E[T]={mstar:.3f}ft P99={p99:.1f}ft", flush=True)
+
+
+def p99_exact(q, b, K):
+    lo, hi = 0.0, 300.0
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        if exact_tail(q, b, mid, K) > 0.01:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+print("policy table: tail-aware (min E[T] s.t. P99<=12ft):", flush=True)
+EDGES = [0.0, 0.05, 0.1, 0.2, 0.3, 0.45, 0.6, 0.8, 1.01]
+ROWS = []
+for i in range(8):
+    q = (EDGES[i] + min(EDGES[i + 1], 1.0)) / 2
+    best = (1e30, None, None)
+    for K in (1, 2, 3, 4):
+        for b in np.arange(1.0, 4.01, 0.05):
+            m = mean_T(q, b, K)
+            if p99_exact(q, b, K) <= 12.0 and m < best[0]:
+                best = (m, round(float(b), 2), K)
+    if best[1] is None:
+        # Infeasible (give-up atom alone exceeds the 1% target at this
+        # q): fall back to unconstrained min-E and FLAG it (mode=1).
+        # K=1 is not the answer: it has worse mean AND same violation.
+        be = (1e30, None, None)
+        for K in (1, 2, 3, 4):
+            for b in np.arange(1.0, 4.01, 0.05):
+                m = mean_T(q, b, K)
+                if m < be[0]:
+                    be = (m, round(float(b), 2), K)
+        best = (be[0], be[1], be[2])
+        mode = 1
+    else:
+        mode = 0
+    ROWS.append((int(EDGES[i] * 1000), int(round(best[1] * 100)),
+                 best[2], mode))
+    print(f"  q~{q:.3f}: b*={best[1]:.2f} K*={best[2]} E={best[0]:.3f}ft"
+          f"{' CAP-VIOLATED' if mode else ''}",
+          flush=True)
+print("C: static const struct {int qlo; int b; int K; int mode;} "
+      "POL[8] = {" + ", ".join(
+          "{%d,%d,%d,%d}" % r for r in ROWS) + "};", flush=True)
+print("FASM: POL dd " + ", ".join(
+    "%d,%d,%d,%d" % r for r in ROWS), flush=True)

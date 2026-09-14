@@ -279,71 +279,134 @@ int main(void) {
     int wsum = 0;
     for (int i = 1; i < 9; i++)
         wsum += w[i];
-    printf("%5s %10s %8s %10s %8s %10s %8s\n", "f", "dem-bytes",
-           "dem-rtt", "alw-bytes", "alw-rtt", "tcp-bytes", "tcp-rtt");
+    /* policy table from laplace_latency.py (qlo_milli -> K; b/mode ride
+     * along for firmware, unused in RTT-round currency). Buckets:
+     * [0,.05,.1,.2,.3,.45,.6,.8] -> K = {4,4,4,4,4,4,4,1}. */
+    static const int POLK[8] = { 4, 4, 4, 4, 4, 4, 4, 1 };
+    static const double POLE[9] =
+        { 0.0, 0.05, 0.1, 0.2, 0.3, 0.45, 0.6, 0.8, 1.01 };
+    static double qhat = 0.1; /* EWMA over adaptive attempts only */
+    printf("%5s %10s %8s %10s %8s %10s %8s %10s %10s\n", "f",
+           "adapt-B", "adapt-R", "K1-B", "K1-R", "K4-B", "K4-R",
+           "tcp-B", "alw-B");
     const double fs[] = { 0.0, 0.01, 0.05, 0.10, 0.25, 0.50, 0.80 };
     for (int fi = 0; fi < 7; fi++) {
-        double f = fs[fi], bd = 0, rd = 0, ba = 0, ra = 0, bt = 0,
-               rt = 0;
+        double f = fs[fi], ba = 0, ra = 0, b1 = 0, r1 = 0, b4 = 0,
+               r4 = 0, bt = 0, bl = 0;
         for (int t = 0; t < NSIM; t++) {
-            memcpy(fru, bku, sizeof fru);
-            int lost[NP], nloss = 0, kind = 0;
-            double r = (double)(trand() % 1000000) / 1000000.0;
-            if (r < f) {
-                int pick = (int)(trand() % (uint64_t)wsum), acc = 0;
-                for (int k = 1; k < 9; k++) {
-                    acc += w[k];
-                    if (pick < acc) {
-                        kind = k;
-                        break;
+            /* fetch channel regime: good/bad 200-frame blocks */
+            double qf = ((t / 200) % 2 == 0) ? 0.02 : 0.85;
+            /* one shared damage draw per policy below needs care:
+             * draw per policy (existing pattern), same regime. */
+            int Ks[3] = { -1, 1, 4 }; /* -1 = adaptive */
+            double *bcs[3] = { &ba, &b1, &b4 };
+            double *rds[3] = { &ra, &r1, &r4 };
+            for (int pi = 0; pi < 3; pi++) {
+                memcpy(fru, bku, sizeof fru);
+                int lost[NP], nloss = 0, kind = 0;
+                double r =
+                    (double)(trand() % 1000000) / 1000000.0;
+                if (r < f) {
+                    int pick = (int)(trand() % (uint64_t)wsum),
+                        acc = 0;
+                    for (int k = 1; k < 9; k++) {
+                        acc += w[k];
+                        if (pick < acc) {
+                            kind = k;
+                            break;
+                        }
                     }
+                    dmg(kind, lost, &nloss);
                 }
-                dmg(kind, lost, &nloss);
-            }
-            int dirty = bytes_ok() != FR;
-            /* on-demand: routine + fetch + fallback */
-            double cd = FR + META;
-            double dd = 0;
-            if (dirty && !repair(lost, nloss, 0)) {
-                if (nloss >= 1 && nloss <= 2) {
-                    cd += 64 + 2 * PL; /* request + P+Q fetch */
-                    dd += 1;
-                    if (!repair(lost, nloss, 1)) {
-                        cd += FR; /* resend fallback */
+                int dirty = bytes_ok() != FR;
+                double cd = FR + META, dd = 0;
+                int Kpol = Ks[pi];
+                if (Kpol < 0) { /* adaptive: bucket qhat */
+                    int bi = 0;
+                    while (bi < 7 && qhat >= POLE[bi + 1])
+                        bi++;
+                    Kpol = POLK[bi];
+                }
+                if (dirty && !repair(lost, nloss, 0)) {
+                    if (nloss >= 1 && nloss <= 2) {
+                        int ok = 0;
+                        for (int a = 0; a < Kpol && !ok; a++) {
+                            cd += 64 + 2 * PL;
+                            dd += 1;
+                            int fail =
+                                (double)(trand() % 1000000) /
+                                    1000000.0 <
+                                qf;
+                            if (pi == 0)
+                                qhat += 0.1 * (fail - qhat);
+                            if (!fail)
+                                ok = repair(lost, nloss, 1);
+                        }
+                        if (!ok) {
+                            cd += FR;
+                            dd += 1;
+                        }
+                    } else {
+                        cd += FR;
                         dd += 1;
                     }
-                } else {
-                    cd += FR; /* no erasures: parity can't help */
-                    dd += 1;
                 }
+                *bcs[pi] += cd;
+                *rds[pi] += dd;
             }
-            bd += cd;
-            rd += dd;
             /* always-send: routine+P+Q, resend if unrecoverable */
             memcpy(fru, bku, sizeof fru);
-            if (kind)
-                dmg(kind, lost, &nloss);
-            double ca = FR + 2 * PL + NP * 16;
-            double da = 0;
-            if (dirty && !repair(lost, nloss, 1)) {
-                ca += FR;
-                da += 1;
+            {
+                int lost[NP], nloss = 0, kind = 0;
+                double r = (double)(trand() % 1000000) / 1000000.0;
+                if (r < f) {
+                    int pick = (int)(trand() % (uint64_t)wsum),
+                        acc = 0;
+                    for (int k = 1; k < 9; k++) {
+                        acc += w[k];
+                        if (pick < acc) {
+                            kind = k;
+                            break;
+                        }
+                    }
+                    dmg(kind, lost, &nloss);
+                }
+                int dirty = bytes_ok() != FR;
+                double ca = FR + 2 * PL + NP * 16;
+                if (dirty && !repair(lost, nloss, 1))
+                    ca += FR;
+                bl += ca;
             }
-            ba += ca;
-            ra += da;
             /* tcp: frame resend on any damage */
-            double ct = FR + META;
-            double dt = 0;
-            if (dirty) {
-                ct += FR;
-                dt += 1;
+            {
+                int lost[NP], nloss = 0, kind = 0;
+                double r = (double)(trand() % 1000000) / 1000000.0;
+                if (r < f) {
+                    int pick = (int)(trand() % (uint64_t)wsum),
+                        acc = 0;
+                    for (int k = 1; k < 9; k++) {
+                        acc += w[k];
+                        if (pick < acc) {
+                            kind = k;
+                            break;
+                        }
+                    }
+                    dmg(kind, lost, &nloss);
+                }
+                double ct = FR + META;
+                if (bytes_ok() != FR) {
+                    (void)kind;
+                    (void)nloss;
+                    (void)lost;
+                    ct += FR;
+                }
+                bt += ct;
             }
-            bt += ct;
-            rt += dt;
         }
-        printf("%5.2f %10.0f %8.3f %10.0f %8.3f %10.0f %8.3f\n", f,
-               bd / NSIM, rd / NSIM, ba / NSIM, ra / NSIM, bt / NSIM,
-               rt / NSIM);
+        printf("%5.2f %10.0f %8.3f %10.0f %8.3f %10.0f %8.3f %10.0f "
+               "%10.0f\n",
+               f, ba / NSIM, ra / NSIM, b1 / NSIM, r1 / NSIM,
+               b4 / NSIM, r4 / NSIM, bt / NSIM, bl / NSIM);
     }
     printf("RETENTION 1KB x 64-frame window = 64KB sender-side\n");
     return 0;
