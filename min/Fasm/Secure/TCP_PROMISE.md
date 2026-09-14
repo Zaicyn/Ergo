@@ -64,10 +64,17 @@ demandbench (bytes/frame, RTT/frame vs damaged-frame fraction f):
 | f | on-demand B | on-demand RTT | always-send B | always-send RTT | TCP B | TCP RTT |
 |---|---|---|---|---|---|---|
 | 0.00 | 4352 | 0.000 | 5248 | 0.000 | 4352 | 0.000 |
-| 0.01 | 4361 | 0.004 | 5256 | 0.002 | 4385 | 0.008 |
-| 0.10 | 4498 | 0.072 | 5332 | 0.021 | 4725 | 0.091 |
-| 0.50 | 5067 | 0.368 | 5676 | 0.104 | 6380 | 0.495 |
-| 0.80 | 5571 | 0.619 | 6014 | 0.187 | 7649 | 0.805 |
+| 0.01 | 4360 | 0.003 | 5256 | 0.002 | 4385 | 0.008 |
+| 0.10 | 4476 | 0.051 | 5332 | 0.021 | 4725 | 0.091 |
+| 0.50 | 4962 | 0.272 | 5676 | 0.104 | 6380 | 0.495 |
+| 0.80 | 5385 | 0.448 | 6014 | 0.187 | 7649 | 0.805 |
+
+Fetch guard (measured improvement over the table's first cut): the
+receiver knows the missing-unit count before fetching, and parity
+solves erasures only — so fetch fires iff 1–2 units are actually
+missing. Pure-error damage skips the fetch (straight to
+resend-fallback accounting); pure loss always fetches. The table
+above includes the guard.
 
 Readings: on-demand wins bytes at every f (fetch fires only when
 SEC-alone fails — a fraction of damaged frames, hence better than the
@@ -118,6 +125,28 @@ itself never fails. SP n=2 (173) sits in the same bucket as MX/MX2
 - Bursts longer than interleave depth (L>8 at depth 8).
 - Whole-segment (1460 B) wire erasure.
 - 3+ whole-unit losses (Q covers 2).
+
+## Socket validation (`sockbench.c`)
+
+Real loopback sockets (UDP datagrams + TCP streams, sender →
+fault-injecting proxy → receiver, fetch round trip genuine). NTR=50,
+identical draws both modes. Recovery matches the sims; compute is
+3–106 µs/frame, loopback fetch RTT 1–7 µs (TCP_NODELAY set — Nagle
+stalled the 11 B req to ~1.5 ms before that).
+
+| cell | UDP | TCP |
+|---|---|---|
+| clean / SP1 / BUI8 | 50/50, 0 fetch | 50/50, 0 fetch |
+| SP4 | 29/50, 0 fetch (guard) | 29/50, 0 fetch |
+| BUI64 | 0/50, 0 fetch (guard) | 0/50, 0 fetch |
+| LO1 / LO2 | 50/50, fetch | 50/50, fetch |
+| MX | 49/50, fetch | 49/50, fetch |
+
+Bugs the sockets caught (all in harness, none in the math):
+stale length header on hand-rolled fetch replies (shipped 1-byte
+"parities", commitment caught it); SO_RCVTIMEO {0,0} means BLOCK
+not poll (drain via select() instead); missing SO_REUSEADDR hung
+setup on reruns (TIME_WAIT); missing TCP_NODELAY stalled fetches.
 
 ## Files / reproduce
 

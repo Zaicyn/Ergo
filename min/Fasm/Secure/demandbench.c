@@ -305,10 +305,15 @@ int main(void) {
             double cd = FR + META;
             double dd = 0;
             if (dirty && !repair(lost, nloss, 0)) {
-                cd += 64 + 2 * PL; /* request + P+Q fetch */
-                dd += 1;
-                if (!repair(lost, nloss, 1)) {
-                    cd += FR; /* resend fallback */
+                if (nloss >= 1 && nloss <= 2) {
+                    cd += 64 + 2 * PL; /* request + P+Q fetch */
+                    dd += 1;
+                    if (!repair(lost, nloss, 1)) {
+                        cd += FR; /* resend fallback */
+                        dd += 1;
+                    }
+                } else {
+                    cd += FR; /* no erasures: parity can't help */
                     dd += 1;
                 }
             }
