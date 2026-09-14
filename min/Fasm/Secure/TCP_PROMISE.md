@@ -61,13 +61,21 @@ packetbench v2 (full recovery / mean bytes-correct of 4096):
 
 demandbench (bytes/frame, RTT/frame vs damaged-frame fraction f):
 
-| f | on-demand B | on-demand RTT | always-send B | always-send RTT | TCP B | TCP RTT |
+| f | adapt B | adapt RTT | K1 B | K4 B | TCP B | always B |
 |---|---|---|---|---|---|---|
-| 0.00 | 4352 | 0.000 | 5248 | 0.000 | 4352 | 0.000 |
-| 0.01 | 4360 | 0.003 | 5256 | 0.002 | 4385 | 0.008 |
-| 0.10 | 4476 | 0.051 | 5332 | 0.021 | 4725 | 0.091 |
-| 0.50 | 4962 | 0.272 | 5676 | 0.104 | 6380 | 0.495 |
-| 0.80 | 5385 | 0.448 | 6014 | 0.187 | 7649 | 0.805 |
+| 0.00 | 4352 | 0.000 | 4352 | 4352 | 4352 | 5248 |
+| 0.10 | 4553 | 0.101 | 4544 | 4534 | 4848 | 5332 |
+| 0.50 | 5271 | 0.419 | 5363 | 5412 | 6670 | 5711 |
+| 0.80 | 5858 | 0.665 | 5863 | 6098 | 7746 | 5955 |
+
+Adaptive = EWMA channel estimate (fetch outcomes only) driving the
+emitted policy table (K per q-hat bucket; fetch channel alternates
+good/bad 200-frame blocks at 2%/85% loss). Adaptive ties-or-beats
+fixed K=1 everywhere and beats fixed K=4 clearly at high damage
+(6098 -> 5858 bytes at f=0.80: no wasted retries in bad regimes).
+RTT sits between K1 and K4. The table's b/mode columns ride along
+for firmware (sub-RTT scheduling, multi-channel); the sim consumes
+K. Table source: `laplace_latency.py` policy emitter.
 
 Fetch guard (measured improvement over the table's first cut): the
 receiver knows the missing-unit count before fetching, and parity
