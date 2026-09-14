@@ -169,6 +169,22 @@ but three optimizations were run to check where e really governs.
   Cheap retries -> aggressive (small) base; e carries pedigree,
   not victory, under these constants.
 
+## Bursts: occupancy model + use cases
+
+Multi-burst cells (NTR=200, independent random starts): 2xL2 127
+(occupancy predicts 5/8=125), 2xL4 21 (predict 1/8=25), 3xL2 39,
+2xL8 0 (structural: two full coverages = 2 bytes/unit everywhere).
+Burst + 1 unit loss (L4+LO1): 200/200 — structural full (burst
+contributes <=1 byte/unit, losses solve exactly, lost unit absorbs
+burst bytes for free). Sub-wall bursts are phase-invariant by
+construction (contiguous L<=8 always hits distinct units).
+Use cases, mapped: wireless fading/interference (1-2 fades/frame =
+the 2xL2-L4 regime, 60-100% at 0 RTT; interleave is time diversity,
+anti-jam heritage); storage partial-sector defects (sub-sector run
+= burst, whole dead sector = unit loss = parity); stream dropouts
+(audio/video concealment analog: even L=64 keeps 4032/4096 bytes);
+narrow jammer (absorbed; wide jam = SEG = resend, honestly kept).
+
 ## Files / reproduce
 
 - `min/Fasm/Secure/packetbench.c` — wire format + recovery cells.

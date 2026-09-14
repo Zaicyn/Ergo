@@ -183,6 +183,20 @@ static int force_err(const int *lost, int e) {
     }
     return nu;
 }
+/* multi-burst: nb bursts of len L at independent random starts
+ * (union damage; overlapping fades allowed, like real channels) */
+static void dmg_burstN(int nb, int len) {
+    for (int b = 0; b < nb; b++) {
+        int st = (int)(trand() % (FR - len));
+        for (int j = 0; j < len; j++) {
+            int pos = st + j, dv;
+            do {
+                dv = (int)((trand() & 255) + 1) & 255;
+            } while (!dv);
+            fru[pos % 8][pos / 8] ^= (uint8_t)dv;
+        }
+    }
+}
 /* burst confined to one unit (non-interleaved control) */
 static void dmg_burst1(int len) {
     int u = (int)(trand() % NP), st = (int)(trand() % (PL - len));
@@ -303,6 +317,16 @@ int main(void) {
     CELL("BUI", "L=64", restore(); dmg_burst(64); run_ecc(NULL, 0); FINISH());
     CELL("BUI", "L=256", restore(); dmg_burst(256); run_ecc(NULL, 0); FINISH());
     CELL("BU1", "L=64", restore(); dmg_burst1(64); run_ecc(NULL, 0); FINISH());
+    /* multi-burst occupancy: predict 2xL2~60%%, 2xL4~12%%, 2xL8=0 */
+    CELL("B2", "2xL2", restore(); dmg_burstN(2, 2); run_ecc(NULL, 0); FINISH());
+    CELL("B2", "2xL4", restore(); dmg_burstN(2, 4); run_ecc(NULL, 0); FINISH());
+    CELL("B3", "3xL2", restore(); dmg_burstN(3, 2); run_ecc(NULL, 0); FINISH());
+    CELL("B2", "2xL8", restore(); dmg_burstN(2, 8); run_ecc(NULL, 0); FINISH());
+    { int full = 0; long be = 0; int lost[NP];
+      for (int tt = 0; tt < NTR; tt++) {
+          restore(); int nl = dmg_loss(1, lost); dmg_burstN(1, 4);
+          run_ecc(lost, nl); FINISH(); }
+      printf("BL L4+LO1 ecc=%.1f full=%d/200\n", be / 200.0, full); }
     { int full = 0; long be = 0; int lost[NP];
       for (int t = 0; t < NTR; t++) {
           restore(); int nl = dmg_loss(1, lost); run_ecc(lost, nl);
