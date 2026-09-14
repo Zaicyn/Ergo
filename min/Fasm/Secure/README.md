@@ -110,3 +110,117 @@ three detect 2000/2000 multi-byte corruptions — detection is not the
 differentiator at this size. Recommendation: splitmix-stream for the
 integrity hash; keep FNV-1a as the canonical cross-context fallback
 (proposal Trigger 3: CPU/GPU agreement).
+---
+
+# Part II — from frames to the wire (handshake, tiers, codec, transport)
+
+Repair data streams in place instead of resending them. A 4096-byte
+frame travels as 8 packets with enough redundancy to fix random
+damage on arrival — no round trip — and a handshake decides who gets
+to see how much of it.
+
+Status: researched, prototyped, measured, and ported to bare-metal
+FASM with C mirrors. Every claim below has a bench behind it; see
+`TCP_PROMISE.md` for numbers, `AUDIT.md` for everything that broke
+along the way.
+
+## How it works (the whole path in one page)
+
+**Handshake.** Two parties hold a secret each (a 4-byte color plus a
+magnitude lane). A Diffie–Hellman-style exchange over a small group
+produces a shared bond both sides compute independently
+(`rgba_dh.c`, `rgba_hs.asm`). The bond becomes a transient session
+key: it encrypts the frame and signs an 8-byte tag per piece. Wrong
+secret → different bond → garbage plus a failed tag. Verified both
+directions, tamper-tested.
+
+**Tiers.** Trust is not all-or-nothing. The frame's four 1024-byte
+slices unlock progressively: strangers see only the "safe" slice,
+higher trust unlocks more (`tierbench.c`, 4-tier demo in `rgba_hs`).
+More tiers cost essentially nothing (~6 ns each through 64 tested) —
+pick the count by trust granularity, not performance. Four maps
+naturally onto the frame's four channels.
+
+**Codec.** The frame is byte-interleaved across 8×512-byte units
+(unit u holds every 8th byte). Each unit carries four running
+checksums (S0–S3); a gated single-byte solver (SEC) fixes one damaged
+byte per unit or provably refuses. Two extra parity units (P = plain
+XOR, Q = weighted sum over GF(256)) rebuild any one or two *lost*
+units exactly. A keyed commitment over the parities lets a receiver
+trust fetched parity without trusting the sender blindly
+(`pktcodec.asm` / `pktcore.inc`).
+
+**Wire.** Routine transmission is 3×1460-byte segments: 4096 bytes of
+frame + 256 bytes of metadata (128 checksums + 64 parity commitment +
+64 stream tag). Parities wait at the sender and are fetched only when
+damage exceeds what the checksums can fix — the "promise" design
+(`demandbench.c`, `TCP_PROMISE.md`). Recovery order matters: repair
+survivors first, rebuild from clean data, reverify (rebuilding first
+transplants errors into the fresh packet — measured 0/200 → 176/200
+on fixing the order).
+
+**Transport.** `udp_node.asm` and `tcp_node.asm` speak the protocol
+over real loopback sockets from one shared core (`pktcore.inc`, no
+libc, static binaries ~24 KB). Proven by interop: asm↔asm, asm↔C,
+C↔asm, all directions byte-identical verdicts through a
+fault-injecting proxy.
+
+## Measured behavior (not marketing)
+
+| damage | result, 0 RTT |
+|---|---|
+| 1 random byte error | always fixed (200/200) |
+| n spread errors | graceful: n=2 → ~88%, n=8 → ~0% full but ~4091/4096 bytes right |
+| burst ≤ 8 (interleaved) | always fixed (200/200) |
+| burst > 8 | refused, needs resend (cliff, not slope) |
+| 1–2 whole packets lost | rebuilt exactly (200/200) |
+| 1 loss + 2 errors | ~88% full (162–184/200) |
+| whole 1460 B segment eaten | unrecoverable — resend |
+
+On-demand vs always-send-parity vs TCP-resend was simulated across
+damage rates: on-demand wins on bytes at every rate and on round
+trips against TCP everywhere; against always-send it trades a little
+RTT for fewer bytes and one less segment per frame.
+
+## Use cases — pros and cons
+
+**Live streams over lossy links (wireless, sensor feeds, voice/video
+adjacent).** Pro: most damage repairs with no round trip, and partial
+recovery degrades gracefully (a bad burst costs bytes, not the
+frame). Con: damage past the boundary still resends; ~16–28% wire
+overhead depending on layout.
+
+**Cluster interconnect with bursty loss.** Pro: avoids retransmit
+storms for the common small-damage cases. Con: real engineering cost
+vs "TCP already works" — worth it only where tail latency matters.
+
+**Storage with sector defects.** Pro: the damage shapes map exactly —
+partial-sector damage is a burst, a dead sector is a unit loss, and
+each meets its matched defender. Con: needs layout integration; the
+overhead only pays if defects are common enough.
+
+**Hostile or jammed links.** Pro: narrow interference is absorbed as
+bursts (interleaving is time diversity, Cold War-approved). Con: a
+wide jammer just forces resends; and this is resilience, not
+identity — the keyed tags authenticate *within* a bonded session but
+there is no public-key infrastructure here.
+
+**Not for:** bulk reliable transfer where TCP is fine (don't pay
+complexity for nothing), tiny messages (fixed overhead dominates),
+damage beyond two lost units without a resend path, or anyone needing
+formal security proofs (this is measured engineering: 200-trial
+cells, not theorems).
+
+## Files
+
+- `rgba_dh.c`, `rgba_hs.asm/.c` — handshake + disclosure
+- `tierbench.c` — tier scaling, tag choice, disclosure demo
+- `pktcodec.asm/.c`, `pktcore.inc` — codec core + shared include
+- `packetbench.c`, `demandbench.c`, `sockbench.c` — recovery cells,
+  on-demand sim, socket validation
+- `udp_node.asm`, `udp_cpeer.c`, `udp_proxy.c` — UDP shell + peers
+- `tcp_node.asm`, `tcp_cpeer.c`, `tcp_proxy.c` — TCP shell + peers
+- `eulerbench.c` — unit-size optimum, burst e-curve, backoff sweep
+- `TCP_PROMISE.md` — design + full measurement tables
+- `PLAN.md`, `PHASEMAP.md` — campaign plan, tier map
+- `AUDIT.md` — every fixed issue with its commit
