@@ -111,6 +111,23 @@ project) lives outside the tree for now; results above are the
 record. The Meshtastic firmware it replaced can be re-flashed
 anytime via their web flasher.
 
+## Script store + log retrieval (LittleFS, no radio yet)
+
+Follow-up layer on the same board: length-framed file ops
+(`WRITE/APPEND path len` + raw bytes, `CAT` answers `BEGIN n` +
+bytes + `END`), a line-command dispatcher (`RUNSQ4`, `STATUS`),
+results appended to `/s/log.txt` with millis() stamps, driven
+from USB serial by a host script. End-to-end verified: pushed a
+14-byte script, ran it, fetched the 195-byte log — oracle lines
+identical to the direct run (`O1 100096/100096`, same victims,
+`det=3 rep=3 rem=0`, `coh 0/512`; 502.9 ns/item with logging).
+LittleFS reports 16384/1572864 B (room for hundreds of scripts).
+Bring-up notes: subdirectories are not auto-created (`mkdir /s`
+at boot); `rm` of a missing file must answer, not error; host
+must flush framework log spam before each reply. The frames are
+LoRa-ready by design (explicit lengths = chunk grammar); the
+radio transport itself is still to build.
+
 ## Reproduce
 
 ```
