@@ -208,6 +208,20 @@ empty air); startup races (ready-probe ports before sending);
 `restore`/`used`/`LDS` reserved words; post-include segment reset
 (pitfall #16, entry landed in readable).
 
+## TCP shell (`tcp_node.asm`, same core)
+
+`tcp_node.asm` includes `pktcore.inc` untouched — zero UDP bytes in
+the binary and vice versa. Framed streams ([len16][msg]), NODELAY,
+same S/V verdicts. Interop matrix, fixed vectors, byte-identical
+across directions: clean 9/0/0/1, drop=3 8/1/1/1, drop=1,5 7/2/1/1,
+flip 9/0/0/1, all 8 combos green (asm->C, C->asm, asm->asm).
+Bugs the TCP pass caught: sender must ignore SIGPIPE (died silently
+on send-into-closed); test probes must not TCP-connect (a probe
+consumes the one accept and desyncs the matrix — sleep ordering
+instead); uninitialized accept addrlen; serve counter init must sit
+before the listen-select (timeout path printed the socket fd as
+"served=3" — accounting artifact, recovery always correct).
+
 ## Files / reproduce
 
 - `min/Fasm/Secure/packetbench.c` — wire format + recovery cells.
