@@ -447,6 +447,24 @@ FNV-1a stays the cross-context fallback. No allocator changes needed
     `vzeroupper` wiped an entry-loaded `ymm7` three sessions later and
     broke 43 healthy slots while isolated probes passed. Reload per use;
     the loads are ~1cy, the debugging is hours.
+19. **Cross-lane 256-bit ops cost extra on every machine (ISA design,
+    not a bug).** Most AVX2 256-bit ops are two independent 128-bit
+    lanes; anything crossing lanes (`vpermute2f128`, extract/insertf128,
+    some broadcasts, `vgather`, `vpmulld`) pays extra uops and port
+    pressure everywhere — measured 1.38x an in-lane op on Zen 2. The
+    "256-bit slowed down some operations" report is almost always this,
+    not width. Prefer in-lane shuffles; every cross-lane op earns its
+    place via microbench (same rule as #17: audit with silicon, not eye).
+20. **256-bit execution width is a per-machine fact: measure, don't
+    assume.** Zen 1/Excavator (and Sandy Bridge-era Intel for most ops)
+    crack 256-bit AVX into 2x128 halves; Zen 2+ runs it full-width —
+    measured 1.7x for a throughput loop on this Ryzen 5 3600 (20 ms vs
+    11 ms per 200Kx4096 B). Standing rule from this: default 128-bit
+    VEX for latency/complex kernels, 256-bit only where the microbench
+    proves it (sq5 flux/pay_ok, v8 fold earned theirs), and keep a
+    128-bit path measured so Zen 1-era targets aren't stranded. VEX
+    everything regardless — #17's transition penalty is Intel-side but
+    the encoding costs nothing and travels.
 
 ## Pitfalls — methodology (learned the hard way)
 
