@@ -1,18 +1,30 @@
 # BLOBS — binary-object inventory (checkable, not vibes)
 
-Policy: every precompiled object in our binaries is listed here with
-what pulls it in, whether it is needed, and the path to removing it.
-A blob appearing here that no feature needs is a bug. Regenerate with
-the commands at the bottom; do it per release build.
+Policy: the end state is ZERO precompiled objects. Blobs are
+unacceptable and tolerated only where no open path exists yet;
+every entry below is either eliminated, scheduled for elimination
+with a named mechanism, or the single documented exception under
+active replacement. A blob appearing here that no feature needs
+is a bug. Regenerate with the commands at the bottom; do it per
+release build.
 
 Status of 2026-09-15 (`esfnode` skeleton, ESP-IDF 5.5, S3):
+
+## Eliminated
+
+| object | how |
+|---|---|
+| `esp_coex/.../libcoexist.a` (was: 601 objects) | `# CONFIG_ESP_COEX_SW_COEXIST_ENABLE is not set` in `esfnode/sdkconfig.defaults` (+ board-specific copy — PIO prioritizes `sdkconfig.<env>`). Nothing to arbitrate with no WiFi. Rebuilt, relinked, map shows zero references; device boots clean with identical heap/PSRAM numbers. |
+
+Caveat: BT stack not started yet in the skeleton — if NimBLE
+bring-up proves to need coexistence symbols, this row moves back
+with the error attached. Verify at radio_if bring-up, not assumed.
 
 ## Linked into our binary today
 
 | object | members linked | pulled by | needed? | basis / removal |
 |---|---|---|---|---|
-| `esp_coex/.../libcoexist.a` | 601 | BT enabled (auto) | MAYBE NOT | Apache-2.0 framework grant, used unmodified. Attempt removal: disable coexistence (no WiFi in our config to arbitrate) and re-verify link. Open item. |
-| `xtensa/.../libxt_hal.a` | 11 | toolchain HAL | yes (for now) | Compiler/HAL adjacent; open equivalent exists upstream. Watch item, not alarm. |
+| `xtensa/.../libxt_hal.a` | 11 | toolchain HAL | yes (for now) | Compiler/HAL adjacent; open equivalent exists upstream. Next candidate after NimBLE lands. |
 | `libgcc.a` | 212 | compiler runtime | yes | Standard toolchain runtime. |
 
 ## Arriving with next features (declared in advance)

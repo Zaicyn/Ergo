@@ -5,4 +5,7 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=4
+# CONFIG_ESP_COEX_SW_COEXIST_ENABLE is not set
+# (kills libcoexist.a from the link; no WiFi to arbitrate. If a future
+# feature needs coexistence back, this line is the switch.)
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
