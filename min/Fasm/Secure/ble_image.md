@@ -149,6 +149,25 @@ insurance against channel weirdness).
   constraint is per-connection-event airtime, i.e. interval+PHY,
   i.e. items (1–2). Log silencing (`CORE_DEBUG_LEVEL=0`) kept
   (correct hygiene, no measurable gain at these rates).
+- Interval note (external reference + our probe): a published
+  analysis hits ~1400 kbps with 247 B payloads, DLE, 2M PHY, and a
+  400 ms interval — the interval cancels in their math *if* the
+  sender saturates every event (287 packets/event amortizes IFS).
+  We probed flat-400 ms: no GAP completion (ungranted, as above)
+  and slightly worse numbers (27–89 kbps, volatile) — expected if
+  granted, since our sparse test pattern would leave 400 ms of dead
+  air between small bursts. Long intervals reward saturated senders
+  and punish sparse ones; tuning blind to saturation is futile.
+  Restored 15–30 ms request as default. Separate cost to log: long
+  intervals also inflate round-trip latency, which our fetch
+  handshake pays per round — throughput and latency want opposite
+  intervals here, another reason to keep the default until the
+  sender saturates.
+- SDU-size sweep at fixed count (all byte-exact): 100 B at 35 kbps,
+  220 B at 45, 480 B at 49, 512 B at 44. Larger SDUs help modestly
+  (+40% to 480 B) then plateau at the MTU edge — consistent with
+  per-event airtime binding, not per-SDU overhead. 480 B is the
+  working size until parameters move.
 - GATT side note: reads, notifications, discovery, and connect all
   work; GATT *write-request* fails `NotSupported` against this
   stack (flags+permissions set correctly — root cause not chased,
