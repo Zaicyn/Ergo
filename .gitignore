@@ -26,6 +26,8 @@
 !min/**/*.s
 !min/**/*.c
 !min/**/*.h
+!min/**/platformio.ini
+!min/**/sdkconfig.defaults
 min/**/*audit*.txt
 # benchmark/bench_sq4.c — overflow-probe fix tracked (second pass);
 # the rest of benchmark/ stays ignored per whitelist (dir opened
