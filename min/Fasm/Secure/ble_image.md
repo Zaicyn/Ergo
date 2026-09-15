@@ -114,7 +114,31 @@ insurance against channel weirdness).
    rate, compare against the demand-model predictions.
 4. **Reverse + larger:** Heltec→PC, then 720p.
 
-## Tooling to install (not yet)
+## Measured: CoC bring-up (2026-09-15, loopback bench)
+
+- Firmware: NimBLE-Arduino 2.5.1, `NimBLEDevice::createL2CAPServer()`,
+  PSM `0x81`, MTU 512, `COC-SRV-OK` on boot. Requires
+  `-DCONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=4` (default 0 = compiled
+  out — silent, no error). API notes: server callbacks take
+  `(NimBLEServer*, NimBLEConnInfo&[, int])`; never block in
+  `onRead` (it runs in the NimBLE task — a blocking echo deadlocks
+  the stack; count in the callback, report from `loop()`).
+- PC: hci0 (BT 5.1) + BlueZ 5.87. Python stdlib sockets **cannot**
+  open LE CoC (no address-type field — always EHOSTDOWN);
+  `l2test -V le_public -P 129` is the tool (`-V` is mandatory,
+  and `-N` is frame count while `-n` is a *mode* — that typo cost
+  an hour). Python can still drive `l2test`/raw-HCI later; stdlib
+  alone cannot.
+- Results: channel opens first try thereafter; MTU 512 negotiated
+  both ways; **100/100 SDUs delivered (22000 B, zero loss)**;
+  ~35–60 kbps with untouched connection parameters (interval and
+  1M PHY as negotiated — the headroom: 7.5 ms interval + 2M PHY +
+  bigger MTU, expected 200–500 kbps, unmeasured).
+- GATT side note: reads, notifications, discovery, and connect all
+  work; GATT *write-request* fails `NotSupported` against this
+  stack (flags+permissions set correctly — root cause not chased,
+  since CoC supersedes writes in this design; GATT stays for
+  META/discovery only).
 
 - PC: raw L2CAP sockets (`AF_BLUETOOTH`, `SOCK_SEQPACKET`,
   `BTPROTO_L2CAP` — stdlib, no `bleak`; bleak is GATT-only and
