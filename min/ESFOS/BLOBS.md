@@ -20,12 +20,17 @@ Caveat: BT stack not started yet in the skeleton — if NimBLE
 bring-up proves to need coexistence symbols, this row moves back
 with the error attached. Verify at radio_if bring-up, not assumed.
 
-## Linked into our binary today
+## Linked into our binary today (BT active, CoC verified)
 
 | object | members linked | pulled by | needed? | basis / removal |
 |---|---|---|---|---|
-| `xtensa/.../libxt_hal.a` | 11 | toolchain HAL | yes (for now) | Compiler/HAL adjacent; open equivalent exists upstream. Next candidate after NimBLE lands. |
-| `libgcc.a` | 212 | compiler runtime | yes | Standard toolchain runtime. |
+| `bt/controller/.../libbtdm_app.a` | 7242 | NimBLE controller (radio_if bring-up) | **THE documented exception** | Closed; framework grant, used unmodified, drives RF silicon only. Replacement path: nRF+Zephyr coprocessor behind the same `radio_if.h`. |
+| `esp_phy/.../libphy.a`, `libbtbb.a` | 1164 + 101 | RF calibration at BT bring-up | same exception | Same basis; arrived together as predicted, nothing else did. |
+| `xtensa/.../libxt_hal.a` | 11 | toolchain HAL | yes (for now) | Next candidate after radio settles. |
+| `libgcc.a` | 212 | compiler runtime | yes | Standard. |
+
+Still absent (re-verified this build): `libcoexist.a` (stays out —
+BT works without it), all WiFi libs, mesh, OpenThread.
 
 ## Arriving with next features (declared in advance)
 
