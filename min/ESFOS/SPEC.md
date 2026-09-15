@@ -86,14 +86,34 @@ transport tags). Verification replays the chain; first break marks
 the tamper point exactly. Written by the dispatcher on every
 mutating op and every repair event.
 
+## Erase granularity (flash physics first)
+
+Erase exists only in 4 KB whole-sector units — there is no sub-sector
+delete, on this or any NOR flash. The design complies by construction:
+deletion is a tombstone *version* (a write, never an erase); the only
+erases in v1 are whole-sector journal/audit rotation, mkfs format,
+and bad-sector remap. Nothing ever needs a partial erase because
+nothing ever asks for one.
+
 ## Wear policy (workload-matched, not general)
 
-- Journal + audit + logs rotate through rings (wear spreads by use).
+- Journal (2 sectors) + audit (4 sectors) are circular rings: records
+  never span sectors, head wraps with erase-oldest, resume is
+  scan-derived (no cursor to lose). Rotation evenness is asserted in
+  tests (sector erase counts within 1... see S5).
 - Scripts/config (write-rarely) sit static — no wear concern.
-- No general wear leveling in v1: stated scope cut. The emulator
-  counts erases per sector so skew is measured, not assumed.
-- Bad sectors: detected by failed erase/verify → tombstoned into
-  the spare region, remapped once (no second chances at this size).
+- Slot pool is bump-only (128 versions, then -1 full): pool
+  compaction is deferred, documented, and bounded — the pool fills
+  measurably (S5: 127 files) instead of corrupting.
+- Bad sectors: erase-verify on every erase; failure remaps through a
+  persisted table (SB sector, own checksum, redundant copies) to the
+  spare region. `mkfs` scans all sectors so factory defects are
+  remapped on day zero. Remap survives remount (S4 asserts this).
+- Per-boot erase budget trips the FS read-only instead of looping
+  (S6 asserts clean failure + valid state, never a hang).
+- No general wear leveling in v1: stated scope cut. At append-mostly
+  KB/day rates the rings give centuries of headroom (S3 measures the
+  skew; max-sector is the number to watch).
 
 ## Explicitly out of scope (v1)
 

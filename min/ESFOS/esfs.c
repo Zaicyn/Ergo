@@ -48,6 +48,15 @@ static uint8_t flash[NSEC][SECB];
 static long erases[NSEC];
 static long long cut_at = -1;
 static int crashed;
+static int bad_sec = -1;     /* fault hook: sector behaves failed (-1 off) */
+static long erase_budget = 1000000; /* per-boot erase rate limiter */
+/* remap: logical sector -> physical (identity unless remapped). The
+ * table persists in the SB sector (after sb_t) because forgetting a
+ * remap across reboot would reuse a bad sector. */
+static int phys_sec[NSEC];
+#define REMAP_MAX 8
+static int remap_bad[REMAP_MAX], remap_sp[REMAP_MAX], remap_n;
+static int spare_next;
 
 /* ---------- splitmix64 ---------- */
 static uint64_t sm64(uint64_t *s) {
@@ -79,26 +88,141 @@ static int cut_tick(void) {
     }
     return 0;
 }
+static int phys(int sec) { return phys_sec[sec]; }
 static int fl_write(uint32_t off, const uint8_t *p, size_t len) {
+    int sec = (int)(off >> 12);
+    if (sec == bad_sec)
+        return -2;
+    uint32_t po = ((uint32_t)phys(sec) << 12) | (off & 4095);
     for (size_t i = 0; i < len; i++) {
-        uint8_t old = ((uint8_t *)flash)[off + i];
+        uint8_t old = ((uint8_t *)flash)[po + i];
         if ((old & p[i]) != p[i])
             return -2;
-        ((uint8_t *)flash)[off + i] = old & p[i];
+        ((uint8_t *)flash)[po + i] = old & p[i];
     }
     if (cut_tick())
         return -1;
     return 0;
 }
+/* remap table persists in the SB sector (after sb_t, own checksum):
+ * forgetting a remap across reboot would reuse a bad sector. */
+static uint64_t rmap_sum_body(const uint8_t *b) {
+    return hash_bytes(b, 8 + REMAP_MAX * 4, 0x52454D415052454Dull) ^ b[0];
+}
+static void rmap_save(void) {
+    /* Rewrite both SB copies read-modify-erase-write (a cut mid-copy
+     * tears at most one copy; the other stays valid -- that is what
+     * the redundancy is for). */
+    static uint8_t secbuf[SECB];
+    uint8_t b[8 + REMAP_MAX * 4 + 8];
+    memset(b, 0, sizeof b); /* no uninitialized bytes under checksum */
+    /* layout: count u32 [0..4), reserved [4..8), pairs [8..40),
+     * checksum [40..48). (An earlier rev put pairs at [4..36) while
+     * everything else assumed [8..40): checksum overwrote pair[7]
+     * and load read 4 bytes off. Named offsets now.) */
+    b[0] = (uint8_t)remap_n;
+    for (int i = 0; i < REMAP_MAX; i++) {
+        b[8 + i * 4 + 0] = (uint8_t)(remap_bad[i] & 255);
+        b[8 + i * 4 + 1] = (uint8_t)((remap_bad[i] >> 8) & 255);
+        b[8 + i * 4 + 2] = (uint8_t)(remap_sp[i] & 255);
+        b[8 + i * 4 + 3] = (uint8_t)((remap_sp[i] >> 8) & 255);
+    }
+    uint64_t c = rmap_sum_body(b);
+    for (int i = 0; i < 8; i++)
+        b[8 + REMAP_MAX * 4 + i] = (uint8_t)((c >> (8 * i)) & 255);
+    for (int copy = 0; copy < 2; copy++) {
+        int sec = copy ? SB1 : SB0;
+        memcpy(secbuf, (uint8_t *)flash + sec * SECB, SECB);
+        memcpy(secbuf + 64, b, sizeof b);
+        memset(flash[sec], 0xFF, SECB);
+        erases[sec]++;
+        if (cut_tick())
+            return;
+        for (int o = 0; o < SECB; o += 512) {
+            size_t n = SECB - o > 512 ? 512 : (size_t)(SECB - o);
+            if (fl_write((uint32_t)sec * SECB + (uint32_t)o,
+                         secbuf + o, n))
+                return;
+        }
+    }
+}
+/* add a remap unless already mapped (idempotent: replay-safe) */
+static int rmap_add(int sec, int sp) {
+    for (int i = 0; i < remap_n; i++)
+        if (remap_bad[i] == sec)
+            return 0;
+    if (remap_n >= REMAP_MAX)
+        return -1;
+    remap_bad[remap_n] = sec;
+    remap_sp[remap_n] = sp;
+    remap_n++;
+    phys_sec[sec] = sp;
+    return 0;
+}
+static int rmap_load(void) {
+    for (int copy = 0; copy < 2; copy++) {
+        uint8_t b[8 + REMAP_MAX * 4 + 8];
+        int sec = copy ? SB1 : SB0;
+        memcpy(b, (uint8_t *)flash + sec * SECB + 64, sizeof b);
+        uint64_t c = 0;
+        for (int i = 0; i < 8; i++)
+            c |= (uint64_t)b[8 + REMAP_MAX * 4 + i] << (8 * i);
+        if (rmap_sum_body(b) != c)
+            continue;
+        remap_n = b[0];
+        if (remap_n < 0 || remap_n > REMAP_MAX)
+            continue;
+        for (int i = 0; i < REMAP_MAX; i++) {
+            remap_bad[i] = b[8 + i * 4] | (b[8 + i * 4 + 1] << 8);
+            remap_sp[i] = b[8 + i * 4 + 2] | (b[8 + i * 4 + 3] << 8);
+        }
+        for (int s = 0; s < NSEC; s++)
+            phys_sec[s] = s;
+        for (int i = 0; i < remap_n; i++)
+            phys_sec[remap_bad[i]] = remap_sp[i];
+        return 0;
+    }
+    return -1;
+}
 static int fl_erase(int sec) {
-    memset(flash[sec], 0xFF, SECB);
-    erases[sec]++;
+    if (erase_budget-- <= 0)
+        return -1; /* read-only trip: budget exhausted, state valid */
+    int ps = phys(sec);
+    if (ps == bad_sec || sec == bad_sec) {
+        int sp = spare_next++;
+        if (sp >= NSEC)
+            return -1;
+        memset(flash[sp], 0xFF, SECB);
+        erases[sp]++;
+        if (rmap_add(sec, sp))
+            return -1;
+        rmap_save();
+        if (cut_tick())
+            return -1;
+        return 0;
+    }
+    memset(flash[ps], 0xFF, SECB);
+    erases[ps]++;
+    for (int i = 0; i < SECB; i++)
+        if (flash[ps][i] != 0xFF) {
+            int sp = spare_next++;
+            if (sp >= NSEC)
+                return -1;
+            memset(flash[sp], 0xFF, SECB);
+            erases[sp]++;
+            if (rmap_add(sec, sp))
+                return -1;
+            rmap_save();
+            break;
+        }
     if (cut_tick())
         return -1;
     return 0;
 }
 static void fl_read(uint32_t off, uint8_t *p, size_t len) {
-    memcpy(p, (uint8_t *)flash + off, len);
+    int sec = (int)(off >> 12);
+    uint32_t po = ((uint32_t)phys(sec) << 12) | (off & 4095);
+    memcpy(p, (uint8_t *)flash + po, len);
 }
 
 /* ---------- superblock ---------- */
@@ -220,10 +344,27 @@ static int slot_alloc(void) {
     return -1;
 }
 
-/* ---------- journal ---------- */
+/* ---------- journal (circular, 2 sectors) ----------
+ * Records never span sectors: if one doesn't fit the remainder, the
+ * head pads to the next sector start (0xFF pad, scan skips it). Wrap
+ * erases the OTHER sector (tail). Safe at any point: erasing kills
+ * only committed history (slots carry applied truth) or void
+ * uncommitted intents (replay ignores them); the current op's own
+ * records always live at head. Uncommitted-intent erasure can only
+ * strand its own commit, which replay also ignores. */
 static uint32_t jrn_head, jrn_seq;
+static long jrn_wraps;
 static uint32_t jrn_base(void) { return (uint32_t)JRN0 * SECB; }
 static uint32_t jrn_size(void) { return JRN_SECTORS * SECB; }
+/* sector has any content (records always start at sector start) */
+static int sec_used(int base_sec, int idx) {
+    uint8_t h[8];
+    fl_read((uint32_t)(base_sec + idx) * SECB, h, 8);
+    for (int i = 0; i < 8; i++)
+        if (h[i] != 0xFF)
+            return 1;
+    return 0;
+}
 static int jrn_append(uint8_t op, int slot, const uint8_t *pl,
                       uint16_t len) {
     uint8_t hdr[8];
@@ -250,8 +391,27 @@ static int jrn_append(uint8_t op, int slot, const uint8_t *pl,
         tail[4 + i] = (uint8_t)((s1 >> (8 * i)) & 255);
     }
     uint32_t need = 8u + len + 8u;
-    if (jrn_head + need > jrn_size())
-        return -3;
+    if (need > SECB)
+        return -3; /* record bigger than a sector: v1 limit */
+    if (jrn_head >= jrn_size()) {
+        /* exact-fill edge: head past the end; oldest sector (0) holds
+         * only committed-or-void history by the ring argument */
+        if (sec_used(JRN0, 0) && fl_erase(JRN0))
+            return -1;
+        jrn_head = 0;
+    }
+    uint32_t sec_end =
+        ((jrn_head / SECB) + 1) * SECB; /* end of head's sector */
+    if (jrn_head + need > sec_end) {
+        /* wrap: erase the other sector (tail: committed-or-void only),
+         * jump head to its start. Skip the erase if already erased
+         * (common right after a previous wrap). */
+        int other = (jrn_head / SECB == 0) ? 1 : 0;
+        if (sec_used(JRN0, other) && fl_erase(JRN0 + other))
+            return -1;
+        jrn_wraps++;
+        jrn_head = (uint32_t)other * SECB;
+    }
     uint32_t off = jrn_base() + jrn_head;
     if (fl_write(off, hdr, 8))
         return -1;
@@ -263,7 +423,11 @@ static int jrn_append(uint8_t op, int slot, const uint8_t *pl,
     jrn_seq++;
     return 0;
 }
-/* verify one record at off; returns total length or 0 end / -1 bad */
+/* per-sector walk: parse records from sector start, stop at first
+ * invalid (erased pad, torn tail, or sector end). Fills seqs/ends
+ * arrays, returns count. Records never span sectors by construction.
+ * verify one record at absolute region off; returns total length,
+ * 0 clean-end, -1 invalid. */
 static int jrn_check(uint32_t off, uint32_t *len_out) {
     uint8_t hdr[8];
     fl_read(jrn_base() + off, hdr, 8);
@@ -276,8 +440,9 @@ static int jrn_check(uint32_t off, uint32_t *len_out) {
     if (erased)
         return 0;
     uint16_t len = (uint16_t)(hdr[6] | (hdr[7] << 8));
-    if (off + 16u + len > jrn_size())
-        return -1; /* torn tail */
+    uint32_t sec_end = ((off / SECB) + 1) * SECB; /* region-relative */
+    if (off + 16u + len > sec_end)
+        return -1; /* torn tail or sector crosser (never written) */
     static uint8_t tmp[512];
     uint8_t tail[8];
     if (len > sizeof tmp)
@@ -312,25 +477,59 @@ static int jrn_check(uint32_t off, uint32_t *len_out) {
     *len_out = len;
     return (int)(16u + len);
 }
-/* replay: count intents; uncommitted ones ignored (staged bytes were
- * fresh, never linked). Stops at first invalid (torn tail). */
+/* replay over merged seq order from all sectors: count intents;
+ * uncommitted ones ignored (staged bytes were fresh, never linked).
+ * Stops per sector at first invalid (torn tail / pad). */
 static int jrn_replay(void) {
-    uint32_t off = 0;
     int intents = 0;
-    for (;;) {
-        uint32_t len = 0;
-        int r = jrn_check(off, &len);
-        if (r == 0)
-            break; /* clean end */
-        if (r < 0)
-            break; /* torn tail: stop, ignore rest */
-        uint8_t op;
-        fl_read(jrn_base() + off + 4, &op, 1);
-        if (op == 1)
-            intents++;
-        off += (uint32_t)r;
+    for (int s = 0; s < JRN_SECTORS; s++) {
+        uint32_t off = (uint32_t)s * SECB;
+        for (;;) {
+            uint32_t len = 0;
+            int r = jrn_check(off, &len);
+            if (r <= 0)
+                break;
+            uint8_t op;
+            fl_read(jrn_base() + off + 4, &op, 1);
+            if (op == 1)
+                intents++;
+            off += (uint32_t)r;
+        }
     }
     return intents;
+}
+/* scan-derive head/seq at mount: end past the max-seq valid record,
+ * seq one above it. Survives wraps with no persisted cursor. */
+static void jrn_scan(void) {
+    uint32_t maxseq = 0, maxend = 0;
+    int found = 0;
+    for (int s = 0; s < JRN_SECTORS; s++) {
+        uint32_t off = (uint32_t)s * SECB;
+        for (;;) {
+            uint32_t len = 0;
+            int r = jrn_check(off, &len);
+            if (r <= 0)
+                break;
+            uint8_t hdr[8];
+            fl_read(jrn_base() + off, hdr, 8);
+            uint32_t seq =
+                hdr[0] | ((uint32_t)hdr[1] << 8) |
+                ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
+            if (!found || seq > maxseq) {
+                maxseq = seq;
+                maxend = off + (uint32_t)r;
+                found = 1;
+            }
+            off += (uint32_t)r;
+        }
+    }
+    if (found) {
+        jrn_head = maxend;
+        jrn_seq = maxseq + 1;
+    } else {
+        jrn_head = 0;
+        jrn_seq = 1;
+    }
 }
 
 /* ---------- audit chain ---------- */
@@ -350,8 +549,26 @@ static int audit_append(const uint8_t *pl, uint16_t len) {
     hdr[13] = (uint8_t)(len >> 8);
     hdr[14] = hdr[15] = 0;
     uint32_t need = 16u + len;
-    if (aud_head + need > aud_size())
-        return -3;
+    if (need > SECB)
+        return -3; /* bigger than a sector: v1 limit */
+    if (aud_head >= aud_size()) {
+        if (sec_used(AUD0, 0) && fl_erase(AUD0))
+            return -1;
+        aud_head = 0;
+    }
+    uint32_t sec_end = ((aud_head / SECB) + 1) * SECB;
+    if (aud_head + need > sec_end) {
+        int other = (aud_head / SECB == 0) ? 1 : 0;
+        /* audit has 4 sectors: erase oldest (tail). With 4 sectors the
+         * tail is (head_sector + 1) % 4 only if full; v1 rule: erase
+         * the sector AFTER head's (ring order), which always holds
+         * the oldest committed-or-void history. */
+        int tail = ((int)(aud_head / SECB) + 1) % AUD_SECTORS;
+        (void)other;
+        if (sec_used(AUD0, tail) && fl_erase(AUD0 + tail))
+            return -1;
+        aud_head = (uint32_t)tail * SECB;
+    }
     uint32_t off = aud_base() + aud_head;
     if (fl_write(off, hdr, 16))
         return -1;
@@ -362,93 +579,157 @@ static int audit_append(const uint8_t *pl, uint16_t len) {
     aud_seq++;
     return 0;
 }
-/* verify chain; torn tail (non-erased garbage at end) truncates:
- * walk records, stop at first invalid ONLY if the rest is erased,
- * else corruption. Returns records verified or negative. */
+/* verify chain over merged seq order from all sectors. The FIRST
+ * retained record's prev points into erased (rotated) history, so its
+ * prev-check is exempt by design (anchor lost to rotation, stated);
+ * every later link must close. Returns records verified or negative
+ * (a broken interior link = corruption, never a tear: tears only
+ * exist at a window end, and wrapped windows end at erased space). */
 static int audit_verify(void) {
-    uint32_t off = 0, expect = 0, n = 0;
-    uint64_t prev = 0;
-    for (;;) {
-        uint8_t hdr[16];
-        if (off + 16 > aud_size())
-            break;
-        fl_read(aud_base() + off, hdr, 16);
-        int erased = 1;
-        for (int i = 0; i < 16; i++)
-            if (hdr[i] != 0xFF) {
-                erased = 0;
+    /* collect valid records: (seq, off) with bounds+checksum valid */
+    static uint32_t rseq[2048];
+    static uint32_t roff[2048];
+    int nr = 0;
+    for (int s = 0; s < AUD_SECTORS; s++) {
+        uint32_t off = (uint32_t)s * SECB;
+        uint32_t send = off + SECB;
+        for (;;) {
+            uint8_t hdr[16];
+            if (off + 16 > send)
                 break;
-            }
-        if (erased)
-            break;
-        uint32_t seq =
-            hdr[0] | ((uint32_t)hdr[1] << 8) | ((uint32_t)hdr[2] << 16) |
-            ((uint32_t)hdr[3] << 24);
-        uint16_t len = (uint16_t)(hdr[12] | (hdr[13] << 8));
-        static uint8_t tmp[512];
-        int ok = 1;
-        if (seq != expect)
-            ok = 0;
-        else if (len > sizeof tmp)
-            ok = 0;
-        else {
-            if (len)
-                fl_read(aud_base() + off + 16, tmp, len);
-            uint64_t h =
-                hash_bytes(tmp, len, prev ^ 0x4155444954415544ull);
-            uint64_t got = 0;
-            for (int i = 0; i < 8; i++)
-                got |= (uint64_t)hdr[4 + i] << (8 * i);
-            if (h != got)
-                ok = 0;
-            else {
-                prev = h;
-                expect++;
-                n++;
-            }
-        }
-        if (!ok) {
-            /* torn tail (rest erased) is fine; else corruption */
-            uint32_t ro = off;
-            int rest_erased = 1;
-            uint8_t b;
-            while (ro < aud_base() + aud_size()) {
-                fl_read(ro, &b, 1);
-                if (b != 0xFF) {
-                    /* allow the failed record's own bytes: skip one
-                     * record-length window then require erased */
+            fl_read(aud_base() + off, hdr, 16);
+            int e = 1;
+            for (int i = 0; i < 16; i++)
+                if (hdr[i] != 0xFF) {
+                    e = 0;
                     break;
                 }
-                ro++;
-            }
-            /* crude but sound for v1: any invalid record ends the
-             * verified prefix; corruption vs tear distinguished by
-             * whether a LATER valid record exists (scan ahead) */
-            uint32_t ahead = off + 16u + len;
-            int later_valid = 0;
-            while (ahead + 16 <= aud_size()) {
-                uint8_t h2[16];
-                fl_read(aud_base() + ahead, h2, 16);
-                int e2 = 1;
-                for (int i = 0; i < 16; i++)
-                    if (h2[i] != 0xFF) {
-                        e2 = 0;
-                        break;
-                    }
-                if (e2)
-                    break;
-                later_valid = 1;
+            if (e)
                 break;
+            uint32_t seq =
+                hdr[0] | ((uint32_t)hdr[1] << 8) |
+                ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
+            uint16_t len = (uint16_t)(hdr[12] | (hdr[13] << 8));
+            if (len > 512 || off + 16u + len > send)
+                break; /* torn/pad: sector done */
+            /* NOTE: audit records have no checksum tail (unlike
+             * journal records): collection ends at erased headers
+             * and bounds only. A torn tail parses as a garbage
+             * record at worst; the verify phase below treats a
+             * link failure at the LAST position as truncation. */
+            if (nr < 2048) {
+                rseq[nr] = seq;
+                roff[nr] = off;
+                nr++;
             }
-            (void)rest_erased;
-            (void)ro;
-            if (later_valid)
-                return -30 - (int)n;
-            break; /* torn tail: prefix verifies */
+            off += 16u + len;
         }
-        off += 16u + len;
     }
-    return (int)n;
+    /* order by seq (insertion: tiny n) and verify links */
+    for (int i = 1; i < nr; i++) {
+        uint32_t qs = rseq[i], qo = roff[i];
+        int j = i - 1;
+        while (j >= 0 && rseq[j] > qs) {
+            rseq[j + 1] = rseq[j];
+            roff[j + 1] = roff[j];
+            j--;
+        }
+        rseq[j + 1] = qs;
+        roff[j + 1] = qo;
+    }
+    int n = 0;
+    uint64_t prev = 0;
+    int have_prev = 0;
+    static uint8_t tmp[512];
+    for (int i = 0; i < nr; i++) {
+        uint8_t hdr[16];
+        fl_read(aud_base() + roff[i], hdr, 16);
+        uint16_t len = (uint16_t)(hdr[12] | (hdr[13] << 8));
+        if (len)
+            fl_read(aud_base() + roff[i] + 16, tmp, len);
+        if (!have_prev) {
+            /* window head: recompute hash forward but exempt the
+             * prev-link (anchor rotated away) */
+            uint64_t h =
+                hash_bytes(tmp, len, prev ^ 0x4155444954415544ull);
+            (void)h;
+            prev = 0; /* re-anchor below from stored value */
+            uint64_t got = 0;
+            for (int k = 0; k < 8; k++)
+                got |= (uint64_t)hdr[4 + k] << (8 * k);
+            /* stored hash must equal hash over (payload, prev=?) --
+             * unknowable; instead adopt it as the new anchor after
+             * checking the rest of the chain closes from here */
+            prev = got;
+            have_prev = 1;
+            n++;
+            continue;
+        }
+        uint64_t h = hash_bytes(tmp, len, prev ^ 0x4155444954415544ull);
+        uint64_t got = 0;
+        for (int k = 0; k < 8; k++)
+            got |= (uint64_t)hdr[4 + k] << (8 * k);
+        if (h != got) {
+            /* link failure at the LAST collected record = torn tail
+             * (partial write): truncate, prefix verifies. Anywhere
+             * else = corruption (tears only exist at window ends). */
+            if (i == nr - 1)
+                break;
+            return -30 - n;
+        }
+        prev = h;
+        n++;
+    }
+    return n;
+}
+/* scan-derive resume: head past max-seq record end, seq/hash after it */
+static void aud_scan(void) {
+    uint32_t maxseq = 0, maxend = 0;
+    uint64_t maxh = 0;
+    int found = 0;
+    for (int s = 0; s < AUD_SECTORS; s++) {
+        uint32_t off = (uint32_t)s * SECB;
+        uint32_t send = off + SECB;
+        for (;;) {
+            uint8_t hdr[16];
+            if (off + 16 > send)
+                break;
+            fl_read(aud_base() + off, hdr, 16);
+            int e = 1;
+            for (int i = 0; i < 16; i++)
+                if (hdr[i] != 0xFF) {
+                    e = 0;
+                    break;
+                }
+            if (e)
+                break;
+            uint32_t seq =
+                hdr[0] | ((uint32_t)hdr[1] << 8) |
+                ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
+            uint16_t len = (uint16_t)(hdr[12] | (hdr[13] << 8));
+            if (off + 16u + len > send)
+                break;
+            uint64_t h = 0;
+            for (int k = 0; k < 8; k++)
+                h |= (uint64_t)hdr[4 + k] << (8 * k);
+            if (!found || seq > maxseq) {
+                maxseq = seq;
+                maxend = off + 16u + len;
+                maxh = h;
+                found = 1;
+            }
+            off += 16u + len;
+        }
+    }
+    if (found) {
+        aud_head = maxend;
+        aud_seq = maxseq + 1;
+        aud_prev = maxh;
+    } else {
+        aud_head = 0;
+        aud_seq = 0;
+        aud_prev = 0;
+    }
 }
 
 /* ---------- data bump allocator ---------- */
@@ -619,7 +900,12 @@ static void esfs_mkfs(void) {
     for (int s = 0; s < NSEC; s++)
         erases[s] = 0;
     for (int s = 0; s < NSEC; s++)
-        fl_erase(s); /* counted wear; v1 erases nowhere else (bump-only) */
+        phys_sec[s] = s;
+    remap_n = 0;
+    spare_next = SPARE0;
+    for (int s = 0; s < NSEC; s++)
+        if (fl_erase(s))
+            break; /* bad sectors remapped here via fault hook path */
     crashed = 0;
     cut_at = -1;
     sb_t sb;
@@ -637,6 +923,7 @@ static void esfs_mkfs(void) {
     sb_write(SB1, &sb);
     jrn_head = 0;
     jrn_seq = 1;
+    jrn_wraps = 0;
     aud_head = 0;
     aud_prev = 0;
     aud_seq = 0;
@@ -645,6 +932,18 @@ static void esfs_mkfs(void) {
     slot_scan();
 }
 static int esfs_mount(void) {
+    if (rmap_load()) {
+        for (int s = 0; s < NSEC; s++)
+            phys_sec[s] = s;
+        remap_n = 0;
+        spare_next = SPARE0;
+    } else {
+        int mxsp = SPARE0;
+        for (int i = 0; i < remap_n; i++)
+            if (remap_sp[i] >= mxsp)
+                mxsp = remap_sp[i] + 1;
+        spare_next = mxsp;
+    }
     sb_t a, b;
     int oka = sb_read(SB0, &a), okb = sb_read(SB1, &b);
     if (oka && okb)
@@ -652,65 +951,10 @@ static int esfs_mount(void) {
     if (slot_scan() < 0)
         return -1;
     jrn_replay();
-    jrn_head = 0;
-    for (;;) {
-        uint8_t h[8];
-        if (jrn_head + 8 > jrn_size())
-            break;
-        fl_read(jrn_base() + jrn_head, h, 8);
-        int e = 1;
-        for (int i = 0; i < 8; i++)
-            if (h[i] != 0xFF) {
-                e = 0;
-                break;
-            }
-        if (e)
-            break;
-        uint16_t len = (uint16_t)(h[6] | (h[7] << 8));
-        jrn_head += 16u + len;
-    }
-    /* audit resume: last valid seq/hash (torn tail truncated) */
-    {
-        uint32_t off = 0, expect = 0;
-        uint64_t prev = 0;
-        for (;;) {
-            uint8_t h[16];
-            if (off + 16 > aud_size())
-                break;
-            fl_read(aud_base() + off, h, 16);
-            int e = 1;
-            for (int i = 0; i < 16; i++)
-                if (h[i] != 0xFF) {
-                    e = 0;
-                    break;
-                }
-            if (e)
-                break;
-            uint32_t seq =
-                h[0] | ((uint32_t)h[1] << 8) | ((uint32_t)h[2] << 16) |
-                ((uint32_t)h[3] << 24);
-            uint16_t len = (uint16_t)(h[12] | (h[13] << 8));
-            static uint8_t tmp[512];
-            if (seq != expect || len > sizeof tmp)
-                break;
-            if (len)
-                fl_read(aud_base() + off + 16, tmp, len);
-            uint64_t hh =
-                hash_bytes(tmp, len, prev ^ 0x4155444954415544ull);
-            uint64_t got = 0;
-            for (int i = 0; i < 8; i++)
-                got |= (uint64_t)h[4 + i] << (8 * i);
-            if (hh != got)
-                break;
-            prev = hh;
-            expect++;
-            off += 16u + len;
-        }
-        aud_head = off;
-        aud_prev = prev;
-        aud_seq = expect;
-        op_seq = expect + 1;
-    }
+    jrn_scan(); /* scan-derive head/seq (wrap-aware; no cursor kept) */
+    /* audit resume: scan-derive (wrap-aware); op_seq follows audit */
+    aud_scan();
+    op_seq = aud_seq + 1;
     {
         uint32_t mx = DATA0;
         for (int si = 1; si < NSLOT; si++) {
@@ -864,6 +1108,108 @@ static void script_S3(void) {
     CHECK(mx < 100000, "S3 endurance headroom");
     CHECK(esfs_mount() == 0 && slot_scan() == 0, "S3 valid after load");
 }
+/* S4: bad-sector remap (fault hook on a data sector) */
+static void script_S4(void) {
+    bad_sec = DATA0 + 5;
+    esfs_mkfs();
+    CHECK(remap_n >= 1, "S4 sector remapped at mkfs");
+    CHECK(esfs_mount() == 0, "S4 mount with remap");
+    size_t got = 0;
+    fill_pat(wbuf, 6000, 9);
+    CHECK(esfs_write("d.bin", wbuf, 6000) == 0, "S4 write across remap");
+    fill_pat(wbuf, 6000, 9);
+    CHECK(esfs_read("d.bin", rbuf, sizeof rbuf, &got) == 0 &&
+              got == 6000 && !memcmp(rbuf, wbuf, 6000),
+          "S4 read exact via spare");
+    /* remap persists across remount */
+    CHECK(esfs_mount() == 0, "S4 remount");
+    CHECK(remap_n >= 1, "S4 remap table reloaded");
+    fill_pat(wbuf, 6000, 9);
+    CHECK(esfs_read("d.bin", rbuf, sizeof rbuf, &got) == 0 &&
+              got == 6000 && !memcmp(rbuf, wbuf, 6000),
+          "S4 read exact after remount");
+    bad_sec = -1;
+}
+/* S5: wrap cycling + pool-full boundary */
+static void script_S5(void) {
+    esfs_mkfs();
+    CHECK(esfs_mount() == 0, "S5 mount");
+    /* 120 distinct small writes: ~1 journal wrap, pool stays < 128 */
+    for (int i = 0; i < 120; i++) {
+        char nm[16];
+        snprintf(nm, sizeof nm, "q%03d", i);
+        fill_pat(wbuf, 50, (unsigned)i);
+        if (esfs_write(nm, wbuf, 50))
+            break;
+    }
+    printf("S5 journal wraps=%ld\n", jrn_wraps);
+    CHECK(jrn_wraps >= 1, "S5 journal wrapped");
+    long e0 = erases[JRN0], e1 = erases[JRN0 + 1];
+    long d = e0 > e1 ? e0 - e1 : e1 - e0;
+    printf("S5 journal sector erases: %ld %ld\n", e0, e1);
+    CHECK(d <= 2, "S5 rotation even");
+    CHECK(esfs_mount() == 0 && slot_scan() == 0, "S5 valid after wraps");
+    CHECK(audit_verify() >= 0, "S5 audit verifies post-wrap");
+    /* audit wrap directly (no pool involvement): 600 records */
+    for (int i = 0; i < 600; i++) {
+        char m[16];
+        snprintf(m, sizeof m, "a%03d", i);
+        if (audit_append((uint8_t *)m, 5))
+            break;
+    }
+    CHECK(audit_verify() >= 0, "S5 audit verifies post-rotation");
+    {
+        long m0 = erases[AUD0], m1 = erases[AUD0 + 1];
+        long m2 = erases[AUD0 + 2], m3 = erases[AUD0 + 3];
+        long mn = m0, mx = m0;
+        long vs[4] = { m0, m1, m2, m3 };
+        for (int i = 0; i < 4; i++) {
+            if (vs[i] < mn)
+                mn = vs[i];
+            if (vs[i] > mx)
+                mx = vs[i];
+        }
+        printf("S5 audit sector erases: %ld %ld %ld %ld\n", m0, m1, m2,
+               m3);
+        CHECK(mx - mn <= 2, "S5 audit rotation even");
+    }
+    /* pool-full boundary: distinct files until -1, state stays valid */
+    esfs_mkfs();
+    CHECK(esfs_mount() == 0, "S5 remount");
+    int made = 0, hitfull = 0;
+    for (int i = 0; i < 300; i++) {
+        char nm[16];
+        snprintf(nm, sizeof nm, "z%03d", i);
+        fill_pat(wbuf, 10, (unsigned)i);
+        if (esfs_write(nm, wbuf, 10)) {
+            hitfull = 1;
+            break;
+        }
+        made++;
+    }
+    printf("S5 pool: %d files then full=%d\n", made, hitfull);
+    CHECK(hitfull, "S5 pool-full returns -1 (documented v1 limit)");
+    CHECK(esfs_mount() == 0 && slot_scan() == 0, "S5 valid at pool-full");
+}
+/* S6: erase budget trip -> clean read-only failure, state valid */
+static void script_S6(void) {
+    esfs_mkfs();
+    CHECK(esfs_mount() == 0, "S6 mount");
+    erase_budget = 4;
+    int failed = 0;
+    for (int i = 0; i < 150; i++) {
+        char nm[16];
+        snprintf(nm, sizeof nm, "b%03d", i);
+        fill_pat(wbuf, 200, (unsigned)i);
+        if (esfs_write(nm, wbuf, 200))
+            failed++;
+    }
+    printf("S6 ops failed cleanly: %d/150\n", failed);
+    CHECK(failed > 0, "S6 budget trips (no infinite erase loop)");
+    erase_budget = 1000000;
+    CHECK(esfs_mount() == 0 && slot_scan() == 0, "S6 valid after trip");
+    CHECK(audit_verify() >= 0, "S6 audit verifies after trip");
+}
 
 int main(void) {
     esfs_mkfs();
@@ -871,6 +1217,9 @@ int main(void) {
     script_S1();
     script_S2();
     script_S3();
+    script_S4();
+    script_S5();
+    script_S6();
     printf(fails ? "RESULT: %d FAILURES\n" : "RESULT: ALL PASS\n",
            fails);
     return fails != 0;
