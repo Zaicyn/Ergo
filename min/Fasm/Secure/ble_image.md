@@ -131,9 +131,24 @@ insurance against channel weirdness).
   alone cannot.
 - Results: channel opens first try thereafter; MTU 512 negotiated
   both ways; **100/100 SDUs delivered (22000 B, zero loss)**;
-  ~35–60 kbps with untouched connection parameters (interval and
-  1M PHY as negotiated — the headroom: 7.5 ms interval + 2M PHY +
-  bigger MTU, expected 200–500 kbps, unmeasured).
+  ~35–60 kbps with untouched connection parameters.
+- Tuning round (measured, no gain): peripheral requested 2M/2M PHY,
+  251-octet data length, 15–30 ms interval — all calls returned 0
+  (HCI accepted locally) but **no completion events ever arrived**
+  (no CONN_UPDATE / PHY_UPDATE / DATA_LEN completions in the GAP
+  event log). Throughput unchanged at ~50–55 kbps. Reading: the
+  central (BlueZ, no root here) never completes peripheral-
+  initiated PHY/interval/datalen procedures, so requests are
+  sent-and-ignored. Unblocks, in order: (1) central-side setup
+  (`btmgmt phy`, conn-interval policy — needs root/CAP_NET_ADMIN,
+  unavailable in this environment); (2) verify our GAP event
+  callback isn't shadowed by NimBLE-Arduino's internal dispatcher
+  (raw `ble_gap_set_event_cb` may conflict — untested);
+  (3) 480 B SDUs measured identical rate (42–55 kbps), ruling out
+  per-SDU overhead as the binding constraint — the binding
+  constraint is per-connection-event airtime, i.e. interval+PHY,
+  i.e. items (1–2). Log silencing (`CORE_DEBUG_LEVEL=0`) kept
+  (correct hygiene, no measurable gain at these rates).
 - GATT side note: reads, notifications, discovery, and connect all
   work; GATT *write-request* fails `NotSupported` against this
   stack (flags+permissions set correctly — root cause not chased,
