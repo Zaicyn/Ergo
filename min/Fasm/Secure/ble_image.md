@@ -174,6 +174,39 @@ insurance against channel weirdness).
   since CoC supersedes writes in this design; GATT stays for
   META/discovery only).
 
+## Measured: first image over CoC (2026-09-15, file framing)
+
+Framed-stream protocol (v1, implemented + verified): 20 B header
+`[magic "ESIMG0" (6)][total_len u32 LE][expected FNV-1a64][rsv 2]`
+then raw payload SDUs. Parser is restart-safe (header re-arms a new
+transfer; state survives across CoC connections, reset only by a new
+valid header). No reassembly buffer: payload streams straight to a
+LittleFS file with a running FNV; completion declared when bytes
+reach total, verified against the header hash (`match=1` iff
+byte-exact).
+- **OLED frame (1024 B): `match=1`, both FNV halves exact.** First
+  image over BLE, end to end.
+- `l2test -B` sends a whole file as ONE SDU: anything over the 512
+  MTU dies at the first SDU (observed: header parses, then silence).
+  Application chunking is mandatory — 480 B SDUs verified working.
+- Per-connection state reset is a bug, not a feature: clearing
+  parser state on CoC open breaks multi-connection transfers
+  (`bad-header` on chunk 2+). State belongs to the transfer
+  (header), not the connection.
+- Arduino cannot see PSRAM on this board (`getPsramSize()=0` —
+  board JSON lacks `memory_type`, so sdkconfig leaves SPIRAM off).
+  Streaming-to-LittleFS adopted instead of buffering; revisit under
+  ESP-IDF where octal PSRAM is explicit. (480p framebuffer at 1.2 MB
+  wants real PSRAM — one more reason for the ESP-IDF move below.)
+- OPEN, unsolved: custom C sender (`SOCK_SEQPACKET` + correct LE
+  address type in `sockaddr_l2`) connects cleanly and `send()`
+  succeeds, but zero bytes arrive; `l2test` on the same channel
+  delivers. Not MTU, pacing, staleness, or TUNE interference
+  (all eliminated). Suspect: socket options BlueZ sets implicitly
+  (credits/MPS negotiation path) — needs `strace`/source read of
+  `l2test -s` to close. 480p transfer waits on this or on
+  chunk-per-`l2test`-invocation (too slow: ~3 s setup each).
+
 ## Tooling (measured path, updated)
 
 - PC: `l2test -V le_public` for manual transfers (stdlib sockets
