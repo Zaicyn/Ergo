@@ -140,10 +140,12 @@ insurance against channel weirdness).
   since CoC supersedes writes in this design; GATT stays for
   META/discovery only).
 
-- PC: raw L2CAP sockets (`AF_BLUETOOTH`, `SOCK_SEQPACKET`,
-  `BTPROTO_L2CAP` — stdlib, no `bleak`; bleak is GATT-only and
-  can't do CoC) + `btmgmt`/`bluetoothctl` for adapter setup.
-- Heltec: NimBLE-Arduino or Bluedroid L2CAP CoC APIs (server
-  endpoint + credits — verify exact API surface at build time;
-  this is the one integration risk, flagged now); new sketch
-  (separate from espfs — display + BLE roles differ).
+## Tooling (measured path, updated)
+
+- PC: `l2test -V le_public` for manual transfers (stdlib sockets
+  cannot address LE CoC); `bluetoothctl` scripted for scan/connect;
+  `btmgmt` needs root (unavailable — D-Bus paths only).
+- Heltec: NimBLE-Arduino 2.5.1, verified API surface
+  (`createL2CAPServer`, `createService(psm, mtu, cb)`,
+  `onRead`/`onConnect`/`onDisconnect`, `COC_MAX_NUM` define).
+  New sketch per role (separate from espfs).
