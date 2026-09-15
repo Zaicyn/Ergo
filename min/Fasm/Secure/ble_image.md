@@ -55,14 +55,41 @@ Base UUID pattern `E5F5xxxx-....` (document exact on implement):
   `[frame u16][chunk u16][total u16][payload ≤220 B]`.
 - `STAT` (notify): `GOT <bitmap-ish range>`, `DONE`, `ERR <code>`.
 
-Direction v1 is PC→Heltec, so PC writes CTRL and consumes STAT
-while Heltec notifies DATA... note the inversion: DATA flows
-PC→Heltec, which over BLE means Heltec must *receive* — use CTRL
-writes carrying chunk payloads for v1 (write-without-response,
-221 B ATT payloads), and reserve notify-DATA for the Heltec→PC
-direction. Simpler alternative if write throughput disappoints:
-L2CAP CoC (credited stream, both directions symmetric). Decide by
-measurement; spec both, implement writes first.
+## Transport: L2CAP Credit-Based CoC (primary)
+
+Mode support (checked): PC hci0 is BT 5.1, Heltec BLE 5.0 — both
+clear the BT 4.1 bar for basic LE Credit-Based CoC; neither reaches
+5.2, so ECFC (multi-channel/QoS) is out. Common denominator is one
+basic LE CoC channel per direction, which is all v1 needs.
+
+Why CoC over GATT writes/notifications here:
+
+- **Headroom:** no ATT framing per packet (no opcode/UUID/length
+  tax), larger SDUs with segmentation handled below us — typically
+  20–50% more goodput than notifications in practice.
+- **Control:** credit-based flow control is receiver-paced
+  backpressure for free. The Heltec has iffy-hundred-KB RAM; credits
+  mean the sender *cannot* overrun it, where blind writes would need
+  an app-level throttle we then have to debug.
+- **Symmetry:** bidirectional channels kill the direction problem —
+  image bytes one way, FETCH bitmaps back the other, no role swap,
+  no primitive change between v1 (PC→Heltec) and reverse.
+- **Loss model change (honest):** a CoC channel is reliable +
+  in-order (link-layer retransmits), so losses become *stalls*,
+  not holes — our parity drops to second line of defense and the
+  FETCH path fires rarely. Keep both: stalls cost latency (still
+  measured), and residual corruption still lands as erasures.
+
+Keep one minimal GATT service anyway: advertising + discovery +
+PSM exchange + META read (parameters and commitment are small,
+infrequent, and GATT-shaped). Bulk bytes ride CoC; everything
+else stays where it is. GATT writes remain the fallback if CoC
+proves painful (documented, not deleted).
+
+Framing over the SDU stream (same headers, bigger payloads):
+`[frame u16][chunk u16][total u16][payload ≤ 480 B]`, chunks
+numbered so reassembly is order-independent anyway (cheap
+insurance against channel weirdness).
 
 ## Transfer protocol (mirrors the promise design)
 
@@ -89,6 +116,10 @@ measurement; spec both, implement writes first.
 
 ## Tooling to install (not yet)
 
-- PC: `bleak` (pip) for GATT scripting.
-- Heltec: NimBLE-Arduino (PlatformIO lib) or Bluedroid; new
-  sketch (separate from espfs — display + BLE roles differ).
+- PC: raw L2CAP sockets (`AF_BLUETOOTH`, `SOCK_SEQPACKET`,
+  `BTPROTO_L2CAP` — stdlib, no `bleak`; bleak is GATT-only and
+  can't do CoC) + `btmgmt`/`bluetoothctl` for adapter setup.
+- Heltec: NimBLE-Arduino or Bluedroid L2CAP CoC APIs (server
+  endpoint + credits — verify exact API surface at build time;
+  this is the one integration risk, flagged now); new sketch
+  (separate from espfs — display + BLE roles differ).
