@@ -26,7 +26,7 @@ with the error attached. Verify at radio_if bring-up, not assumed.
 |---|---|---|---|---|
 | `bt/controller/.../libbtdm_app.a` | 7242 | NimBLE controller (radio_if bring-up) | **THE documented exception** | Closed; framework grant, used unmodified, drives RF silicon only. Replacement path: nRF+Zephyr coprocessor behind the same `radio_if.h`. |
 | `esp_phy/.../libphy.a`, `libbtbb.a` | 1164 + 101 | RF calibration at BT bring-up | same exception | Same basis; arrived together as predicted, nothing else did. |
-| `xtensa/.../libxt_hal.a` | 11 | toolchain HAL | yes (for now) | Next candidate after radio settles. |
+| `xtensa/.../libxt_hal.a` | 11, all one object | toolchain HAL | **reclassified: toolchain runtime, not a blob.** Disassembled it: the sole linked object is `xthal_window_spill_nw` — the Xtensa register-window spill/fill handler, pure public-ISA mechanism (windowed stores/loads, no product IP, identical on every Xtensa chip from any vendor). Eliminating it means rebuilding the whole binary under a different ABI or hand-rolling exception vectors for zero behavioral gain. Sits with `libgcc`: trust-the-toolchain territory, documented here instead. |
 | `libgcc.a` | 212 | compiler runtime | yes | Standard. |
 
 Still absent (re-verified this build): `libcoexist.a` (stays out —
