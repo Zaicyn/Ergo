@@ -1,0 +1,100 @@
+== le_enable @0x40004c44 ==
+== le_init @0x42026630 ==
+  W 0x60031074 <= (v&0xffffdfff)|0x00000000
+  W 0x60031080 <= (v&0xffffff00)|0x00000064
+  W 0x60031080 <= (v&0xff00ffff)|0x00640000
+  W 0x60031084 <= (v&0xffffff00)|0x00000064
+  W 0x60031084 <= (v&0xff00ffff)|0x00640000
+  W 0x60031088 <= (v&0xffffff00)|0x00000064
+  W 0x60031088 <= (v&0xff00ffff)|0x00640000
+  W 0x6003108c <= (v&0xffffff00)|0x00000064
+  W 0x6003108c <= (v&0xff00ffff)|0x00640000
+  W 0x60031090 <= (v&0xffffff80)|0x0000000d
+  W 0x60031094 <= (v&0xffffff80)|0x0000000d
+  W 0x60031098 <= (v&0xffffff80)|0x0000000d
+  W 0x6003109c <= (v&0xffffff80)|0x0000000d
+  W 0x60031000 <= (v&0xffffffff)|0x0000000f
+  W 0x600310e0 <= (v&0xfc00ffff)|0x01be0000
+  W 0x600310e0 <= (v&0xfffffe00)|0x000000fa
+  W 0x60031070 <= 0x00000000
+  W 0x60031074 <= (v&0xffffffff)|0x00001020
+  W 0x60031078 <= 0x0cc00100
+  W 0x60031078 <= (v&0xfff8ffff)|0x00010000
+  W 0x60031094 <= 0x00020202
+  W 0x60031098 <= 0x0f020202
+  W 0x6003109c <= 0x0f020202
+  ? l8ui a9, a9, 58
+  ? sub a8, a8, a9
+  W 0x60011050 <= (v&0xfffff800)|0x00000320
+  ? callx8 a10
+  ? l8ui a3, a10, 17
+  ? beqz a3, 4202682d <r_rf_rw_v9_le_init+0x1fd>
+  ? callx8 a10
+  ? l8ui a3, a10, 17
+  ? bbci a3, 1, 4202681d <r_rf_rw_v9_le_init+0x1ed>
+  ? j 4202683b <r_rf_rw_v9_le_init+0x20b>
+  ? srai a0, a0, 16
+  W 0x60011868 <= (v&0xffffc7df)|0x00000000
+  ? callx8 a10
+  ? l8ui a3, a10, 25
+  ? bnei a3, 1, 42026879 <r_rf_rw_v9_le_init+0x249>
+  ? callx8 a10
+  ? l8ui a2, a10, 18
+  W None
+  W None
+  W None
+  W None
+  ? mov.n a15, a12
+  ? mov.n a14, a12
+  ? mov.n a13, a12
+  ? sub a11, a11, a2
+  ? mov.n a10, a3
+  ? callx8 a8
+  ? bltu a12, a0, 42026885 <r_rf_rw_v9_le_init+0x255>
+  ? ee.vmulas.u8.qacc.ld.xp.qup q3, a15, a0, q6, q1, q7, q7
+  ? muls.ad.ll a7, m2
+  W 0x600310f8 <= (v&0xfffff7ff)|0x00000000
+  ? blti a8, 3, 420268b4 <rw_rf_le_exit_test_mode+0x28>
+  ? callx8 a8
+  W 0x60031098 <= (v&0xff00ffff)|0x00020000
+  W 0x6003109c <= (v&0xff80ffff)|0x00020000
+  ? blti a2, 3, 42026904 <rw_rf_le_exit_test_mode+0x78>
+== hw_disable @0x42032b30 ==
+  ? bnei a2, 2, 42032ba2 <r_rwble_hw_disable+0x72>
+  W 0x60031000 <= (v&0xfffffeff)|0x00000000
+  W 0x60031000 <= (v&0x7fffffff)|0x80000000
+  BR a9, 42032b64 <r_rwble_hw_disable+0x34>
+  W 0x6003100c <= None
+  W None
+  ? l8ui a8, a8, 69
+  BR a8, 42032ba2 <r_rwble_hw_disable+0x72>
+  W None
+  BR a2, 42032bc9 <r_rwble_init+0x25>
+  ? callx8 a10
+  W None
+  ? add.n a10, a11, a10
+  W None
+  ? callx8 a3
+  ? callx8 a8
+  ? addmi a8, a8, 0x400
+  ? callx8 a8
+  ? mov.n a10, a2
+  ? callx8 a8
+  ? mov.n a10, a2
+  ? callx8 a8
+  BR a2, 42032c06 <r_rwble_init+0x62>
+  ? mov.n a10, a2
+  ? callx8 a8
+  ? addmi a8, a8, 0x600
+  ? callx8 a8
+  ? mov.n a10, a2
+  ? addmi a3, a3, 0x400
+  ? callx8 a3
+  W None
+  ? ill 
+  W None
+  ? ill 
+  ? bnez.n a8, 42032c99 <bb_int_init+0x31>
+  ? callx8 a10
+  ? l8ui a8, a10, 17
+  BR a8, 42032cad <bb_int_init+0x45>
