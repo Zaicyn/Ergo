@@ -20,12 +20,80 @@
 #include "services/gap/ble_svc_gap.h"
 #include "os/os_mbuf.h"
 
+#include "radio_if.h"
+
 #define COC_PSM 0x81
 #define COC_MTU 512
 
 static volatile unsigned long rx_bytes, rx_sdus;
 static volatile uint64_t rx_fnv = 0xcbf29ce484222325ULL;
 static uint16_t conn_h = BLE_HS_CONN_HANDLE_NONE;
+static radio_ev_fn app_ev;
+static void    *app_ev_ctx;
+
+int radio_init(const char *name, radio_ev_fn ev, void *ctx) {
+    (void)name;
+    app_ev = ev;
+    app_ev_ctx = ctx;
+    return 0;   /* radio already brought up by app_main NimBLE init */
+}
+
+int radio_chan_open(const uint8_t *peer_addr6, uint16_t psm, uint16_t mtu) {
+    (void)peer_addr6; (void)psm; (void)mtu;
+    return -1;  /* peripheral: channels arrive via CoC accept, not here */
+}
+
+int radio_send(int ch, const uint8_t *data, size_t len) {
+    (void)ch; (void)data; (void)len;
+    return -1;  /* not implemented in probe build */
+}
+
+size_t radio_pending(int ch) {
+    (void)ch;
+    return 0;
+}
+
+void radio_on_rx(radio_rx_fn fn, void *ctx) {
+    (void)fn; (void)ctx;   /* probe routes SDUs to built-in counter */
+}
+
+void radio_chan_close(int ch) {
+    (void)ch;
+}
+
+int radio_request(int ch, uint8_t phy_mask,
+                  uint16_t itvl_min_125, uint16_t itvl_max_125,
+                  uint16_t dle_octets) {
+    uint16_t h = (ch >= 0) ? (uint16_t)ch : conn_h;
+    int rc = 0, fail = 0;
+    if (h == BLE_HS_CONN_HANDLE_NONE) { printf("REQ noconn\n"); return -1; }
+    if (phy_mask) {
+        int r = ble_gap_set_prefered_le_phy(h, phy_mask, phy_mask,
+                                            BLE_GAP_LE_PHY_CODED_ANY);
+        printf("REQ phy=%02x rc=%d\n", phy_mask, r);
+        if (r != 0) fail++;
+    }
+    if (itvl_min_125 && itvl_max_125) {
+        struct ble_gap_upd_params p = {
+            .itvl_min = itvl_min_125,
+            .itvl_max = itvl_max_125,
+            .latency  = 0,
+            .supervision_timeout = 420,   /* 4200 ms in 10 ms units */
+            .min_ce_len = 0,
+            .max_ce_len = 0,
+        };
+        int r = ble_gap_update_params(h, &p);
+        printf("REQ itvl=%d..%d rc=%d\n", itvl_min_125, itvl_max_125, r);
+        if (r != 0) fail++;
+    }
+    if (dle_octets) {
+        int r = ble_gap_set_data_len(h, dle_octets, 2120);
+        printf("REQ dle=%d rc=%d\n", dle_octets, r);
+        if (r != 0) fail++;
+    }
+    rc = fail ? -1 : 0;
+    return rc;
+}
 
 static void start_adv(void) {
     struct ble_hs_adv_fields f;
@@ -51,6 +119,11 @@ static int gap_ev(struct ble_gap_event *ev, void *arg) {
         if (ev->connect.status == 0) {
             conn_h = ev->connect.conn_handle;
             printf("EVT connected h=%u\n", conn_h);
+            if (app_ev) app_ev(RADIO_EV_CONNECTED, 0, app_ev_ctx);
+            /* kick PHY, interval, DLE from central right away */
+            radio_request(-1, BLE_GAP_LE_PHY_2M_MASK,
+                          6, 12,   /* 7.5–15 ms in 1.25 ms units */
+                          251);
         } else {
             printf("EVT conn-fail %d\n", ev->connect.status);
             start_adv();
@@ -58,9 +131,28 @@ static int gap_ev(struct ble_gap_event *ev, void *arg) {
     } else if (ev->type == BLE_GAP_EVENT_DISCONNECT) {
         printf("EVT disconnected reason=%d\n", ev->disconnect.reason);
         conn_h = BLE_HS_CONN_HANDLE_NONE;
+        if (app_ev) app_ev(RADIO_EV_DISCONNECTED, 0, app_ev_ctx);
         start_adv();
     } else if (ev->type == BLE_GAP_EVENT_ADV_COMPLETE) {
         start_adv();
+    } else if (ev->type == BLE_GAP_EVENT_CONN_UPDATE) {
+        struct ble_gap_conn_desc d;
+        uint32_t v;
+        if (ble_gap_conn_find(ev->conn_update.conn_handle, &d) == 0) {
+            v = ((uint32_t)d.conn_itvl << 16) | (d.conn_latency & 0xffff);
+            printf("EVT params itvl=%d lat=%d\n", d.conn_itvl, d.conn_latency);
+        } else {
+            v = 0;
+            printf("EVT params status=%d\n", ev->conn_update.status);
+        }
+        if (app_ev) app_ev(RADIO_EV_PARAMS, v, app_ev_ctx);
+    } else if (ev->type == BLE_GAP_EVENT_PHY_UPDATE_COMPLETE) {
+        /* LE PHY Update Complete → packs tx/rx phy */
+        uint32_t v = ((uint32_t)ev->phy_updated.tx_phy << 8) |
+                     (ev->phy_updated.rx_phy & 0xff);
+        printf("EVT phy tx=%d rx=%d\n", ev->phy_updated.tx_phy,
+               ev->phy_updated.rx_phy);
+        if (app_ev) app_ev(RADIO_EV_PHY, v, app_ev_ctx);
     }
     return 0;
 }

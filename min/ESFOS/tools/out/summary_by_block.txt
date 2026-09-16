@@ -1,0 +1,7 @@
+# 0x1000-block census: count, block, floor region name+offset
+   1  0x60004000  GPIO+0x0 block
+  38  0x60011000  BT+0x0 block
+   6  0x60026000  SYSTIMER+0x3000
+ 170  0x60031000  UART2+0x3000
+  10  0x60042000  LCD_CAM+0x1000
+   6  0x600c0000  LCD_CAM+0x7f000
