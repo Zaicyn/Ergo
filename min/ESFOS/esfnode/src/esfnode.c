@@ -3,6 +3,10 @@
  * proves the radio path first (advertise -> CoC accept -> count).
  */
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,74 +31,11 @@
 
 static volatile unsigned long rx_bytes, rx_sdus;
 static volatile uint64_t rx_fnv = 0xcbf29ce484222325ULL;
+/* Auto-TX: fire N known-pattern frames once per CoC open, paced by
+ * credits. Lets the host verify the TX path with no serial input. */
+static volatile int auto_tx = 0;
+static int auto_n = 0;
 static uint16_t conn_h = BLE_HS_CONN_HANDLE_NONE;
-static radio_ev_fn app_ev;
-static void    *app_ev_ctx;
-
-int radio_init(const char *name, radio_ev_fn ev, void *ctx) {
-    (void)name;
-    app_ev = ev;
-    app_ev_ctx = ctx;
-    return 0;   /* radio already brought up by app_main NimBLE init */
-}
-
-int radio_chan_open(const uint8_t *peer_addr6, uint16_t psm, uint16_t mtu) {
-    (void)peer_addr6; (void)psm; (void)mtu;
-    return -1;  /* peripheral: channels arrive via CoC accept, not here */
-}
-
-int radio_send(int ch, const uint8_t *data, size_t len) {
-    (void)ch; (void)data; (void)len;
-    return -1;  /* not implemented in probe build */
-}
-
-size_t radio_pending(int ch) {
-    (void)ch;
-    return 0;
-}
-
-void radio_on_rx(radio_rx_fn fn, void *ctx) {
-    (void)fn; (void)ctx;   /* probe routes SDUs to built-in counter */
-}
-
-void radio_chan_close(int ch) {
-    (void)ch;
-}
-
-int radio_request(int ch, uint8_t phy_mask,
-                  uint16_t itvl_min_125, uint16_t itvl_max_125,
-                  uint16_t dle_octets) {
-    uint16_t h = (ch >= 0) ? (uint16_t)ch : conn_h;
-    int rc = 0, fail = 0;
-    if (h == BLE_HS_CONN_HANDLE_NONE) { printf("REQ noconn\n"); return -1; }
-    if (phy_mask) {
-        int r = ble_gap_set_prefered_le_phy(h, phy_mask, phy_mask,
-                                            BLE_GAP_LE_PHY_CODED_ANY);
-        printf("REQ phy=%02x rc=%d\n", phy_mask, r);
-        if (r != 0) fail++;
-    }
-    if (itvl_min_125 && itvl_max_125) {
-        struct ble_gap_upd_params p = {
-            .itvl_min = itvl_min_125,
-            .itvl_max = itvl_max_125,
-            .latency  = 0,
-            .supervision_timeout = 420,   /* 4200 ms in 10 ms units */
-            .min_ce_len = 0,
-            .max_ce_len = 0,
-        };
-        int r = ble_gap_update_params(h, &p);
-        printf("REQ itvl=%d..%d rc=%d\n", itvl_min_125, itvl_max_125, r);
-        if (r != 0) fail++;
-    }
-    if (dle_octets) {
-        int r = ble_gap_set_data_len(h, dle_octets, 2120);
-        printf("REQ dle=%d rc=%d\n", dle_octets, r);
-        if (r != 0) fail++;
-    }
-    rc = fail ? -1 : 0;
-    return rc;
-}
-
 static void start_adv(void) {
     struct ble_hs_adv_fields f;
     memset(&f, 0, sizeof f);
@@ -119,11 +60,7 @@ static int gap_ev(struct ble_gap_event *ev, void *arg) {
         if (ev->connect.status == 0) {
             conn_h = ev->connect.conn_handle;
             printf("EVT connected h=%u\n", conn_h);
-            if (app_ev) app_ev(RADIO_EV_CONNECTED, 0, app_ev_ctx);
-            /* kick PHY, interval, DLE from central right away */
-            radio_request(-1, BLE_GAP_LE_PHY_2M_MASK,
-                          6, 12,   /* 7.5–15 ms in 1.25 ms units */
-                          251);
+            radio_gap_notify(RADIO_EV_CONNECTED, 0);
         } else {
             printf("EVT conn-fail %d\n", ev->connect.status);
             start_adv();
@@ -131,7 +68,7 @@ static int gap_ev(struct ble_gap_event *ev, void *arg) {
     } else if (ev->type == BLE_GAP_EVENT_DISCONNECT) {
         printf("EVT disconnected reason=%d\n", ev->disconnect.reason);
         conn_h = BLE_HS_CONN_HANDLE_NONE;
-        if (app_ev) app_ev(RADIO_EV_DISCONNECTED, 0, app_ev_ctx);
+        radio_gap_notify(RADIO_EV_DISCONNECTED, 0);
         start_adv();
     } else if (ev->type == BLE_GAP_EVENT_ADV_COMPLETE) {
         start_adv();
@@ -145,14 +82,14 @@ static int gap_ev(struct ble_gap_event *ev, void *arg) {
             v = 0;
             printf("EVT params status=%d\n", ev->conn_update.status);
         }
-        if (app_ev) app_ev(RADIO_EV_PARAMS, v, app_ev_ctx);
+        radio_gap_notify(RADIO_EV_PARAMS, v);
     } else if (ev->type == BLE_GAP_EVENT_PHY_UPDATE_COMPLETE) {
         /* LE PHY Update Complete → packs tx/rx phy */
         uint32_t v = ((uint32_t)ev->phy_updated.tx_phy << 8) |
                      (ev->phy_updated.rx_phy & 0xff);
         printf("EVT phy tx=%d rx=%d\n", ev->phy_updated.tx_phy,
                ev->phy_updated.rx_phy);
-        if (app_ev) app_ev(RADIO_EV_PHY, v, app_ev_ctx);
+        radio_gap_notify(RADIO_EV_PHY, v);
     }
     return 0;
 }
@@ -178,16 +115,40 @@ static int coc_ev(struct ble_l2cap_event *event, void *arg) {
         printf("COC accept\n");
         return 0;
     }
+    /* NOTE: accept carries no chan pointer in this stack version;
+     * attach happens at CONNECT with event->connect.chan. */
     if (event->type == BLE_L2CAP_EVENT_COC_CONNECTED) {
         printf("COC open status=%d\n", event->connect.status);
-        if (event->connect.status == 0)
+        if (event->connect.status == 0) {
+            int slot = radio_chan_attach(event->connect.chan,
+                                         event->connect.conn_handle);
+            printf("COC slot=%d\n", slot);
+            if (slot >= 0)
+                radio_request(slot, BLE_GAP_LE_PHY_2M_MASK,
+                              6, 12, 251);
+            auto_tx = 8;
             coc_arm(event->connect.chan);
+        }
         return 0;
     }
     if (event->type == BLE_L2CAP_EVENT_COC_DATA_RECEIVED) {
         struct os_mbuf *om = event->receive.sdu_rx;
         struct ble_l2cap_chan *ch = event->receive.chan;
         uint16_t n = OS_MBUF_PKTLEN(om);
+        static uint8_t flat[2048];
+        if (n <= sizeof flat) {
+            size_t o = 0;
+            struct os_mbuf *q = om;
+            while (q && o < sizeof flat) {
+                size_t k = q->om_len;
+                if (o + k > sizeof flat)
+                    k = sizeof flat - o;
+                memcpy(flat + o, q->om_data, k);
+                o += k;
+                q = SLIST_NEXT(q, om_next);
+            }
+            radio_chan_rx(ch, flat, o);
+        }
         struct os_mbuf *o = om;
         while (o) {
             for (int i = 0; i < o->om_len; i++) {
@@ -203,11 +164,13 @@ static int coc_ev(struct ble_l2cap_event *event, void *arg) {
         return 0;
     }
     if (event->type == BLE_L2CAP_EVENT_COC_DISCONNECTED) {
+        radio_chan_detach(event->disconnect.chan);
         printf("COC closed bytes=%lu sdus=%lu fnv=%08lx%08lx\n", rx_bytes,
                rx_sdus, (unsigned long)(rx_fnv >> 32),
                (unsigned long)(rx_fnv & 0xFFFFFFFFULL));
         rx_bytes = 0;
         rx_sdus = 0;
+        rx_fnv = 0xcbf29ce484222325ULL;
         return 0;
     }
     return 0;
@@ -246,12 +209,55 @@ void app_main(void) {
     ble_hs_cfg.reset_cb = on_reset;
     nimble_port_freertos_init(host_task);
     int n = 0;
+    fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
+    static char cmd[32];
+    static int cmdlen = 0;
+    static uint8_t txb[480];
     while (1) {
+        char c;
+        if (read(STDIN_FILENO, &c, 1) == 1) {
+            if (c == '\n' || cmdlen >= (int)sizeof cmd - 1) {
+                cmd[cmdlen] = 0;
+                cmdlen = 0;
+                if (!strncmp(cmd, "TX ", 3)) {
+                    int cnt = atoi(cmd + 3), ok = 0;
+                    for (int i = 0; i < cnt; i++) {
+                        for (int j = 0; j < 480; j++)
+                            txb[j] = (uint8_t)((i * 480 + j) & 0xFF);
+                        /* Credit-paced: peer grants arrive over time;
+                         * retry instead of dropping on a dry window. */
+                        for (int att = 0; att < 400; att++) {
+                            if (radio_send(0, txb, 480) == 480) {
+                                ok++;
+                                break;
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(5));
+                    }
+                    printf("TX done %d/%d\n", ok, cnt);
+                } else if (!strcmp(cmd, "STAT")) {
+                    printf("STAT rx=%lu sdus=%lu\n", rx_bytes,
+                           rx_sdus);
+                }
+            } else if (c != '\r') {
+                cmd[cmdlen++] = c;
+            }
+        }
         if (++n % 5 == 0)
             printf("HB heap=%u rx=%lu\n",
                    (unsigned)esp_get_free_heap_size(), rx_bytes);
         else
             printf("HB\n");
+        if (auto_tx > 0) {
+            for (int j = 0; j < 480; j++)
+                txb[j] = (uint8_t)((auto_n * 480 + j) & 0xFF);
+            if (radio_send(0, txb, 480) == 480) {
+                printf("ATX %d ok\n", auto_n);
+                auto_n++;
+                auto_tx--;
+            }
+        }
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }

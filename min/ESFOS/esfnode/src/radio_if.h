@@ -38,3 +38,14 @@ int radio_request(int ch, uint8_t phy_mask, uint16_t itvl_min_125,
                   uint16_t itvl_max_125, uint16_t dle_octets);
 /* Close channel / shut down. */
 void radio_chan_close(int ch);
+
+/* ---- internal glue (stack-facing; app + radio_if.c only) ----
+ * The CoC event owner (app side) routes stack events here:
+ * attach on accept/connect (returns slot id), rx per SDU payload,
+ * detach on disconnect. Slot ids are what radio_send() takes. */
+struct ble_l2cap_chan;
+int radio_chan_attach(struct ble_l2cap_chan *chan, uint16_t conn);
+void radio_chan_detach(struct ble_l2cap_chan *chan);
+void radio_chan_rx(struct ble_l2cap_chan *chan, const uint8_t *data,
+                   size_t len);
+void radio_gap_notify(int ev, uint32_t arg);
