@@ -218,6 +218,8 @@ static void rekick(void) {
     *r = v | 0x100U;
     __asm__ volatile ("memw");
     printf("REKICK bit8=1, adv restart:\n");
+    int rs = ble_gap_adv_stop();
+    printf("REKICK stop rc=%d\n", rs);
     start_adv();
 }
 /* Phase B: replay the static part of r_rf_rw_v9_le_init (see
