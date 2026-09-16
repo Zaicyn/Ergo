@@ -176,6 +176,86 @@ static int coc_ev(struct ble_l2cap_event *event, void *arg) {
     return 0;
 }
 
+/* Direct-register probe, phase A: SAFE-SUBSET dump + bit8 toggle.
+ * Whitelist = config/trim/timing/status regs touched by le_init or
+ * plain config writers. EXCLUDED (read side-effects suspected):
+ * ISR/ack/FIFO/command regs 0x6003100c,10,18,24,48,50, 0x60011084,
+ * 0x6001108c,0x60011090, 0x60011868, 0x60031304,0x60031360,0x60031364.
+ * 0x6003101c/28 are the riskiest inclusions: bisect targets if ADV
+ * is stillborn again. */
+static const uint32_t probe_addrs[] = {
+    0x60031000, 0x6003101c, 0x60031028, 0x60031070, 0x60031074,
+    0x60031078, 0x60031080, 0x60031084, 0x60031088, 0x6003108c,
+    0x60031090, 0x60031094, 0x60031098, 0x6003109c, 0x600310e0,
+    0x600310f8, 0x60011004, 0x60011050, 0x600110b8, 0x600110d4,
+    0x60011800, 0x6001186c, 0x600118fc,
+};
+static void reg_dump(void) {
+    for (unsigned i = 0; i < sizeof probe_addrs / sizeof probe_addrs[0];
+         i++) {
+        uint32_t a = probe_addrs[i];
+        printf("REG %08lx=%08lx\n", (unsigned long)a,
+               (unsigned long)*(volatile uint32_t *)a);
+    }
+}
+static void poke(uint32_t a, uint32_t and_m, uint32_t or_b) {
+    volatile uint32_t *r = (volatile uint32_t *)a;
+    __asm__ volatile ("memw");
+    uint32_t v = *r;
+    v = (v & and_m) | or_b;
+    __asm__ volatile ("memw");
+    *r = v;
+    __asm__ volatile ("memw");
+}
+/* Phase C: software re-kick. Bit8 must be set first (hardware gate),
+ * then re-issue ADV start through the blob's own API to resync its
+ * software state machine with the hardware underneath. */
+static void rekick(void) {
+    volatile uint32_t *r = (volatile uint32_t *)0x60031000;
+    __asm__ volatile ("memw");
+    uint32_t v = *r;
+    __asm__ volatile ("memw");
+    *r = v | 0x100U;
+    __asm__ volatile ("memw");
+    printf("REKICK bit8=1, adv restart:\n");
+    start_adv();
+}
+/* Phase B: replay the static part of r_rf_rw_v9_le_init (see
+ * tools/out/poke_tables.txt) on a wedged controller, then set bit8.
+ * Dynamic/calibration calls from the original are skipped. */
+static void resume_pokes(void) {
+    poke(0x60031074, 0xffffdfff, 0x00000000);
+    poke(0x60031080, 0xffffff00, 0x00000064);
+    poke(0x60031080, 0xff00ffff, 0x00640000);
+    poke(0x60031084, 0xffffff00, 0x00000064);
+    poke(0x60031084, 0xff00ffff, 0x00640000);
+    poke(0x60031088, 0xffffff00, 0x00000064);
+    poke(0x60031088, 0xff00ffff, 0x00640000);
+    poke(0x6003108c, 0xffffff00, 0x00000064);
+    poke(0x6003108c, 0xff00ffff, 0x00640000);
+    poke(0x60031090, 0xffffff80, 0x0000000d);
+    poke(0x60031094, 0xffffff80, 0x0000000d);
+    poke(0x60031098, 0xffffff80, 0x0000000d);
+    poke(0x6003109c, 0xffffff80, 0x0000000d);
+    poke(0x60031000, 0xffffffff, 0x0000000f);
+    poke(0x600310e0, 0xfc00ffff, 0x01be0000);
+    poke(0x600310e0, 0xfffffe00, 0x000000fa);
+    poke(0x60031070, 0x00000000, 0x00000000);
+    poke(0x60031074, 0xffffffff, 0x00001020);
+    poke(0x60031078, 0xffffffff, 0x0cc00100);
+    poke(0x60031078, 0xffffffff, 0x00010000);
+    poke(0x60031094, 0xffffffff, 0x00020202);
+    poke(0x60031098, 0xffffffff, 0x0f020202);
+    poke(0x6003109c, 0xffffffff, 0x0f020202);
+    poke(0x60011050, 0xfffff800, 0x00000320);
+    poke(0x60011868, 0xffffc7df, 0x00000000);
+    poke(0x600310f8, 0xfffff7ff, 0x00000000);
+    poke(0x60031098, 0xff00ffff, 0x00020000);
+    poke(0x6003109c, 0xff80ffff, 0x00020000);
+    /* finally set LE enable bit8 */
+    poke(0x60031000, 0xffffffff, 0x00000100);
+    printf("RES done reg=%08lx\n", (unsigned long)*(volatile uint32_t *)0x60031000);
+}
 static void on_sync(void) {
     printf("SYNC\n");
     int rc = ble_svc_gap_device_name_set("ESFOC");
@@ -249,6 +329,30 @@ void app_main(void) {
                    (unsigned)esp_get_free_heap_size(), rx_bytes);
         else
             printf("HB\n");
+        if (n == 5 || (n >= 45 && (n % 40) == 5))
+            reg_dump();
+        if (n >= 37 && (n % 8) == 5) {
+            /* 4-phase cycle: set -> clear -> RESUME(init replay) ->
+             * REKICK(bit8 + adv_start through the blob API). */
+            static int phase = 0;
+            if (phase == 2) {
+                resume_pokes();
+            } else if (phase == 3) {
+                rekick();
+            } else {
+                int want = (phase == 1) ? 0 : 1;
+                volatile uint32_t *r = (volatile uint32_t *)0x60031000;
+                __asm__ volatile ("memw");
+                uint32_t v = *r;
+                v = (want == 0) ? (v & ~0x100U) : (v | 0x100U);
+                __asm__ volatile ("memw");
+                *r = v;
+                __asm__ volatile ("memw");
+                printf("TOG bit8=%d reg=%08lx\n", want,
+                       (unsigned long)*r);
+            }
+            phase = (phase + 1) % 4;
+        }
         if (auto_tx > 0) {
             for (int j = 0; j < 480; j++)
                 txb[j] = (uint8_t)((auto_n * 480 + j) & 0xFF);
