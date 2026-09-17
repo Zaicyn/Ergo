@@ -107,7 +107,33 @@ mww 0x600310E0 0x0190012c   (event arming; idle/init value 0x01be00fa)
 TWO WRITES. The CS stores were belt-and-braces (CS is never broken by
 the kill). 90/94/98/9C and 11050 differ dead-vs-live but are NOT needed
 to resume (likely HW-updated consequences, or reprogrammed lazily).
-E0 bit-level split (high 0x0190 vs low 0x12c) still open.
+
+## 6. E0 bit ablation: bit0 is the arming bit (COMPLETE)
+
+Idle `0x01be00fa` vs armed `0x0190012c`: 10 differing bits
+{1,2,4,6,7,8,17,18,19,21}. Every trial kill-verified by gate readback
+(a dropped readback once voided two trials; redone properly):
+
+- C0 (gate + E0:=idle): dead (control).
+- H (high half `0x019000fa`): dead.
+- L (low half `0x01be012c`): RETURN.
+- L1 (idle + bits{0,2} = `0x01be00ff`): RETURN.
+- B2 (bit2 alone = `0x01be00fe`): dead.
+- B0R (bit0 alone = `0x01be00fb`): RETURN, with BlueZ `DEL` then `NEW`
+  inside one scan and HB-only serial (no blob fingerprint).
+
+Minimal resume, final form:
+
+```
+mww 0x60031000 0x0010030f   (gate bit8)
+mww 0x600310E0 <idle | 0x01>  (set E0 bit0; readback sticks, level arm)
+```
+
+E0 bit0 alone is sufficient; the other 9 differing bits, the CS words,
+and the 90-group/11050 are all don't-care for resume. Note the baseline
+armed value has bit0 CLEAR yet also resumes, so bit0 is one sufficient
+arming path, not the exclusive one; E0 has no read side-effects observed
+(readback-verified after every write).
 
 Ops note: repeated JTAG halt/resume skewed the app loop ~10x slow
 (HB cadence degraded, tick-skew suspected) starting ~02:05. Harmless for
