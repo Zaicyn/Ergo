@@ -173,3 +173,24 @@ w2 0x3a->0x4d over 7 min) reads as the RX descriptor ring
 Proposed next: trap ROM `frm_cbk` per-event (resolve veneer `0x4000405c`
 first) to find the DMA/body programming, then attempt live instance-1
 TX (CS1 + pool1 + gate/E0 trigger, second name/address on air).
+
+## 8. Body-link mechanism: T1 confirmed (modem reads host mbuf live)
+
+Two theories: (T1) modem DMAs the host mbuf per event/continuously;
+(T2) modem reads a per-REKICK-filled FIFO, pokes working only via the
+next REKICK's copy. Discriminator: poke marker `ESFOJ` at `0x3FCB6E8C`,
+sight on air (`NEW ... ESFOJ`), then re-read the mbuf. Result: mbuf
+STILL HOLDS the poked bytes (`...4a 4f`). REKICK always reallocates +
+recopies `ESFOC` from flash (10+ observations), so an intact poked mbuf
+proves NO REKICK ran between poke and sighting. The modem transmitted
+the poked bytes with zero fields-set/HCI traffic. **T1 CONFIRMED, T2 dead.**
+Consequence stands: control mbuf bytes -> control air bytes, no blob,
+no REKICK needed (re-poke per cycle as the mbuf reallocates).
+
+frm_cbk (veneer `0x4000405c` -> ROM `0x4001828c`): pure dispatcher
+(switch on event type -> `ip_funcs` slots `0x1B8/0x1BC`/ENV+12 calls).
+NO DMA/body programming. `lld_adv_end_ind_handler_hack @0x4202dfac`:
+event reporting to host, also no MMIO. The body fetch is fully
+modem-autonomous; no per-event or per-REKICK CPU body programming
+exists anywhere in the ADV path (adv_start, adv_data_set, frm_cbk,
+frm_isr ECO, end_ind all disassembled and clean).
