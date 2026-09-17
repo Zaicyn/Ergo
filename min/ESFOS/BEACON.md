@@ -84,8 +84,32 @@ the six reg writes above. v1 (CS x3 only) verified INSUFFICIENT (no return).
   (per-cycle copy from transient mbuf @`0x3FCAE240`, trapped at `0x4001937d`).
   Persistent AdvA spoof needs the efuse-shadow source (open).
 
-## 5. Ablation status
+## 5. Ablation: the load-bearing write is E0 (COMPLETE)
 
-v3 = gate + CSx3 + {90,94,98,9C} + E0 + 11050. Load-bearing subset TBD
-(group trials: timer-reg group vs E0 vs 11050). BlueZ NEW/DEL + serial
-phase audit per trial; any blob restart leaves a serial fingerprint.
+Kill = clear bit8 (BlueZ `DEL` observed 2x, gate readback-verified each
+trial). Trials (kill -> 8 s drain -> subset stores -> 20 s BlueZ scan;
+slow app loop ~10 min/phase at the time => no blob phase fits in a trial;
+any blob restart would print REKICK/RES/ADV-start on serial):
+
+- v1 (gate + CSx3): NO return (2x).
+- T2 (gate + CSx3 + 90/94/98/9C): NO return (2x, second with serial audit).
+- T3 (gate + CSx3 + E0): RETURN (2x, second with serial audit).
+- M1 (gate + E0, NO CS stores): RETURN, serial shows only HB + periodic
+  REG dump (no restart fingerprint).
+
+Pattern: E0 absent -> dead; E0 present -> alive. Minimal resume set:
+
+```
+mww 0x60031000 0x0010030f   (gate bit8)
+mww 0x600310E0 0x0190012c   (event arming; idle/init value 0x01be00fa)
+```
+
+TWO WRITES. The CS stores were belt-and-braces (CS is never broken by
+the kill). 90/94/98/9C and 11050 differ dead-vs-live but are NOT needed
+to resume (likely HW-updated consequences, or reprogrammed lazily).
+E0 bit-level split (high 0x0190 vs low 0x12c) still open.
+
+Ops note: repeated JTAG halt/resume skewed the app loop ~10x slow
+(HB cadence degraded, tick-skew suspected) starting ~02:05. Harmless for
+JTAG-driven trials (fewer phase confounds); REKICK still fires.
+If the loop wedges fully, the BOOT+RST dance in the brief applies.
