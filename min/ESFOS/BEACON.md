@@ -260,3 +260,15 @@ infeasible by 1-2 orders of magnitude (jitter alone kills it; halting
 perturbs modem timing). Slow alternation (~10 s flips) is trivially
 doable but proves nothing beyond the existing poke proofs. Second
 payload needs the modem-private latch (unbounded hunt, parked).
+
+## 10. Direction finding: parked (doc check, no silicon time)
+
+ESP32-S3 is Bluetooth 5.0 (LE): 125K/500K/1M/2M PHY, adv extensions,
+CSA#2. Constant Tone Extension / AoA / AoD is Bluetooth 5.1+;
+Espressif positions the ESP32-H4 as its first DF-capable part
+(5.0 -> 5.4), and `SOC_BLE_CTE_SUPPORTED` is enabled only for
+H2/C5/C61, never S3. No DF hardware on S3: `0x60031028`
+(`r_bt_rma_configure`) and `r_cali_phase_match_p` (`0x600310F8`) read
+as RF multi-antenna config / phase calibration for normal PHY use.
+DF parked permanently. Next: RX ring mapping, then minimal connection
+(only if RX proves drivable).
