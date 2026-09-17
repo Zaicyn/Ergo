@@ -221,3 +221,24 @@ frm_isr ECO, end_ind all disassembled and clean).
   across running windows (parse while halted); background serial readers
   die in this environment (use foreground reads); distrust empty scans
   without neighbor sightings as control.
+
+## 9. Scan-rsp recon: dormant, mbuf-gated (RECON COMPLETE)
+
+Baseline: modem auto-responds to SCAN_REQ with SCAN_RSP, Data length 0
+(btmon-verified). `[inst+128]` (scan tracking, @`0x3FCEBCE8`) reads 0;
+firmware never sets scan-rsp (start_adv sets adv fields only).
+ROM `r_lld_adv_scan_rsp_data_set` (`0x40016BE8`, via hack `0x40378ec8`)
+mirrors adv_data_set (header word with PDU-type nibble `|4`, len store);
+instance struct holds separate adv (`+126`) and scan (`+128`) fields.
+
+Live tests (all reverted afterward, rig pristine):
+- `[inst+128] := 10` alone: SCAN_RSP still length 0 (len not from inst).
+- Full scan record (PDU `0x1024`, len 10, AdvA + ESFO2 AD record) at
+  pool1 (`0x3FCAEE68`, zeros, safe): SCAN_RSP still length 0.
+- Full scan record at B-12 (`0x3FCAEDDC`): COLLIDED with adv pool header
+  (`B+0..B+7`), ADV broke; restored byte-exact from pre-write dump,
+  ADV verified back. (B-12 is NOT a separate scan slot.)
+Verdict: scan body is mbuf-gated exactly like adv (no scan mbuf exists
+-> pool writes ignored, len stays 0). Second payload via scan-rsp needs
+the same modem-private latch as instance-1. Time-slicing the single
+adv mbuf remains the bounded second-payload path.
