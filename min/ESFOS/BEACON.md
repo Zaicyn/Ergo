@@ -139,3 +139,37 @@ Ops note: repeated JTAG halt/resume skewed the app loop ~10x slow
 (HB cadence degraded, tick-skew suspected) starting ~02:05. Harmless for
 JTAG-driven trials (fewer phase confounds); REKICK still fires.
 If the loop wedges fully, the BOOT+RST dance in the brief applies.
+
+## 7. Instance-1 mapping + body-link verdict (MAPPING COMPLETE)
+
+Instance model (from ROM disasm + live traps): CS array stride 90 B
+(`F()+90*idx`, F = call `[ENV+188]` = `0x3FCAE664` for idx0), adv-data
+pool stride 126 B (pool0 @ `0x3FCAEDE8` = region `0x60031214`).
+
+Read-only recon, all verified on silicon:
+- CS1 @ `0x3FCAE6BE`: zeros except `+0x02=0x0001`, `+0x5C=0x0002`.
+  CS0 `+0x5C=0x0001`: **+0x5C is the instance index** (init-tagged).
+- pool1 @ `0x3FCAEE66` (`0x3FCAEDE8+126`): all zeros.
+- `lld_adv_env @0x3FCEFCB0`: only slot0 (`0x3fcebc68`); no idx1 struct.
+- inst0 @`0x3fcebc68`: flags `[+116]=0x0013`, fn ptrs (`0x40004038`,
+  `0x40379148`), misc params. Reference for crafting idx1 params.
+- `ip_funcs` slots: frm_cbk `0x1B4`->veneer `0x4000405c` (ROM),
+  frm_isr `0x1B8`->`r_lld_adv_frm_isr_eco @0x4037917c` (IRAM override).
+  ECO ISR disassembled: per-event bookkeeping + callback dispatch only
+  (tolerates NULL instance: `beq` skips), NO DMA programming.
+
+Body-link verdict: the CURRENT host mbuf address (`0x3FCB09F0`) appears
+in NO dump (EM/CS/pools/inst/host-heap, exhaustive LE-u32 search).
+No static CPU-visible pointer to the TX body exists. The modem DMAs the
+body straight from the host mbuf; the address travels per-event via the
+task/ISR path into modem-private state. Consequence: instance 1 cannot
+reuse "the host mbuf mechanism" (no mbuf will ever exist for handle 1);
+live instance-1 TX needs the per-event DMA linkage first.
+Side finding: EM+0x000 16-entry table (w1 ~0xCC stride, churning,
+w2 0x3a->0x4d over 7 min) reads as the RX descriptor ring
+(16 RX buffers, recycled on SCAN_REQ RX; N=16 matches
+"EM DATA RX BUFFER[%d]"). Medium confidence, untested.
+
+Proposed next: trap ROM `frm_cbk` per-event (resolve veneer `0x4000405c`
+first) to find the DMA/body programming, then attempt live instance-1
+TX (CS1 + pool1 + gate/E0 trigger, second name/address on air).
