@@ -135,6 +135,16 @@ armed value has bit0 CLEAR yet also resumes, so bit0 is one sufficient
 arming path, not the exclusive one; E0 has no read side-effects observed
 (readback-verified after every write).
 
+CORRECTION (same session, post-hoc): the don't-care claims for
+90/94/98/9C and 11050 were made with an uncontrolled variable. RES
+(init replay) resets E0 AND the 90-group AND 11050 to init/idle values;
+TOG-RMW preserves them. Trials that "didn't write" those regs inherited
+unknown leftovers, so only the SUFFICIENCY direction stands (the written
+sets all resumed ADV with no blob code running). Exact minimal
+sufficiency (E0-only? E0+90s? E0+11050? all three?) needs a
+reset-controlled protocol: force ALL candidates to idle first, verify
+dead, then write only the trial subset. Open.
+
 Ops note: repeated JTAG halt/resume skewed the app loop ~10x slow
 (HB cadence degraded, tick-skew suspected) starting ~02:05. Harmless for
 JTAG-driven trials (fewer phase confounds); REKICK still fires.
@@ -194,3 +204,22 @@ event reporting to host, also no MMIO. The body fetch is fully
 modem-autonomous; no per-event or per-REKICK CPU body programming
 exists anywhere in the ADV path (adv_start, adv_data_set, frm_cbk,
 frm_isr ECO, end_ind all disassembled and clean).
+
+## 9. Ops: wedges, slow loop, JTAG reset recovery
+
+- After ~40 halt/resume cycles + a B-12 pool clobber (byte-exact restored)
+  the rig degraded on three axes at once: app loop ~10x slow then silent,
+  serial CDC silent (host `select` empty, no error), BT scans deaf. JTAG
+  (same USB device) stayed fully functional throughout -> wedge was NOT
+  the USB device as a whole.
+- Serial silence with PC=idle (scheduler alive) + no HBs = app task
+  blocked/starved, not a halt. Likely contributors: tick-skew from
+  repeated halts, red-zone state from the clobber window.
+- Recovery: OpenOCD `reset` (soft reset, both CPUs) + `resume` boots the
+  app cleanly from flash (ESP-ROM banner, same heap 2341776, ADV back in
+  seconds). This also cleared the CDC wedge and the slow loop. No BOOT+RST
+  dance needed (that is only for post-flash stub stranding).
+- Lesson: always verify kill by gate readback; never split scan+poke
+  across running windows (parse while halted); background serial readers
+  die in this environment (use foreground reads); distrust empty scans
+  without neighbor sightings as control.
