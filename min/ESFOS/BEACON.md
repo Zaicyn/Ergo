@@ -84,73 +84,71 @@ the six reg writes above. v1 (CS x3 only) verified INSUFFICIENT (no return).
   (per-cycle copy from transient mbuf @`0x3FCAE240`, trapped at `0x4001937d`).
   Persistent AdvA spoof needs the efuse-shadow source (open).
 
-## 5. Ablation: the load-bearing write is E0 (COMPLETE)
+## 5. Ablation: two redundant arming paths (COMPLETE, reset-controlled)
 
-Kill = clear bit8 (BlueZ `DEL` observed 2x, gate readback-verified each
-trial). Trials (kill -> 8 s drain -> subset stores -> 20 s BlueZ scan;
-slow app loop ~10 min/phase at the time => no blob phase fits in a trial;
-any blob restart would print REKICK/RES/ADV-start on serial):
+Method (hard-won): every trial = halt, force ALL of {gate,E0,90s,11050}
+to idle with readbacks, drain, write ONLY the trial subset with
+readbacks, resume, fresh BlueZ scan (neighbors as scanner control),
+post-hoc audit (mbuf addr/content + reg readbacks detect RES/REKICK
+intrusion; intruded trials are void, retried). APP loop phases
+(TOG/RES/REKICK) are the confound: RES resets E0+90s+11050 to idle,
+REKICK reallocates the mbuf + restarts via blob, TOG-RMW preserves.
+Early trials without idle-forcing inherited unknown leftovers; only
+the reset-controlled matrix below is trustworthy.
 
-- v1 (gate + CSx3): NO return (2x).
-- T2 (gate + CSx3 + 90/94/98/9C): NO return (2x, second with serial audit).
-- T3 (gate + CSx3 + E0): RETURN (2x, second with serial audit).
-- M1 (gate + E0, NO CS stores): RETURN, serial shows only HB + periodic
-  REG dump (no restart fingerprint).
+Matrix (gate SET in every row; CS/pool/mbuf always intact):
 
-Pattern: E0 absent -> dead; E0 present -> alive. Minimal resume set:
+| E0        | 90s  | 11050 | result |
+|-----------|------|-------|--------|
+| idle      | idle | idle  | dead (C0 control) |
+| full      | idle | idle  | dead (frozen trial, audited) |
+| full      | live | idle  | dead (AF frozen + audited) |
+| full      | idle | live  | ALIVE (B, phase-model clean) |
+| full      | live | live  | ALIVE (v3 control) |
+| idle      | live | live  | ALIVE (I: NEW 5 s post-stores) |
+| idle      | idle | live  | ALIVE (J3: full readbacks + audit) |
+| bit0-only | idle | idle  | ALIVE (K: full readbacks + audit) |
 
-```
-mww 0x60031000 0x0010030f   (gate bit8)
-mww 0x600310E0 0x0190012c   (event arming; idle/init value 0x01be00fa)
-```
+Reading: 11050-live alone suffices (J3); E0.bit0 alone suffices (K);
+E0-full alone fails; E0-full+90s fails; 90s never help nor are needed.
+**Gate + 11050-live and gate + E0.bit0 are two REDUNDANT arming paths**
+(OR-gate). The 90-group is pure don't-care. CS necessity untested
+(CS was never broken; zeroing it is future destructive work).
 
-TWO WRITES. The CS stores were belt-and-braces (CS is never broken by
-the kill). 90/94/98/9C and 11050 differ dead-vs-live but are NOT needed
-to resume (likely HW-updated consequences, or reprogrammed lazily).
-
-## 6. E0 bit ablation: bit0 is the arming bit (COMPLETE)
-
-Idle `0x01be00fa` vs armed `0x0190012c`: 10 differing bits
-{1,2,4,6,7,8,17,18,19,21}. Every trial kill-verified by gate readback
-(a dropped readback once voided two trials; redone properly):
-
-- C0 (gate + E0:=idle): dead (control).
-- H (high half `0x019000fa`): dead.
-- L (low half `0x01be012c`): RETURN.
-- L1 (idle + bits{0,2} = `0x01be00ff`): RETURN.
-- B2 (bit2 alone = `0x01be00fe`): dead.
-- B0R (bit0 alone = `0x01be00fb`): RETURN, with BlueZ `DEL` then `NEW`
-  inside one scan and HB-only serial (no blob fingerprint).
-
-Minimal resume, final form:
+Minimal resume, either (from full idle):
 
 ```
 mww 0x60031000 0x0010030f   (gate bit8)
-mww 0x600310E0 <idle | 0x01>  (set E0 bit0; readback sticks, level arm)
+mww 0x60011050 0x711e02d0   (path B; idle/init 0x711e0320)
+```
+or
+```
+mww 0x60031000 0x0010030f   (gate bit8)
+mww 0x600310E0 <idle | 0x01>  (path A; E0 bit0, readback sticks)
 ```
 
-E0 bit0 alone is sufficient; the other 9 differing bits, the CS words,
-and the 90-group/11050 are all don't-care for resume. Note the baseline
-armed value has bit0 CLEAR yet also resumes, so bit0 is one sufficient
-arming path, not the exclusive one; E0 has no read side-effects observed
-(readback-verified after every write).
+Notes: the baseline "armed" E0 (`0x0190012c`, bit0 CLEAR) works only via
+path-B leftovers in old trials; under reset-control full-E0 never
+resumed anything by itself. E0.bit0=1 with everything else idle resumes
+(K), so bit0 is the true E0 trigger, not a leftover artifact. E0 has no
+read side-effects (readback-verified throughout). 0x60011050 is a BT
+baseband reg (init programs `...0320`); its live `...02d0` bits TBD.
 
-CORRECTION (same session, post-hoc): the don't-care claims for
-90/94/98/9C and 11050 were made with an uncontrolled variable. RES
-(init replay) resets E0 AND the 90-group AND 11050 to init/idle values;
-TOG-RMW preserves them. Trials that "didn't write" those regs inherited
-unknown leftovers, so only the SUFFICIENCY direction stands (the written
-sets all resumed ADV with no blob code running). Exact minimal
-sufficiency (E0-only? E0+90s? E0+11050? all three?) needs a
-reset-controlled protocol: force ALL candidates to idle first, verify
-dead, then write only the trial subset. Open.
+Bit-narrowing history (how bit0 was found; early rows predate
+reset-control, superseded by the matrix where they conflict): C0
+(gate+E0:=idle) dead; H (high half `0x019000fa`) dead; L (low half
+`0x01be012c`) RETURN (with live leftovers); L1 (idle+bits{0,2}) RETURN
+(same caveat); B2 (bit2 alone) dead; B0R/K (bit0 alone) RETURN, K under
+full reset-control with audit. Lesson learned mid-battery: a dropped
+kill/idle readback voids a trial (two redos); phase-model + post-hoc
+audits arbitrate every verdict.
 
 Ops note: repeated JTAG halt/resume skewed the app loop ~10x slow
 (HB cadence degraded, tick-skew suspected) starting ~02:05. Harmless for
 JTAG-driven trials (fewer phase confounds); REKICK still fires.
 If the loop wedges fully, the BOOT+RST dance in the brief applies.
 
-## 7. Instance-1 mapping + body-link verdict (MAPPING COMPLETE)
+## 6. Instance-1 mapping + body-link verdict (MAPPING COMPLETE)
 
 Instance model (from ROM disasm + live traps): CS array stride 90 B
 (`F()+90*idx`, F = call `[ENV+188]` = `0x3FCAE664` for idx0), adv-data
@@ -184,7 +182,7 @@ Proposed next: trap ROM `frm_cbk` per-event (resolve veneer `0x4000405c`
 first) to find the DMA/body programming, then attempt live instance-1
 TX (CS1 + pool1 + gate/E0 trigger, second name/address on air).
 
-## 8. Body-link mechanism: T1 confirmed (modem reads host mbuf live)
+## 7. Body-link mechanism: T1 confirmed (modem reads host mbuf live)
 
 Two theories: (T1) modem DMAs the host mbuf per event/continuously;
 (T2) modem reads a per-REKICK-filled FIFO, pokes working only via the
@@ -205,7 +203,7 @@ modem-autonomous; no per-event or per-REKICK CPU body programming
 exists anywhere in the ADV path (adv_start, adv_data_set, frm_cbk,
 frm_isr ECO, end_ind all disassembled and clean).
 
-## 9. Ops: wedges, slow loop, JTAG reset recovery
+## 8. Ops: wedges, slow loop, JTAG reset recovery
 
 - After ~40 halt/resume cycles + a B-12 pool clobber (byte-exact restored)
   the rig degraded on three axes at once: app loop ~10x slow then silent,
