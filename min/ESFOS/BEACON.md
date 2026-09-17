@@ -242,3 +242,21 @@ Verdict: scan body is mbuf-gated exactly like adv (no scan mbuf exists
 -> pool writes ignored, len stays 0). Second payload via scan-rsp needs
 the same modem-private latch as instance-1. Time-slicing the single
 adv mbuf remains the bounded second-payload path.
+
+## 10. Timing scope: per-event time-slicing infeasible via JTAG (SCOPED)
+
+Question: can two payloads alternate per ADV event by JTAG-poking the
+mbuf between events? Needs event interval + poke latency.
+- ADV interval: firmware sets no interval -> NimBLE legacy defaults
+  (`BLE_GAP_ADV_FAST_INTERVAL{1,2}`, 5-150 ms from `ble_gap.h`).
+  Direct btmon measurement failed (passwordless sudo covers `btmon`
+  itself, NOT `timeout`-wrapped invocations; background capture is
+  unreliable in this environment - foreground `sudo btmon` + concurrent
+  scan is the working pattern, but scans kept landing in kill windows).
+- JTAG round-trip (halt/mdw|mwb/resume via OpenOCD telnet): ~280 ms/op
+  measured over 14 samples; a verified poke cycle ~1 s.
+Verdict: 5-150 ms events vs ~300 ms/op makes per-event slicing
+infeasible by 1-2 orders of magnitude (jitter alone kills it; halting
+perturbs modem timing). Slow alternation (~10 s flips) is trivially
+doable but proves nothing beyond the existing poke proofs. Second
+payload needs the modem-private latch (unbounded hunt, parked).
