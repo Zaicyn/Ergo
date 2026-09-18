@@ -84,8 +84,25 @@ OWNED_MATH = {Op.SIN: "_ergo_sin", Op.COS: "_ergo_cos",
 
 
 def _real_math(base: str) -> str:
-    """libm function name for the current REAL precision (sin vs sinf)."""
-    return base + "f" if get_real_precision() == 32 else base
+    """Emit name for a math op at the current REAL precision.
+
+    Hardware-mapped ops (sqrt, fma, fabs, fmax, fmin) lower to GCC/Clang
+    __builtin_* so no <math.h> symbol is needed — the compiler emits the
+    appropriate instruction directly (sqrtsd/sqrtss, vfmadd*, etc.).
+    All other names fall through to their libm spellings unchanged.
+    """
+    f32 = get_real_precision() == 32
+    # Ops that map to pure hardware / compiler builtins — no libm needed.
+    BUILTIN = {
+        "fma":       ("__builtin_fmaf",   "__builtin_fma"),
+        "sqrt":      ("__builtin_sqrtf",  "__builtin_sqrt"),
+        "fabs":      ("__builtin_fabsf",  "__builtin_fabs"),
+        "fmax":      ("__builtin_fmaxf",  "__builtin_fmax"),
+        "fmin":      ("__builtin_fminf",  "__builtin_fmin"),
+    }
+    if base in BUILTIN:
+        return BUILTIN[base][0] if f32 else BUILTIN[base][1]
+    return base + "f" if f32 else base
 
 
 def _c_str_escape(s: str) -> str:
@@ -2510,7 +2527,7 @@ class IRCodeGen:
         if op == Op.ABS:
             a = self._operand(args[0])
             if self._is_int_operand(args[0]):
-                self._put(f"{result} = abs({a});")
+                self._put(f"{result} = __builtin_abs({a});")
             else:
                 self._put(f"{result} = {_real_math('fabs')}({a});")
             return
@@ -2519,9 +2536,13 @@ class IRCodeGen:
         if op == Op.SIGN:
             a, b = self._operand(args[0]), self._operand(args[1])
             if self._is_int_operand(args[0]):
-                self._put(f"{result} = (abs({a}) * (({b}) >= 0 ? 1 : -1));")
+                self._put(f"{result} = (__builtin_abs({a}) * (({b}) >= 0 ? 1 : -1));")
             else:
-                self._put(f"{result} = {_real_math('copysign')}({a}, {b});")
+                # __builtin_copysign(f) lowers to a single ANDPS/ORPS bit-transfer;
+                # no libm symbol needed.
+                fn = ("__builtin_copysignf" if get_real_precision() == 32
+                      else "__builtin_copysign")
+                self._put(f"{result} = {fn}({a}, {b});")
             return
 
         # PRNG intrinsics — splitmix64 at the runtime's native width
@@ -3330,8 +3351,8 @@ class IRCodeGen:
             else:
                 self._put(f"double _gpu = {arr}[_vi];")
             self._put(f"double _cpu = _oracle_{arr}[_vi];")
-            self._put(f"double _denom = fabs(_cpu) > 1e-30 ? fabs(_cpu) : 1e-30;")
-            self._put(f"double _rel = fabs(_gpu - _cpu) / _denom;")
+            self._put(f"double _denom = __builtin_fabs(_cpu) > 1e-30 ? __builtin_fabs(_cpu) : 1e-30;")
+            self._put(f"double _rel = __builtin_fabs(_gpu - _cpu) / _denom;")
             self._put(f"if (_rel > _max_err) {{ _max_err = _rel; "
                       f"_worst_gpu = _gpu; _worst_cpu = _cpu; "
                       f"_worst_arr = \"{arr}\"; _worst_idx = _vi; }}")
@@ -3341,7 +3362,7 @@ class IRCodeGen:
         # λ ≈ |rate/divergence| — exponential growth indicator
         self._put(f"double _d_err = _max_err - _oracle_prev_err;")
         self._put(f"double _lyap = (_max_err > 1e-30) ? "
-                  f"fabs(_d_err) / _max_err : 0.0;")
+                  f"__builtin_fabs(_d_err) / _max_err : 0.0;")
         self._put(f"const char *_regime = "
                   f"(_lyap > 1.0) ? \"EXPONENTIAL\" : "
                   f"(_lyap < 0.1) ? \"PLATEAU\" : "
