@@ -80,7 +80,10 @@ C_MATH = {
 # and mapped back to host libm under --libm-fallback.
 OWNED_MATH = {Op.SIN: "_ergo_sin", Op.COS: "_ergo_cos",
               Op.EXP: "_ergo_exp", Op.LOG: "_ergo_log",
-              Op.ATAN2: "_ergo_atan2", Op.POW: "_ergo_pow"}
+              Op.ATAN2: "_ergo_atan2", Op.POW: "_ergo_pow",
+              Op.TAN: "_ergo_tan", Op.ATAN: "_ergo_atan",
+              Op.LOG10: "_ergo_log10", Op.ASIN: "_ergo_asin",
+              Op.ACOS: "_ergo_acos"}
 
 
 def _real_math(base: str) -> str:

@@ -1298,5 +1298,65 @@ static inline float _ergo_powf(float x, float y) {
     return sign ? -r : r;
 }
 
+/* =========================================================================
+ * PROTOTYPE: Composed Math Kernels (Batch 1)
+ * 
+ * These functions build upon the existing bit-identical kernels (_ergo_sin,
+ * _ergo_cos, _ergo_atan2, _ergo_log). Because the underlying routines are 
+ * robust (e.g. Payne-Hanek reduction in sin/cos, correct Inf/NaN propagation), 
+ * composing them using standard IEEE operations guarantees predictability.
+ * ========================================================================= */
+
+static inline double _ergo_tan(double x) {
+    /* IEEE division of two deterministic kernels. 
+     * Handles poles naturally if cos(x) hits exactly 0 (returns Inf),
+     * though exact 0 is unlikely for large x due to pi/2 irrationality. */
+    return _ergo_sin(x) / _ergo_cos(x);
+}
+
+static inline float _ergo_tanf(float x) {
+    return _ergo_sinf(x) / _ergo_cosf(x);
+}
+
+static inline double _ergo_atan(double x) {
+    /* Exact composition: atan(x) = atan2(x, 1.0) */
+    return _ergo_atan2(x, 1.0);
+}
+
+static inline float _ergo_atanf(float x) {
+    return _ergo_atan2f(x, 1.0f);
+}
+
+static inline double _ergo_log10(double x) {
+    /* log10(x) = log(x) / ln(10) = log(x) * 0.43429448190325182765 */
+    return _ergo_log(x) * 0.43429448190325182765;
+}
+
+static inline float _ergo_log10f(float x) {
+    return _ergo_logf(x) * 0.43429448190325182765f;
+}
+
+static inline double _ergo_asin(double x) {
+    /* asin(x) = atan2(x, sqrt(1-x^2)).
+     * We use fma(-x, x, 1.0) to maintain precision near |x| = 1 and 
+     * prevent catastrophic cancellation. If |x| > 1, fma is negative, 
+     * sqrt returns NaN, atan2 returns NaN. Matches IEEE perfectly. */
+    return _ergo_atan2(x, __builtin_sqrt(__builtin_fma(-x, x, 1.0)));
+}
+
+static inline float _ergo_asinf(float x) {
+    return _ergo_atan2f(x, __builtin_sqrtf(__builtin_fmaf(-x, x, 1.0f)));
+}
+
+static inline double _ergo_acos(double x) {
+    /* acos(x) = atan2(sqrt(1-x^2), x). 
+     * Same robust FMA + SQRT composition as asin. */
+    return _ergo_atan2(__builtin_sqrt(__builtin_fma(-x, x, 1.0)), x);
+}
+
+static inline float _ergo_acosf(float x) {
+    return _ergo_atan2f(__builtin_sqrtf(__builtin_fmaf(-x, x, 1.0f)), x);
+}
+
 #endif /* ERGO_MATH_LIBM */
 #endif /* ERGO_MATH_KERNELS_H */
