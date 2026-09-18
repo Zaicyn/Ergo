@@ -276,6 +276,12 @@ static void host_task(void *param) {
     nimble_port_freertos_deinit();
 }
 
+/* Auto-cycle gate: the TOG/RES/REKICK 4-phase probe loop was for TX
+ * mapping (done). RX/connection work needs a stable rig, so the cycle
+ * can be parked at runtime: "CYCLE 0" freezes it (state left as-is),
+ * "CYCLE 1" resumes. Default on (legacy behavior). */
+static int cycle_en = 1;
+
 void app_main(void) {
     printf("BOOT-esfnode\n");
     printf("heap_free=%u psram_free=%u psram_size=%u\n",
@@ -321,6 +327,12 @@ void app_main(void) {
                 } else if (!strcmp(cmd, "STAT")) {
                     printf("STAT rx=%lu sdus=%lu\n", rx_bytes,
                            rx_sdus);
+                } else if (!strcmp(cmd, "CYCLE 0")) {
+                    cycle_en = 0;
+                    printf("CYCLE off\n");
+                } else if (!strcmp(cmd, "CYCLE 1")) {
+                    cycle_en = 1;
+                    printf("CYCLE on\n");
                 }
             } else if (c != '\r') {
                 cmd[cmdlen++] = c;
@@ -333,7 +345,7 @@ void app_main(void) {
             printf("HB\n");
         if (n == 5 || (n >= 45 && (n % 40) == 5))
             reg_dump();
-        if (n >= 37 && (n % 8) == 5) {
+        if (cycle_en && n >= 37 && (n % 8) == 5) {
             /* 4-phase cycle: set -> clear -> RESUME(init replay) ->
              * REKICK(bit8 + adv_start through the blob API). */
             static int phase = 0;

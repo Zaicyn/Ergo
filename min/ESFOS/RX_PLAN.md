@@ -112,3 +112,76 @@ Key live addresses (re-verify post-reboot; heap is deterministic):
 6. Locate a received payload in DRAM (search for a known advertiser's
    bytes, e.g. a phone's name) -> confirms landing zone.
 7. Doc + commit. Go/no-go on minimal connection attempt.
+
+## 6. Session log 2026-09-18 (RX mapping, TX stable baseline kept)
+
+Rig: OpenOCD espusbjtag (caps 0x2000, 303a:1001) telnet :4444; GDB :3333
+unused (PIO GDB needs libpython2.7, absent). JTAG helper
+`~/opencode/jtag.py` (scratch, NOT committed): passive banner drain
+(the "lag" is only the connect banner + a `\x00` prefix on reply lines;
+single-xchg is synchronous after that), address-echo-matched mdw with
+continuation lines, bulk reads need cpu halted. BT helper
+`~/opencode/btctl.py`: interactive bluetoothctl held open (per-process
+`--timeout`/bare-`&` sessions drop discovery/link on exit -- this voided
+early trials). `bluetoothctl --timeout N scan on` HOLDS discovery for Ns.
+
+- RX ring @EM+0x000 = 16x16B confirmed. e0 = unprogrammed header
+  (`a5a5a5a5` fill, w3 `0x148`); e1-15 live: w0 = bufptr (full 32b word,
+  marches; low half was `0x281a`-class at some boots), w1 = `0x0270:RRRR`
+  (RRRR monotonic +1/15-30 s while alive, frozen-static, survives REKICK
+  re-init), w2 `0x0af70200` const, w3 `0f000c00` const. Entry stride in
+  w0hi ~0xC0-0xE0 (avg ~0xD0 = 208 B-ish).
+- March needs cpu1 (controller core) running: frozen (cpu1 halted) =
+  static; alive = +25-31 KB/30 s ambient. NOT accelerated by held active
+  scan + confirmed SCAN_REQ elicitation (stimulus == quiet) and NOT a
+  per-packet counter (w1-lo +1/30 s metronomic in both). Relocates on
+  REKICK re-init (two-group ~0xD00-split deltas).
+- No `0x281a` literal in any blob .o -> tag is ROM-written. CPU
+  watchpoint (OpenOCD `wp`, verified listed) on marching word never
+  fires over 30-60 s: writer is NOT cpu1 (modem DMA) or wp silently
+  broken (rwp removal errors; support immature -- treat as medium
+  confidence). e0 never programs under ADV-RX (reserved for data-RX?).
+- ISR/handler static decode (btdm/obj/lld.o + saved dis/lld.o.txt):
+  ISR logs `[0x60031024]&0x7fff` + `[0x600312d0]&0x7fff`, clears bit7
+  @0x600312d0, then calls `[[modules]+228]` = `r_ke_msg_send_basic`
+  (0x40003abc, resolved via ELF ROM symbols) = RX-done signal.
+  `r_lld_update_rxbuf(SZ,NB)` asserts SZ<=0x110, NB<=9 (so the 16-entry
+  ring is NOT its table); handler loop is mod-10/20 B-stride with
+  `r_emi_get_mem_addr_by_offset` (0x40003648 veneer) conversions,
+  s16i status stores with bit15 = ready flag, and SETS bit15
+  @0x600312d4 = recycle/update trigger (live: 312d0=0, 312d4=0xff when
+  ADV off). `nm firmware.elf` carries the full BT ROM symbol table
+  (all `r_*` addrs above from it).
+- Landing zone: EM 8 K holds no payloads (only own BDADDR @0x152);
+  480 KB DRAM sweep for live ambient names/MACs = zero hits (host never
+  scans; buffers recycle too fast or never leave modem). Verdict:
+  modem-private buffers, host-visible only via HCI (host scan) / L2CAP.
+- CS base is PER-BOOT (0x3FCAE664 old build -> 0x3FCAE674 this build;
+  magic-aligned: CNTL 0404/BDADDR/AA/CRCINIT/8027/txcount). mbuf likewise
+  (0x3FCB0A00, `02 01 06 06 09 ESFOC` intact). RE-VERIFY EVERY BOOT.
+  (One mis-poked mbuf-adjacent byte this session; healed by reset.)
+- esfnode: added `CYCLE 0/1` serial gate for the 4-phase auto-cycle
+  (default on; `cycle_en` + cmd parser; src synced to
+  `~/opencode/esfnode`, rebuilt (PIO 6.2.0, 33 s), flashed post-OpenOCD
+  stop). Serial input verified working (`STAT`/`CYCLE`). New heap
+  2341760 (fresh boot 2402500, fragments with uptime).
+- DUAL-CORE METHOD FIX: bare telnet halt/resume hits the current target
+  (cpu1) only. A dual halt/resume dance WEDGES both cores (resume-order
+  failure, only JTAG `reset` recovers). Discipline: cpu1-only
+  halt/resume (freezes LL schedule; app on cpu0 keeps running, so
+  phase-audits stay mandatory). `targets` state display lies (shows
+  halted while app prints); serial HBs + memory are ground truth.
+- REGRESSION: full v3 resume set, then row-K (gate+E0.bit0,
+  readback-verified, gate PROVEN SET across a 20 s held scan with
+  neighbor control) both DEAD where trial-E row-K was ALIVE. txcount
+  static 000b, mbuf intact, CS magic-aligned. Soft reset revived ADV
+  once (RSSI -42), then decayed again. Next: PHYSICAL power cycle
+  (JTAG reset no longer suffices); then re-verify + re-run.
+- CoC BLOCKED (independent of the above): GAP connects (ServicesResolved)
+  but raw L2CAP CoC (coc.py, PSM 129) always EHOSTUNREACH at connect(),
+  zero air egress, while ESP GATT answers (link + host alive) and ESP app
+  prints no `EVT connected` for some establishments (stale-link
+  re-resolution suspected in later tries). Historical rx.log proves the
+  recipe (GAP-then-CoC) worked on this laptop stack. Laptop dmesg clean.
+  Open: bind-type variant, l2test cross-check, MGMT-level trace of the
+  failing connect.
