@@ -36,7 +36,20 @@ static volatile uint64_t rx_fnv = 0xcbf29ce484222325ULL;
 static volatile int auto_tx = 0;
 static int auto_n = 0;
 static uint16_t conn_h = BLE_HS_CONN_HANDLE_NONE;
+static int gap_ev(struct ble_gap_event *ev, void *arg);
+/* The LE hardware gate (bit8 @0x60031000) is NOT touched by the blob's
+ * ADV path (shared-memory + task messages only). Natural ADV (boot init)
+ * dies at the first TOG-clear/adv-stop; only TOG-set/REKICK re-arms it.
+ * So every host-side (re)start sets the gate itself -- else disconnect
+ * recovery silently leaves the modem deaf. */
+static void gate_set(void) {
+    volatile uint32_t *r = (volatile uint32_t *)0x60031000;
+    __asm__ volatile ("memw");
+    *r = *r | 0x100U;
+    __asm__ volatile ("memw");
+}
 static void start_adv(void) {
+    gate_set();
     struct ble_hs_adv_fields f;
     memset(&f, 0, sizeof f);
     f.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
@@ -50,7 +63,7 @@ static void start_adv(void) {
     p.conn_mode = BLE_GAP_CONN_MODE_UND;
     p.disc_mode = BLE_GAP_DISC_MODE_GEN;
     rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
-                           &p, NULL, NULL);
+                           &p, gap_ev, NULL);
     printf("ADV start rc=%d\n", rc);
 }
 
@@ -135,6 +148,7 @@ static int coc_ev(struct ble_l2cap_event *event, void *arg) {
         struct os_mbuf *om = event->receive.sdu_rx;
         struct ble_l2cap_chan *ch = event->receive.chan;
         uint16_t n = OS_MBUF_PKTLEN(om);
+        printf("RX sdu len=%u\n", n);
         static uint8_t flat[2048];
         if (n <= sizeof flat) {
             size_t o = 0;
@@ -297,6 +311,11 @@ void app_main(void) {
     ble_hs_cfg.reset_cb = on_reset;
     nimble_port_freertos_init(host_task);
     int n = 0;
+    /* Serial input via IDF usb_serial_jtag_read_bytes HANGS the app loop
+     * (Arduino owns the USB peripheral; PC pins inside
+     * usb_serial_jtag_read_bytes, console goes silent). Reverted to the
+     * legacy stdin path (input effectively dead, output fine); RX state
+     * is monitored passively via HB rx= lines. */
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
     static char cmd[32];
     static int cmdlen = 0;

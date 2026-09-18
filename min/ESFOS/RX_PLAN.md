@@ -185,3 +185,53 @@ early trials). `bluetoothctl --timeout N scan on` HOLDS discovery for Ns.
   recipe (GAP-then-CoC) worked on this laptop stack. Laptop dmesg clean.
   Open: bind-type variant, l2test cross-check, MGMT-level trace of the
   failing connect.
+
+## 7. Session log 2026-09-18 p2 (connection path + CoC data-RX)
+
+- `coc.py` BUG (scratch): `BDADDR_LE_PUBLIC = 0` == BREDR. Kernel paged
+  BREDR (Page Timeout in btmon) to the LE-only ESP -> EHOSTUNREACH.
+  Fixed to 1. Lesson: EHOSTUNREACH + stray BREDR Create Connection in
+  btmon = wrong addr type, not a dead peer.
+- ESP `EVT connected` silence EXPLAINED: `ble_gap_adv_start(..., NULL,
+  NULL)` never registered gap_ev. Fixed (prototype + pass gap_ev):
+  first `EVT connected h=1`, `EVT phy tx=2 rx=2`, `EVT params` prints
+  observed. gap_ev DISCONNECT->start_adv now runs (was dead code).
+- LE gate NOT in blob ADV path: natural ADV dies at first TOG-clear/
+  adv-stop; only probe TOG-set/REKICK re-armed it. Fix: `gate_set()`
+  (bit8 MMIO) inside `start_adv()` -- every host (re)start re-arms.
+- Serial INPUT is dead (Arduino owns USB CDC; stdin never arrives) AND
+  IDF `usb_serial_jtag_read_bytes` HANGS the app loop (PC pins inside
+  it, console silent -- diagnosed via JTAG PC resolve to
+  `usb_serial_jtag_read_bytes+0x14`). Reverted to stdin path. RX state
+  via passive `HB heap=%u rx=%lu` only. CYCLE gate therefore
+  unreachable at runtime (cycle runs; phase-model discipline stands).
+- CoC STATUS: GAP connects (held BTSess keeps BlueZ link),
+  `COC accept/open status=0/slot`, ESP->laptop DATA PROVEN (729 B
+  received, ATX frames on air). laptop->ESP data SYSTEMATICALLY LOST:
+  PDU confirmed on air (btmon dlen 204, 1 credit), ESP
+  `bytes=0/sdus=0`, no `RX sdu`, no credit updates, single-PDU sends
+  clean (rc=0), multi-frame sends get ESP-initiated Disconnect
+  (CID 65, 30 ms after 2nd PDU). Credit math sane (MTU512/MPS248 ->
+  initial 3; recv_ready tops up per mbuf). No `COC nombuf` ever.
+  Verdict: controller-side ACL-U RX pool never delivers (drop before
+  host). `r_lld_update_rxbuf`/ISR/handler (log level raised to 5 via
+  JTAG, readback-verified) NEVER print across boot/ambient/connect/
+  send: the data-RX programmer is inert in all observed states.
+  Live ip_funcs slots = ROM addrs (lld.o copies dormant).
+  OPEN: who programs the NB<=9 data pool, and what recycles it
+  (312d4.bit15 path), and whether ambient ADV-RX shares/drains it.
+  Next: sub-MTU (50 B) probe, e0-descriptor-while-connected dump,
+  NimBLE `disable_auto_credit_update`/SDU_BUFF_COUNT review.
+- Rig mechanics: `reset halt` + single-core resume STRANDS cpu0 (app
+  never boots; only ROM/PSRAM prints). Always plain `reset`.
+  Post-flash silence needs one JTAG reset (esptool hard-reset leaves it
+  needing a kick). pkill -f with the openocd cmdline MATCHES YOUR OWN
+  SHELL (self-kill); use `pkill -x openocd`. USB re-enumeration moves
+  ACM0->ACM1 (all scripts must take the node as a parameter -- TODO).
+  `targets` state display unreliable; serial HBs + memory = truth.
+  Single-word mdw while running now refused ("target not halted") --
+  halt even for singles. Halt budget ~6-8 cpu1 halts per wedge; reset
+  revives. FreeRTOS tick verified 110 Hz (healthy); slow serial =
+  CDC-TX backpressure (printf-blocked loop), NOT slow clocks.
+  `BTLIV` state to re-verify every boot: EM base, CS base (per-build
+  ...674), mbuf addr, gate, ESFOC on air.
