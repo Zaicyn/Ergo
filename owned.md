@@ -13,14 +13,14 @@ This document tracks the progress of decoupling the Ergo compiler's generated C 
 
 ## Phase 2: Extend `ergo_math_kernels.h`
 Implement the remaining transcendental and math operations using existing owned components.
-- [ ] `_ergo_atan`: Implement via `_ergo_atan2(x, 1.0)`.
-- [ ] `_ergo_acos`: Implement via `_ergo_atan2(sqrt(1-x*x), x)`.
-- [ ] `_ergo_asin`: Implement via `_ergo_atan2(x, sqrt(1-x*x))`.
-- [ ] `_ergo_tan`: Implement via `_ergo_sin(x) / _ergo_cos(x)`.
+- [x] `_ergo_atan`: Implement via `_ergo_atan2(x, 1.0)`.
+- [x] `_ergo_acos`: Implement via `_ergo_atan2(sqrt(1-x*x), x)`.
+- [x] `_ergo_asin`: Implement via `_ergo_atan2(x, sqrt(1-x*x))`.
+- [x] `_ergo_tan`: Implement via `_ergo_sin(x) / _ergo_cos(x)`.
+- [x] `_ergo_log10`: Implement via `_ergo_log(x) * (1.0 / ln(10))`.
 - [ ] `_ergo_fmod`: Implement fully owned `x - trunc(x/y)*y` using bit manipulation.
-- [ ] `_ergo_log10`: Implement via `_ergo_log(x) * (1.0 / ln(10))`.
 - [ ] Hyperbolics (`_ergo_sinh`, `_ergo_cosh`, `_ergo_tanh`): Implement via `_ergo_exp` formulations.
-- [ ] Wire these new functions into `C_MATH` and `OWNED_MATH` in `ir_codegen.py`.
+- [x] Wire these new functions into `C_MATH` and `OWNED_MATH` in `ir_codegen.py`.
 
 ## Phase 3: I/O & `stdio.h` Eradication
 Replace the slow `printf`/`fprintf` paths and `FILE*` streams.
