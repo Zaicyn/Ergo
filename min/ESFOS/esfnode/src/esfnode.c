@@ -138,6 +138,7 @@ static void coc_arm(struct ble_l2cap_chan *chan) {    /* No auto-buffers in raw 
 static uint8_t c_units[8][512], c_p[512], c_q[512];
 static uint32_t c_refs[8][4];
 static uint8_t c_lostmask, c_gotmask, c_phase; /* phase: 0 idle,1 units,2 P,3 Q */
+static unsigned c_stripe;
 static int c_err;
 static void codec_reset(void) {
     c_lostmask = 0;
@@ -157,7 +158,8 @@ static void codec_rx(const uint8_t *d, size_t n) {
                                ((uint32_t)d[2 + 16 * u + 4 * k + 3] << 24);
         memset(c_units, 0, sizeof c_units);
         c_phase = 1;
-        printf("CODEC refs mask=%02x\n", c_lostmask);
+        c_stripe++;
+        printf("CODEC stripe=%u refs mask=%02x\n", c_stripe, c_lostmask);
         return;
     }
     if (c_phase == 0) {
@@ -179,8 +181,8 @@ static void codec_rx(const uint8_t *d, size_t n) {
                 f ^= c_units[u][i];
                 f *= 0x100000001b3ULL;
             }
-        printf("CODEC done nl=%d rc=%d sec=%d/8 fnv=%08lx%08lx\n", nl,
-               rc, secok, (unsigned long)(f >> 32),
+        printf("CODEC stripe=%u done nl=%d rc=%d sec=%d/8 fnv=%08lx%08lx\n",
+               c_stripe, nl, rc, secok, (unsigned long)(f >> 32),
                (unsigned long)(f & 0xFFFFFFFFULL));
         c_phase = 0;
         return;
@@ -472,7 +474,7 @@ void app_main(void) {
             }
         }
         if (++n % 5 == 0)
-            printf("HB-FLASH5 heap=%u rx=%lu sdus=%lu\n",
+            printf("HB-FLASH6 heap=%u rx=%lu sdus=%lu\n",
                    (unsigned)esp_get_free_heap_size(), rx_bytes, rx_sdus);
         else
             printf("HB\n");

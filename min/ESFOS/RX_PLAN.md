@@ -328,3 +328,14 @@ early trials). `bluetoothctl --timeout N scan on` HOLDS discovery for Ns.
   (mask 24, Q-path with GF division): `nl=2 rc=0 sec=8/8`, same FNV.
   Both first-try. Refs verify the rebuilt units (refs alone cannot
   reconstruct). Stripe generator: `/tmp/genstripe.c` (same pktcc.c).
+
+## 12. Session log 2026-09-19 p5 (multi-stripe, 4/4 PASS)
+
+- Seeded generator (`/tmp/genstripe.c` argv seed mixes into every
+  unit byte; distinct FNV per stripe) + ESP stripe counter in
+  verdicts (FLASH6).
+- 4 stripes back-to-back on ONE held CoC channel, rotating masks +
+  distinct data: u0 (P, edge), u1+u6 (Q, split), u7 (P, edge),
+  u3+u4 (Q, adjacent). All `rc=0 sec=8/8`, all 4 FNVs match
+  laptop-expected. Repair is position-independent; channel holds
+  across stripes with no re-arm decay.
