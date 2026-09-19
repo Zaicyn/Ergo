@@ -25,6 +25,7 @@
 #include "os/os_mbuf.h"
 
 #include "radio_if.h"
+#include "pktcc.h"
 
 #define COC_PSM 0x81
 #define COC_MTU 512
@@ -112,8 +113,7 @@ static int gap_ev(struct ble_gap_event *ev, void *arg) {
     return 0;
 }
 
-static void coc_arm(struct ble_l2cap_chan *chan) {
-    /* No auto-buffers in raw NimBLE: the app must supply an SDU
+static void coc_arm(struct ble_l2cap_chan *chan) {    /* No auto-buffers in raw NimBLE: the app must supply an SDU
      * buffer AND the credits that come with it, on accept and after
      * every SDU. Skip this and the sender stalls at zero credits. */
     struct os_mbuf *om = os_msys_get_pkthdr(COC_MTU, 0);
@@ -126,6 +126,100 @@ static void coc_arm(struct ble_l2cap_chan *chan) {
         printf("COC arm rc=%d\n", rc);
         os_mbuf_free_chain(om);
     }
+}
+/* Codec stripe RX (v1 protocol, see RX_PLAN.md 11). SDU layout:
+ * REFS [01][lostmask:1][refs:8x4xu32 LE=128] (130 B, resets state)
+ * UNIT raw 512 B payload, positional ascent skipping lostmask bits
+ * P    512 B XOR parity (after all present units)
+ * Q    512 B GF parity (after P)
+ * DONE [05] (1 B: repair + verify + report)
+ * Any out-of-phase SDU -> ERR + reset. Units fit MTU exactly, so no
+ * sub-chunking and no per-SDU index headers in v1. */
+static uint8_t c_units[8][512], c_p[512], c_q[512];
+static uint32_t c_refs[8][4];
+static uint8_t c_lostmask, c_gotmask, c_phase; /* phase: 0 idle,1 units,2 P,3 Q */
+static int c_err;
+static void codec_reset(void) {
+    c_lostmask = 0;
+    c_gotmask = 0;
+    c_phase = 0;
+    c_err = 0;
+}
+static void codec_rx(const uint8_t *d, size_t n) {
+    if (n >= 2 && d[0] == 0x01 && n == 130) {
+        codec_reset();
+        c_lostmask = d[1];
+        for (int u = 0; u < 8; u++)
+            for (int k = 0; k < 4; k++)
+                c_refs[u][k] = (uint32_t)d[2 + 16 * u + 4 * k] |
+                               ((uint32_t)d[2 + 16 * u + 4 * k + 1] << 8) |
+                               ((uint32_t)d[2 + 16 * u + 4 * k + 2] << 16) |
+                               ((uint32_t)d[2 + 16 * u + 4 * k + 3] << 24);
+        memset(c_units, 0, sizeof c_units);
+        c_phase = 1;
+        printf("CODEC refs mask=%02x\n", c_lostmask);
+        return;
+    }
+    if (c_phase == 0) {
+        return; /* non-codec traffic (stats path still counts it) */
+    }
+    if (n == 1 && d[0] == 0x05 && c_phase == 3) {
+        int lost[8], nl = 0;
+        for (int u = 0; u < 8; u++) {
+            lost[u] = (c_lostmask >> u) & 1;
+            nl += lost[u];
+        }
+        int rc = pktcc_repair_erase(c_units, c_p, c_q, lost);
+        int secok = 0;
+        for (int u = 0; u < 8; u++)
+            secok += pktcc_sec(c_units[u], c_refs[u]);
+        uint64_t f = 0xcbf29ce484222325ULL;
+        for (int u = 0; u < 8; u++)
+            for (int i = 0; i < 512; i++) {
+                f ^= c_units[u][i];
+                f *= 0x100000001b3ULL;
+            }
+        printf("CODEC done nl=%d rc=%d sec=%d/8 fnv=%08lx%08lx\n", nl,
+               rc, secok, (unsigned long)(f >> 32),
+               (unsigned long)(f & 0xFFFFFFFFULL));
+        c_phase = 0;
+        return;
+    }
+    if (n == 512 && c_phase >= 1 && c_phase <= 3) {
+        if (c_phase == 1) {
+            int u;
+            for (u = 0; u < 8; u++)
+                if (!((c_lostmask >> u) & 1) && !((c_gotmask >> u) & 1))
+                    break;
+            if (u >= 8) {
+                printf("CODEC ERR extra-unit\n");
+                c_err = 1;
+                c_phase = 0;
+                return;
+            }
+            memcpy(c_units[u], d, 512);
+            c_gotmask |= (uint8_t)(1 << u);
+            int want = 0;
+            for (int k = 0; k < 8; k++)
+                want += !((c_lostmask >> k) & 1);
+            int got = 0;
+            for (int k = 0; k < 8; k++)
+                got += !!((c_gotmask >> k) & 1);
+            if (got >= want)
+                c_phase = 2;
+            return;
+        }
+        if (c_phase == 2) {
+            memcpy(c_p, d, 512);
+            c_phase = 3;
+            return;
+        }
+        memcpy(c_q, d, 512);
+        return;
+    }
+    printf("CODEC ERR phase=%d n=%u\n", c_phase, (unsigned)n);
+    c_err = 1;
+    c_phase = 0;
 }
 static int coc_ev(struct ble_l2cap_event *event, void *arg) {
     (void)arg;
@@ -176,6 +270,7 @@ static int coc_ev(struct ble_l2cap_event *event, void *arg) {
                 q = SLIST_NEXT(q, om_next);
             }
             radio_chan_rx(ch, flat, o);
+            codec_rx(flat, o);
         }
         struct os_mbuf *o = om;
         while (o) {
@@ -315,6 +410,8 @@ static int cycle_en = 0;
 
 void app_main(void) {
     printf("BOOT-esfnode\n");
+    pktcc_init();
+    codec_reset();
     printf("heap_free=%u psram_free=%u psram_size=%u\n",
            (unsigned)esp_get_free_heap_size(),
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -375,7 +472,7 @@ void app_main(void) {
             }
         }
         if (++n % 5 == 0)
-            printf("HB-FLASH4 heap=%u rx=%lu sdus=%lu\n",
+            printf("HB-FLASH5 heap=%u rx=%lu sdus=%lu\n",
                    (unsigned)esp_get_free_heap_size(), rx_bytes, rx_sdus);
         else
             printf("HB\n");

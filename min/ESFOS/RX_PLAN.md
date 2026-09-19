@@ -308,3 +308,23 @@ early trials). `bluetoothctl --timeout N scan on` HOLDS discovery for Ns.
   wedge. Always `s.disconnect(mac)` + 10 s before close; ADV returns
   with no reset. `GAP: False` from the helper is flaky (link still
   comes up); `info_connected` is ground truth.
+
+## 11. Session log 2026-09-19 p4 (codec over CoC, first-try PASS)
+
+- Portable core: `esfnode/src/pktcc.{h,c}` (verbatim extract of
+  pktcodec.c encode/repair/verify, no test scaffolding). Single
+  source for host tools (gcc) and ESP-IDF (picked up by the
+  `src/*.*` glob). One fidelity fix found by KAT: original
+  solve_erase silently rebuilds first-two of >2 losses (no refusal);
+  extract mirrors that. Host KAT (`/tmp/pktcc_kat.c`, not in repo):
+  secfix/secref vectors, 8x erase-1, 28x erase-2 pairs, erase-0
+  no-op — PASS. Reference `pktcodec.c` self-test also PASS on host.
+- Stripe protocol v1 (RX_PLAN: REFS[01+mask+128] / 7x UNIT 512 B
+  positional / P / Q / DONE[05]). Units fit CoC MTU exactly — no
+  sub-chunking, no index headers. ESP keeps 5.2 KB static, repairs
+  on DONE, reports `CODEC done nl/rc/sec/fnv` over serial.
+- AIR, erase-1 (mask 08, unit 3 withheld): `nl=1 rc=0 sec=8/8
+  fnv=5744c600c3261f5f` == laptop-expected stripe FNV. AIR, erase-2
+  (mask 24, Q-path with GF division): `nl=2 rc=0 sec=8/8`, same FNV.
+  Both first-try. Refs verify the rebuilt units (refs alone cannot
+  reconstruct). Stripe generator: `/tmp/genstripe.c` (same pktcc.c).
