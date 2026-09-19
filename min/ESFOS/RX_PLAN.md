@@ -289,3 +289,22 @@ early trials). `bluetoothctl --timeout N scan on` HOLDS discovery for Ns.
   reset needed post-flash); tick/chan-pool addrs move per build;
   physical reset recovered the ~50 s boot wedge; ADV stable with
   cycle off (no more TOG lottery).
+
+## 10. Session log 2026-09-19 p3 (burst / MTU-abuse / soak)
+
+- BURST: 10x200 B back-to-back in 0.2 s, all 10 delivered, ESP FNV ==
+  laptop FNV (b7e993ad..). Credit loop + per-SDU re-arm + MSYS pool
+  hold at full speed, no nombuf/unstalled.
+- MTU ABUSE: kernel enforces peer MTU itself — sendall 513/1024 B
+  fails locally with EMSGSIZE (Errno 90), zero air traffic. ESP-side
+  oversize-reject path (`sdu_len > rx->mtu` -> disconnect,
+  ble_l2cap_coc.c:227) statically verified, not reachable from this
+  peer. Link survives; app healthy.
+- SOAK: 100x200 B = 20000 bytes in 2.0 s on one held channel, all 100
+  SDUs delivered, FNV MATCH (86be9e96..), heap pinned at 2341760
+  across 100 alloc/free/arm cycles (no leak), no stalls.
+- HYGIENE (important): `BTSess.close()` does NOT tear down the GAP
+  link — every "ADV death" after a test was a lingering link, not a
+  wedge. Always `s.disconnect(mac)` + 10 s before close; ADV returns
+  with no reset. `GAP: False` from the helper is flaky (link still
+  comes up); `info_connected` is ground truth.
