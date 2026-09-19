@@ -24,6 +24,8 @@
 #include "services/gap/ble_svc_gap.h"
 #include "os/os_mbuf.h"
 
+#include "os/os_mbuf.h"
+
 #include "radio_if.h"
 #include "pktcc.h"
 
@@ -41,6 +43,18 @@ static volatile uint64_t rx_fnv = 0xcbf29ce484222325ULL;
  * credits. Lets the host verify the TX path with no serial input. */
 static volatile int auto_tx = 0;
 static int auto_n = 0;
+/* TX soak: laptop sends a "GO" SDU, ESP blasts 200x512 B back-to-back
+ * (credit-paced, 20 ms retry) for a TX goodput number. Replaces ATX
+ * (now off) as the TX direction test. */
+static volatile int tx_soak = 0;
+static volatile int tx_soak_bad = 0;
+static unsigned tx_soak_n = 0;
+static unsigned tx_soak_stalls = 0;
+static uint64_t tx_soak_fnv = 0xcbf29ce484222325ULL;
+static uint32_t tx_soak_t0 = 0;
+#define TX_SOAK_FRAMES 200
+#define TX_SOAK_LEN 240
+#define TX_SOAK_PACE_MS 10
 static uint16_t conn_h = BLE_HS_CONN_HANDLE_NONE;
 static int gap_ev(struct ble_gap_event *ev, void *arg);
 /* The LE hardware gate (bit8 @0x60031000) is NOT touched by the blob's
@@ -248,8 +262,8 @@ static int coc_ev(struct ble_l2cap_event *event, void *arg) {
             if (slot >= 0)
                 radio_request(slot, BLE_GAP_LE_PHY_2M_MASK,
                               6, 12, 251);
-            auto_tx = 8;
 #endif
+            auto_tx = 0;
             coc_arm(event->connect.chan);
         }
         return 0;
@@ -273,6 +287,16 @@ static int coc_ev(struct ble_l2cap_event *event, void *arg) {
             }
             radio_chan_rx(ch, flat, o);
             codec_rx(flat, o);
+            if (o >= 2 && flat[0] == 'G' && flat[1] == 'O' &&
+                tx_soak == 0) {
+                tx_soak = TX_SOAK_FRAMES;
+                tx_soak_n = 0;
+                tx_soak_stalls = 0;
+                tx_soak_bad = 0;
+                tx_soak_fnv = 0xcbf29ce484222325ULL;
+                tx_soak_t0 = xTaskGetTickCount();
+                printf("TXSOAK start\n");
+            }
         }
         struct os_mbuf *o = om;
         while (o) {
@@ -290,6 +314,8 @@ static int coc_ev(struct ble_l2cap_event *event, void *arg) {
     }
     if (event->type == BLE_L2CAP_EVENT_COC_TX_UNSTALLED) {
         printf("COC unstalled status=%d\n", event->tx_unstalled.status);
+        if (event->tx_unstalled.status != 0)
+            tx_soak_bad = 1;
         return 0;
     }
     if (event->type == BLE_L2CAP_EVENT_COC_DISCONNECTED) {        radio_chan_detach(event->disconnect.chan);
@@ -412,6 +438,7 @@ static int cycle_en = 0;
 
 void app_main(void) {
     printf("BOOT-esfnode\n");
+    printf("MSYS total=%d free=%d\n", os_msys_count(), os_msys_num_free());
     pktcc_init();
     codec_reset();
     printf("heap_free=%u psram_free=%u psram_size=%u\n",
@@ -474,7 +501,7 @@ void app_main(void) {
             }
         }
         if (++n % 5 == 0)
-            printf("HB-FLASH6 heap=%u rx=%lu sdus=%lu\n",
+            printf("HB-FLASH7 heap=%u rx=%lu sdus=%lu\n",
                    (unsigned)esp_get_free_heap_size(), rx_bytes, rx_sdus);
         else
             printf("HB\n");
@@ -509,6 +536,44 @@ void app_main(void) {
                 printf("ATX %d ok\n", auto_n);
                 auto_n++;
                 auto_tx--;
+            }
+        }
+        if (tx_soak > 0) {
+            /* Paced queue: one SDU per 20 ms. EBUSY-pacing alone
+             * overruns the HCI queue (slot frees at segmentation,
+             * not at drain): ble_l2cap_tx then fails ENOMEM mid-SDU,
+             * the stack FREES the SDU, retry re-queues it -> DUPLICATE
+             * SDU on air -> stream shift. Abort on unstalled-error. */
+            static uint8_t soak[TX_SOAK_LEN];
+            while (tx_soak > 0 && !tx_soak_bad) {
+                for (int j = 0; j < TX_SOAK_LEN; j++)
+                    soak[j] = (uint8_t)((tx_soak_n + j) & 0xFF);
+                if (radio_send(0, soak, TX_SOAK_LEN) == TX_SOAK_LEN) {
+                    for (int j = 0; j < TX_SOAK_LEN; j++) {
+                        tx_soak_fnv ^= soak[j];
+                        tx_soak_fnv *= 0x100000001b3ULL;
+                    }
+                    tx_soak--;
+                    tx_soak_n++;
+                    if ((tx_soak_n % 50) == 0 || tx_soak == 0) {
+                        uint32_t dt =
+                            xTaskGetTickCount() - tx_soak_t0;
+                        printf("TXSOAK %u/%d stalls=%u ticks=%lu fnv=%08lx%08lx\n",
+                               tx_soak_n, TX_SOAK_FRAMES,
+                               tx_soak_stalls, (unsigned long)dt,
+                               (unsigned long)(tx_soak_fnv >> 32),
+                               (unsigned long)(tx_soak_fnv & 0xFFFFFFFFULL));
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(TX_SOAK_PACE_MS));
+                } else {
+                    tx_soak_stalls++;
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+            }
+            if (tx_soak_bad) {
+                printf("TXSOAK CORRUPT unstalled-err at %u\n",
+                       tx_soak_n);
+                tx_soak = 0;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(2000));

@@ -339,3 +339,36 @@ early trials). `bluetoothctl --timeout N scan on` HOLDS discovery for Ns.
   u3+u4 (Q, adjacent). All `rc=0 sec=8/8`, all 4 FNVs match
   laptop-expected. Repair is position-independent; channel holds
   across stripes with no re-arm decay.
+
+## 13. Session log 2026-09-19 p6 (TX bandwidth: 127 kbps clean)
+
+- TX goodput (ESP->laptop, 240 B SDUs): 48 KB in 3.0 s = 127 kbps,
+  200/200 SDUs, FNV MATCH, zero stalls/errors. Full set: RX 92 kbps
+  / TX 127 kbps, all FNV-verified.
+- Pacing cliff: 20 ms/SDU -> 74 kbps clean; 10 ms -> 127 kbps clean;
+  5 ms -> ENOMEM abort. Unpaced back-to-back -> same abort.
+- Root causes found (both real, both fixed/worked around):
+  (a) STALE TX CONTENT: `radio_send` used `get_pkthdr(len)+append`;
+  under load frame N+1 went on air carrying frame N's bytes
+  (air-proven via btmon). Fix: header-only pkthdr + append (stack
+  practice) in `radio_if.c`.
+  (b) HCI-QUEUE OVERRUN: slot frees at segmentation, not at drain;
+  over-queueing makes `ble_l2cap_tx` fail ENOMEM mid-SDU, the stack
+  FREES the SDU (data loss), retry re-queues it -> DUPLICATE SDU on
+  air -> stream shift. App detects via TX_UNSTALLED(status!=0) and
+  must abort (soak does). Lesson for the transport layer: per-SDU
+  sequence numbers + retry live here.
+- MSYS_1 bumped 12->32 in `sdkconfig.defaults` (cheap headroom; did
+  not move the cliff — the binding constraint is HCI depth, not
+  MSYS count). NOTE: PIO keeps a managed
+  `sdkconfig.heltec_wifi_lora_32_V3` that OVERRIDES defaults; the
+  bump had to be applied there too (build-local, untracked). Fresh
+  checkouts: delete the managed file so it regenerates from
+  defaults. JTAG pool read (idle): msys1 32 blocks ~full, min_free
+  barely dipped — exhaustion was transient queue pressure, and the
+  runtime count does apply (heap delta confirms).
+- Rig hygiene hardened: single serial reader per test (two readers
+  split bytes); setsid drains die on flash USB-reset (restart after);
+  halt-then-abandoned-tool-call leaves the core halted (always
+  resume in the same script); physical reset remains the ground
+  truth for soft-reset wedges.

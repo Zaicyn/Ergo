@@ -72,7 +72,11 @@ int radio_chan_open(const uint8_t *peer_addr6, uint16_t psm,
 int radio_send(int ch, const uint8_t *data, size_t len) {
     if (ch < 0 || ch >= NCHAN || !slots[ch].open || !len)
         return -1;
-    struct os_mbuf *om = os_msys_get_pkthdr((uint16_t)len, 0);
+    /* Header-only pkthdr + append (stack practice): get_pkthdr(len)
+     * preallocates uninitialized data space whose interplay with a
+     * following append produced stale TX payloads under back-to-back
+     * load (frame N+1 carrying frame N's bytes on air). */
+    struct os_mbuf *om = os_msys_get_pkthdr(0, 0);
     if (!om)
         return -1;
     if (os_mbuf_append(om, data, (uint16_t)len) != 0) {
