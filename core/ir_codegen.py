@@ -83,7 +83,9 @@ OWNED_MATH = {Op.SIN: "_ergo_sin", Op.COS: "_ergo_cos",
               Op.ATAN2: "_ergo_atan2", Op.POW: "_ergo_pow",
               Op.TAN: "_ergo_tan", Op.ATAN: "_ergo_atan",
               Op.LOG10: "_ergo_log10", Op.ASIN: "_ergo_asin",
-              Op.ACOS: "_ergo_acos"}
+              Op.ACOS: "_ergo_acos",
+              Op.SINH: "_ergo_sinh", Op.COSH: "_ergo_cosh",
+              Op.TANH: "_ergo_tanh"}
 
 
 def _real_math(base: str) -> str:
@@ -479,8 +481,10 @@ class IRCodeGen:
         if not self.libm_fallback and self._uses_owned_math(mod):
             self._emit_math_kernels()
         elif self.libm_fallback and self._uses_owned_math(mod):
-            self._put_raw("/* --libm-fallback: SIN/COS/EXP/LOG/ATAN2/POW "
-                          "lower to host libm; cross-libc bit-identity is "
+            self._put_raw("/* --libm-fallback: all owned math "
+                          "(SIN/COS/EXP/LOG/ATAN2/POW/TAN/ATAN/LOG10/"
+                          "ASIN/ACOS/SINH/COSH/TANH/FMOD) lower to host "
+                          "libm; cross-libc bit-identity is "
                           "NOT guaranteed (Spec/Ergo_Hardware_Op_Map.md "
                           "§2). */")
 
@@ -2431,6 +2435,11 @@ class IRCodeGen:
             a, b = self._operand(args[0]), self._operand(args[1])
             if self._is_int_operand(args[0]) and self._is_int_operand(args[1]):
                 self._put(f"{result} = ({a} % {b});")
+            elif not self.libm_fallback:
+                # Owned exact fmod (no libm symbol; bit-exact vs fmod).
+                fn = ("_ergo_fmodf" if get_real_precision() == 32
+                      else "_ergo_fmod")
+                self._put(f"{result} = {fn}({a}, {b});")
             else:
                 self._put(f"{result} = {_real_math('fmod')}({a}, {b});")
             return
@@ -3819,6 +3828,12 @@ class IRCodeGen:
                     for inst in item.insts:
                         if inst.op in OWNED_MATH:
                             return True
+                        # Real-valued MOD lowers to owned _ergo_fmod (int
+                        # MOD is plain % and needs no kernels).
+                        if inst.op == Op.MOD and len(inst.args) >= 2:
+                            if not (self._is_int_operand(inst.args[0])
+                                    and self._is_int_operand(inst.args[1])):
+                                return True
                 elif isinstance(item, IRLoop):
                     if walk_items(item.body):
                         return True

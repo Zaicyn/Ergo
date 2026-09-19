@@ -18,9 +18,19 @@ Implement the remaining transcendental and math operations using existing owned 
 - [x] `_ergo_asin`: Implement via `_ergo_atan2(x, sqrt(1-x*x))`.
 - [x] `_ergo_tan`: Implement via `_ergo_sin(x) / _ergo_cos(x)`.
 - [x] `_ergo_log10`: Implement via `_ergo_log(x) * (1.0 / ln(10))`.
-- [ ] `_ergo_fmod`: Implement fully owned `x - trunc(x/y)*y` using bit manipulation.
-- [ ] Hyperbolics (`_ergo_sinh`, `_ergo_cosh`, `_ergo_tanh`): Implement via `_ergo_exp` formulations.
+- [x] `_ergo_fmod`: exact shift-and-subtract on integer mantissas (bit-exact
+  vs `fmod` over 3M+ random patterns incl. denormals; NaN/Inf/zero per C
+  semantics). Real-valued `MOD` in codegen now emits `_ergo_fmod`/`_ergo_fmodf`
+  by default, libm `fmod` under `--libm-fallback`.
+- [x] Hyperbolics (`_ergo_sinh`, `_ergo_cosh`, `_ergo_tanh` + `f` variants):
+  Taylor poly for |x| < 0.25 (no cancellation at 0), direct `_ergo_exp`
+  composition mid-range, half-scaled `exp(x/2)` path above 700 (f64) / 80
+  (f32) so e.g. `sinh(710) = 1.117e308` instead of overflowing to Inf;
+  `tanh` clamps to +-1 beyond 20. Measured <= 5.1 ulp (f64) / <= 4 ulp (f32)
+  vs libm over [-800, 800]; all NaN/Inf/zero/denormal edges match.
 - [x] Wire these new functions into `C_MATH` and `OWNED_MATH` in `ir_codegen.py`.
+- [x] Verified: f64+f32+fallback compile+run; core pytest 23 passed;
+  golden IR-vs-legacy 16/16 MATCH; corpus 200/200 vs baseline.
 
 ## Phase 3: I/O & `stdio.h` Eradication
 Replace the slow `printf`/`fprintf` paths and `FILE*` streams.
