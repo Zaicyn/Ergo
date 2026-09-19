@@ -29,6 +29,11 @@
 #define COC_PSM 0x81
 #define COC_MTU 512
 
+/* RX-only test build: skip PHY/DLE/interval tune + auto-TX flood at
+ * CoC open, so inbound-SDU delivery is measured without LL reconfig
+ * racing it or mbuf-pool pressure from ATX. 0 = full behavior. */
+#define RX_ONLY_TEST 1
+
 static volatile unsigned long rx_bytes, rx_sdus;
 static volatile uint64_t rx_fnv = 0xcbf29ce484222325ULL;
 /* Auto-TX: fire N known-pattern frames once per CoC open, paced by
@@ -125,7 +130,8 @@ static void coc_arm(struct ble_l2cap_chan *chan) {
 static int coc_ev(struct ble_l2cap_event *event, void *arg) {
     (void)arg;
     if (event->type == BLE_L2CAP_EVENT_COC_ACCEPT) {
-        printf("COC accept\n");
+        printf("COC accept peer_sdu=%u\n",
+               event->accept.peer_sdu_size);
         return 0;
     }
     /* NOTE: accept carries no chan pointer in this stack version;
@@ -133,13 +139,21 @@ static int coc_ev(struct ble_l2cap_event *event, void *arg) {
     if (event->type == BLE_L2CAP_EVENT_COC_CONNECTED) {
         printf("COC open status=%d\n", event->connect.status);
         if (event->connect.status == 0) {
+            struct ble_l2cap_chan_info ci;
+            memset(&ci, 0, sizeof ci);
+            int cir = ble_l2cap_get_chan_info(event->connect.chan, &ci);
+            printf("COC info rc=%d scid=%u dcid=%u psm=%u our_mtu=%u peer_mtu=%u our_coc=%u peer_coc=%u\n",
+                   cir, ci.scid, ci.dcid, ci.psm, ci.our_l2cap_mtu,
+                   ci.peer_l2cap_mtu, ci.our_coc_mtu, ci.peer_coc_mtu);
             int slot = radio_chan_attach(event->connect.chan,
                                          event->connect.conn_handle);
             printf("COC slot=%d\n", slot);
+#if !RX_ONLY_TEST
             if (slot >= 0)
                 radio_request(slot, BLE_GAP_LE_PHY_2M_MASK,
                               6, 12, 251);
             auto_tx = 8;
+#endif
             coc_arm(event->connect.chan);
         }
         return 0;
@@ -177,8 +191,11 @@ static int coc_ev(struct ble_l2cap_event *event, void *arg) {
         coc_arm(ch);
         return 0;
     }
-    if (event->type == BLE_L2CAP_EVENT_COC_DISCONNECTED) {
-        radio_chan_detach(event->disconnect.chan);
+    if (event->type == BLE_L2CAP_EVENT_COC_TX_UNSTALLED) {
+        printf("COC unstalled status=%d\n", event->tx_unstalled.status);
+        return 0;
+    }
+    if (event->type == BLE_L2CAP_EVENT_COC_DISCONNECTED) {        radio_chan_detach(event->disconnect.chan);
         printf("COC closed bytes=%lu sdus=%lu fnv=%08lx%08lx\n", rx_bytes,
                rx_sdus, (unsigned long)(rx_fnv >> 32),
                (unsigned long)(rx_fnv & 0xFFFFFFFFULL));
@@ -292,9 +309,9 @@ static void host_task(void *param) {
 
 /* Auto-cycle gate: the TOG/RES/REKICK 4-phase probe loop was for TX
  * mapping (done). RX/connection work needs a stable rig, so the cycle
- * can be parked at runtime: "CYCLE 0" freezes it (state left as-is),
- * "CYCLE 1" resumes. Default on (legacy behavior). */
-static int cycle_en = 1;
+ * now DEFAULTS OFF (serial input is dead, so no runtime toggle):
+ * cycle_en = 0 freezes it; set 1 to resume probing. */
+static int cycle_en = 0;
 
 void app_main(void) {
     printf("BOOT-esfnode\n");
@@ -358,8 +375,8 @@ void app_main(void) {
             }
         }
         if (++n % 5 == 0)
-            printf("HB heap=%u rx=%lu\n",
-                   (unsigned)esp_get_free_heap_size(), rx_bytes);
+            printf("HB-FLASH3 heap=%u rx=%lu sdus=%lu\n",
+                   (unsigned)esp_get_free_heap_size(), rx_bytes, rx_sdus);
         else
             printf("HB\n");
         if (n == 5 || (n >= 45 && (n % 40) == 5))

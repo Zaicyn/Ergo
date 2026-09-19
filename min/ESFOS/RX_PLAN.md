@@ -235,3 +235,38 @@ early trials). `bluetoothctl --timeout N scan on` HOLDS discovery for Ns.
   CDC-TX backpressure (printf-blocked loop), NOT slow clocks.
   `BTLIV` state to re-verify every boot: EM base, CS base (per-build
   ...674), mbuf addr, gate, ESFOC on air.
+
+## 8. Session log 2026-09-19 (CoC-RX root cause: laptop framing)
+
+- Direction-convention correction: in btmon `<` = HOST->controller
+  (outgoing over air), `>` = controller->host (incoming). All prior
+  "ESP-initiated disconnect" readings were INVERTED: every close was
+  the laptop's own socket close (kernel Disconnect Request), ESP
+  answers with Response. No spurious ESP kills, ever.
+- JTAG channel-pool snapshot (pool @ per-build addr from `nm
+  firmware.elf ble_l2cap_chan_mem`; entry 0x4C by next-chain;
+  scid+8/mps+A/psm+1C/mtu+28/credits+2A/data_offset+2C verified
+  against live values) after 1x50B send: credits 3->2 (PDU REACHED
+  the host), data_offset=0x0100=256 = sdu_len parsed from pattern
+  bytes `00 01`. Mechanism: kernel sends BASIC-style frames (no
+  2-byte SDU length) -> host waits forever for 256B. Controller,
+  NimBLE host, app all innocent.
+- Why: coc.py never binds; kernel auto-transport still signals LE CoC
+  but frames TX as BASIC. l2test (reference) frames correctly (wire
+  `len 52 sdu 50`, header `32 00` prepended). BIND WITH LE TYPE FIXES
+  IT: bind local `78:2B:46:BC:62:76` type LE_PUBLIC before connect ->
+  kernel prepends SDU length. (`setsockopt L2CAP_MODE`: 0x80 had no
+  effect on framing; 3=ERTM connects-but-dead; 4=STREAMING aborts.
+  L2CAP_OPTIONS 11B struct -> EINVAL. l2test itself uses mode 0.)
+- Constructive proof: `coc.py raw` with manual `3000`+48B -> ESP
+  `RX sdu len=48`, `closed bytes=48 sdus=1`. Bidirectional CoC works;
+  remaining work is laptop-side framing in coc.py (add LE bind).
+- Rig: auto-cycle DEFAULT OFF now (`cycle_en=0`, serial dead so no
+  runtime toggle) -> ADV stable across links. DEBUG host logs WEDGE
+  the device (reverted; INFO is the max usable). xTickCount +
+  chan-pool addrs MOVE EVERY BUILD (re-nm after each flash).
+- RIG DOWN at close: app wedges ~50s after boot (tick frozen, 1 HB /
+  3min, both cores report "running", JTAG reset ineffective).
+  Documented recovery = PHYSICAL power cycle. JTAG halt budget +
+  dual-core resume-order hazard suspected contributor (pool-dump
+  halt preceded the wedge).
