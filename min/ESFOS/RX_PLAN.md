@@ -270,3 +270,22 @@ early trials). `bluetoothctl --timeout N scan on` HOLDS discovery for Ns.
   Documented recovery = PHYSICAL power cycle. JTAG halt budget +
   dual-core resume-order hazard suspected contributor (pool-dump
   halt preceded the wedge).
+
+## 9. Session log 2026-09-19 p2 (CoC FULL DUPLEX proven)
+
+- Laptop RX sweep (LE bind, FLASH3 RX-only build): 200 / 480 / 512 B
+  all delivered (`RX sdu len=` each, multi-frame reassembly incl.
+  MTU edge), FNV bit-exact vs laptop pattern (43cfa802../e2a6dd09../
+  9432c614..). `coc.py` fixed in scratch: `l2bind()` (LE_PUBLIC
+  source bind before connect) + LE_FLOWCTL note; `raw` mode kept for
+  manual-framing probes (defaults BASIC).
+- Full stack restore (FLASH4: `RX_ONLY_TEST 0` = PHY/DLE tune +
+  auto-TX back, `cycle_en=0` kept): TX 8x480 = 3840 B FNV MATCH;
+  DUPLEX on one channel: ESP->laptop 3840 B + laptop->ESP 3x200 =
+  600 B sdus=3 interleaved in time (RX at 3-5 s inside ATX 8-15
+  window), both FNV MATCH. CoC is FULLY FUNCTIONAL both directions,
+  simultaneously, with tune enabled.
+- Rig notes: flash USB-reset kills OpenOCD daemon (restart + JTAG
+  reset needed post-flash); tick/chan-pool addrs move per build;
+  physical reset recovered the ~50 s boot wedge; ADV stable with
+  cycle off (no more TOG lottery).

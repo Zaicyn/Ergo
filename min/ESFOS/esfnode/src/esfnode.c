@@ -32,7 +32,7 @@
 /* RX-only test build: skip PHY/DLE/interval tune + auto-TX flood at
  * CoC open, so inbound-SDU delivery is measured without LL reconfig
  * racing it or mbuf-pool pressure from ATX. 0 = full behavior. */
-#define RX_ONLY_TEST 1
+#define RX_ONLY_TEST 0
 
 static volatile unsigned long rx_bytes, rx_sdus;
 static volatile uint64_t rx_fnv = 0xcbf29ce484222325ULL;
@@ -375,7 +375,7 @@ void app_main(void) {
             }
         }
         if (++n % 5 == 0)
-            printf("HB-FLASH3 heap=%u rx=%lu sdus=%lu\n",
+            printf("HB-FLASH4 heap=%u rx=%lu sdus=%lu\n",
                    (unsigned)esp_get_free_heap_size(), rx_bytes, rx_sdus);
         else
             printf("HB\n");
